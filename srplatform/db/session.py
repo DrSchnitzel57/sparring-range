@@ -5,6 +5,7 @@ everything at runtime uses the app-role URL so the append-only revocations bite.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from functools import lru_cache
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -12,12 +13,14 @@ from sqlalchemy.orm import Session, sessionmaker
 from srplatform.settings import get_settings
 
 
+@lru_cache
 def owner_engine():
-    return create_engine(get_settings().postgres_url_owner)
+    return create_engine(get_settings().postgres_url_owner, pool_size=5, pool_pre_ping=True)
 
 
+@lru_cache
 def app_engine():
-    return create_engine(get_settings().postgres_url)
+    return create_engine(get_settings().postgres_url, pool_size=5, pool_pre_ping=True)
 
 
 @contextmanager

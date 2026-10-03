@@ -44,6 +44,7 @@ def test_db_url_owner() -> str:
 @pytest.fixture(scope="session")
 def migrated_db(test_db_url_owner, test_db_url_app):
     """Fresh schema: drop/recreate the test DB, then run the REAL migration path."""
+    _psql_admin("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='sparring_range_test'")
     _psql_admin("DROP DATABASE IF EXISTS sparring_range_test")
     # explicit UTF8: the cluster default here is SQL_ASCII, which breaks JSONB
     # unicode escapes; Drew's production DB must also be UTF8.
