@@ -1,0 +1,29 @@
+# cloud-init for the Linux golden image (Ubuntu server / web01 template).
+# Baked once at golden-image build time (Drew, M1); per-clone the orchestrator
+# only pins the scenario IP via ipconfig0.
+hostname: golden-linux
+manage_etc_hosts: true
+
+users:
+  - name: drew
+    groups: [sudo]
+    shell: /bin/bash
+    # Drew's SSH pubkey goes here at image build time (or left empty — the
+    # bastion is the only sanctioned path into the range; direct keys are for
+    # golden-image bootstrap only).
+    ssh_authorized_keys: []
+
+package_update: false   # the golden image is built once; no runtime internet needed
+
+write_files:
+  # The telemetry shipper (telemetry/shipper.py) is installed by the golden-image
+  # provisioning script; this is where it learns where to POST.
+  - path: /etc/sparring-range/shipper.conf
+    content: |
+      # POST target = platform API ingest endpoint (control plane side only)
+      INGEST_URL=http://CHANGEME-control-plane:8000/ingest/auditd
+      # This host's role tag (matches the scenario topology name)
+      HOST_TAG=CHANGEME
+
+runcmd:
+  - systemctl enable --now auditd

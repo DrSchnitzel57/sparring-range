@@ -85,6 +85,9 @@ class FakeProxmox:
 
     def get(self, path):
         self.calls.append(("GET", path))
+        if path.rstrip("/").endswith("/cluster/resources"):
+            return [{"vmid": vmid, "name": v["name"], "node": "fake", "type": "qemu", "status": v["status"]}
+                    for vmid, v in self.vms.items()]
         return []
 
     def post(self, path, **kwargs):
@@ -106,6 +109,8 @@ class FakeProxmox:
 
     def stop(self, node, vmid, force=False):
         self.calls.append(("STOP", node, vmid, force))
+        if vmid in self.vms:
+            self.vms[vmid]["status"] = "stopped"
         return "job-3"
 
     def destroy(self, node, vmid):

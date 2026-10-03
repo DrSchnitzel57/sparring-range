@@ -29,8 +29,13 @@ class Settings(BaseSettings):
     # --- Range network (control-plane-side view) ---
     range_bridge: str = "vmbr1"
     range_vlan: int = 66
+    range_gateway: str = "10.66.0.1"
     bastion_address: str = "10.66.0.2"
     kali_container: str = "kali-red-01"
+
+    # --- Deploy (M1) ---
+    proxmox_node: str = "r740"
+    deploy_vmid_base: int = 210
 
     # --- Golden image templates ---
     template_vmid_web: int = 9001

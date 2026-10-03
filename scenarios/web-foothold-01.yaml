@@ -1,0 +1,26 @@
+# Target shape from the plan (Part 5/M4). Loaded by srplatform/scenario_engine/loader.py.
+id: web-foothold-01
+name: "Vulnerable web app foothold"
+difficulty: 1
+focus: [web, initial-access]        # library filter: domain / skill area
+est_minutes: 30                     # shown in the scenario library
+techniques: [T1190, T1505.003]      # MITRE, for library browse + AAR tagging
+topology:
+  hosts:
+    - name: web01
+      template_vmid: 9001
+      ip: 10.66.0.10
+      services: [http]
+red:
+  start_phase: recon
+  objectives:
+    - id: foothold
+      verifier: flag_file_present
+      args: { host: web01, path: /root/flag_foothold.txt }
+    - id: persistence
+      verifier: cron_persistence_present
+      args: { host: web01 }
+scoring:
+  blue_checks:
+    - { verifier: no_rogue_admin, host: web01, points: 10 }
+    - { verifier: firewall_enabled, host: web01, points: 5 }

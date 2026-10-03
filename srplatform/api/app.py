@@ -158,6 +158,48 @@ def safety_verify():
     return get_supervisor().verify()
 
 
+# --- deploy layer (M1) — the API front door for scenario spin-up ----------------
+class DeployIn(BaseModel):
+    session_id: uuid.UUID | None = None
+
+
+def _proxmox_for_request():
+    from srplatform.api.deps import get_proxmox
+
+    return get_proxmox()
+
+
+@app.get("/scenarios")
+def scenarios_list():
+    from srplatform.scenario_engine.loader import list_scenarios
+
+    return list_scenarios()
+
+
+@app.post("/deploy/{scenario_id}")
+def deploy_scenario(scenario_id: str, body: DeployIn | None = None):
+    from srplatform.scenario_engine import orchestrator
+
+    return orchestrator.deploy(scenario_id, _proxmox_for_request(),
+                               session_id=body.session_id if body else None)
+
+
+@app.post("/deploy/{scenario_id}/reset")
+def reset_scenario(scenario_id: str, body: DeployIn | None = None):
+    from srplatform.scenario_engine import orchestrator
+
+    return orchestrator.reset(scenario_id, _proxmox_for_request(),
+                              session_id=body.session_id if body else None)
+
+
+@app.post("/deploy/{scenario_id}/teardown")
+def teardown_scenario(scenario_id: str, body: DeployIn | None = None):
+    from srplatform.scenario_engine import orchestrator
+
+    return orchestrator.teardown(scenario_id, _proxmox_for_request(),
+                                 session_id=body.session_id if body else None)
+
+
 # --- shared helper ---------------------------------------------------------------
 def _log_event(db: Session, session_id, actor, host, action_type, payload, phase=None,
                mitre_technique=None, raw_ref=None, raw_output_hash=None, ts=None):

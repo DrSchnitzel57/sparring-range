@@ -12,6 +12,11 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VENV_PY = str(REPO_ROOT / ".venv" / "bin" / "python")
 
+# Point ALL settings at the test DB before anything imports srplatform.settings
+# (get_settings is lru-cached on first call). Tests never touch the dev DB.
+os.environ["POSTGRES_URL"] = "postgresql+psycopg2://sr_app:sr_app_dev@localhost:5432/sparring_range_test"
+os.environ["POSTGRES_URL_OWNER"] = "postgresql+psycopg2://sr_owner:sr_owner_dev@localhost:5432/sparring_range_test"
+
 
 def _psql_admin(sql: str) -> str:
     return subprocess.run(
