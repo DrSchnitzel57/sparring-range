@@ -158,6 +158,78 @@ def safety_verify():
     return get_supervisor().verify()
 
 
+class PidIn(BaseModel):
+    pid: int
+
+
+@app.post("/safety/register-pid")
+def register_red_agent_pid(body: PidIn):
+    """A red-agent process (possibly in another process/service) registers itself
+    so the killswitch can stop it — constraint #2 across process boundaries."""
+    get_supervisor().register_red_agent(body.pid)
+    return {"ok": True}
+
+
+# --- agent_state (M3): rolling red-agent memory, via the front door --------------
+class AgentStateIn(BaseModel):
+    summary: str | None = None
+    summary_upto: int | None = None
+    current_phase: str | None = None
+
+
+@app.put("/agent_state/{session_id}")
+def put_agent_state(session_id: uuid.UUID, body: AgentStateIn, db: Session = Depends(get_db)):
+    st = db.get(AgentState, session_id)
+    if not st:
+        st = AgentState(session_id=session_id)
+        db.add(st)
+        db.flush()
+    # agent_state is mutable working memory — the ONLY non-append-only table,
+    # and it holds no evidence, only derived context.
+    if body.summary is not None:
+        st.summary = body.summary
+    if body.summary_upto is not None:
+        st.summary_upto = body.summary_upto
+    if body.current_phase is not None:
+        st.current_phase = body.current_phase
+    return {"ok": True}
+
+
+@app.get("/agent_state/{session_id}")
+def get_agent_state(session_id: uuid.UUID, db: Session = Depends(get_db)):
+    st = db.get(AgentState, session_id)
+    if not st:
+        raise HTTPException(404, "no agent state")
+    return {"session_id": str(st.session_id), "summary": st.summary,
+            "summary_upto": st.summary_upto, "current_phase": st.current_phase}
+
+
+# --- run (M3): start the red agent loop for a session -----------------------------
+class RunIn(BaseModel):
+    session_id: uuid.UUID
+
+
+@app.post("/run/{scenario_id}")
+def run_scenario(scenario_id: str, body: RunIn):
+    """Start the red agent loop in a background thread (dev/prod single-host).
+    The loop itself registers with the safety supervisor, so the killswitch
+    can stop it (constraint #2)."""
+    import threading
+
+    from srplatform.red_agent.llm import LLM
+    from srplatform.red_agent.loop import RedAgentLoop
+    from srplatform.red_agent.sandbox import KaliSandbox
+    from srplatform.red_agent.transport import HttpTransport
+    from srplatform.settings import get_settings as gs
+
+    def _go():
+        loop = RedAgentLoop(str(body.session_id), scenario_id, HttpTransport(gs().api_base_url), LLM(), KaliSandbox())
+        loop.run()
+
+    threading.Thread(target=_go, daemon=True).start()
+    return {"ok": True, "session_id": str(body.session_id)}
+
+
 # --- deploy layer (M1) — the API front door for scenario spin-up ----------------
 class DeployIn(BaseModel):
     session_id: uuid.UUID | None = None
