@@ -9,6 +9,7 @@ from rangectl.commands import deploy as deploy_cmds
 from rangectl.commands import report as report_cmds
 from rangectl.commands import run as run_cmds
 from rangectl.commands import safety as safety_cmds
+from rangectl.commands import scoring as scoring_cmds
 
 app = typer.Typer(name="rangectl", help="AI Red-Team Sparring Range control CLI.", no_args_is_help=True)
 app.add_typer(db_cmds.app, name="db")
@@ -16,6 +17,7 @@ app.add_typer(deploy_cmds.app, name="deploy")
 app.add_typer(run_cmds.app, name="run")
 app.add_typer(report_cmds.app, name="report")
 app.add_typer(safety_cmds.app, name="safety")
+app.add_typer(scoring_cmds.app, name="score")
 
 
 @app.command("hint")

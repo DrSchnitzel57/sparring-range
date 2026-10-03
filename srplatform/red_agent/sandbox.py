@@ -62,6 +62,12 @@ class FakeSandbox:
         self.history: list[str] = []
         # host -> path -> content; shared with the verifier Context
         self.fs: dict[str, dict[str, str]] = {}
+        # per-host command-pattern state for verifier exec: list of
+        # (host, substring, (exit, out)) — set by tests to fake real host truth
+        self.pattern_state: list[tuple[str, str, tuple[int, str]]] = []
+
+    def set_state(self, host: str, command_pattern: str, resp: tuple[int, str]) -> None:
+        self.pattern_state.append((host, command_pattern, resp))
 
     def run(self, command: str) -> tuple[int, str]:
         self.history.append(command)
@@ -75,6 +81,10 @@ class FakeSandbox:
 
     # ---- verifier exec bridge: exec(host, command) -> (code, out) ------------
     def verifier_exec(self, host: str, command: str) -> tuple[int, str]:
+        # LATER set_state entries win, so tests can flip host state mid-test
+        for h, pattern, resp in reversed(self.pattern_state):
+            if h == host and pattern in command:
+                return resp
         if command.startswith("cat "):
             path = command[4:].strip()
             fs = self.fs.get(host, {})

@@ -1,0 +1,39 @@
+# M4 acceptance scenario: defined ENTIRELY in YAML — no code changes. Every
+# verifier referenced already exists in the library; the same checks serve red
+# objectives and blue scoring.
+id: db-exfil-01
+name: "Database exfiltration drill"
+difficulty: 2
+focus: [data, exfiltration, lateral]
+est_minutes: 45
+techniques: [T1190, T1041, T1021.004]
+topology:
+  hosts:
+    - name: web01
+      template_vmid: 9001
+      ip: 10.66.0.10
+      services: [http]
+    - name: db01
+      template_vmid: 9004
+      ip: 10.66.0.11
+      services: [mysql]
+red:
+  start_phase: recon
+  objectives:
+    - id: foothold
+      verifier: flag_file_present
+      args: { host: web01, path: /root/flag_foothold.txt }
+    - id: loot
+      verifier: exfil_flag
+      args: { host: web01, path: /tmp/exfil/loot }
+    - id: persistence
+      verifier: service_present
+      args: { host: db01, service: mysql-router }
+scoring:
+  blue_checks:
+    - { verifier: no_rogue_admin, host: web01, points: 10 }
+    - { verifier: firewall_enabled, host: web01, points: 5 }
+    - { verifier: rogue_account, host: db01, points: 10,
+        known_users: [root, mysql, daemon] }
+    - { verifier: data_integrity, host: db01, path: /var/lib/mysql/ibdata1,
+        expected_sha256: 7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d6772842dd42728a0f1383e, points: 15 }

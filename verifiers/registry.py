@@ -3,6 +3,10 @@ from __future__ import annotations
 
 from verifiers.base import Verifier
 from verifiers.library.flag_file import FlagFilePresent, CronPersistencePresent
+from verifiers.library.ccdc import (
+    NoRogueAdmin, RogueAccount, FirewallEnabled, AvEnabled, ServicePresent,
+    ScheduledTaskPresent, PersistenceRunKey, UnpatchedService, DataIntegrity, ExfilFlag,
+)
 
 REGISTRY: dict[str, Verifier] = {}
 
@@ -17,5 +21,7 @@ def get(verifier_id: str) -> Verifier:
     return REGISTRY[verifier_id]
 
 
-register(FlagFilePresent())
-register(CronPersistencePresent())
+for _v in (FlagFilePresent(), CronPersistencePresent(), NoRogueAdmin(), RogueAccount(),
+           FirewallEnabled(), AvEnabled(), ServicePresent(), ScheduledTaskPresent(),
+           PersistenceRunKey(), UnpatchedService(), DataIntegrity(), ExfilFlag()):
+    register(_v)
