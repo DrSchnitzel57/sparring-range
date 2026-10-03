@@ -1,0 +1,11 @@
+# .gitignore — secrets stay out of git (hard constraint #5)
+.env
+.venv/
+__pycache__/
+*.pyc
+recordings/
+*.cast
+.pytest_cache/
+*.egg-info/
+web/node_modules/
+web/.next/

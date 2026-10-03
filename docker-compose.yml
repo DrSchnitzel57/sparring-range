@@ -1,0 +1,53 @@
+# Dev-only composition of the platform services (Part 2: compose for dev, LXC for real).
+# The real deployment places these same services into LXCs on the R740.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: sr_owner
+      POSTGRES_PASSWORD: devowner
+      POSTGRES_DB: sparring_range
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sr_owner"]
+      interval: 5s
+      retries: 10
+
+  # Application role: everything except `db migrate` connects as this role so the
+  # append-only revocations actually bite (they'd be no-ops for the owner).
+  bootstrap-roles:
+    image: postgres:16
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      PGPASSWORD: devowner
+    command: >
+      psql -h postgres -U sr_owner -d sparring_range -v ON_ERROR_STOP=1 -f /bootstrap.sql
+    volumes:
+      - ./infra/db/bootstrap.sql:/bootstrap.sql:ro
+
+  api:
+    build: { context: ., dockerfile: infra/dev/Dockerfile }
+    command: uvicorn srplatform.api.app:app --host 0.0.0.0 --port 8000
+    env_file: .env
+    environment:
+      POSTGRES_URL: postgresql+psycopg2://sr_app:devapp@postgres:5432/sparring_range
+      POSTGRES_URL_OWNER: postgresql+psycopg2://sr_owner:devowner@postgres:5432/sparring_range
+    ports: ["8000:8000"]
+    depends_on: [bootstrap-roles]
+
+  red-agent:
+    build: { context: ., dockerfile: infra/dev/Dockerfile }
+    command: python -m srplatform.red_agent.loop
+    env_file: .env
+    depends_on: [api]
+
+  coach:
+    build: { context: ., dockerfile: infra/dev/Dockerfile }
+    command: uvicorn srplatform.coach.service:app --host 0.0.0.0 --port 8001
+    env_file: .env
+    depends_on: [api]
+
+volumes:
+  pgdata:

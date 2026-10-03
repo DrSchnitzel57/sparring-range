@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sparring-range"
+version = "0.1.0"
+description = "AI Red-Team Sparring Range — see plan.markdown (Parts 1-7 are the contract)"
+requires-python = ">=3.11"
+dependencies = [
+    # Part 2 — decided stack. Do not add libraries without justification.
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "sqlalchemy>=2.0",
+    "psycopg2-binary>=2.9",
+    "alembic>=1.13",
+    "asyncssh>=2.14",
+    "proxmoxer>=2.0",
+    "openai>=1.40",
+    "typer>=0.12",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "PyYAML>=6.0",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+rangectl = "rangectl.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["rangectl*", "infra*", "srplatform*", "verifiers*", "telemetry*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
