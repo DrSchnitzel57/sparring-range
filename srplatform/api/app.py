@@ -17,6 +17,11 @@ from srplatform.safety import get_supervisor
 
 app = FastAPI(title="sparring-range API", version="0.1.0")
 
+# M5 coach routes (AAR + Socratic hints on a priority queue)
+from srplatform.api.coach_routes import router as coach_router  # noqa: E402
+
+app.include_router(coach_router)
+
 
 def get_db():
     with db() as s:

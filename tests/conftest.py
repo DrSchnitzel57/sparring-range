@@ -45,7 +45,10 @@ def test_db_url_owner() -> str:
 def migrated_db(test_db_url_owner, test_db_url_app):
     """Fresh schema: drop/recreate the test DB, then run the REAL migration path."""
     _psql_admin("DROP DATABASE IF EXISTS sparring_range_test")
-    _psql_admin("CREATE DATABASE sparring_range_test OWNER sr_owner")
+    # explicit UTF8: the cluster default here is SQL_ASCII, which breaks JSONB
+    # unicode escapes; Drew's production DB must also be UTF8.
+    _psql_admin("CREATE DATABASE sparring_range_test OWNER sr_owner ENCODING 'UTF8' TEMPLATE template0 "
+                "LC_COLLATE 'C' LC_CTYPE 'C'")
     env = {**os.environ, "POSTGRES_URL_OWNER": test_db_url_owner, "DB_APP_ROLE": "sr_app"}
     r = subprocess.run([VENV_PY, "-m", "alembic", "upgrade", "head"], cwd=REPO_ROOT, env=env,
                        capture_output=True, text=True)
