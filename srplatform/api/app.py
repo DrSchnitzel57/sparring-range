@@ -200,6 +200,62 @@ def teardown_scenario(scenario_id: str, body: DeployIn | None = None):
                                  session_id=body.session_id if body else None)
 
 
+# --- login tokens (bastion target selection, M2) --------------------------------
+class TokenIn(BaseModel):
+    token: str
+    target_host: str
+    target_port: int = 22
+    session_id: uuid.UUID | None = None
+
+
+@app.post("/tokens", status_code=201)
+def create_token(body: TokenIn, db: Session = Depends(get_db)):
+    if db.get(LoginToken, body.token):
+        raise HTTPException(409, "token exists")
+    db.add(LoginToken(token=body.token, target_host=body.target_host,
+                      target_port=body.target_port, session_id=body.session_id))
+    return {"ok": True}
+
+
+@app.get("/tokens/{token}")
+def get_token(token: str, db: Session = Depends(get_db)):
+    t = db.get(LoginToken, token)
+    if not t or t.revoked_at is not None:
+        raise HTTPException(404, "token not found")
+    return {"token": t.token, "session_id": str(t.session_id) if t.session_id else None,
+            "target_host": t.target_host, "target_port": int(t.target_port)}
+
+
+# --- auditd ingest (M2): execve truth from range hosts, tied to live session ----
+class AuditdIn(BaseModel):
+    host: str
+    ts: str | datetime | None = None
+    uid: str | int | None = None
+    comm: str | None = None
+    exe: str | None = None
+    argv: str | None = None
+    raw: dict | None = None
+
+
+@app.post("/ingest/auditd", status_code=201)
+def ingest_auditd(body: AuditdIn, db: Session = Depends(get_db)):
+    """Records auditd execve events as action_type='command'. The live session is
+    resolved via active login tokens for this host (M2 acceptance: correct
+    session_id). auditd — not the bastion PTY — is the command source of truth."""
+    tok = db.execute(
+        select(LoginToken)
+        .where(LoginToken.target_host == body.host, LoginToken.revoked_at.is_(None))
+        .order_by(LoginToken.created_at.desc())
+    ).scalars().first()
+    session_id = tok.session_id if tok else None
+    _log_event(
+        db, session_id, "telemetry", body.host, "command",
+        {"source": "auditd", "uid": body.uid, "comm": body.comm, "exe": body.exe, "argv": body.argv,
+         "raw": body.raw},
+    )
+    return {"ok": True, "session_id": str(session_id) if session_id else None}
+
+
 # --- shared helper ---------------------------------------------------------------
 def _log_event(db: Session, session_id, actor, host, action_type, payload, phase=None,
                mitre_technique=None, raw_ref=None, raw_output_hash=None, ts=None):

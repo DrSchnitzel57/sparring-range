@@ -1,0 +1,21 @@
+# auditd rules (telemetry/auditd.rules) — shipped to Linux golden images.
+# Command-level truth for the range comes from auditd execve (NOT from scraping
+# the bastion's interactive PTY — Part 6.2). Keep this lean; it's the v1 set.
+
+-D
+
+# execve syscalls for all uid >= 0 (catch root and users alike)
+-a always,exit -F arch=b64 -S execve -F auid>=0 -k sparring_cmd
+-a always,exit -F arch=b32 -S execve -F auid>=0 -k sparring_cmd
+
+# log-user (shell history equivalent: what interactive users ran)
+-w /var/log/audit/ -p wa -k sparring_auditlog
+
+# persistence staples CCDC verifiers care about
+-w /etc/cron.d/ -p wa -k sparring_persistence
+-w /etc/systemd/system/ -p wa -k sparring_persistence
+-w /etc/passwd -p wa -k sparring_accounts
+-w /etc/shadow -p wa -k sparring_accounts
+
+# kill the old rules, load these
+-e 2
