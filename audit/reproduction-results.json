@@ -1,0 +1,100 @@
+[
+  {
+    "probe": "Python 3.12 source parse",
+    "observed": {
+      "files": 61,
+      "errors": [],
+      "test_functions": 25
+    }
+  },
+  {
+    "probe": "Python 3.11 conftest syntax",
+    "observed": "accepted"
+  },
+  {
+    "probe": "Unrelated SSH disconnect erases miss",
+    "observed": {
+      "before": 1,
+      "after": 0
+    }
+  },
+  {
+    "probe": "Missing scorecard grade",
+    "observed": "F"
+  },
+  {
+    "probe": "One objective discounts perfect score",
+    "observed": "B"
+  },
+  {
+    "probe": "firewall_enabled accepts failed command",
+    "observed": true
+  },
+  {
+    "probe": "av_enabled accepts failed command",
+    "observed": true
+  },
+  {
+    "probe": "unpatched_service accepts failed command",
+    "observed": true
+  },
+  {
+    "probe": "Baseline cron file confirms persistence",
+    "observed": true
+  },
+  {
+    "probe": "Empty tool args accepted",
+    "observed": ""
+  },
+  {
+    "probe": "Non-string command coerced",
+    "observed": "42"
+  },
+  {
+    "probe": "Unwired killswitch",
+    "observed": {
+      "killswitch": "engaged",
+      "actions": [
+        "WARNING: no proxmox connection \u2014 datapath drop NOT applied"
+      ]
+    }
+  },
+  {
+    "probe": "Release without state or firewall operation",
+    "observed": {
+      "killswitch": "released",
+      "note": "baseline egress-deny from infra/firewall/range-egress-deny.nft.conf.tmpl must still be active"
+    }
+  },
+  {
+    "probe": "Production adapter request paths (intercepted)",
+    "observed": [
+      {
+        "path": "/nodes/{node}/qemu/9001/clone",
+        "args": {
+          "newid": 210,
+          "name": "test",
+          "full": 0
+        }
+      },
+      {
+        "path": "/nodes/r740/qemu/210/destroy",
+        "args": {}
+      }
+    ]
+  },
+  {
+    "probe": "DONE stops after only one of two objectives passes",
+    "observed": {
+      "model_calls": 1,
+      "result": {
+        "steps": 0,
+        "phase": "recon",
+        "achieved": [
+          "first"
+        ],
+        "complete": false
+      }
+    }
+  }
+]

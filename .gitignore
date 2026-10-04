@@ -11,3 +11,4 @@ web/node_modules/
 web/.next/
 web/npm-install.log
 .playwright-cli/
+/Claude outputs
