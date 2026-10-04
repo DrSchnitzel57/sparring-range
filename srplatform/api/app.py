@@ -17,10 +17,27 @@ from srplatform.safety import get_supervisor
 
 app = FastAPI(title="sparring-range API", version="0.1.0")
 
+# The web app (M7) is a browser client on another LAN origin → CORS for the
+# local dev/deploy origins only. Home-LAN trust boundary (constraint #6): we do
+# not expose this API to the internet, so a tight local allow-list suffices.
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # M5 coach routes (AAR + Socratic hints on a priority queue)
 from srplatform.api.coach_routes import router as coach_router  # noqa: E402
 
 app.include_router(coach_router)
+
+# M7 web routes (accounts/login, live, replay, progress — all views over the log)
+from srplatform.api.web_routes import router as web_router  # noqa: E402
+
+app.include_router(web_router)
 
 
 def get_db():

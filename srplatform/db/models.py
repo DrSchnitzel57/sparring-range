@@ -99,3 +99,13 @@ class LoginToken(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (UniqueConstraint("token", name="uq_login_token"),)
+
+
+class WebToken(Base):
+    """Simple LAN session tokens for the M7 web app (no SSO — scope traps out)."""
+
+    __tablename__ = "web_tokens"
+
+    token: Mapped[str] = mapped_column(Text, primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.user_id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
