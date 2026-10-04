@@ -1,18 +1,28 @@
-"""M7 web endpoints: accounts/login (simple LAN tokens), replay data, progress.
-Every response here is either a query over the event log or a read of a .cast
-recording — the web app is just another view over the same front door."""
+"""M7 web endpoints — auth-wired, recording-ID-based, domain-aware progress.
+
+  * Replay data comes from RECORDING IDS (F16) with strict root containment
+    and size/frame validation — never from client-supplied filesystem paths.
+  * Progress is computed per scoring DOMAIN from score-snapshot items (F20),
+    with chronological history, event-ID tie-break, trend deltas, and honest
+    handling of empty/zero/unknown scores.
+  * The live dashboard reads real detections with source times.
+"""
 from __future__ import annotations
 
 import json
-import secrets
+import os
 import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
-from sqlalchemy import text as sa_text
+from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel, Field
+from sqlalchemy import select, text as sa_text
 from sqlalchemy.orm import Session
 
-from srplatform.db.models import Event, User, WebToken
+from srplatform.api.auth import Principal, make_auth_dependencies
+from srplatform.db.models import Event, Recording, Session as SessionModel
 from srplatform.db.session import db as _db_ctx
 from srplatform.settings import get_settings
 
@@ -24,131 +34,206 @@ def get_db():
         yield s
 
 
-# --- accounts & login -------------------------------------------------------------
-class UserIn(BaseModel):
-    username: str
-    display_name: str | None = None
+principal, any_member, operator, service = make_auth_dependencies(get_db)
 
 
-@router.post("/users", status_code=201)
-def create_user(body: UserIn, db: Session = Depends(get_db)):
-    """Member accounts (LAN gym members — created by Drew from the UI or CLI)."""
-    if db.query(User).filter(User.username == body.username).first():
-        raise HTTPException(409, "exists")
-    u = User(username=body.username, display_name=body.display_name)
-    db.add(u)
+def _session_or_403(db: Session, p: Principal, session_id: uuid.UUID) -> SessionModel:
+    sess = db.get(SessionModel, session_id)
+    if sess is None:
+        raise HTTPException(404, "session not found")
+    if not p.is_operator and str(sess.user_id) != str(p.user_id):
+        raise HTTPException(403, "not your session")
+    return sess
+
+
+# --- recordings (opaque IDs; server-side paths — F16) ---------------------------
+class RecordingIn(BaseModel):
+    cast_path: str = Field(min_length=1)
+    status: str = "recording"
+
+
+@router.post("/sessions/{session_id}/recordings", status_code=201)
+def register_recording(session_id: uuid.UUID, body: RecordingIn,
+                       p: Principal = Depends(service("bastion")),
+                       db: Session = Depends(get_db)):
+    """Called by the bastion with its capability; the path never becomes a
+    client-facing identifier — clients only ever see recording_id."""
+    if p.session_id is not None and str(p.session_id) != str(session_id):
+        raise HTTPException(403, "bastion token bound to another session")
+    if db.get(SessionModel, session_id) is None:
+        raise HTTPException(404, "session not found")
+    root = Path(get_settings().recordings_dir).resolve()
+    path = Path(body.cast_path).resolve()
+    if not path.is_relative_to(root):
+        raise HTTPException(422, "cast path outside recordings root")
+    rec = Recording(session_id=session_id, cast_path=str(path), status=body.status)
+    db.add(rec)
     db.flush()
-    return {"user_id": str(u.user_id), "username": u.username}
+    return {"recording_id": str(rec.recording_id)}
 
 
-class LoginIn(BaseModel):
-    username: str
+@router.get("/sessions/{session_id}/recordings")
+def list_recordings(session_id: uuid.UUID, p: Principal = Depends(any_member),
+                    db: Session = Depends(get_db)):
+    _session_or_403(db, p, session_id)
+    rows = db.execute(select(Recording).where(Recording.session_id == session_id)
+                      .order_by(Recording.created_at)).scalars().all()
+    return [{"recording_id": str(r.recording_id), "created_at": r.created_at.isoformat(),
+             "status": r.status, "bytes": r.bytes} for r in rows]
 
 
-@router.post("/auth/login")
-def login(body: LoginIn, db: Session = Depends(get_db)):
-    """Simple session token for a known member (no password prompt on a home LAN —
-    hard constraint #6 says this is the trust boundary; add keys per member if
-    that changes)."""
-    u = db.query(User).filter(User.username == body.username).first()
-    if not u:
-        raise HTTPException(404, "no such member — ask Drew to create your account")
-    tok = secrets.token_hex(16)
-    db.add(WebToken(token=tok, user_id=u.user_id))
-    return {"token": tok, "user_id": str(u.user_id), "username": u.username}
+def _safe_read_cast(path: str) -> dict:
+    """Root containment + symlink policy + size cap + frame validation."""
+    settings = get_settings()
+    root = Path(settings.recordings_dir).resolve()
+    p = Path(path)
+    if p.is_symlink():
+        raise HTTPException(422, "symlink recordings rejected")
+    p = p.resolve()
+    if not p.is_relative_to(root):
+        raise HTTPException(422, "recording path escapes storage root")
+    if not p.exists():
+        raise HTTPException(404, "recording file missing on this host "
+                                 "(shared storage/transfer contract — see docs/OPERATOR_RUNBOOK.md)")
+    size = p.stat().st_size
+    if size > settings.recording_max_bytes:
+        raise HTTPException(413, f"recording exceeds size cap ({size} bytes)")
+    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    if not lines:
+        raise HTTPException(422, "empty recording")
+    header = json.loads(lines[0])
+    frames = []
+    for ln in lines[1:]:
+        try:
+            f = json.loads(ln)
+            if (isinstance(f, list) and len(f) == 3 and isinstance(f[0], (int, float))
+                    and f[1] in ("o", "i", "r") and isinstance(f[2], str)):
+                frames.append(f)
+        except json.JSONDecodeError:
+            continue  # a torn tail line must not break the whole replay
+    return {"header": header, "frames": frames, "bytes": size}
 
 
-def user_from_token(db: Session, token: str) -> User:
-    wt = db.get(WebToken, token)
-    if not wt:
-        raise HTTPException(401, "bad token")
-    u = db.get(User, wt.user_id)
-    if not u:
-        raise HTTPException(401, "bad token")
-    return u
+@router.get("/recordings/{recording_id}")
+def get_recording(recording_id: uuid.UUID, p: Principal = Depends(any_member),
+                  db: Session = Depends(get_db)):
+    rec = db.get(Recording, recording_id)
+    if rec is None:
+        raise HTTPException(404, "recording not found")
+    _session_or_403(db, p, rec.session_id)
+    data = _safe_read_cast(rec.cast_path)
+    return {"recording_id": str(rec.recording_id), "session_id": str(rec.session_id), **data}
 
 
-# --- replay data (asciinema cast files, streamed for the web player) ---------------
 @router.get("/sessions/{session_id}/replay")
-def replay(session_id: uuid.UUID, db: Session = Depends(get_db)):
-    """Locate .cast recordings for a session (via bastion events' raw_ref) and
-    return parsed frames for scrubbing, plus the event timeline to sync against."""
-    events = db.execute(
-        sa_text("SELECT event_id, ts, actor, action_type, phase, payload FROM events "
-                "WHERE session_id = :sid ORDER BY ts, event_id"), {"sid": str(session_id)}
-    ).fetchall()
-
-    casts = []
-    seen = set()
-    for e in events:
-        ref = (e.payload or {}).get("cast")
-        if ref and ref not in seen:
-            seen.add(ref)
-            try:
-                lines = open(ref, encoding="utf-8").read().splitlines()
-                header = json.loads(lines[0])
-                frames = [json.loads(l) for l in lines[1:]]
-                casts.append({"name": ref.split("/")[-1], "header": header, "frames": frames})
-            except OSError:
-                casts.append({"name": ref.split("/")[-1], "header": None, "frames": []})
-
+def replay(session_id: uuid.UUID, p: Principal = Depends(any_member),
+           db: Session = Depends(get_db)):
+    """Multiple recordings; each header's epoch is the sync anchor (F17)."""
+    sess = _session_or_403(db, p, session_id)
+    events = db.execute(sa_text(
+        "SELECT event_id, ts, actor, action_type, phase FROM events "
+        "WHERE session_id = :sid ORDER BY event_id"), {"sid": str(session_id)}).fetchall()
     timeline = [{"event_id": e.event_id, "ts": e.ts.isoformat(), "actor": e.actor,
                  "action_type": e.action_type, "phase": e.phase} for e in events]
-    return {"session_id": str(session_id), "casts": casts, "timeline": timeline}
+    recs = db.execute(select(Recording).where(Recording.session_id == session_id)
+                      .order_by(Recording.created_at)).scalars().all()
+    casts = []
+    for r in recs:
+        try:
+            data = _safe_read_cast(r.cast_path)
+            casts.append({"recording_id": str(r.recording_id),
+                          "name": os.path.basename(r.cast_path), **data})
+        except HTTPException as e:
+            casts.append({"recording_id": str(r.recording_id), "error": e.detail,
+                          "header": None, "frames": []})
+    return {"session_id": str(session_id), "scenario_id": sess.scenario_id,
+            "casts": casts, "timeline": timeline}
 
 
-# --- progress dashboard (a VIEW over the log — no new tables) ----------------------
+# --- progress: per-domain scores from scoring ITEMS (F20) -------------------------
 @router.get("/users/{username}/progress")
-def progress(username: str, db: Session = Depends(get_db)):
-    """Per-domain scores across sessions, trends, lagging skills. Domain labels come
-    from scenario YAML metadata; the numeric facts come from v_session_scores."""
-    rows = db.execute(sa_text(
-        "SELECT DISTINCT ON (session_id) session_id, scenario_id, earned, total, scored_at "
-        "FROM v_session_scores WHERE username = :u ORDER BY session_id, scored_at DESC"),
-        {"u": username}).fetchall()
+def progress(username: str, p: Principal = Depends(any_member), db: Session = Depends(get_db)):
+    if not p.is_operator and p.username != username:
+        raise HTTPException(403, "own progress only")
+    rows = db.execute(sa_text("""
+        SELECT session_id, scenario_id, username, event_id, scored_at, domain,
+               awarded, points, status, scorecard_status
+        FROM v_score_items
+        WHERE username = :u
+        ORDER BY scored_at, event_id"""), {"u": username}).fetchall()
 
-    from srplatform.scenario_engine.loader import scenarios_dir
-
-    def focus_of(scenario_id: str) -> list[str]:
-        p = scenarios_dir() / f"{scenario_id}.yaml"
-        if not p.exists():
-            return ["general"]
-        import yaml
-        return (yaml.safe_load(p.read_text()) or {}).get("focus") or ["general"]
+    # latest scorecard per session (event_id tie-break, chronological order)
+    by_sid: dict[str, dict] = {}
+    for r in rows:
+        if r.scorecard_status not in ("scored", "partial"):
+            continue
+        sid = str(r.session_id)
+        cur = by_sid.get(sid)
+        if cur is None or r.event_id > cur["event_id"]:
+            by_sid[sid] = {"event_id": r.event_id, "items": [r]}
+        elif r.event_id == cur["event_id"]:
+            cur["items"].append(r)
 
     sessions_out, domains = [], {}
-    for r in rows:
-        pct = round(100 * r.earned / r.total) if r.total else None
-        sessions_out.append({"session_id": str(r.session_id), "scenario_id": r.scenario_id,
-                             "earned": r.earned, "total": r.total, "pct": pct,
-                             "scored_at": r.scored_at.isoformat()})
-        for d in focus_of(r.scenario_id):
-            domains.setdefault(d, []).append(pct)
+    for sid, entry in by_sid.items():
+        items = entry["items"]
+        earned = sum(i.awarded for i in items if i.awarded is not None)
+        total = sum(i.points for i in items if i.points is not None)
+        pct = round(100 * earned / total) if total else None
+        sessions_out.append({"session_id": sid, "scenario_id": items[0].scenario_id,
+                             "earned": earned, "total": total, "pct": pct,
+                             "scored_at": items[0].scored_at.isoformat(),
+                             "status": items[0].scorecard_status})
+        for i in items:
+            d = domains.setdefault(i.domain or "general", [])
+            d.append(i)
+    sessions_out.sort(key=lambda s: s["scored_at"])
 
-    per_domain = {d: {"avg_pct": round(sum(v) / len(v)) if v else None, "sessions": len(v)}
-                  for d, v in domains.items()}
-    lagging = sorted([d for d, m in per_domain.items() if m["avg_pct"] is not None],
+    per_domain = {}
+    for d, items in domains.items():
+        earned = sum(i.awarded for i in items if i.awarded is not None)
+        total = sum(i.points for i in items if i.points is not None)
+        avg = round(100 * earned / total) if total else None
+        # trend: compare first half vs second half of per-session domain pcts
+        by_sess: dict[str, list] = {}
+        for i in items:
+            by_sess.setdefault(str(i.session_id), []).append(i)
+        pcts = []
+        for ss in sorted(by_sess, key=lambda x: min(i.scored_at for i in by_sess[x])):
+            e = sum(i.awarded for i in by_sess[ss] if i.awarded is not None)
+            t = sum(i.points for i in by_sess[ss] if i.points is not None)
+            if t:
+                pcts.append(100 * e / t)
+        trend = None
+        if len(pcts) >= 2:
+            half = len(pcts) // 2
+            avg_of = lambda xs: sum(xs) / len(xs)
+            trend = round(avg_of(pcts[half:]) - avg_of(pcts[:half]))
+        per_domain[d] = {"avg_pct": avg, "sessions": len(by_sess), "trend": trend}
+
+    lagging = sorted((d for d, m in per_domain.items() if m["avg_pct"] is not None),
                      key=lambda d: per_domain[d]["avg_pct"])[:2]
     return {"username": username, "sessions": sessions_out, "by_domain": per_domain,
-            "lagging_domains": lagging}
+            "lagging_domains": lagging,
+            "unscored_note": "sessions without a trusted scorecard are listed only when scored"}
 
 
-# --- live dashboard helper: current red phase + recent detections -------------------
+# --- live dashboard: current red phase + real detections with source times -------
 @router.get("/sessions/{session_id}/live")
-def live(session_id: uuid.UUID, db: Session = Depends(get_db)):
-    sess_row = db.execute(sa_text("SELECT started_at, status FROM sessions WHERE session_id=:sid"),
-                          {"sid": str(session_id)}).first()
-    if not sess_row:
-        raise HTTPException(404, "session not found")
-    state = db.execute(sa_text("SELECT current_phase, summary_upto FROM agent_state WHERE session_id=:sid"),
-                       {"sid": str(session_id)}).first()
+def live(session_id: uuid.UUID, p: Principal = Depends(any_member),
+         db: Session = Depends(get_db)):
+    sess = _session_or_403(db, p, session_id)
+    state = db.execute(sa_text(
+        "SELECT current_phase, summary_upto FROM agent_state WHERE session_id=:sid"),
+        {"sid": str(session_id)}).first()
     recent = db.execute(sa_text(
         "SELECT event_id, ts, actor, action_type, phase, payload FROM events "
-        "WHERE session_id=:sid ORDER BY event_id DESC LIMIT 12"), {"sid": str(session_id)}).fetchall()
+        "WHERE session_id=:sid ORDER BY event_id DESC LIMIT 12"),
+        {"sid": str(session_id)}).fetchall()
     detections = [d for d in reversed(recent) if d.action_type in ("verifier", "detection")]
     return {
-        "session_id": str(session_id), "status": sess_row.status,
-        "started_at": sess_row.started_at.isoformat(),
+        "session_id": str(session_id), "status": sess.status,
+        "started_at": sess.started_at.isoformat() if sess.started_at else None,
         "red_phase": state.current_phase if state else None,
         "recent": [{"event_id": e.event_id, "ts": e.ts.isoformat(), "actor": e.actor,
                     "action_type": e.action_type, "phase": e.phase} for e in reversed(recent)],

@@ -40,3 +40,14 @@ include = ["rangectl*", "infra*", "srplatform*", "verifiers*", "telemetry*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Test layers (audit F22): unit tests must run with NO infrastructure;
+# `db` needs an explicit disposable Postgres admin (see tests/conftest.py);
+# `adapter` exercises production adapters against simulated transports;
+# `browser` is the E2E layer; `live` is the operator's hardware gate (opt-in).
+markers = [
+    "db: requires a real (disposable) PostgreSQL — explicit admin via SR_PG_ADMIN_URL/SR_PG_ADMIN_CMD",
+    "adapter: production-adapter contract tests against simulated transports",
+    "browser: end-to-end browser tests (opt-in)",
+    "live: operator live-infrastructure acceptance gate (never automatic)",
+]
+addopts = "-m 'not browser and not live'"

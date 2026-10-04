@@ -1,39 +1,64 @@
 # M4 acceptance scenario: defined ENTIRELY in YAML — no code changes. Every
 # verifier referenced already exists in the library; the same checks serve red
-# objectives and blue scoring.
+# objectives and blue scoring, with EXPLICIT polarity (`expect`) and scoring
+# domains so a reused predicate can never award the wrong side (audit F10/F19).
+#
+# Scoring-domain values: identify | protect | detect | respond | recover
+# (CCDC-style domains mapped loosely to NIST CSF for the progress dashboard).
 id: db-exfil-01
 name: "Database exfiltration drill"
 difficulty: 2
 focus: [data, exfiltration, lateral]
 est_minutes: 45
 techniques: [T1190, T1041, T1021.004]
+version: 2
 topology:
   hosts:
     - name: web01
       template_vmid: 9001
       ip: 10.66.0.10
       services: [http]
+      os: linux
     - name: db01
       template_vmid: 9004
       ip: 10.66.0.11
       services: [mysql]
+      os: linux
 red:
   start_phase: recon
   objectives:
     - id: foothold
+      phase: initial-access
+      args: { host: web01, path: /root/flag_foothold.txt,
+              expected_content: "FLAG{dbx01-foothold}" }   # provenance REQUIRED
       verifier: flag_file_present
-      args: { host: web01, path: /root/flag_foothold.txt }
     - id: loot
+      phase: objectives
+      description: "stage exfiltrated customer rows on the web tier"
+      args: { host: web01, path: /tmp/exfil/loot,
+              expected_content: "CUSTOMER-ROWS-9F3C" }      # scenario-specific exfil identity
       verifier: exfil_flag
-      args: { host: web01, path: /tmp/exfil/loot }
     - id: persistence
-      verifier: service_present
+      phase: persistence
       args: { host: db01, service: mysql-router }
+      verifier: service_present
 scoring:
   blue_checks:
-    - { verifier: no_rogue_admin, host: web01, points: 10 }
-    - { verifier: firewall_enabled, host: web01, points: 5 }
-    - { verifier: rogue_account, host: db01, points: 10,
+    - { verifier: no_rogue_admin, host: web01, points: 10, domain: identify }
+    - { verifier: firewall_enabled, host: web01, points: 5, domain: protect }
+    - { verifier: rogue_account, host: db01, points: 10, domain: identify,
         known_users: [root, mysql, daemon] }
+    # GOLDEN BASELINE (F10): the hash MUST be generated during golden-image
+    # capture (`sha256sum /var/lib/mysql/ibdata1` on the clean template) and is
+    # recorded there; normal DB writes make this check fail by design — score
+    # it only for scenarios with a read-only data volume. Placeholder below is
+    # sha256("") until the operator captures the real baseline value.
     - { verifier: data_integrity, host: db01, path: /var/lib/mysql/ibdata1,
-        expected_sha256: 7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d6772842dd42728a0f1383e, points: 15 }
+        expected_sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,
+        points: 15, domain: recover }
+    # INVERSE POLARITY: the same cron predicate scores the DEFENDER when the
+    # intruder's persistence is ABSENT (expect: absent) — never award blue for
+    # the bad state itself (audit F10).
+    - { verifier: cron_persistence_present, host: web01, points: 10, domain: detect,
+        expect: absent,
+        baseline_files: [e2scrub_all] }

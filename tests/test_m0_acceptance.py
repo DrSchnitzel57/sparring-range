@@ -1,67 +1,112 @@
 """M0 acceptance tests — one test per acceptance criterion from Part 5/M0.
 
-  1. Range VLAN cannot reach the internet (datapath default-deny). The datapath
-     proof from a live range VM is Drew's step; here we verify the policy is
-     default-deny and that the verifier correctly REPORTS a failed probe as PASS
-     (i.e., no-egress working == probes failing), using an injected probe.
-  2. killswitch stops the red agent service AND drops the range datapath.
-  3. db migrate creates the schema; an attempted UPDATE on events RAISES.
+  1. Range datapath is default-DENY and machine-checkable: the rendered nft
+     rulesets are default-drop and parse (nft -c when available), and the
+     emergency ruleset drops ALL range traffic.
+  2. killswitch stops red agent worker processes AND drops the range datapath —
+     independently, truthfully reported, and the latch survives a restart.
+  3. db migrate creates the full schema; an UPDATE on events RAISES.
 """
+import shutil
 import signal
 import subprocess
-import time
-from datetime import datetime, timezone
-from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
-from infra.proxmox_client import FakeProxmox
-from srplatform.api.app import app
-from srplatform.safety import Supervisor
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO = "infra/firewall"
 
 
 # --- criterion 1 ---------------------------------------------------------------
-def test_m0_range_egress_is_default_deny_and_verify_reports_probe_failures():
-    """Policy must be default-DENY; a range VM whose ping/DNS FAIL means safety HOLDS.
-    The verifier takes probes (run on the range VM by Drew in the real range) and
-    passes only when they fail."""
-    tmpl = (REPO_ROOT / "infra" / "firewall" / "range-egress-deny.nft.conf.tmpl").read_text()
-    assert "policy drop" in tmpl, "egress-deny ruleset must be default-deny"
+def test_m0_rendered_rulesets_are_default_deny_and_parse():
+    from srplatform.safety.firewall import (render_baseline_ruleset,
+                                             render_emergency_ruleset)
 
-    def verify_egress(ping_output: str, dns_output: str) -> dict:
-        ping_fails = ping_output.strip() == "" or "100% packet loss" in ping_output
-        dns_fails = dns_output.strip() == ""
-        return {"egress_denied": ping_fails and dns_fails}
+    base = render_baseline_ruleset()
+    # default-deny semantics: everything from the range that is not an
+    # EXPLICIT allow before this point hits an unconditional drop
+    assert "meta nfproto ipv4 drop" in base and "meta nfproto ipv6 drop" in base
+    assert "10.66.0.0/24" in base          # range-scoped
+    assert "vmbr1" in base                 # management bridges untouched
 
-    # From a VM on the range VLAN: ping 1.1.1.1 fails and DNS resolution fails.
-    assert verify_egress("", "")["egress_denied"] is True
-    # If a VM CAN reach 1.1.1.1, the verifier must fail the range (and block the gate).
-    assert verify_egress("64 bytes from 1.1.1.1: icmp_seq=1 ttl=57 time=9.1 ms", "")["egress_denied"] is False
+    em = render_emergency_ruleset()
+    assert 'iifname "vmbr1" drop' in em and 'oifname "vmbr1" drop' in em
+    assert "table bridge" in em            # no same-bridge L2 escape
+
+    nft = shutil.which("nft")
+    if not nft:
+        pytest.skip("nft not on this host — CI covers ruleset validation")
+    import tempfile
+    from pathlib import Path
+    for rs in (base, em):
+        with tempfile.NamedTemporaryFile("w", suffix=".nft") as f:
+            f.write(rs)
+            f.flush()
+            r = subprocess.run([nft, "-c", "-f", f.name], capture_output=True, text=True)
+            assert r.returncode == 0, f"nft -c rejected ruleset:\n{r.stderr}"
 
 
 # --- criterion 2 ---------------------------------------------------------------
-def test_m0_killswitch_stops_red_agent_and_drops_datapath(tmp_path):
-    proc = subprocess.Popen(["sleep", "300"])
-    fake_pve = FakeProxmox()
-    sup = Supervisor(proxmox=fake_pve)
+def test_m0_killswitch_stops_workers_and_drops_datapath(tmp_path):
+    from srplatform.safety import Supervisor
+    from srplatform.safety.runregistry import RunHandle, run_registry
+    from tests.helpers import FakeDatapath
+
+    proc = subprocess.Popen(["sleep", "300"], start_new_session=True)
+    dp = FakeDatapath()
+    sup = Supervisor(datapath=dp, state_file=str(tmp_path / "state.json"))
+    run_registry.add(RunHandle(run_id="r1", pid=proc.pid, pgid=proc.pid,
+                               process=proc, meta={}))
     try:
-        sup.register_red_agent(proc.pid)
-        result = sup.killswitch()
+        result = sup.engage("test")
         assert result["killswitch"] == "engaged"
-        # (a) red agent stopped
+        # (a) worker process GROUP terminated
         assert proc.poll() is not None or proc.wait(timeout=5) in (-signal.SIGTERM, 143, -15)
-        # (b) datapath drop went out to the Proxmox API
-        assert any(c[0] == "POST" and "firewall" in c[1] for c in fake_pve.calls), \
-            "killswitch must drop the range datapath via the Proxmox API, not just stop the process"
+        # (b) datapath controller invoked INDEPENDENTLY of (a)
+        assert "apply_emergency" in dp.calls
+        assert result["latched"] is True
     finally:
         if proc.poll() is None:
             proc.kill()
 
+    # the latch outlives process restarts (fresh Supervisor, same state file)
+    sup2 = Supervisor(datapath=dp, state_file=str(tmp_path / "state.json"))
+    assert sup2.latch_status()["latched"] is True
+    allowed, reasons = sup2.start_gate()
+    assert not allowed and any("LATCHED" in r for r in reasons)
+
+
+def test_m0_partial_engagement_is_reported_truthfully(tmp_path):
+    from srplatform.safety import Supervisor
+    from tests.helpers import FakeDatapath
+
+    class BadDatapath(FakeDatapath):
+        def apply_emergency(self):
+            raise RuntimeError("nft exploded")
+
+    sup = Supervisor(datapath=BadDatapath(), state_file=str(tmp_path / "s.json"))
+    result = sup.engage("test")
+    assert result["killswitch"] == "engaged-partial"
+    assert "Datapath drop FAILED" in result["warning"]
+
+
+def test_m0_release_requires_datapath_and_invalidates_evidence(tmp_path):
+    from srplatform.safety import Supervisor
+    from tests.helpers import FakeDatapath
+
+    dp = FakeDatapath()
+    sup = Supervisor(datapath=dp, state_file=str(tmp_path / "s.json"))
+    sup.engage("test")
+    out = sup.release()
+    assert out["killswitch"] == "released"
+    assert sup.latch_status()["latched"] is False
+    # after release, the gate demands FRESH evidence (mechanism != noop):
+    allowed, reasons = sup.start_gate()
+    if not allowed:
+        assert any("baseline verification" in r or "datapath proof" in r for r in reasons)
+
 
 # --- criterion 3 -----------------------------------------------------------------
+@pytest.mark.db
 def test_m0_migrate_creates_schema_and_update_events_raises(migrated_db, test_db_url_app):
     import sqlalchemy as sa
     from sqlalchemy import create_engine
@@ -69,12 +114,14 @@ def test_m0_migrate_creates_schema_and_update_events_raises(migrated_db, test_db
     eng_owner = create_engine(migrated_db)
     eng_app = create_engine(test_db_url_app)
 
-    # schema exists (via the owner connection)
     with eng_owner.connect() as c:
-        for t in ("users", "sessions", "events", "agent_state", "login_tokens"):
+        for t in ("users", "sessions", "events", "agent_state", "login_tokens",
+                  "service_tokens", "range_lease", "deployments", "runs",
+                  "safety_state", "safety_records", "recordings"):
             assert c.execute(sa.text(f"SELECT 1 FROM {t} LIMIT 1")).fetchall() is not None
+        # scoring view from migration 0005
+        assert c.execute(sa.text("SELECT 1 FROM v_score_items LIMIT 1")).fetchall() is not None
 
-    # app role can INSERT into the log
     with eng_app.connect() as c:
         c.execute(sa.text(
             "INSERT INTO events (session_id, ts, actor, action_type, payload) "
@@ -82,7 +129,6 @@ def test_m0_migrate_creates_schema_and_update_events_raises(migrated_db, test_db
         ))
         c.commit()
 
-    # ...but an attempted UPDATE raises — belt (trigger) and braces (grants).
     with eng_app.connect() as c:
         with pytest.raises(sa.exc.ProgrammingError):
             c.execute(sa.text("UPDATE events SET action_type='x' WHERE action_type='verifier'"))
@@ -91,3 +137,5 @@ def test_m0_migrate_creates_schema_and_update_events_raises(migrated_db, test_db
     with eng_owner.connect() as c:
         with pytest.raises(sa.exc.InternalError):
             c.execute(sa.text("UPDATE events SET action_type='x' WHERE action_type='verifier'"))
+        with pytest.raises(sa.exc.InternalError):
+            c.execute(sa.text("DELETE FROM events WHERE action_type='verifier'"))

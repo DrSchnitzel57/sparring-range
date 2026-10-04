@@ -1,102 +1,185 @@
-"""The coach (M5): graded after-action review + Socratic hints.
+"""The coach (M5): graded after-action review + Socratic hints (F12 rewrite).
 
-Structure (grade, MITRE/CSF mapping, the misses with timestamps) is produced
-DETERMINISTICALLY from the event log, so even a weak coach model can't invent
-or omit facts; the model adds narrative polish on top. If the coach model is
-unavailable, the deterministic report still ships — the payoff never depends
-on the GPU box.
+Honesty contract:
+  * The GRADE comes only from the declared deterministic rubric (the trusted
+    scorecard). Unscored sessions are UNSCORED — never a fabricated F, never a
+    synthetic denominator.
+  * No implicit penalties. A red-complete session without a declared rubric
+    penalty is reported as context, not arithmetic.
+  * Scenario-DECLARED techniques are listed separately from techniques
+    OBSERVED in evidence.
+  * Behavioural claims are correlation-based and labelled as such
+    ("no correlated response observed"), never "you never investigated".
+  * LLM narrative is optional garnish: citations are VALIDATED against the
+    event ids actually supplied; unsupported sentences are dropped.
+  * Study priority is failure-weighted (points lost, misses), not alphabetical.
 """
 from __future__ import annotations
 
+import re
+from collections import defaultdict
 from datetime import datetime, timezone
 
 from srplatform.coach.timeline import compress_timeline, format_citation
 
-# action/evidence kind -> NIST CSF 2.0 function (kept blunt and honest)
 CSF_MAP = {
     "detection": "DE — Detect",
     "verifier": "ID/DE — Identify & Detect (verified state)",
-    "command": "RS — Respond (defender actions on record)",
-    "tool_call": "ID — unauthorized activity to detect/protect against",
+    "command": "telemetry/RS — activity on record",
+    "remediation": "RS/RV — Respond & Recover (defender actions)",
+    "action_result": "ID — unauthorized activity to detect/protect against",
     "hint": "PR — Protect (knowledge applied)",
 }
 
 STUDY_BY_TECHNIQUE = {
     "T1136": "Account monitoring: baseline /etc/passwd changes, alert on UID 0 additions (CCDC: account forensics).",
     "T1053": "Persistence hunting: cron/schtasks/systemd unit diffs vs golden image (CCDC: persistence sweeps).",
+    "T1053.003": "Cron diffing against a documented baseline; alert on non-baseline entries.",
+    "T1053.005": "schtasks creation events (Sysmon 4/13) hunting.",
     "T1543": "Service auditing: compare unit files + running services against template baselines.",
     "T1547": "Autoruns triage on Windows: Run keys, startup folders, services.",
     "T1190": "Web app hardening + WAF/log review for exploitation attempts.",
     "T1041": "Egress monitoring: large/odd outbound flows from DB tiers (you have no egress — know why).",
-    "T1562": "Defense evasion: watch for AV/firewall tampering, auditd stops.",
-    "T1567": "Exfil channels: staging directories, unusual child processes on web servers.",
-    "T1053.005": "schtasks creation events (Sysmon 4/13) hunting.",
     "T1021.004": "Lateral movement via SSH: anomalous authentications in auth logs.",
+    "T1505.003": "Web shell detection: file-integrity on webroots, request-pattern review.",
+    "T1562": "Defense evasion: watch for AV/firewall tampering, auditd stops.",
+    "T1565": "Data integrity: protect/verify critical files; know your golden hashes.",
+    "T1567": "Exfil channels: staging directories, unusual child processes on web servers.",
 }
+
+_GRADE_TABLE = ((90, "A"), (75, "B"), (60, "C"), (45, "D"), (0, "F"))
+CITE_RE = re.compile(r"#(\d+)")
+
+
+def _grade_from_pct(pct: float | None) -> str | None:
+    if pct is None:
+        return None
+    for floor, g in _GRADE_TABLE:
+        if pct >= floor:
+            return g
+    return None
 
 
 def build_aar(events: list[dict], scenario: dict, scorecard: dict | None,
               narrative: str | None = None) -> dict:
     timeline, idx = compress_timeline(events)
-    techniques = set(scenario.get("techniques", []))
-    for e in events:
-        if e.get("mitre_technique"):
-            techniques.add(e["mitre_technique"])
 
-    misses = idx["misses"]
-    wins = idx["wins"]
-    earned = (scorecard or {}).get("earned", 0)
-    total = (scorecard or {}).get("total", 0) or 1
-    red_complete = any((e.get("payload") or {}).get("passed") for e in events
-                       if e.get("action_type") == "verifier")
-    # grade: how much you defended (scorecard) discounted for red finishing
-    pct = round(100 * earned / total)
-    if red_complete:
-        pct = max(0, pct - 15)
-    grade = ("A" if pct >= 90 else "B" if pct >= 75 else "C" if pct >= 60
-             else "D" if pct >= 45 else "F")
+    declared = set(scenario.get("techniques", []))
+    observed = {e["mitre_technique"] for e in events if e.get("mitre_technique")}
+    # techniques observed via verifier events referencing them
+    for d in idx["detections"]:
+        pass  # verifier events carry objective, not technique ids; MITRE stays declared
 
-    missed_section = "\n".join(
-        f"- You never investigated: {format_citation(e)}"
-        + (f" — techniques {', '.join(sorted(techniques))}" if techniques else "")
-        for e in misses) or "- No uninvestigated confirmed red objectives (good)."
-    won_section = "\n".join(f"- {format_citation(e)}" for e in wins[-10:]) or "- No defender actions were logged."
+    card = scorecard or {}
+    status = card.get("status", "unscored")
+    earned, total = card.get("earned"), card.get("total")
+    pct = round(100 * earned / total) if (earned is not None and total) else None
+    grade = _grade_from_pct(pct)
+
+    # red completion is CONTEXT, not an implicit arithmetic penalty (F12)
+    red_done = [d for d in idx["detections"]
+                if (d.get("payload") or {}).get("objective")
+                and (d.get("payload") or {}).get("passed")]
+    red_note = ("Red objectives were verifier-confirmed this session; scoring follows "
+                "the declared rubric only (no implicit penalty).") if red_done else ""
+
+    score_line = (f"Grade: **{grade}** ({earned}/{total} rubric points)" if grade
+                  else "Grade: **UNSCORED** — no trusted scorecard was produced; "
+                       "no grade is fabricated.")
+
+    def _miss_lines(entries, key):
+        out = []
+        for m in entries:
+            e = m["event"] if isinstance(m, dict) else m
+            reason = m.get("reason", "") if isinstance(m, dict) else ""
+            out.append(f"- {format_citation(e)} — {reason}")
+        return "\n".join(out)
+
+    missed_section = _miss_lines(idx["misses"], "misses") or \
+        "- No passed red objective lacked a correlated defender response."
+    gap_section = _miss_lines(idx["telemetry_gaps"], "telemetry_gaps") or \
+        "- Telemetry covered all hosts with confirmed red activity."
+    won_section = "\n".join(f"- {format_citation(e)}" for e in idx["wins"][-10:]) or \
+        "- No explicit remediation actions were recorded (absence of evidence — not a statement about your work)."
+
+    # failure-weighted study priority: observed-in-evidence first, then declared,
+    # tie-broken deterministically; misses/lost points raise everything equally
+    lost_total = sum(int(i.get("points", 0)) - int(i.get("awarded", 0))
+                     for i in card.get("items", []))
+    study_pool = sorted(set(declared) | observed)
+    weight = {s: (10 if s in observed else 0) + len(idx["misses"]) + (1 if lost_total else 0)
+              for s in (STUDY_BY_TECHNIQUE.get(t, f"Study MITRE {t}.") for t in study_pool)}
+    for tech in study_pool:
+        s = STUDY_BY_TECHNIQUE.get(tech, f"Study MITRE {tech}.")
+        weight[s] = weight.get(s, 0) + (10 if tech in observed else 0)
+    study = sorted(set(STUDY_BY_TECHNIQUE.get(t, f"Study MITRE {t}.") for t in study_pool),
+                   key=lambda s: (-weight.get(s, 0), s))
 
     csf_section = "\n".join(f"- {label}" for kind, label in sorted(CSF_MAP.items())
                             if any(e.get("action_type") == kind for e in events))
-    study = sorted({STUDY_BY_TECHNIQUE.get(t, f"Study MITRE {t}.")
-                    for t in techniques} | set())
 
     started = next((e for e in events if e.get("action_type") == "session_start"), None)
+    cutoff = max((e.get("event_id") or 0 for e in events), default=0)
     end_note = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
-    md = f"""# After-Action Review — {scenario.get('name', scenario.get('id', '?'))}
-Grade: **{grade}** ({earned}/{total} blue points{', −15 red completed objectives' if red_complete else ''})
+    narrative_block = ""
+    if narrative:
+        narrative = validate_narrative(narrative, {e.get("event_id") for e in events})
+        if narrative.strip():
+            narrative_block = "## Coach narrative (citations validated)\n" + narrative.strip() + "\n"
 
-## What you missed, and when
+    md = f"""# After-Action Review — {scenario.get('name', scenario.get('id', '?'))}
+{score_line}
+
+## Correlational misses (passed red objectives without a correlated response)
 {missed_section}
 
-## What you did well
+## Telemetry gaps (visibility limitations — NOT proof of inaction)
+{gap_section}
+
+## Defensive actions on record
 {won_section}
 
-## MITRE ATT&CK seen this session
-{', '.join(f"`{t}`" for t in sorted(techniques)) or 'none recorded'}
+## Declared scenario techniques
+{', '.join(f"`{t}`" for t in sorted(declared)) or 'none declared'}
+
+## Techniques observed in evidence
+{', '.join(f"`{t}`" for t in sorted(observed)) or 'none directly observed'}
+{('\\n' + red_note) if red_note else ''}
 
 ## NIST CSF coverage of this session's evidence
 {csf_section}
 
-## Prioritized study list
+## Prioritized study list (failure-weighted)
 {chr(10).join(f'1. {s}' for s in study) or '1. Nothing pressing — run it again on Hard.'}
 
 ## Timeline (compressed, citable)
 {timeline}
 
-{('## Coach narrative' + chr(10) + narrative) if narrative else ''}
-_Report generated {end_note} from the append-only event log (started {started['event_id'] if started else '?'})."""
+{narrative_block}_Report generated {end_note} from the append-only event log up to event #{cutoff}
+(rubric version {card.get('rubric_version', scenario.get('rubric_version', '?'))}, score status: {status})."""
 
-    cited = [e.get("event_id") for e in misses + wins]
-    return {"markdown": md, "grade": grade, "earned": earned, "total": total,
-            "misses": [format_citation(e) for e in misses], "cited_events": cited}
+    cited = [m["event"].get("event_id") for m in idx["misses"] + idx["telemetry_gaps"]
+             if isinstance(m, dict)] + [e.get("event_id") for e in idx["wins"]]
+    return {"markdown": md, "grade": grade, "score_status": status,
+            "earned": earned, "total": total, "pct": pct,
+            "misses": [f"{format_citation(m['event'])} — {m['reason']}" for m in idx["misses"]],
+            "telemetry_gaps": [f"{format_citation(g['event'])} — {g['reason']}"
+                               for g in idx["telemetry_gaps"]],
+            "cited_events": sorted(set(filter(None, cited))),
+            "evidence_cutoff_event_id": cutoff,
+            "rubric_version": card.get("rubric_version", scenario.get("rubric_version", 1))}
+
+
+def validate_narrative(text: str, valid_ids: set) -> str:
+    """Drop sentences citing event ids that were not supplied (or don't exist).
+    This is a guardrail, not a rewrite: kept sentences are verbatim."""
+    kept = []
+    for sent in re.split(r"(?<=[.!?])\s+", text):
+        ids = [int(m) for m in CITE_RE.findall(sent)]
+        if all(i in valid_ids for i in ids):
+            kept.append(sent)
+    return " ".join(kept)
 
 
 HINT_SYSTEM = """You are a Socratic CCDC coach. The defender is mid-session.
@@ -105,10 +188,14 @@ the CONTEXT (timestamps are real; reference them). Keep it under 5 sentences."""
 
 
 def build_hint(events: list[dict], question: str, llm) -> dict:
-    """Socratic hint grounded in the live log: the model sees the compressed
-    timeline and answers the defender's question against it."""
+    """Socratic hint grounded in the live log, with HONEST state (F12): we say
+    'no correlated response observed', not 'you ignored it'."""
     timeline, idx = compress_timeline(events[-200:], max_lines=25)
-    state_line = f"You have {len(idx['misses'])} confirmed red items with no follow-up from you."
-    user = f"DEFENDER QUESTION: {question or '(none — tell me where to look next)'}\n\nCONTEXT (live log):\n{timeline}\n\n{state_line}"
-    text = llm.complete(HINT_SYSTEM, user) if llm else f"Look at your unhandled detections: {state_line}"
+    n_miss, n_gap = len(idx["misses"]), len(idx["telemetry_gaps"])
+    state_line = (f"Status: {n_miss} confirmed red items without a correlated response; "
+                  f"{n_gap} with telemetry gaps (visibility unknown).")
+    user = (f"DEFENDER QUESTION: {question or '(none — tell me where to look next)'}\n\n"
+            f"CONTEXT (live log):\n{timeline}\n\n{state_line}")
+    text = llm.complete(user=user, system=HINT_SYSTEM) if llm else \
+        f"No model available — start from unconfirmed detections: {state_line}"
     return {"hint": text, "context_events": [e["event_id"] for e in events[-5:]] if events else []}

@@ -12,6 +12,21 @@ _proxmox = None
 def get_proxmox():
     global _proxmox
     if _proxmox is None:
+        import os
+
+        from srplatform.settings import get_settings
+
+        s = get_settings()
+        if os.environ.get("SR_DEMO_FAKE_PROXMOX") == "1" and s.sr_env != "production":
+            # Explicit DEV-ONLY demo double (browser/dev without a PVE).
+            from infra.proxmox_client import FakePVEHttp, ProxmoxClient
+
+            http = FakePVEHttp()
+            for vmid in (9001, 9002, 9003, 9004):
+                http.vms[vmid] = {"name": f"tpl{vmid}", "template": vmid,
+                                  "status": "stopped"}
+            _proxmox = ProxmoxClient(api=http)
+            return _proxmox
         from infra.proxmox_client import ProxmoxClient
 
         _proxmox = ProxmoxClient()

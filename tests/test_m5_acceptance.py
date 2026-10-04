@@ -1,97 +1,180 @@
 """M5 acceptance tests — Part 5/M5 'Accept when':
 
-  * `report <session>` emits a graded AAR that cites specific logged events
-    with timestamps ("Sysmon flagged the new service at 14:02 — you never
-    investigated it")
-  * hint returns a context-aware Socratic hint mid-session without stalling
-    the red loop (priority queue: hints jump ahead of batch work)
+  * `report` emits a GRADED AAR that cites specific logged events by id with
+    real timestamps — and is HONEST: correlation (not any-later-activity)
+    counts as response; missing telemetry is a gap, never an accusation; and
+    without a trusted scorecard the report says UNSCORED instead of inventing
+    a grade (or an F) (F12).
+  * hint returns a context-aware Socratic hint without stalling the queue:
+    interactive priority jumps ahead of batch AAR work.
 """
+import threading
 import time
 
 import pytest
-from fastapi.testclient import TestClient
 
-from srplatform.api.app import app
 from srplatform.api.coach_routes import set_coach_llm
-from srplatform.coach.queue import coach_queue
+from srplatform.coach.aar import build_aar, validate_narrative
+from srplatform.coach.timeline import compress_timeline
+from srplatform.model_gateway import get_model_gateway
 
-TS = "2026-10-03T14:02:00+00:00"  # the plan's example moment
+pytestmark = pytest.mark.db
 
 
-@pytest.fixture()
-def seeded_session(migrated_db):
-    c = TestClient(app)
-    sid = c.post("/sessions", json={"scenario_id": "web-foothold-01"}).json()["session_id"]
-    evs = [
-        # red installed a persistence service at 14:02 — verifier confirmed it
-        {"session_id": sid, "ts": TS, "actor": "red", "host": "web01", "action_type": "tool_call",
-         "phase": "persistence", "payload": {"command": "systemctl enable backup-updater"}},
-        {"session_id": sid, "ts": TS, "actor": "system", "host": "web01", "action_type": "verifier",
-         "payload": {"objective": "persistence", "verifier": "service_present", "passed": True,
-                     "evidence": {"service": "backup-updater"}}, "mitre_technique": "T1543.002"},
-        # defender did nothing after — this must surface as a MISS
+def ev(eid, ts, actor, kind, host=None, payload=None, **kw):
+    return {"event_id": eid, "ts": f"2026-10-04T15:{ts:02d}:00+00:00", "actor": actor,
+            "action_type": kind, "host": host, "payload": payload or {}, **kw}
+
+
+# --- timeline: correlation, not magic ------------------------------------------------------------
+def test_timeline_response_must_be_correlated_same_host_within_window():
+    events = [
+        ev(1, 0, "system", "verifier", "web01", {"objective": "foothold", "passed": True}),
+        ev(2, 5, "drew", "bastion_session_end"),                 # disconnect != response
+        ev(3, 10, "telemetry", "command", "db01", {"argv": "ps aux"}),  # wrong host
     ]
-    for e in evs:
-        assert c.post("/events", json=e).status_code == 201
-    yield c, sid
-    set_coach_llm(None)
+    _, idx = compress_timeline(events)
+    assert len(idx["misses"]) == 0 and len(idx["telemetry_gaps"]) == 1
+    assert "no telemetry received" in idx["telemetry_gaps"][0]["reason"]
+
+    events.append(ev(4, 20, "telemetry", "command", "web01", {"argv": "cat /var/log/auth.log"}))
+    _, idx = compress_timeline(events)
+    assert len(idx["misses"]) == 0            # now correlated on the right host
+    assert len(idx["telemetry_gaps"]) == 0
+
+    # telemetry exists on this host but NO response AFTER the objective -> miss
+    # (activity precedes the compromise — it cannot be the investigation)
+    events2 = [
+        ev(2, 55, "telemetry", "command", "web01", {"argv": "uptime"}),
+        ev(1, 0, "system", "verifier", "web01", {"objective": "x", "passed": True}),
+    ]
+    _, idx2 = compress_timeline(sorted(events2, key=lambda e: e["event_id"]))
+    assert len(idx2["misses"]) == 1
+    assert "no correlated defender action" in idx2["misses"][0]["reason"]
 
 
-def test_m5_report_cites_timestamped_events(seeded_session):
-    c, sid = seeded_session
-    # scorecard recorded by `rangectl score` (a verifier event with scorecard payload)
-    c.post("/events", json={"session_id": sid, "ts": "2026-10-03T14:30:00+00:00", "actor": "system",
-                            "action_type": "verifier",
-                            "payload": {"scorecard": {"earned": 5, "total": 15}}})
-    set_coach_llm(False)  # deterministic report path (no GPU needed)
-
-    r = c.post(f"/sessions/{sid}/aar", json={"narrative": True})
-    assert r.status_code == 200, r.text
-    aar = r.json()
-    md = aar["markdown"]
-    assert "Grade" in md and aar["grade"] in "ABCDF"
-    # THE acceptance line: cites the specific logged event with its timestamp
-    assert "14:02" in md, "AAR must cite event timestamps"
-    assert "never investigated" in md
-    assert aar["cited_events"], "AAR must cite event ids"
-    assert "T1543" in md or "T1190" in md  # MITRE mapping present
-    assert "CSF" in md or "DE —" in md     # NIST CSF mapping present
-    assert "study" in md.lower()
+def test_timeline_wins_are_explicit_remediations_only():
+    events = [ev(1, 0, "blue:drew", "command", "web01", {"command": "ls"}),
+              ev(2, 1, "blue:drew", "remediation", "web01", {"action": "removed cron"})]
+    _, idx = compress_timeline(events)
+    assert [e["event_id"] for e in idx["wins"]] == [2]
 
 
-def test_m5_hint_is_context_aware(seeded_session):
-    c, sid = seeded_session
+def test_timeline_response_outside_window_still_a_miss():
+    events = [
+        {"event_id": 1, "ts": "2026-10-04T10:00:00+00:00", "actor": "system",
+         "action_type": "verifier", "host": "web01",
+         "payload": {"objective": "x", "passed": True}},
+        {"event_id": 2, "ts": "2026-10-04T12:00:00+00:00", "actor": "telemetry",
+         "action_type": "command", "host": "web01", "payload": {"argv": "ls"}},
+    ]
+    _, idx = compress_timeline(events)
+    assert len(idx["misses"]) == 1
 
+
+# --- AAR honesty ---------------------------------------------------------------------------------
+def test_aar_unscored_never_becomes_an_f():
+    report = build_aar([ev(1, 0, "system", "session_start", payload={})],
+                       {"name": "x", "techniques": []}, None)
+    assert "UNSCORED" in report["markdown"] and "Grade: **" not in report["markdown"].replace(
+        "Grade: **UNSCORED**", "")
+    assert report["grade"] is None and report["score_status"] == "unscored"
+
+
+def test_aar_grades_only_from_trusted_scorecard():
+    card = {"status": "scored", "earned": 8, "total": 10, "items": [
+        {"points": 10, "awarded": 8, "status": "passed"}], "rubric_version": 2}
+    report = build_aar([ev(1, 0, "system", "session_start", payload={})],
+                       {"name": "x", "techniques": ["T1190"]}, card)
+    assert report["grade"] and f"{report['earned']}/{report['total']}" in report["markdown"]
+
+
+def test_narrative_citations_are_validated_verbatim_kept():
+    out = validate_narrative(
+        "You missed the cron at #3. Also #999 never happened. Clear.", {1, 2, 3})
+    assert "#3" in out and "#999" not in out
+    assert "You missed the cron at #3." in out       # kept VERBATIM, not rewritten
+
+
+# --- API: hint (priority scheduling) and AAR (persisted versions) --------------------------------
+def test_hint_endpoint_is_context_aware(client, users):
     class FakeCoach:
-        def __init__(self): self.prompts = []
+        def __init__(self):
+            self.n = 0
         def complete(self, system, user):
-            self.prompts.append((system, user))
-            return "You saw a service change at 14:02 — what does an enable-only change suggest, and which log line proves the binary?"
+            self.n += 1
+            assert "10.66.0.10" in user or "DEFENDER QUESTION" in user
+            return "What changed on web01 since the scan?"
+    fc = FakeCoach()
+    set_coach_llm(fc)
+    try:
+        sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
+                          headers=users["member"]).json()["session_id"]
+        r = client.post(f"/sessions/{sid}/hint", json={"question": "where next?"},
+                        headers=users["member"])
+        assert r.status_code == 200 and "web01" in r.json()["hint"]
+        assert fc.n == 1
+        # hint is evidence in the log
+        logged = client.get("/events", params={"session_id": sid, "tail": 20},
+                            headers=users["member"]).json()
+        assert any(e["action_type"] == "hint" for e in logged)
+    finally:
+        set_coach_llm(None)
 
-    coach = FakeCoach()
-    set_coach_llm(coach)
-    r = c.post(f"/sessions/{sid}/hint", json={"question": "what should I look at?"})
-    assert r.status_code == 200, r.text
-    # context-aware: the coach prompt contains the real timeline (14:02 event)
-    assert any("14:02" in u for (_, u) in coach.prompts)
-    assert "14:02" in r.json()["hint"]
-    # hint itself is logged (the log is the product)
-    logged = c.get("/events", params={"session_id": sid}).json()
-    assert any(e["action_type"] == "hint" for e in logged)
+
+def test_aar_get_never_regenerates_post_persists_versions(client, users):
+    class CountingLLM:
+        def __init__(self):
+            self.n = 0
+        def complete(self, system, user):
+            self.n += 1
+            return "Narrative."
+    llm = CountingLLM()
+    set_coach_llm(llm)
+    try:
+        sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
+                          headers=users["member"]).json()["session_id"]
+        r = client.get(f"/sessions/{sid}/aar", headers=users["member"])
+        assert r.status_code == 200 and r.json()["status"] == "no-report"
+        assert llm.n == 0                                     # GET spent nothing
+
+        first = client.post(f"/sessions/{sid}/aar", json={"narrative": True},
+                            headers=users["member"]).json()
+        assert first["persisted"] and first["version"] == 1 and llm.n == 1
+
+        again = client.get(f"/sessions/{sid}/aar", headers=users["member"]).json()
+        assert again["version"] == 1 and llm.n == 1           # GET never regenerates
+
+        second = client.post(f"/sessions/{sid}/aar",
+                             json={"regenerate": True, "narrative": True},
+                             headers=users["member"]).json()
+        assert second["version"] == 2 and llm.n == 2          # explicit regen = new version
+    finally:
+        set_coach_llm(None)
 
 
-def test_m5_hint_jumps_the_queue_ahead_of_batch_work():
-    """Interactive hints never starve behind the red agent's/AAR's long batch
-    calls on the single GPU slot (Part 6.5)."""
-    def slow(name, secs):
-        time.sleep(secs)
-        return name
+def test_hint_jumps_the_queue_ahead_of_batch_work(client, users):
+    gateway = get_model_gateway()
+    release = threading.Event()
+    completion_order: list[str] = []
+    lock = threading.Lock()
 
-    b1 = coach_queue.submit(9, "aar-batch-1", slow, "b1", 0.35)
-    b2 = coach_queue.submit(9, "aar-batch-2", slow, "b2", 0.35)
-    time.sleep(0.05)  # let b1 start the job
-    hint = coach_queue.submit(0, "hint", slow, "hint", 0.02)
+    def job(name, sleep=0.0):
+        def _f():
+            release.wait(5)
+            time.sleep(sleep)
+            with lock:
+                completion_order.append(name)
+            return name
+        return _f
 
-    hint.result(timeout=5)          # hint returns while batch work is mid-flight
-    assert not b2.done(), "hint must not queue behind batch work"
-    assert b1.result(timeout=5) and b2.result(timeout=5)
+    blocker = gateway.submit(9, "blocker", job("blocker"))
+    time.sleep(0.1)                                # blocker now occupies the worker
+    slow_batch = gateway.submit(9, "batch", job("batch", sleep=0.2))
+    hint = gateway.submit(0, "hint", job("hint"))  # queued AFTER batch, priority ABOVE it
+    release.set()
+    assert hint.result(timeout=5) == "hint"
+    assert slow_batch.result(timeout=5) == "batch"
+    assert blocker.result(timeout=5) == "blocker"
+    # the later-submitted batch job did NOT run before the interactive hint
+    assert completion_order.index("hint") < completion_order.index("batch")

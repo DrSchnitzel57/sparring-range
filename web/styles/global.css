@@ -19,3 +19,6 @@ pre.cast { background:#000; padding:12px; height:420px; overflow:auto; white-spa
 .bar { background:#21262d; height:10px; border-radius:5px; overflow:hidden; }
 .bar > div { background:var(--ok); height:100%; }
 a { color:#58a6ff; }
+
+button.danger { background:#b62324; border-color:#b62324; color:#fff; }
+button.danger:hover { background:#d0272b; }

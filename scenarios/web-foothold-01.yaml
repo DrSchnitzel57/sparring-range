@@ -1,26 +1,37 @@
-# Target shape from the plan (Part 5/M4). Loaded by srplatform/scenario_engine/loader.py.
+# Target shape from the plan (Part 5/M4). Loaded by srplatform/scenario_engine/loader.py
+# — fully validated by the typed schema (F19): ids, uniqueness, IPs, positive
+# points, required verifier args, polarity, phases, domains.
 id: web-foothold-01
 name: "Vulnerable web app foothold"
 difficulty: 1
 focus: [web, initial-access]        # library filter: domain / skill area
 est_minutes: 30                     # shown in the scenario library
 techniques: [T1190, T1505.003]      # MITRE, for library browse + AAR tagging
+version: 2
 topology:
   hosts:
     - name: web01
       template_vmid: 9001
       ip: 10.66.0.10
       services: [http]
+      os: linux
 red:
   start_phase: recon
   objectives:
     - id: foothold
+      phase: initial-access
       verifier: flag_file_present
-      args: { host: web01, path: /root/flag_foothold.txt }
+      args: { host: web01, path: /root/flag_foothold.txt,
+              expected_content: "FLAG{web01-root}" }   # scenario flag = proof of access
     - id: persistence
+      phase: persistence
       verifier: cron_persistence_present
-      args: { host: web01 }
+      # baseline-aware (F10): files the GOLDEN image already ships are expected
+      args: { host: web01, baseline_files: [e2scrub_all] }
 scoring:
   blue_checks:
-    - { verifier: no_rogue_admin, host: web01, points: 10 }
-    - { verifier: firewall_enabled, host: web01, points: 5 }
+    - { verifier: no_rogue_admin, host: web01, points: 10, domain: identify }
+    - { verifier: firewall_enabled, host: web01, points: 5, domain: protect }
+    # defender is scored on persistence being ABSENT (inverse polarity, F10)
+    - { verifier: cron_persistence_present, host: web01, points: 10, domain: detect,
+        expect: absent, baseline_files: [e2scrub_all] }

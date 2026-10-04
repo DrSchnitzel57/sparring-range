@@ -1,0 +1,28 @@
+{
+  "events": [
+    {
+      "kind": "detection",
+      "ts": "2026-10-04T15:04:05+00:00",
+      "uid": "S-1-5-18",
+      "comm": "powershell.exe",
+      "exe": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      "argv": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -enc JAB3AGMAPQ...",
+      "audit_key": "sysmon-1",
+      "source_id": "4711",
+      "boot_id": "win-dc00-machineid",
+      "raw": {"channel": "Microsoft-Windows-Sysmon/Operational", "event_id": 1,
+              "host": "win-dc01", "user": "CORP\\svc-backup"}
+    },
+    {
+      "kind": "detection",
+      "ts": "2026-10-04T15:04:09+00:00",
+      "comm": "svchost.exe",
+      "argv": "svchost.exe -clipsvc -> outbound tcp 10.66.0.10:4444",
+      "audit_key": "sysmon-3",
+      "source_id": "4712",
+      "boot_id": "win-dc00-machineid",
+      "raw": {"channel": "Microsoft-Windows-Sysmon/Operational", "event_id": 3,
+              "destination": "10.66.0.10:4444"}
+    }
+  ]
+}

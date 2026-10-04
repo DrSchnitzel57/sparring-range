@@ -1,143 +1,171 @@
 """M4 acceptance tests — Part 5/M4 'Accept when':
 
   * a scenario defined ENTIRELY in YAML (no code changes) deploys, runs, and
-    produces a score
+    produces a score — proven by the quick-win-01 file that only exists as YAML
   * adding a new objective is a YAML edit reusing an existing verifier
-Plus the M4 deliverables themselves: metadata the M7 launcher filters on, the
-validator, and verifiers that serve red AND blue.
+Plus the M4 deliverables: library metadata for the launcher, strict validation,
+and verifier semantics shared by red AND blue (polarity, unknown, provenance).
 """
-from pathlib import Path
-
 import pytest
-from fastapi.testclient import TestClient
 
-from infra.proxmox_client import FakeProxmox
-from srplatform.api import deps
-from srplatform.api.app import app
-from srplatform.red_agent.loop import RedAgentLoop
-from srplatform.red_agent.sandbox import FakeSandbox
-from srplatform.red_agent.transport import TestClientTransport
-from srplatform.scenario_engine.loader import ScenarioError, load_scenario, parse_scenario
-from srplatform.scenario_engine.scoring import compute_blue_score
-from tests.test_m3_acceptance import FakeLLM, tool
+from srplatform import verification_service
+from verifiers.base import Context
+from verifiers import registry
+
+pytestmark = pytest.mark.db
 
 
-def test_m4_scenario_metadata_for_the_library():
-    spec = load_scenario("db-exfil-01")
-    assert spec["focus"] and spec["est_minutes"] and spec["techniques"]
-    assert spec["difficulty"] == 2
+# --- criterion 1: YAML-only scenario, end to end through the API --------------
+def test_m4_yaml_only_scenario_deploys_verifies_scores(client, users, fake_pve):
+    sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
+                      headers=users["member"]).json()["session_id"]
+    assert client.post(f"/sessions/{sid}/launch", headers=users["member"]).status_code == 200
+
+    def host_exec(host, command):
+        if command.startswith("cat "):
+            return 0, "FLAG{quick-win}\n"
+        if "awk" in command and "/etc/passwd" in command:
+            return 0, ""                       # no rogue uid-0
+        if "list-unit-files" in command:
+            return 0, "sshd.service enabled enabled\n"
+        return 127, "no route"
+    verification_service.set_verifier_exec(host_exec)
+
+    # red objective confirmed by the BACKEND verifier, not a claim
+    r = client.post(f"/sessions/{sid}/verifier_checks",
+                    json={"objective_id": "flaggrab"}, headers=users["member"])
+    assert r.status_code == 200 and r.json()["passed"] is True
+    assert r.json()["status"] == "passed" and r.json()["event_id"]
+
+    card = client.post(f"/sessions/{sid}/score", headers=users["member"]).json()
+    assert card["status"] == "scored"
+    assert card["earned"] == card["total"] == 15
+    assert {i["domain"] for i in card["items"]} == {"identify", "protect"}
+
+    # score snapshot persisted; the progress view can see it (owner DB connection)
+    snap = client.get(f"/sessions/{sid}/score", headers=users["member"]).json()
+    assert snap["event_id"] == card["event_id"]
 
 
-def test_m4_validator_catches_broken_scenarios():
-    base = {
-        "id": "x", "name": "x", "difficulty": 1, "focus": [], "est_minutes": 1,
-        "techniques": [], "topology": {"hosts": [{"name": "h", "template_vmid": 9001, "ip": "10.0.0.1"}]},
+def test_m4_unreachable_state_is_unknown_not_fabricated(client, users):
+    sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
+                      headers=users["member"]).json()["session_id"]
+    client.post(f"/sessions/{sid}/launch", headers=users["member"])
+
+    def dead_exec(host, command):
+        raise TimeoutError("host unreachable")
+    verification_service.set_verifier_exec(dead_exec)
+
+    card = client.post(f"/sessions/{sid}/score", headers=users["member"]).json()
+    # documented policy: unknown scores 0 but REMAINS VISIBLE as partial —
+    # no fabricated passes, no silent all-F scorecard
+    assert card["status"] == "partial"
+    assert card["earned"] == 0 and card["total"] == 15
+    assert all(i["status"] == "unknown" for i in card["items"])
+    assert all(i["error"] for i in card["items"])
+
+    # and an UNKNOWN red objective never counts as compromised
+    r = client.post(f"/sessions/{sid}/verifier_checks",
+                    json={"objective_id": "flaggrab"}, headers=users["member"])
+    assert r.json()["status"] == "unknown" and r.json()["passed"] is False
+
+
+# --- criterion 2: YAML validation is strict and offline ------------------------
+def test_m4_loader_rejects_bad_scenarios(tmp_path, monkeypatch):
+    import shutil
+
+    from srplatform.scenario_engine import loader
+
+    # copy the real library so cross-references (verifier ids) resolve
+    shutil.copytree("scenarios", tmp_path, dirs_exist_ok=True)
+    good = (tmp_path / "quick-win-01.yaml").read_text()
+    monkeypatch.setattr(loader, "scenarios_dir", lambda: tmp_path)
+
+    # targeted mutations, each individually unacceptable
+    mutations = {
+        "negative points": good.replace("points: 10", "points: -5"),
+        "unknown verifier": good.replace("verifier: flag_file_present", "verifier: magic_wand"),
+        "missing required arg": good.replace("path: /root/flag_quickwin.txt", "xhost: nope"),
+        "bad ip": good.replace("10.66.0.10", "999.1.1.1"),
     }
-    import yaml
-    # unknown verifier id — an objective nobody could ever confirm
-    bad = dict(base, red={"objectives": [{"id": "o", "verifier": "not_a_verifier", "args": {}}]})
-    with pytest.raises(ScenarioError) as e:
-        parse_scenario(yaml.safe_dump(bad))
-    assert "not_a_verifier" in str(e.value)
-    # non-integer points
-    bad2 = dict(base, scoring={"blue_checks": [{"verifier": "firewall_enabled", "host": "h", "points": "lots"}]})
-    with pytest.raises(ScenarioError):
-        parse_scenario(yaml.safe_dump(bad2))
-    # blue check on an unknown host
-    bad3 = dict(base, scoring={"blue_checks": [{"verifier": "firewall_enabled", "host": "ghost", "points": 5}]})
-    with pytest.raises(ScenarioError):
-        parse_scenario(yaml.safe_dump(bad3))
-    # a valid scenario passes
-    parse_scenario(yaml.safe_dump(dict(base, red={"objectives": []})))
+    monkeypatch.setattr(loader, "scenarios_dir", lambda: tmp_path)
+    for label, mutated in mutations.items():
+        (tmp_path / "bad-01.yaml").write_text(mutated)
+        with pytest.raises(loader.ScenarioError):
+            loader.load_scenario("bad-01")
+        assert label  # readability
+
+    # list_scenarios surfaces invalid entries instead of hiding them
+    (tmp_path / "bad-02.yaml").write_text(good.replace("points: 10", "points: -1"))
+    rows = loader.list_scenarios(tmp_path)
+    bad_rows = [r for r in rows if r.get("_valid") is False]
+    assert any(r["id"] == "bad-02" for r in bad_rows)
 
 
-def test_m4_pure_yaml_scenario_deploys_runs_and_scores(migrated_db):
-    fake = FakeProxmox()
-    deps.set_proxmox(fake)
-    try:
-        c = TestClient(app)
-
-        # DEPLOY: two hosts cloned from their golden templates
-        r = c.post("/deploy/db-exfil-01")
-        assert r.status_code == 200
-        assert {h["host"] for h in r.json()["hosts"]} == {"web01", "db01"}
-        assert any(call[1] == 9004 for call in fake.calls if call[0] == "CLONE")
-
-        # RUN: scripted model; verifiers (not the model) confirm three objectives
-        sid = c.post("/sessions", json={"scenario_id": "db-exfil-01"}).json()["session_id"]
-        sb = FakeSandbox(script={
-            "nmap": (0, "Nmap: 10.66.0.10 web01, 10.66.0.11 db01"),
-            "exploit.py": lambda cmd: _plant(sb, "/root/flag_foothold.txt", "FLAG{fh}") or (0, "pwned"),
-            "dump": lambda cmd: _plant(sb, "/tmp/exfil/loot", "user,ssn,ssn") or (0, "looted"),
-            "router.sh": lambda cmd: (sb.set_state("db01", "systemctl list-unit-files mysql-router",
-                                                   (0, "mysql-router.service enabled static")) or (0, "installed")),
-        })
-        res = RedAgentLoop(sid, "db-exfil-01", TestClientTransport(c), FakeLLM([
-            tool("scan", "nmap -sn 10.66.0.0/24"),
-            tool("exploit web", "python3 exploit.py --target web01"),
-            tool("loot", "python3 dump.py --db db01 > /tmp/exfil/loot"),
-            tool("persist db", "bash router.sh"),
-        ]), sb, max_steps=10, compress_after=20, keep_recent=4).run()
-        assert res["complete"] and set(res["achieved"]) == {"foothold", "loot", "persistence"}
-
-        # SCORE: blue checks on the same hosts, same verifier code
-        sb.set_state("web01", "awk -F:", (0, ""))                       # no rogue admin
-        sb.set_state("web01", "systemctl is-active firewalld", (0, "active\n"))
-        sb.set_state("db01", "cut -d:", (0, "root\nmysql\n"))           # no unknown accounts
-        sb.set_state("db01", "sha256sum", (0, "7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d6772842dd42728a0f1383e  ibdata1\n"))
-        sc = compute_blue_score("db-exfil-01", _ctx(sb))
-        assert sc["total"] == 40 and sc["earned"] == 40, sc["items"]
-
-        # blue misses one check -> score reflects truth
-        sb.set_state("web01", "systemctl is-active firewalld", (0, "inactive\n"))
-        sc2 = compute_blue_score("db-exfil-01", _ctx(sb))
-        assert sc2["earned"] == 35
-    finally:
-        deps.set_proxmox(None)
+def test_m4_library_metadata_for_launcher(client):
+    rows = client.get("/scenarios").json()
+    wf = next(r for r in rows if r["id"] == "web-foothold-01")
+    # fields the M7 browser filters on
+    assert {"difficulty", "focus", "est_minutes", "techniques"} <= set(wf)
+    assert all(r.get("_valid") is not False for r in rows), "library must be fully valid"
 
 
-def test_m4_adding_an_objective_is_a_yaml_edit_only(migrated_db, tmp_path):
-    """Drop a new objective into a scenario (reusing the flag_file_present
-    verifier with new args) — zero code changes — and the loop honors it."""
-    import yaml
+# --- verifier library semantics (no DB): shared red/blue contract --------------
+def test_verifier_polarity_serves_red_and_blue():
+    from verifiers.library.flag_file import CronPersistencePresent
 
-    spec = dict(load_scenario("web-foothold-01"))
-    spec["id"] = "web-foothold-01b"
-    spec["red"] = dict(spec["red"])
-    spec["red"]["objectives"] = list(spec["red"]["objectives"]) + [
-        {"id": "second_flag", "verifier": "flag_file_present",
-         "args": {"host": "web01", "path": "/root/flag_second.txt"}}]
-    scen = tmp_path / "web-foothold-01b.yaml"
-    scen.write_text(yaml.safe_dump(spec))
-
-    import srplatform.scenario_engine.loader as L
-    orig_dir = L.scenarios_dir
-    L.scenarios_dir = lambda: tmp_path
-    try:
-        c = TestClient(app)
-        sid = c.post("/sessions", json={"scenario_id": "web-foothold-01b"}).json()["session_id"]
-        sb = FakeSandbox(script={
-            "exploit.py": lambda cmd: _plant(sb, "/root/flag_foothold.txt", "FLAG{a}") or (0, "ok"),
-            "deploy2.sh": lambda cmd: _plant(sb, "/root/flag_second.txt", "FLAG{b}") or (0, "ok"),
-            "persist.sh": lambda cmd: (sb.fs.setdefault("web01", {}).__setitem__("/etc/cron.d/x", "cron entry") or (0, "ok")),
-        })
-        res = RedAgentLoop(sid, "web-foothold-01b", TestClientTransport(c), FakeLLM([
-            tool("pwn", "python3 exploit.py --target 10.66.0.10"),
-            tool("second", "bash deploy2.sh"),
-            tool("cron", "bash persist.sh"),
-        ]), sb, max_steps=10, compress_after=20, keep_recent=4).run()
-        assert res["complete"], res
-        assert "second_flag" in res["achieved"], "YAML-added objective must be honored and verified"
-    finally:
-        L.scenarios_dir = orig_dir
+    cron = CronPersistencePresent()
+    ctx = Context(exec=lambda h, c: (0, "e2scrub_all\nbackdoor\n---\n"))
+    red = cron.evaluate(ctx, host="web01", baseline_files=["e2scrub_all"])
+    assert red.status == "passed"                       # red: persistence exists
+    blue = cron.evaluate(ctx, host="web01", expect="absent", baseline_files=["e2scrub_all"])
+    assert blue.status == "failed"                      # blue: NOT allowed to award
+    clean = Context(exec=lambda h, c: (0, "e2scrub_all\n---\n"))
+    blue_clean = cron.evaluate(clean, host="web01", expect="absent", baseline_files=["e2scrub_all"])
+    assert blue_clean.status == "passed"
+    # baseline-only state must NOT count as red persistence (F10)
+    red_clean = cron.evaluate(clean, host="web01", baseline_files=["e2scrub_all"])
+    assert red_clean.status == "failed"
 
 
-# ---------------------------------------------------------------- helpers
-def _plant(sb, path, content):
-    sb.fs.setdefault("web01", {})[path] = content
-    return None  # so `callable() or (code, out)` yields (0, ...)
+def test_verifier_unknown_never_passes_and_typed_args_reject_garbage():
+    from verifiers.library.flag_file import FlagFilePresent
+    from verifiers.library.ccdc import DataIntegrity
+
+    flag = FlagFilePresent()
+    dead = Context(exec=lambda h, c: (_ for _ in ()).throw(OSError("ssh down")))
+    assert flag.evaluate(dead, host="h", path="/x").status == "unknown"
+
+    # wrong type for path (int) is an argument error, not a crash or a pass
+    ok_ctx = Context(exec=lambda h, c: (0, "FLAG{x}"))
+    assert flag.evaluate(ok_ctx, host="h", path=12345).status == "unknown"
+
+    # integrity hash typo in the SCENARIO is caught statically by the loader path
+    di = DataIntegrity()
+    assert di.validate_static({"host": "h", "path": "/x", "expected_sha256": "deadbeef"})
+    assert di.validate_static({"host": "h", "path": "/x",
+                               "expected_sha256": "0" * 64}) is None
 
 
-def _ctx(sb):
-    from verifiers.base import Context
-    return Context(exec=sb.verifier_exec)
+def test_verifier_flag_provenance_mismatch_is_not_a_pass():
+    from verifiers.library.flag_file import FlagFilePresent
+    ctx = Context(exec=lambda h, c: (0, "someone-elses-file"))
+    out = FlagFilePresent().evaluate(ctx, host="h", path="/root/flag_foothold.txt",
+                                     expected_content="FLAG{web01-root}")
+    assert out.status == "failed"
+    assert out.evidence["provenance"] == "mismatch"
+
+
+def test_verifier_commands_are_shell_quoted():
+    """No injection through scenario-provided paths into the management channel."""
+    from verifiers.library.flag_file import FlagFilePresent
+    seen = []
+
+    def spy(h, c):
+        seen.append(c)
+        return 0, "x"
+    FlagFilePresent().evaluate(Context(exec=spy), host="h", path="/x; rm -rf /",
+                               expected_content="x")
+    assert seen and "rm -rf" in seen[0] and ";" in seen[0]
+    # the metacharacters exist only INSIDE a single-quoted argument
+    assert seen[0].split("cat ")[1].startswith("'/x;")

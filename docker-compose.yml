@@ -1,53 +1,91 @@
 # Dev-only composition of the platform services (Part 2: compose for dev, LXC for real).
 # The real deployment places these same services into LXCs on the R740.
+#
+# Service model (audit F07 repair):
+#   postgres            Postgres 16, healthchecked
+#   bootstrap-roles     one-shot: creates the sr_app role (owner is created by initdb)
+#   migrate             one-shot: Alembic upgrade head — THE ONLY service that sees
+#                       the owner (DDL) credentials
+#   api                 the single front door; app-role credentials ONLY
+#   bastion             recording SSH proxy; talks to the API over HTTP only
+#
+# There is deliberately NO red-agent service: red workers are spawned by the API
+# (POST /run/{scenario_id}) as supervised, isolated runs — an unattended
+# always-on attacker process is not a deployment service (audit F01/F07).
+# There is no separate coach service; coach routes are mounted in the API app
+# (the old `srplatform.coach.service` import never existed).
+#
+# Runtime services never receive PROXMOX_* or owner-DB credentials; model
+# selection/execution happens in runner-scoped workers (see docs/ARCHITECTURE_NOTES.md).
 services:
   postgres:
     image: postgres:16
     environment:
       POSTGRES_USER: sr_owner
-      POSTGRES_PASSWORD: devowner
+      POSTGRES_PASSWORD: ${SR_DEV_OWNER_PASSWORD:-devowner}
       POSTGRES_DB: sparring_range
-    ports: ["5432:5432"]
+    ports: ["127.0.0.1:5432:5432"]
     volumes: ["pgdata:/var/lib/postgresql/data"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U sr_owner"]
+      test: ["CMD-SHELL", "pg_isready -U sr_owner -d sparring_range"]
       interval: 5s
       retries: 10
 
-  # Application role: everything except `db migrate` connects as this role so the
-  # append-only revocations actually bite (they'd be no-ops for the owner).
   bootstrap-roles:
     image: postgres:16
     depends_on:
       postgres: { condition: service_healthy }
     environment:
-      PGPASSWORD: devowner
+      PGPASSWORD: ${SR_DEV_OWNER_PASSWORD:-devowner}
     command: >
       psql -h postgres -U sr_owner -d sparring_range -v ON_ERROR_STOP=1 -f /bootstrap.sql
     volumes:
       - ./infra/db/bootstrap.sql:/bootstrap.sql:ro
+    restart: "no"
+
+  migrate:
+    build: { context: ., dockerfile: infra/dev/Dockerfile }
+    command: python -m alembic upgrade head
+    environment:
+      POSTGRES_URL_OWNER: postgresql+psycopg2://sr_owner:${SR_DEV_OWNER_PASSWORD:-devowner}@postgres:5432/sparring_range
+      DB_APP_ROLE: sr_app
+    depends_on:
+      bootstrap-roles: { condition: service_completed_successfully }
+    restart: "no"
 
   api:
     build: { context: ., dockerfile: infra/dev/Dockerfile }
     command: uvicorn srplatform.api.app:app --host 0.0.0.0 --port 8000
     env_file: .env
     environment:
-      POSTGRES_URL: postgresql+psycopg2://sr_app:devapp@postgres:5432/sparring_range
-      POSTGRES_URL_OWNER: postgresql+psycopg2://sr_owner:devowner@postgres:5432/sparring_range
-    ports: ["8000:8000"]
-    depends_on: [bootstrap-roles]
+      # app-role ONLY — the owner URL must not exist in the runtime environment
+      POSTGRES_URL: postgresql+psycopg2://sr_app:${SR_DEV_APP_PASSWORD:-devapp}@postgres:5432/sparring_range
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)\""]
+      interval: 10s
+      retries: 6
 
-  red-agent:
+  bastion:
     build: { context: ., dockerfile: infra/dev/Dockerfile }
-    command: python -m srplatform.red_agent.loop
-    env_file: .env
-    depends_on: [api]
-
-  coach:
-    build: { context: ., dockerfile: infra/dev/Dockerfile }
-    command: uvicorn srplatform.coach.service:app --host 0.0.0.0 --port 8001
-    env_file: .env
-    depends_on: [api]
+    command: python -m srplatform.bastion.proxy
+    environment:
+      API_BASE_URL: http://api:8000
+      RECORDINGS_DIR: /var/lib/sparring-range/recordings
+      BASTION_HOST_KEY_PATH: /etc/sparring-range/bastion_ed25519
+      BASTION_LISTEN_HOST: 0.0.0.0
+      BASTION_LISTEN_PORT: "2222"
+    ports: ["127.0.0.1:2222:2222"]
+    volumes:
+      - recordings:/var/lib/sparring-range/recordings
+      - bastion-keys:/etc/sparring-range
+    depends_on:
+      api: { condition: service_started }
 
 volumes:
   pgdata:
+  recordings:
+  bastion-keys:

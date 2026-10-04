@@ -1,0 +1,21 @@
+[Unit]
+Description=Sparring-range telemetry shipper (auditd -> platform API)
+After=auditd.service network-online.target
+Wants=auditd.service
+
+[Service]
+Type=simple
+# Input: the REAL audit.log in ENRICHED format (documented in install.sh).
+ExecStart=/bin/sh -c 'tail -F -n 0 /var/log/audit/audit.log | /usr/local/bin/sparring-shipper'
+Restart=always
+RestartSec=3
+EnvironmentFile=-/etc/sparring-range/shipper.env
+# trust limit: this service sees what a compromised host claims — it is a
+# SINK, give it no more rights than reading the audit log
+DynamicUser=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sparring-range/shipper
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

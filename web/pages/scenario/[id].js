@@ -13,10 +13,12 @@ export default function Scenario() {
     <div className="panel">
       <h2>{spec.name}</h2>
       <p className="dim">{spec.id} · difficulty {spec.difficulty} · ~{spec.est_minutes} min · focus: {(spec.focus || []).join(", ")}</p>
-      <h4>Red objectives (verifier-confirmed only)</h4>
-      <ul>{(spec.red?.objectives || []).map(o => <li key={o.id}><code>{o.id}</code> → <code>{o.verifier}</code> <span className="dim">{JSON.stringify(o.args || {})}</span></li>)}</ul>
+      <h4>Red objectives (backend-verifier-confirmed only)</h4>
+      <ul>{(spec.red?.objectives || []).map(o => <li key={o.id}><code>{o.id}</code> ({o.phase}) → <code>{o.verifier}</code> <span className="dim">{JSON.stringify(o.args || {})}</span></li>)}</ul>
       <h4>Blue scorecard</h4>
-      <ul>{(spec.scoring?.blue_checks || []).map((b, i) => <li key={i}><code>{b.verifier}</code> on <code>{b.host}</code> — {b.points} pts</li>)}</ul>
+      <ul>{(spec.scoring?.blue_checks || []).map((b, i) => (
+        <li key={i}><code>{b.verifier}</code> on <code>{b.host}</code> — {b.points} pts
+          {" "}<span className="dim">[{b.domain || "general"}{b.expect && b.expect !== "present" ? ` · ${b.expect}` : ""}]</span></li>))}</ul>
       <p className="dim">MITRE: {(spec.techniques || []).join(", ")}</p>
     </div>
   );

@@ -1,97 +1,183 @@
-"""M7 acceptance (API side) — the web app is a thin client of these endpoints;
-if they hold, every screen is just a view over the event log:
+"""M7 acceptance (API side) — the web app is a thin authenticated client of
+these endpoints; if they hold, every screen is just a view over the event log:
 
-  * accounts & login (simple LAN tokens)
-  * one-click launch path = same deploy/run code path
-  * live dashboard data (phase, detections, clock, hint button)
-  * replay data (.cast parsed + timeline to sync against)
-  * progress across MORE THAN ONE session, per-domain, derived as a query
+  * accounts & real credential login (tokens expire; logout revokes)
+  * one-click launch = the same backend workflow the CLI uses
+  * live dashboard data (phase, detections with real times)
+  * replay data (.cast parsed + epoch header + timeline to sync against)
+  * progress across MORE THAN ONE session, PER-DOMAIN from trusted score
+    snapshots (F20), including partial-score honesty
 """
-import json
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from fastapi.testclient import TestClient
 
-from srplatform.api.app import app
-
-
-@pytest.fixture()
-def c(migrated_db):
-    return TestClient(app)
+pytestmark = pytest.mark.db
 
 
-def test_m7_accounts_and_login_tokens(c):
-    assert c.post("/users", json={"username": "teammate1", "display_name": "Teammate One"}).status_code == 201
-    assert c.post("/users", json={"username": "teammate1"}).status_code == 409
-    r = c.post("/auth/login", json={"username": "teammate1"})
-    assert r.status_code == 200 and len(r.json()["token"]) >= 16
-    assert c.post("/auth/login", json={"username": "nobody"}).status_code == 404
+def test_m7_login_lifecycle(client, users):
+    me = client.get("/users/me", headers=users["member"])
+    assert me.status_code == 200 and me.json()["username"] == "blue"
+    # bad password never authenticates; unauthenticated is 401 not 200-with-nulls
+    assert client.post("/auth/login", json={"username": "blue", "password": "nope"}
+                       ).status_code == 401
+    assert client.get("/sessions").status_code == 401
+    # logout revokes: the same token must stop working
+    tok = users["member_token"]
+    assert client.post("/auth/logout",
+                       headers={"Authorization": f"Bearer {tok}"}).status_code == 200
+    assert client.get("/users/me",
+                      headers={"Authorization": f"Bearer {tok}"}).status_code == 401
 
 
-def test_m7_launch_is_the_same_code_path(c, monkeypatch):
-    """Browser launch == deploy + run on the same endpoints rangectl uses."""
-    from infra.proxmox_client import FakeProxmox
-    from srplatform.api import deps
-    deps.set_proxmox(FakeProxmox())
-    try:
-        assert c.post("/deploy/web-foothold-01").status_code == 200
-        sid = c.post("/sessions", json={"scenario_id": "web-foothold-01", "username": "drew"}).json()["session_id"]
-        # live view knows the session even before any agent state exists
-        live = c.get(f"/sessions/{sid}/live")
-        assert live.status_code == 200 and live.json()["status"] == "running"
-    finally:
-        deps.set_proxmox(None)
+def test_m7_library_filters_and_one_click_launch(client, users):
+    rows = client.get("/scenarios", headers=users["member"]).json()
+    easy = [r for r in rows if r["difficulty"] == 1 and "web" in (r.get("focus") or [])]
+    assert any(r["id"] == "web-foothold-01" for r in easy)
+    # one-click = create + launch, and the response carries everything the
+    # browser needs to render the "connect" step
+    sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
+                      headers=users["member"]).json()["session_id"]
+    out = client.post(f"/sessions/{sid}/launch", headers=users["member"]).json()
+    assert out["connections"] and "ssh" in out["connections"][0]
 
 
-def _seed_scored_session(c, username, scenario, earned, total, day):
-    c.post("/users", json={"username": username})
-    uid = c.get("/sessions").json()  # noop keep-alive
-    sid = c.post("/sessions", json={"scenario_id": scenario, "username": username}).json()["session_id"]
-    ts = (datetime.now(timezone.utc) - timedelta(days=day)).isoformat()
-    r = c.post("/events", json={"session_id": sid, "ts": ts, "actor": "system",
-                                "action_type": "verifier", "host": "web01",
-                                "payload": {"scorecard": {"earned": earned, "total": total, "items": []}}})
+def _mk_events_direct(client, users, sid, rows):
+    """Append system-role evidence via the service layer (test stands in for
+    runtime events that the endpoints would create over real time)."""
+    from srplatform.db.session import db as db_ctx
+    from srplatform.db.models import Event
+    with db_ctx() as s:
+        for r in rows:
+            s.add(Event(session_id=uuid.UUID(sid), actor=r.get("actor", "system"),
+                        host=r.get("host"), action_type=r["action_type"],
+                        phase=r.get("phase"), ts=r["ts"], payload=r["payload"]))
+        s.commit()
+
+
+def test_m7_live_dashboard_reads_state_and_real_times(client, users):
+    sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
+                      headers=users["member"]).json()["session_id"]
+    client.put(f"/agent_state/{sid}", json={"current_phase": "recon", "summary": None,
+                                            "summary_upto": 0},
+               headers=users["member"])
+    now = datetime.now(timezone.utc)
+    _mk_events_direct(client, users, sid, [
+        {"action_type": "verifier", "host": "web01", "ts": now - timedelta(minutes=2),
+         "payload": {"objective": "flaggrab", "passed": True}},
+    ])
+    live = client.get(f"/sessions/{sid}/live", headers=users["member"]).json()
+    assert live["red_phase"] == "recon"
+    assert live["detections"] and live["detections"][0]["objective"] == "flaggrab"
+    assert live["detections"][0]["passed"] is True
+    assert live["detections"][0]["ts"].startswith((now - timedelta(minutes=2)).strftime("%Y-%m-%dT"))
+
+
+def test_m7_progress_is_per_domain_from_snapshots_over_multiple_sessions(client, users):
+    import sqlalchemy as sa
+    from sqlalchemy import create_engine
+    from srplatform import verification_service
+
+    # session 1: quick-win fully healthy hosts -> 15/15
+    s1 = client.post("/sessions", json={"scenario_id": "quick-win-01"},
+                     headers=users["member"]).json()["session_id"]
+    client.post(f"/sessions/{s1}/launch", headers=users["member"])
+
+    def healthy(host, command):
+        if "awk" in command:
+            return 0, ""
+        if "list-unit-files" in command:
+            return 0, "sshd.service enabled enabled\n"
+        return 1, "no"
+    verification_service.set_verifier_exec(healthy)
+    c1 = client.post(f"/sessions/{s1}/score", headers=users["member"]).json()
+    assert c1["earned"] == 15
+
+    # session 2: web01 up, sshd gone -> partial domain coverage
+    s2 = client.post("/sessions", json={"scenario_id": "quick-win-01"},
+                     headers=users["member"]).json()["session_id"]
+    client.post(f"/sessions/{s2}/launch", headers=users["member"])
+
+    def degraded(host, command):
+        if "awk" in command:
+            return 0, "hacker\n"          # rogue admin present -> lose identify
+        if "list-unit-files" in command:
+            return 0, "sshd.service enabled enabled\n"
+        return 1, "no"
+    verification_service.set_verifier_exec(degraded)
+    c2 = client.post(f"/sessions/{s2}/score", headers=users["member"]).json()
+    assert c2["earned"] == 5 and c2["status"] == "scored"
+
+    prog = client.get("/users/blue/progress", headers=users["member"]).json()
+    assert prog["by_domain"]["identify"]["avg_pct"] == 50      # 10/20 across sessions
+    assert prog["by_domain"]["protect"]["avg_pct"] == 100
+    assert {s["session_id"] for s in prog["sessions"]} == {s1, s2}
+    assert len(prog["sessions"]) == 2                          # deduped per session
+    # other members cannot read this progress
+    assert client.get("/users/blue/progress", headers=users["op"]).status_code == 200
+    assert client.get("/users/drew/progress", headers=users["member"]).status_code == 403
+
+
+def test_m7_replay_shape_epoch_and_containment(client, users, tmp_path):
+    import json as jsonlib
+    sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
+                      headers=users["member"]).json()["session_id"]
+    recs_dir = tmp_path / "recordings"
+    recs_dir.mkdir(exist_ok=True)
+    cast = recs_dir / "rec1.cast"
+    hdr = {"version": 2, "width": 120, "height": 32,
+           "timestamp": int(datetime.now(timezone.utc).timestamp())}
+    cast.write_text(jsonlib.dumps(hdr) + "\n" +
+                    jsonlib.dumps([0.1, "o", "$ id\n"]) + "\n" +
+                    jsonlib.dumps([0.4, "i", "id\n"]) + "\n")
+    # register through the bastion capability (the only writer)
+    btok = client.post("/admin/service_tokens", json={"scope": "bastion",
+                                                      "session_id": sid},
+                       headers=users["op"]).json()["token"]
+    r = client.post(f"/sessions/{sid}/recordings",
+                    json={"cast_path": str(cast)},
+                    headers={"Authorization": f"Bearer {btok}"})
     assert r.status_code == 201
-    return sid
+    rid = r.json()["recording_id"]
+
+    rp = client.get(f"/sessions/{sid}/replay", headers=users["member"]).json()
+    assert rp["casts"][0]["header"]["timestamp"]              # epoch anchor present
+    assert rp["casts"][0]["frames"][1] == [0.4, "i", "id\n"]
+
+    # path containment: a path outside the recordings root is rejected at REGISTRATION
+    outside = tmp_path / "evil.cast"
+    outside.write_text("x")
+    r = client.post(f"/sessions/{sid}/recordings", json={"cast_path": str(outside)},
+                    headers={"Authorization": f"Bearer {btok}"})
+    assert r.status_code == 422
+
+    # a symlink pointing outside is rejected at READ time (policy in web_routes)
+    link = recs_dir / "link.cast"
+    link.symlink_to("/etc/passwd")
+    from srplatform.db.session import db as db_ctx
+    from srplatform.db.models import Recording
+    with db_ctx() as s:
+        s.add(Recording(session_id=uuid.UUID(sid), cast_path=str(link), status="open"))
+        s.commit()
+    rp = client.get(f"/sessions/{sid}/replay", headers=users["member"]).json()
+    broken = [c for c in rp["casts"] if c.get("error")]
+    assert broken and "symlink" in broken[0]["error"]
 
 
-def test_m7_progress_reflects_more_than_one_session(c):
-    _seed_scored_session(c, "teammate2", "web-foothold-01", 15, 15, day=7)
-    _seed_scored_session(c, "teammate2", "web-foothold-01", 10, 15, day=5)
-    _seed_scored_session(c, "teammate2", "db-exfil-01", 8, 40, day=2)
-
-    r = c.get("/users/teammate2/progress")
-    assert r.status_code == 200
-    prog = r.json()
-    assert len(prog["sessions"]) == 3, "progress must span multiple sessions"
-    # domain labels come from scenario focus metadata
-    assert "web" in prog["by_domain"] and "exfiltration" in prog["by_domain"]
-    # lagging domains are the worst averages; the web drills (15/15, 10/15) are NOT lagging
-    assert prog["lagging_domains"][0] in {"data", "exfiltration", "lateral"}
-    assert "web" not in prog["lagging_domains"]
-    assert prog["by_domain"]["web"]["avg_pct"] == round((100 + 67) / 2) or \
-           prog["by_domain"]["web"]["avg_pct"] in (83, 84)
-
-
-def test_m7_replay_returns_cast_frames_and_sync_timeline(c, tmp_path, monkeypatch):
-    sid = c.post("/sessions", json={"scenario_id": "web-foothold-01"}).json()["session_id"]
-    cast_path = tmp_path / "tok_web01-x.cast"
-    header = {"version": 2, "width": 120, "height": 32, "timestamp": 1770000000, "session_id": sid}
-    cast_path.write_text(json.dumps(header) + "\n" +
-                         json.dumps([0.5, "i", "id\n"]) + "\n" +
-                         json.dumps([1.2, "o", "uid=0(root)\n"]) + "\n")
-    c.post("/events", json={"session_id": sid, "actor": "blue:tok_web01", "host": "bastion",
-                            "action_type": "bastion_session_end",
-                            "payload": {"cast": str(cast_path)}, "raw_ref": str(cast_path)})
-    # one more session's worth of events so the sync timeline has content
-    c.post("/events", json={"session_id": sid, "actor": "red", "action_type": "tool_call",
-                            "phase": "recon", "payload": {"command": "nmap x"}})
-
-    r = c.get(f"/sessions/{sid}/replay")
-    assert r.status_code == 200
-    rep = r.json()
-    assert rep["casts"] and rep["casts"][0]["header"]["version"] == 2
-    dirs = [f[1] for f in rep["casts"][0]["frames"]]
-    assert "i" in dirs and "o" in dirs  # scrub-ready frames both directions
-    assert len(rep["timeline"]) >= 2
+def test_m7_cursor_pagination_deterministic(client, users):
+    sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
+                      headers=users["member"]).json()["session_id"]
+    now = datetime.now(timezone.utc)
+    rows = [{"action_type": "note", "ts": now, "payload": {"i": i}} for i in range(25)]
+    _mk_events_direct(client, users, sid, rows)
+    page1 = client.get("/events", params={"session_id": sid, "limit": 10},
+                       headers=users["member"]).json()
+    page2 = client.get("/events", params={"session_id": sid, "limit": 10,
+                                          "after_event_id": page1[-1]["event_id"]},
+                       headers=users["member"]).json()
+    ids = [e["event_id"] for e in page1 + page2]
+    assert ids == sorted(ids) and len(set(ids)) == 20
+    tail = client.get("/events", params={"session_id": sid, "tail": 3},
+                      headers=users["member"]).json()
+    assert [e["payload"]["i"] for e in tail] == [22, 23, 24]

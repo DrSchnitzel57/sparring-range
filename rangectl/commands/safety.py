@@ -1,34 +1,50 @@
-"""rangectl safety — killswitch and egress verification (hard constraints #1/#2)."""
-import httpx
+"""rangectl safety — operator-side safety operations (F02). All calls carry the
+authenticated token; these endpoints are operator-only."""
+import json
+
 import typer
 
-from srplatform.settings import get_settings
+from rangectl import client as c
 
 app = typer.Typer(no_args_is_help=True)
 
 
 @app.command("killswitch")
 def killswitch():
-    """Stop the red agent service AND drop the range datapath. Both, provably."""
-    r = httpx.post(f"{get_settings().api_base_url}/safety/killswitch", timeout=30)
-    r.raise_for_status()
-    for line in r.json().get("actions", []):
-        typer.echo(line)
-    typer.echo(f"killswitch: {r.json()['killswitch']}")
+    """Engage: stop workers AND drop the range datapath — independently, truthfully."""
+    r = c.call("POST", "/safety/killswitch").json()
+    for line in r.get("actions", []):
+        typer.echo(f"  {line}")
+    typer.echo(f"killswitch: {r['killswitch']}")
+    if r.get("warning"):
+        typer.echo(f"WARNING: {r['warning']}", err=True)
 
 
-@app.command("killswitch-release")
-def killswitch_release():
-    """Release the killswitch (baseline egress-deny must remain active)."""
-    r = httpx.post(f"{get_settings().api_base_url}/safety/killswitch-release", timeout=30)
-    r.raise_for_status()
-    typer.echo(r.json()["note"])
+@app.command("release")
+def release():
+    """Remove the emergency ruleset (baseline deny preserved); invalidates evidence."""
+    r = c.call("POST", "/safety/killswitch-release").json()
+    typer.echo(json.dumps(r, indent=2))
 
 
-@app.command("verify")
-def verify():
-    """Report safety config state and the live datapath proof Drew must run."""
-    r = httpx.get(f"{get_settings().api_base_url}/safety/verify", timeout=30)
-    r.raise_for_status()
-    for k, v in r.json().items():
-        typer.echo(f"{k}: {v}")
+@app.command("status")
+def status():
+    typer.echo(json.dumps(c.call("GET", "/safety/status").json(), indent=2))
+
+
+@app.command("baseline-check")
+def baseline_check():
+    """Run backend baseline verification and RECORD the outcome."""
+    r = c.call("POST", "/safety/baseline-check", json={}).json()
+    typer.echo(json.dumps(r, indent=2))
+
+
+@app.command("datapath-proof")
+def datapath_proof(vm_hostname: str, ping: str, dns: str, ipv6: str | None = None):
+    """Record the operator's live proof from a range VM (probes as OBSERVED —
+    your attestation; the API stores what you state you saw)."""
+    probes = {"ping": ping, "dns": dns}
+    if ipv6:
+        probes["ipv6"] = ipv6
+    r = c.call("POST", "/safety/datapath-proof", json={"probes": probes, "vm_hostname": vm_hostname}).json()
+    typer.echo(json.dumps(r, indent=2))

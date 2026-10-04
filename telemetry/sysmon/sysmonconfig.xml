@@ -1,0 +1,13 @@
+<!-- Minimal Sysmon config for the sparring range (record process starts with
+command lines + network connects; deliberately small — tune later). -->
+<Sysmon schemaversion="4.90">
+  <HashAlgorithms>SHA256</HashAlgorithms>
+  <EventFiltering>
+    <ProcessCreate onmatch="include">
+      <CommandLine condition="contains" />
+    </ProcessCreate>
+    <NetworkConnect onmatch="include">
+      <Image condition="contains" />
+    </NetworkConnect>
+  </EventFiltering>
+</Sysmon>

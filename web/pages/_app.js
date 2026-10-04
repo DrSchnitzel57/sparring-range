@@ -1,11 +1,19 @@
 import "../styles/global.css";
+import "asciinema-player/dist/bundle/asciinema-player.css";
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { currentUser, logout } from "../lib/api";
+import { useRouter } from "next/router";
+import { currentUser, logout, getToken } from "../lib/api";
 
 export default function App({ Component, pageProps }) {
   const [user, setUser] = useState(null);
-  useEffect(() => setUser(currentUser()), []);
+  const router = useRouter();
+  useEffect(() => {
+    const u = currentUser();
+    setUser(u);
+    if (!getToken() && u === null && router.pathname !== "/") router.replace("/");
+  }, [router.pathname]);
+  const isLogin = router.pathname === "/";
   return (
     <div className="shell">
       <header className="topbar">
@@ -13,7 +21,7 @@ export default function App({ Component, pageProps }) {
         <nav>
           <Link href="/library">library</Link>
           <Link href="/progress">progress</Link>
-          {user && <a href="#" onClick={(e) => { logout(); location.href = "/"; }}>{user} (logout)</a>}
+          {user && <a href="#" onClick={(e) => { e.preventDefault(); logout(); location.href = "/"; }}>{user} (logout)</a>}
         </nav>
       </header>
       <main><Component {...pageProps} /></main>

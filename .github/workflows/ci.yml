@@ -1,0 +1,62 @@
+name: ci
+# Real commands, real disposable database (audit F07/F22/F23). Nothing here is
+# aspirational: every step is what a developer can run locally too.
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci_admin_pw
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-retries 10
+    env:
+      # Explicit superuser admin for the disposable per-session test DBs
+      # (tests/conftest.py refuses to run DB tests without it).
+      SR_PG_ADMIN_URL: postgresql+psycopg2://postgres:ci_admin_pw@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install locked dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.lock
+          .venv/bin/pip install --no-deps -e .
+      - name: Unit tests (no infrastructure)
+        run: .venv/bin/python -m pytest -m "not db and not browser and not live" -q
+      - name: Database + adapter tests (disposable PostgreSQL 16)
+        run: .venv/bin/python -m pytest -m "db or adapter" -q
+      - name: Import sanity (entrypoints import without services)
+        run: |
+          .venv/bin/python -c "import srplatform.api.app"
+          .venv/bin/python -c "import srplatform.bastion.proxy"
+          .venv/bin/python -c "import telemetry.shipper"
+          .venv/bin/python -c "import rangectl.cli"
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run: { working-directory: web }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run build

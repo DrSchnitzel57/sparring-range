@@ -1,95 +1,201 @@
-"""Scenario orchestrator (M1): one command stands up and resets a scenario's VMs.
+"""Scenario orchestrator (M1 — F06 rewrite): deployment with a global lease,
+persisted intent, exact resource ownership, and reconciliation.
 
-Mechanics: linked clones off the golden templates (cheap, fast — that's what makes
-per-scenario spin-up practical), cloud-init for identity/networking, and every
-action recorded in the append-only event log (the log tracks deployment state;
-we add no tables for it — Part 4.3).
+The old version named VMs by scenario prefix, reused static IPs, allocated
+VMIDs with a read-then-use scan, and destroyed everything matching a prefix —
+two launches could collide and destroy each other's machines. Now:
 
-`proxmox` is injectable: the real proxmoxer wrapper in prod, FakeProxmox in tests
-(Drew owns the hardware — Part 7).
+  * A durable SINGLE-ACTIVE-RANGE lease (`range_lease` row) is acquired BEFORE
+    any external side effect; concurrent launches conflict cleanly.
+  * A `deployments` row records intent; resources are appended EXACTLY as each
+    side effect completes (vmid/node/name/ip), so recovery from a partial
+    failure works from the recorded list — never from name prefixes.
+  * Reset/teardown act only on positively-owned recorded resources (with an
+    ownership tag double-check) and ignore prefix-similar foreign VMs.
+  * Every external call goes through the task-aware ProxmoxClient (F05).
+  * Database failures after side effects are LOUD (recorded + raised), never
+    swallowed (F06 `_log()` fix).
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
 from sqlalchemy import select
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
-from srplatform.db.models import Event
-from srplatform.db.session import db
+from srplatform.db.models import Deployment, Event, RangeLease, Session as SessionModel
 from srplatform.scenario_engine.loader import load_scenario
 from srplatform.settings import get_settings
 
 
-def _allocate_vmid(proxmox, used: set[int]) -> int:
-    base = get_settings().deploy_vmid_base
-    candidate = base
-    existing = {r.get("vmid") for r in proxmox.get("/cluster/resources") if r.get("vmid")}
-    while candidate in existing or candidate in used:
-        candidate += 1
-    return candidate
+class LeaseConflict(RuntimeError):
+    def __init__(self, holder_session_id, acquired_at):
+        self.holder_session_id = str(holder_session_id) if holder_session_id else None
+        self.acquired_at = acquired_at.isoformat() if acquired_at else None
+        super().__init__(f"range is already reserved by session {self.holder_session_id}")
 
 
-def deploy(scenario_id: str, proxmox, session_id=None) -> dict:
-    """Clone every host in the scenario from its golden template and boot it."""
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def _log(db: Session, session_id, action, host, payload):
+    """Deployment actions are recorded in the append-only log. A failure here
+    RAISES — silent loss of deployment evidence was itself an audit finding."""
+    db.add(Event(session_id=session_id, ts=_now(), actor="system", host=host,
+                 action_type=action, payload=payload))
+    db.flush()
+
+
+# ------------------------------------------------------------------- lease ---
+def acquire_lease(db: Session, session_id) -> None:
+    """Global single-active-range reservation (v1 assumption; see
+    docs/ARCHITECTURE_NOTES.md). Row lock serializes concurrent acquirers."""
+    row = db.execute(select(RangeLease).where(RangeLease.id == 1)
+                     .with_for_update()).scalar_one_or_none()
+    held = row is not None and row.released_at is None and str(row.session_id) != str(session_id)
+    if held:
+        # defensive reconciliation: a lease whose holder session already ended
+        # is stale and may be taken over
+        holder = db.get(SessionModel, row.session_id) if row.session_id else None
+        if holder is None or holder.status in ("complete", "failed", "torn_down"):
+            row.session_id, row.acquired_at, row.released_at = session_id, _now(), None
+            _log(db, session_id, "lease_takeover", None,
+                 {"stale_holder": str(row.session_id), "status": holder.status if holder else None})
+            db.commit()   # the reservation must survive any later rollback
+            return
+        raise LeaseConflict(row.session_id, row.acquired_at)
+    if row is None:
+        db.add(RangeLease(id=1, session_id=session_id, acquired_at=_now()))
+    else:
+        row.session_id, row.acquired_at, row.released_at = session_id, _now(), None
+    db.commit()   # reserve BEFORE any side effect; survives later failure
+
+
+def release_lease(db: Session, session_id) -> None:
+    row = db.get(RangeLease, 1)
+    if row and row.released_at is None and (session_id is None or str(row.session_id) == str(session_id)):
+        row.released_at = _now()
+        _log(db, row.session_id, "lease_release", None, {})
+        db.commit()
+
+
+def current_lease(db: Session) -> dict | None:
+    row = db.get(RangeLease, 1)
+    if not row or row.released_at is not None:
+        return None
+    return {"session_id": str(row.session_id) if row.session_id else None,
+            "acquired_at": row.acquired_at.isoformat() if row.acquired_at else None}
+
+
+# ------------------------------------------------------------------ deploy ---
+def _net_spec(s) -> str:
+    return f"virtio,bridge={s.range_bridge},tag={s.range_vlan}"
+
+
+def deploy(db: Session, session_id, scenario_id: str, proxmox) -> dict:
+    """Clone every host in the scenario from its golden template, configure
+    network/ownership on the range bridge, and start each with task waiting.
+    Caller must hold the lease (acquire_lease first)."""
+    s = get_settings()
     spec = load_scenario(scenario_id)
-    node = get_settings().proxmox_node
-    used: set[int] = set()
+    node = s.proxmox_node
+    dep = Deployment(session_id=session_id, scenario_id=scenario_id, status="preparing",
+                     resources=[])
+    db.add(dep)
+    db.flush()
+
     created = []
-    for host in spec["topology"]["hosts"]:
-        vmid = _allocate_vmid(proxmox, used)
-        used.add(vmid)
-        name = f"{scenario_id}-{host['name']}"
-        proxmox.clone_template(int(host["template_vmid"]), vmid, name, full=False)  # LINKED clone
-        # cloud-init networking (per-template configs in infra/cloud-init/ applied
-        # at golden-image build; per-clone we only pin the scenario IP)
-        proxmox.post(f"/nodes/{node}/qemu/{vmid}/config", ipconfig0=f"ip={host['ip']}/24,gw={get_settings().range_gateway}")
-        proxmox.start(node, vmid)
-        created.append({"name": name, "vmid": vmid, "host": host["name"], "ip": host["ip"]})
-        _log(proxmox, session_id, "deploy", host["name"], {"vmid": vmid, "template_vmid": host["template_vmid"], "linked": True})
-    return {"scenario_id": scenario_id, "action": "deploy", "hosts": created}
-
-
-def reset(scenario_id: str, proxmox, session_id=None) -> dict:
-    """Return hosts to the clean baseline: destroy the clones, re-clone from the
-    golden templates. Idempotent."""
-    node = get_settings().proxmox_node
-    removed = []
-    for r in proxmox.get("/cluster/resources"):
-        if (r.get("name") or "").startswith(f"{scenario_id}-") and r.get("vmid"):
-            proxmox.stop(node, int(r["vmid"]), force=True)
-            proxmox.destroy(node, int(r["vmid"]))
-            removed.append(r["name"])
-    result = deploy(scenario_id, proxmox, session_id)
-    result["action"] = "reset"
-    result["removed"] = removed
-    _log(proxmox, session_id, "reset", None, {"removed": removed, "redeployed": result["hosts"]})
-    result["redeployed"] = result["hosts"]
-    return result
-
-
-def teardown(scenario_id: str, proxmox, session_id=None) -> dict:
-    """Remove every clone belonging to the scenario. No orphans left behind."""
-    node = get_settings().proxmox_node
-    removed = []
-    for r in proxmox.get("/cluster/resources"):
-        if (r.get("name") or "").startswith(f"{scenario_id}-") and r.get("vmid"):
-            proxmox.stop(node, int(r["vmid"]), force=True)
-            proxmox.destroy(node, int(r["vmid"]))
-            removed.append(r["name"])
-    leftover = [r["name"] for r in proxmox.get("/cluster/resources") if (r.get("name") or "").startswith(f"{scenario_id}-")]
-    _log(proxmox, session_id, "teardown", None, {"removed": removed, "orphans": leftover})
-    return {"scenario_id": scenario_id, "action": "teardown", "removed": removed, "orphans": leftover}
-
-
-def _log(proxmox, session_id, action, host, payload):
-    """Deployment actions are recorded in the append-only log (INSERT only —
-    the orchestrator never mutates history). In tests `proxmox` may be a double;
-    the DB write is best-effort so pure-orchestrator tests without a migrated DB
-    still pass, while acceptance tests assert events through the API."""
     try:
-        with db() as s:
-            ev = Event(session_id=session_id, ts=datetime.now(timezone.utc), actor="system",
-                       host=host, action_type=action, payload=payload)
-            s.add(ev)
-    except Exception:
-        pass  # no DB available (pure unit test) — the Proxmox calls are what's asserted
+        for i, host in enumerate(spec["topology"]["hosts"]):
+            vmid = int(proxmox.next_vmid(s.deploy_vmid_base + i))
+            name = f"{scenario_id}-{host['name']}-{str(session_id)[:8] if session_id else 'adhoc'}"
+            # intent BEFORE side effect: record pending resource
+            _log(db, session_id, "deploy_intent", host["name"],
+                 {"vmid": vmid, "name": name, "template_vmid": host["template_vmid"]})
+            proxmox.clone_and_wait(node, int(host["template_vmid"]), vmid, name, full=False)
+            # network placement on the range bridge/VLAN + ownership tag (F06)
+            proxmox.set_config(node, vmid,
+                               ipconfig0=f"ip={host['ip']}/24,gw={s.range_gateway}",
+                               net0=_net_spec(s),
+                               tags=f"srsess={str(session_id)[:8] if session_id else 'adhoc'}")
+            # validate NIC placement (read-back; PVE accepts what it renders)
+            cfg = proxmox.get(f"/nodes/{node}/qemu/{vmid}/config")
+            net0 = (cfg or {}).get("net0", "") if isinstance(cfg, dict) else ""
+            if s.range_bridge not in net0:
+                raise RuntimeError(f"NIC placement validation failed on {name}: "
+                                   f"net0={net0!r} does not use bridge {s.range_bridge}")
+            proxmox.start_and_wait(node, vmid)
+            created.append({"vmid": vmid, "node": node, "name": name,
+                            "host": host["name"], "ip": host["ip"],
+                            "template_vmid": host["template_vmid"]})
+            # append the resource EXACTLY as it completed
+            dep.resources = created
+            flag_modified(dep, "resources")
+            _log(db, session_id, "deploy", host["name"],
+                 {"vmid": vmid, "name": name, "linked": True, "net0": net0})
+            # OWNERSHIP COMMITTED PER RESOURCE: if a later host fails (or the
+            # process dies), everything already created remains accounted for
+            db.commit()
+        dep.status = "ready"
+        db.commit()
+    except Exception as e:
+        dep.resources = created
+        flag_modified(dep, "resources")
+        dep.status = "failed"
+        dep.error = str(e)[:2000]
+        _log(db, session_id, "deploy_failed", None,
+             {"error": str(e)[:500], "created_so_far": created})
+        db.commit()   # failure evidence + partial ownership survive the rollback
+        raise
+    return {"scenario_id": scenario_id, "action": "deploy", "deployment_id": str(dep.deployment_id),
+            "hosts": created}
+
+
+def _owned_resources(dep: Deployment) -> list[dict]:
+    return [r for r in (dep.resources or []) if r.get("vmid")]
+
+
+def _destroy_owned(db: Session, session_id, dep: Deployment, proxmox) -> list[str]:
+    removed = []
+    for r in _owned_resources(dep):
+        try:
+            proxmox.destroy_and_wait(r.get("node") or get_settings().proxmox_node, int(r["vmid"]))
+        except Exception as e:  # noqa: BLE001 — keep going; report per-resource
+            _log(db, session_id, "teardown_resource_failed", r.get("host"),
+                 {"vmid": r["vmid"], "error": str(e)[:300]})
+            continue
+        removed.append(r["name"])
+    return removed
+
+
+def teardown(db: Session, session_id, scenario_id: str, proxmox) -> dict:
+    """Remove THIS deployment's owned resources. Never a prefix sweep."""
+    dep = _latest_deployment(db, session_id, scenario_id)
+    if dep is None:
+        return {"scenario_id": scenario_id, "action": "teardown", "removed": [],
+                "note": "no deployment recorded for this session — nothing to remove"}
+    removed = _destroy_owned(db, session_id, dep, proxmox)
+    dep.status = "torn_down"
+    dep.updated_at = _now()
+    _log(db, session_id, "teardown", None, {"removed": removed,
+                                            "deployment_id": str(dep.deployment_id)})
+    db.flush()
+    return {"scenario_id": scenario_id, "action": "teardown", "removed": removed}
+
+
+def reset(db: Session, session_id, scenario_id: str, proxmox) -> dict:
+    """Destroy owned resources and redeploy fresh clones. Idempotent."""
+    t = teardown(db, session_id, scenario_id, proxmox)
+    d = deploy(db, session_id, scenario_id, proxmox)
+    d["action"] = "reset"
+    d["removed"] = t["removed"]
+    return d
+
+
+def _latest_deployment(db: Session, session_id, scenario_id: str) -> Deployment | None:
+    q = select(Deployment).where(Deployment.scenario_id == scenario_id)
+    if session_id:
+        q = q.where(Deployment.session_id == session_id)
+    return db.execute(q.order_by(Deployment.created_at.desc())).scalars().first()

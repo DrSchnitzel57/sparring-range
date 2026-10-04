@@ -2,72 +2,92 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/router";
 import { api } from "../../../lib/api";
 
-// asciinema .cast playback scrubbed in sync with the event timeline: the slider
-// is the wall-clock offset into the recording; events at/below the cursor are
-// highlighted so you can rewatch yourself against what red was doing.
+// Real terminal playback via the maintained asciinema-player, with the event
+// timeline aligned on the RECORDING's epoch (header.timestamp) — F17. Selecting
+// a different recording re-anchors everything.
 export default function Replay() {
   const router = useRouter();
   const [data, setData] = useState(null);
-  const [t, setT] = useState(0);
-  const [playing, setPlaying] = useState(false);
-  const termRef = useRef(null);
-  const rafRef = useRef(null);
+  const [err, setErr] = useState(null);
+  const [sel, setSel] = useState(0);
+  const [now, setNow] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const rootRef = useRef(null);
+  const playerRef = useRef(null);
 
-  useEffect(() => { if (router.query.id) api(`/sessions/${router.query.id}/replay`).then(setData).catch(() => {}); }, [router.query.id]);
-
-  const cast = data?.casts?.[0];
-  const maxT = cast?.frames?.length ? cast.frames[cast.frames.length - 1][0] : 0;
-
-  const screen = useMemo(() => {
-    if (!cast) return "";
-    let out = "";
-    for (const [dt, dir, s] of cast.frames) {
-      if (dt > t) break;
-      if (dir === "o") out += s;            // show target output; mark input
-      else out += `\x1b[33m${s.replace("\n", "")}\x1b[0m`;
-    }
-    return out;
-  }, [cast, t]);
-
+  const sid = router.query.id;
   useEffect(() => {
-    if (!playing || !cast) return;
-    let last = performance.now(); let cur = t;
-    const step = (now) => {
-      cur += (now - last) / 1000; last = now;
-      if (cur >= maxT) { setPlaying(false); setT(maxT); return; }
-      setT(cur); rafRef.current = requestAnimationFrame(step);
+    if (!sid) return;
+    api(`/sessions/${sid}/replay`).then(setData).catch(e => setErr(String(e.message || e)));
+  }, [sid]);
+
+  const casts = useMemo(() => (data?.casts || []).filter(c => !c.error), [data]);
+  const broken = (data?.casts || []).filter(c => c.error);
+  const cast = casts[sel];
+
+  // rebuild a .cast stream and feed it to asciinema-player (browser-only)
+  useEffect(() => {
+    if (!cast || !rootRef.current) return;
+    let cancelled = false;
+    const lines = [JSON.stringify(cast.header)]
+      .concat(cast.frames.map(f => JSON.stringify(f)));
+    const url = URL.createObjectURL(new Blob([lines.join("\n")], { type: "application/octet-stream" }));
+    import("asciinema-player").then((mod) => {
+      if (cancelled || !rootRef.current) return;
+      const A = mod.default ?? mod;
+      playerRef.current = A.create(url, rootRef.current, { autoPlay: false, loop: false, terminalName: "xterm-256color" });
+      playerRef.current.addEventListener?.("played", () => {});
+      const t = setInterval(() => {
+        if (playerRef.current?.getCurrentTime) setNow(playerRef.current.getCurrentTime());
+        if (playerRef.current?.getDuration) setDuration(playerRef.current.getDuration());
+      }, 250);
+      playerRef.current._timer = t;
+    });
+    return () => {
+      cancelled = true;
+      if (playerRef.current) {
+        clearInterval(playerRef.current._timer);
+        try { playerRef.current.pause(); } catch {}
+      }
+      if (rootRef.current) rootRef.current.innerHTML = "";
+      URL.revokeObjectURL(url);
     };
-    rafRef.current = requestAnimationFrame(step);
-    return () => cancelAnimationFrame(rafRef.current);
-  }, [playing]);
+  }, [cast]);
 
-  useEffect(() => { if (termRef.current) termRef.current.scrollTop = termRef.current.scrollHeight; }, [screen]);
-
+  if (err) return <p className="bad">{err}</p>;
   if (!data) return <p className="dim">loading replay…</p>;
-  if (!cast) return <p className="dim">no .cast recording for this session (defend through the bastion first).</p>;
+  if (casts.length === 0)
+    return <p className="dim">no playable recording for this session yet — defend through the
+      bastion first{broken.length ? ` (${broken.length} unreadable: ${broken[0].error})` : ""}.</p>;
 
-  const t0 = data.timeline.length ? new Date(data.timeline[0].ts).getTime() : 0;
+  // event offsets are relative to THIS recording's epoch anchor
+  const epoch = cast.header?.timestamp;
+  const offsetOf = (iso) => (epoch ? (new Date(iso).getTime() / 1000) - epoch : null);
+
   return (
     <div className="grid">
       <div className="panel">
-        <h2>replay — {cast.name}</h2>
-        <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
-          <button onClick={() => setPlaying(!playing)}>{playing ? "pause" : "play"}</button>
-          <input type="range" min="0" max={maxT} step="0.05" value={t} onChange={(e) => setT(Number(e.target.value))} style={{ flex: 1 }} />
-          <span className="dim">{t.toFixed(1)}s / {maxT.toFixed(1)}s</span>
-        </div>
-        <pre className="cast" ref={termRef}>{screen}</pre>
+        <h2>replay</h2>
+        {casts.length > 1 && (
+          <select value={sel} onChange={(e) => setSel(Number(e.target.value))} style={{ marginBottom: 8 }}>
+            {casts.map((c, i) => <option key={c.recording_id} value={i}>{c.name || c.recording_id}</option>)}
+          </select>
+        )}
+        <div ref={rootRef} style={{ minHeight: 100 }} />
+        {!epoch && <p className="bad">recording has no epoch header — timeline alignment disabled</p>}
       </div>
       <div className="panel">
         <h3>event timeline</h3>
         {data.timeline.map((e) => {
-          const off = (new Date(e.ts).getTime() - t0) / 1000;
-          const active = off <= t;
+          const off = offsetOf(e.ts);
+          const active = off !== null && off >= 0 && off <= now;
           return (
-            <div key={e.event_id} style={{ opacity: active ? 1 : 0.35, cursor: "pointer" }}
-                 onClick={() => setT(Math.max(0, off))}>
-              <span className="dim">{off.toFixed(1)}s</span>{" "}
-              <span className={e.actor === "red" ? "bad" : e.actor.startsWith("blue") ? "ok" : "dim"}>
+            <div key={e.event_id}
+                 style={{ opacity: off === null ? 0.5 : (active ? 1 : 0.35), cursor: off >= 0 ? "pointer" : "default" }}
+                 title={`#${e.event_id}`}
+                 onClick={() => { if (off >= 0) playerRef.current?.seek(off); }}>
+              <span className="dim">{off === null ? "—" : (off >= 0 ? `${off.toFixed(1)}s` : "pre-rec")}</span>{" "}
+              <span className={e.actor === "red" ? "bad" : (e.actor || "").startsWith("blue") ? "ok" : "dim"}>
                 {e.actor} {e.action_type} {e.phase || ""}
               </span>
             </div>
