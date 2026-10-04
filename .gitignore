@@ -9,5 +9,5 @@ recordings/
 *.egg-info/
 web/node_modules/
 web/.next/
-web/
-npm-install.log
+web/npm-install.log
+.playwright-cli/
