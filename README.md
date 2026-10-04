@@ -45,16 +45,43 @@ tests/             one test per acceptance criterion (gates between milestones)
 - **The log is the product** — AAR, timeline, scorecard, /hint, replay are all
   queries over `events`.
 
+## Milestones — all built, one commit per milestone
+
+| Milestone | Automated acceptance (tests/) | Drew's live-infra gate (Part 0.4) |
+|---|---|---|
+| M0 skeleton+safety | ✅ append-only UPDATE raises (real PG), killswitch kills+datapath-drops, default-deny ruleset | prove ping/DNS die from a real range VM |
+| M1 templates+deploy | ✅ linked clones, cloud-init IP pin, reset=destroy+reclone, teardown no orphans | golden images (esp. Win DC/Win10+Sysmon) |
+| M2 bastion+event bus | ✅ real asyncssh round-trip: `.cast` v2 both directions + auditd ingest tied to live session | bastion LXC at the boundary |
+| M3 red harness | ✅ verifier-gated objectives, phase-tagged steps, anti-self-report gate, kill/resume from agent_state | model endpoint `curl` proof (Part 6.1) + prompt tuning |
+| M4 scenarios+verifiers | ✅ validator (unknown verifier/points/host rejected), pure-YAML scenario runs+scores, YAML-only objective addition | author 1–2 more scenarios |
+| M5 coach | ✅ AAR cites event timestamps/ids; hint context-aware; hint jumps the queue ahead of batches | judge AAR usefulness |
+| M6 practice loop | ✅ CLI-over-real-HTTP end-to-end: scenarios→deploy→run→hint→status→report→teardown | run it unaided, list rough edges |
+| M7 web gym | ✅ login/library/live/AAR/replay/progress endpoints (progress = SQL VIEW over the log); Next.js app builds; browser-checked login→library→progress | member accounts, LXC deploy, judge AAR before polishing |
+
+`rangectl` story (Part 0.5) — every command implemented:
+`db migrate` · `safety verify/killswitch` · `deploy` · `run` · `status` · `hint` · `score` · `report` · `reset` · `teardown` · `scenarios` · `sessions`
+
+## Deviations & environment notes (honest list)
+
+1. **`platform/` → `srplatform/`** (above).
+2. **Driver: psycopg2**, not psycopg3 — psycopg3 returns bytes for text on
+   SQL_ASCII databases (this box's cluster default) and SQLAlchemy's dialect
+   chokes. Drew's production DB must be **UTF8** (see `infra/db/bootstrap.sql`
+   comment; the test fixture enforces `ENCODING 'UTF8' TEMPLATE template0`).
+3. The local asyncssh build required `public_key_auth_supported() -> True` and
+   `line_editor=False` on the bastion server (transparent pipe — no double echo).
+4. Killswitch is provably effective in-process/API-level in tests; **the
+   "from inside a range VM" proof is Drew's** — that is by design (Part 0.4)
+   and `rangectl safety verify` prints the exact commands to run.
+5. Web app is dev-only-cors (localhost origins), LAN trust — matches
+   constraint #6; do not expose to the internet.
+
 ## Dev loop
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 cp .env.example .env        # fill in your infra
-.venv/bin/pytest            # one test per acceptance criterion
+.venv/bin/pytest            # 23 tests — one per acceptance criterion
 docker compose up           # dev postgres+api+agents (real deploy = LXCs)
+cd web && npm install && npm run build && npm start   # the gym front door
 ```
-
-## Milestones
-
-M0 skeleton+safety ✅ (automated gates pass locally; datapath proof pending Drew's VLAN)
-M1..M7 — see `plan.markdown` Part 5; tests named `test_m<N>_acceptance_*.py`.
