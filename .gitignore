@@ -24,3 +24,5 @@ pgadmin.env
 # npm
 web/package-lock.json.orig
 .safety_state*
+# junk accidentally created at repo root by a buggy test (key-object repr used as filename)
+*object at 0x*
