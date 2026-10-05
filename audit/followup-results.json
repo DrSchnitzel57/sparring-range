@@ -1,0 +1,44 @@
+{
+  "worker_bearer_auth": {
+    "status": 401,
+    "detail": "authentication required",
+    "setup": "Run token exists only in runs; no WebToken/ServiceToken, matching start_run"
+  },
+  "blue_expect_absent": {
+    "arguments_received_by_verifier": [
+      {
+        "host": "h"
+      }
+    ],
+    "recorded_expected": "true"
+  },
+  "syscall_first_audit_record": [
+    {
+      "kind": "command",
+      "ts": "2026-10-04T13:20:00+00:00",
+      "uid": null,
+      "comm": null,
+      "exe": null,
+      "argv": "id",
+      "audit_key": null,
+      "source_id": "101",
+      "boot_id": "b",
+      "raw": {
+        "types": [
+          "EXECVE",
+          "PROCTITLE"
+        ],
+        "syscall": {}
+      }
+    }
+  ],
+  "last_group_flushed_at_eof": [],
+  "gateway_timeout": {
+    "worker_alive": false,
+    "next_request_completed": false
+  },
+  "gate_after_release_with_preexisting_evidence": [
+    true,
+    []
+  ]
+}
