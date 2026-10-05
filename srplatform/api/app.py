@@ -250,15 +250,80 @@ def get_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
 
 
 # --- launch / end / reset / teardown (F08/F13) ----------------------------------
+# ONE lifecycle policy for every entrypoint (audit N03):
+#   * every mutating operation takes a DURABLE per-session operation claim
+#     (survives the intent commits that release row locks — audit N02);
+#   * teardown/reset stop and CONFIRM the worker before releasing machines
+#     and the lease, or return a conflict;
+#   * terminal sessions are refused except through the documented
+#     reset/relaunch transitions;
+#   * capabilities are revoked when their machines die.
 def _now():
     return datetime.now(timezone.utc)
+
+
+def _revoke_session_capabilities(db, session_id, reason: str) -> int:
+    n = 0
+    t = _now()
+    for lt in db.execute(select(LoginToken).where(LoginToken.session_id == session_id,
+                                                  LoginToken.revoked_at.is_(None))).scalars():
+        lt.revoked_at = t
+        n += 1
+    for st in db.execute(select(ServiceToken).where(ServiceToken.session_id == session_id,
+                                                    ServiceToken.revoked_at.is_(None))).scalars():
+        st.revoked_at = t
+        n += 1
+    if n:
+        db.add(Event(session_id=session_id, ts=t, actor="system",
+                     action_type="capabilities_revoked",
+                     payload={"count": n, "reason": reason}))
+    return n
+
+
+def _stop_active_run_or_conflict(db, sess):
+    """Teardown/reset precondition (audit N03): the worker must be stopped and
+    CONFIRMED dead before its machines/lease are released. A failed stop is a
+    conflict, never a silent continue."""
+    active = runs_svc.active_run_for_session(db, sess.session_id)
+    if not active:
+        return
+    stopped = runs_svc.stop_run(db, active.run_id)
+    if not stopped.get("ok"):
+        raise HTTPException(409, {"error": "worker_stop_failed",
+                                  "run_id": str(active.run_id),
+                                  "detail": stopped.get("detail"),
+                                  "note": "range NOT torn down; retry or engage killswitch"})
+
+
+def _release_claim_safely(db, session_id, succeeded: bool) -> None:
+    """Release the durable operation claim WITHOUT ever rolling back the
+    request's own successful writes (the request transaction commits after
+    the route returns).
+
+    On SUCCESS the claim delete rides the request transaction — atomic and
+    race-free. On FAILURE the transaction is discarded by the request
+    handler anyway, so the claim is removed through a SEPARATE session:
+    committing through the failed transaction would CLOBBER the durable
+    failure evidence the orchestrator just stored (audit N02 item 7), and a
+    crash before this point is recovered by startup reconciliation / the
+    stale-claim window."""
+    from srplatform.scenario_engine import orchestrator
+    try:
+        if succeeded:
+            orchestrator.release_operation(db, session_id)
+        else:
+            from srplatform.db.session import db as db_ctx
+            with db_ctx() as s2:
+                orchestrator.release_operation(s2, session_id)
+    except Exception:  # noqa: BLE001 — recovery is startup/stale-window anyway
+        pass
 
 
 @app.post("/sessions/{session_id}/launch")
 def launch_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
                    db: Session = Depends(get_db)):
     """Shared backend workflow for CLI and browser:
-    authenticate → reserve (lease) → validate → deploy → issue per-host
+    authenticate → claim → reserve (lease) → validate → deploy → issue per-host
     connection capabilities → ready."""
     from srplatform.scenario_engine import orchestrator
     from srplatform.api.deps import get_proxmox
@@ -267,36 +332,47 @@ def launch_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
     if sess is None:
         raise HTTPException(404, "session not found")
     require_session_access(db, p, sess)
-    # ROW LOCK serializes concurrent launch requests for the same session
-    # (audit R08) — two simultaneous POSTs must not double-deploy.
-    db.execute(select(SessionModel).where(SessionModel.session_id == session_id)
-               .with_for_update())
     if sess.status in ("complete", "failed"):
         raise HTTPException(409, f"session is {sess.status}")
+    # DURABLE OPERATION CLAIM (audit N02): replaces the row lock that the
+    # lease/deploy commits used to surrender — two simultaneous launches can
+    # no longer both pass the lease check.
     try:
-        orchestrator.acquire_lease(db, sess.session_id)
-    except orchestrator.LeaseConflict as e:
-        raise HTTPException(409, {"error": "range_busy", "holder_session": e.holder_session_id,
-                                  "acquired_at": e.acquired_at})
-    result = orchestrator.deploy(db, sess.session_id, sess.scenario_id, get_proxmox())
+        orchestrator.claim_operation(db, sess.session_id, "launch")
+    except orchestrator.OperationInProgress as e:
+        raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
+    _ok = False
+    try:
+        try:
+            orchestrator.acquire_lease(db, sess.session_id)
+        except orchestrator.LeaseConflict as e:
+            raise HTTPException(409, {"error": "range_busy", "holder_session": e.holder_session_id,
+                                      "acquired_at": e.acquired_at})
+        try:
+            result = orchestrator.deploy(db, sess.session_id, sess.scenario_id, get_proxmox())
+        except orchestrator.ForeignResourceError as e:
+            raise HTTPException(409, {"error": "foreign_resource", "detail": str(e)[:500]})
 
-    # member-specific host connection capabilities (F08)
-    s = get_settings()
-    instructions = []
-    for r in result["hosts"]:
-        tok = f"tok-{r['host']}-{uuid.uuid4().hex[:6]}"
-        db.add(LoginToken(token=tok, session_id=sess.session_id, user_id=p.user_id,
-                          target_host=r["ip"], target_port=22,
-                          expires_at=_now() + timedelta(hours=s.web_token_ttl_hours)))
-        instructions.append({"host": r["host"], "ip": r["ip"], "login_token": tok,
-                             "ssh": f"ssh {s.bastion_address} -p {s.bastion_listen_port} -l {tok}"})
-    sess.status = "ready"
-    db.add(Event(session_id=sess.session_id, ts=_now(), actor="system",
-                 action_type="session_ready",
-                 payload={"hosts": [i["host"] for i in instructions]}))
-    db.flush()
-    return {"session_id": str(sess.session_id), "status": sess.status,
-            "deployment": result, "connections": instructions}
+        # member-specific host connection capabilities (F08)
+        s = get_settings()
+        instructions = []
+        for r in result["hosts"]:
+            tok = f"tok-{r['host']}-{uuid.uuid4().hex[:6]}"
+            db.add(LoginToken(token=tok, session_id=sess.session_id, user_id=p.user_id,
+                              target_host=r["ip"], target_port=22,
+                              expires_at=_now() + timedelta(hours=s.web_token_ttl_hours)))
+            instructions.append({"host": r["host"], "ip": r["ip"], "login_token": tok,
+                                 "ssh": f"ssh {s.bastion_address} -p {s.bastion_listen_port} -l {tok}"})
+        sess.status = "ready"
+        db.add(Event(session_id=sess.session_id, ts=_now(), actor="system",
+                     action_type="session_ready",
+                     payload={"hosts": [i["host"] for i in instructions]}))
+        db.flush()
+        _ok = True
+        return {"session_id": str(sess.session_id), "status": sess.status,
+                "deployment": result, "connections": instructions}
+    finally:
+        _release_claim_safely(db, sess.session_id, _ok)
 
 
 @app.post("/sessions/{session_id}/end")
@@ -314,7 +390,20 @@ def end_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
     if sess.status == "complete":
         return {"ok": True, "status": "complete", "note": "already ended (idempotent)",
                 "outcome": sess.outcome}
+    try:
+        orchestrator.claim_operation(db, sess.session_id, "end")
+    except orchestrator.OperationInProgress as e:
+        raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
+    _ok = False
+    try:
+        out = _end_session_inner(db, sess, p, verification_service, orchestrator)
+        _ok = True
+        return out
+    finally:
+        _release_claim_safely(db, sess.session_id, _ok)
 
+
+def _end_session_inner(db, sess, p, verification_service, orchestrator):
     active = runs_svc.active_run_for_session(db, sess.session_id)
     if active:
         stopped = runs_svc.stop_run(db, active.run_id)
@@ -377,7 +466,10 @@ def end_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
     else:
         orchestrator.release_lease(db, sess.session_id)
         note = "lease released (no residual resources)"
-    db.flush()
+    # COMMIT the finalize (status/outcome/evidence/revocations): the claim
+    # release in the route's finally must never roll this back, and durable
+    # end evidence must survive independently of the request transaction.
+    db.commit()
     return {"ok": True, "status": sess.status, "outcome": sess.outcome,
             "scorecard_status": scorecard.get("status"),
             "earned": scorecard.get("earned"), "total": scorecard.get("total"),
@@ -413,20 +505,43 @@ def get_score(session_id: uuid.UUID, p: Principal = Depends(any_member),
 def _teardown_common(db, sess, p):
     from srplatform.scenario_engine import orchestrator
     from srplatform.api.deps import get_proxmox
+    # WORKER FIRST (audit N03): machines and the lease are released only after
+    # the session's worker is confirmed stopped — otherwise a later session
+    # could acquire the same static addresses while the old worker still
+    # operates against them.
+    _stop_active_run_or_conflict(db, sess)
     t = orchestrator.teardown(db, sess.session_id, sess.scenario_id, get_proxmox())
+    # capabilities die with their machines (audit N03 lifecycle policy)
+    _revoke_session_capabilities(db, sess.session_id, "teardown")
     # release the reservation ONLY on a COMPLETE teardown (audit R07): failed
     # destroys keep the range reserved so the addresses cannot be reused while
     # the machines still exist.
     if t.get("complete", True):
         orchestrator.release_lease(db, sess.session_id)
+        if sess.status in ("ready", "running", "preparing"):
+            # documented terminal transition: torn-down sessions must go
+            # through launch (a fresh deploy) before they can run again
+            sess.status = "torn_down"
+    db.flush()
     return t
 
 
 @app.post("/sessions/{session_id}/teardown")
 def teardown_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
                      db: Session = Depends(get_db)):
+    from srplatform.scenario_engine import orchestrator
     sess = _get_session(db, p, session_id)
-    return _teardown_common(db, sess, p)
+    try:
+        orchestrator.claim_operation(db, sess.session_id, "teardown")
+    except orchestrator.OperationInProgress as e:
+        raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
+    _ok = False
+    try:
+        out = _teardown_common(db, sess, p)
+        _ok = True
+        return out
+    finally:
+        _release_claim_safely(db, sess.session_id, _ok)
 
 
 @app.post("/sessions/{session_id}/reset")
@@ -435,19 +550,30 @@ def reset_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
     from srplatform.scenario_engine import orchestrator
     from srplatform.api.deps import get_proxmox
     sess = _get_session(db, p, session_id)
-    active = runs_svc.active_run_for_session(db, sess.session_id)
-    if active:
-        raise HTTPException(409, "stop the active run before reset")
     try:
-        # orchestrator.reset ACQUIRES/VERIFIES the global lease first (R07)
-        return orchestrator.reset(db, sess.session_id, sess.scenario_id, get_proxmox())
-    except orchestrator.LeaseConflict as e:
-        raise HTTPException(409, {"error": "range_busy", "holder_session": e.holder_session_id})
-    except RuntimeError as e:
-        raise HTTPException(409, str(e))
+        orchestrator.claim_operation(db, sess.session_id, "reset")
+    except orchestrator.OperationInProgress as e:
+        raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
+    _ok = False
+    try:
+        # stop the worker BEFORE anything is destroyed (audit N03)
+        _stop_active_run_or_conflict(db, sess)
+        # old machines are about to die — their capabilities must die first
+        _revoke_session_capabilities(db, sess.session_id, "reset")
+        try:
+            # orchestrator.reset ACQUIRES/VERIFIES the global lease first (R07)
+            out = orchestrator.reset(db, sess.session_id, sess.scenario_id, get_proxmox())
+            _ok = True
+            return out
+        except orchestrator.LeaseConflict as e:
+            raise HTTPException(409, {"error": "range_busy", "holder_session": e.holder_session_id})
+        except RuntimeError as e:
+            raise HTTPException(409, str(e))
+    finally:
+        _release_claim_safely(db, sess.session_id, _ok)
 
 
-# --- deploy (legacy wrappers — still session-bound + authenticated) ------------
+# --- deploy (legacy wrapper — SAME invariants as /launch, audit N03) -------------
 class DeployIn(BaseModel):
     session_id: uuid.UUID
 
@@ -458,11 +584,30 @@ def deploy_scenario(scenario_id: str, body: DeployIn, p: Principal = Depends(any
     from srplatform.scenario_engine import orchestrator
     from srplatform.api.deps import get_proxmox
     sess = _get_session(db, p, body.session_id)
+    # the legacy route must not become a side door: URL scenario == session
+    # scenario, no deployment under a terminal session, same claim/lease
+    # serialization as /launch.
+    if scenario_id != sess.scenario_id:
+        raise HTTPException(422, f"session runs scenario '{sess.scenario_id}' — "
+                                 f"refusing to deploy '{scenario_id}' under it")
+    if sess.status in ("complete", "failed", "torn_down"):
+        raise HTTPException(409, f"session is {sess.status} — use the documented "
+                                 "reset/relaunch transitions, not raw deploy")
     try:
-        orchestrator.acquire_lease(db, sess.session_id)
-    except orchestrator.LeaseConflict as e:
-        raise HTTPException(409, {"error": "range_busy", "holder_session": e.holder_session_id})
-    return orchestrator.deploy(db, sess.session_id, scenario_id, get_proxmox())
+        orchestrator.claim_operation(db, sess.session_id, "deploy")
+    except orchestrator.OperationInProgress as e:
+        raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
+    _ok = False
+    try:
+        try:
+            orchestrator.acquire_lease(db, sess.session_id)
+        except orchestrator.LeaseConflict as e:
+            raise HTTPException(409, {"error": "range_busy", "holder_session": e.holder_session_id})
+        out = orchestrator.deploy(db, sess.session_id, scenario_id, get_proxmox())
+        _ok = True
+        return out
+    finally:
+        _release_claim_safely(db, sess.session_id, _ok)
 
 
 @app.get("/scenarios")
@@ -479,11 +624,28 @@ class RunIn(BaseModel):
 @app.post("/run/{scenario_id}", status_code=202)
 def run_scenario(scenario_id: str, body: RunIn, p: Principal = Depends(any_member),
                  db: Session = Depends(get_db)):
+    from srplatform.scenario_engine import orchestrator
     sess = _get_session(db, p, body.session_id)
     if sess.scenario_id != scenario_id:
         raise HTTPException(422, f"session runs scenario '{sess.scenario_id}'")
     if sess.status not in ("ready", "running"):
         raise HTTPException(409, f"session is {sess.status} — launch it first")
+    # DEPLOYMENT/RESERVATION checks come BEFORE the safety gate so clients see
+    # the actionable 409 ("not launched / no reservation") rather than a
+    # confusing 423 that mixes in dev-mode evidence relaxations (audit N03).
+    lease = orchestrator.current_lease(db)
+    if not lease or lease["session_id"] != str(sess.session_id):
+        raise HTTPException(409, {"error": "no_current_reservation",
+                                  "note": "the range lease is not held by this session — "
+                                          "launch it again before starting a run"})
+    dep = db.execute(select(Deployment).where(Deployment.session_id == sess.session_id,
+                                              Deployment.scenario_id == sess.scenario_id,
+                                              Deployment.status == "ready")
+                     .order_by(Deployment.created_at.desc())).scalars().first()
+    if dep is None:
+        raise HTTPException(409, {"error": "no_ready_deployment",
+                                  "note": "no ready owned deployment for this session — "
+                                          "launch it first"})
     try:
         run = runs_svc.start_run(db, sess.session_id, scenario_id)
     except runs_svc.GateRefused as e:
@@ -913,3 +1075,11 @@ def _startup():
         runs_svc.reconcile_on_startup()
     except Exception:
         pass  # readiness endpoint reports DB problems; startup must not crash
+    try:
+        # durable operation claims only have meaning while THIS process serves;
+        # anything left over belongs to a dead request (crash recovery).
+        from srplatform.scenario_engine import orchestrator
+        with db() as s:
+            orchestrator.clear_operation_claims(s)
+    except Exception:
+        pass

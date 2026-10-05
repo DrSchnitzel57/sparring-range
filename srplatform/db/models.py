@@ -18,6 +18,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -154,6 +155,22 @@ class RangeLease(Base):
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class OperationClaim(Base):
+    """Durable per-session operation claim (audit N02): survives the intent
+    commits that release normal row locks. One row per session — the session's
+    lifecycle operations (launch/deploy/reset/teardown/end) serialize on it.
+    Cleared at API startup; stale claims are taken over with loud evidence."""
+
+    __tablename__ = "operation_claims"
+
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True),
+                                                  ForeignKey("sessions.session_id"),
+                                                  primary_key=True)
+    operation: Mapped[str] = mapped_column(Text, nullable=False)
+    claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),
+                                                 server_default=func.now(), nullable=False)
+
+
 class Deployment(Base):
     """Exact owned resources for a session deployment (F06). Teardown/reset
     only ever act on vmids recorded here — never on a scenario-name prefix."""
@@ -191,6 +208,14 @@ class Run(Base):
     error: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        # DATABASE-ENFORCED single active run per session (audit N02): a
+        # select-then-insert duplicate check races; a partial unique index
+        # cannot. Concurrent /run requests resolve to exactly one worker.
+        Index("uq_runs_one_active_per_session", "session_id", unique=True,
+              postgresql_where=text("status IN ('queued', 'running', 'stopping')")),
+    )
 
 
 class SafetyState(Base):

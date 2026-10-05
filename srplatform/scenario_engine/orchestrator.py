@@ -18,13 +18,17 @@ two launches could collide and destroy each other's machines. Now:
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import uuid as uuidlib
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
-from srplatform.db.models import Deployment, Event, RangeLease, Session as SessionModel
+from infra.proxmox_client import PveUnavailable, ProxmoxError
+from srplatform.db.models import (Deployment, Event, OperationClaim, RangeLease,
+                                  Session as SessionModel)
 from srplatform.scenario_engine.loader import load_scenario
 from srplatform.settings import get_settings
 
@@ -34,6 +38,75 @@ class LeaseConflict(RuntimeError):
         self.holder_session_id = str(holder_session_id) if holder_session_id else None
         self.acquired_at = acquired_at.isoformat() if acquired_at else None
         super().__init__(f"range is already reserved by session {self.holder_session_id}")
+
+
+class OperationInProgress(RuntimeError):
+    """A durable operation claim for this session is held by another request."""
+
+    def __init__(self, session_id, operation, claimed_at):
+        self.session_id, self.operation = str(session_id), operation
+        self.claimed_at = claimed_at.isoformat() if claimed_at else None
+        super().__init__(f"operation '{operation}' already in progress for session "
+                         f"{self.session_id}")
+
+
+class ForeignResourceError(RuntimeError):
+    """A VMID we intended to use is positively occupied by a foreign machine."""
+
+
+# ------------------------------------------------------------------ claims ---
+# DURABLE OPERATION CLAIMS (audit N02): a normal row lock does NOT survive the
+# intent commits that deployment correctness REQUIRES (acquire_lease/deploy
+# commit per side effect). The claim is a committed row: it serializes
+# launch/deploy/reset/teardown/end for one session ACROSS those commits.
+# Crash recovery: claims older than the stale window may be taken over (with
+# loud evidence), and API startup clears claims (single-API architecture —
+# see docs/ARCHITECTURE_NOTES.md).
+CLAIM_STALE_AFTER = timedelta(minutes=30)
+
+
+def claim_operation(db: Session, session_id, operation: str,
+                    stale_after: timedelta = CLAIM_STALE_AFTER) -> None:
+    now = _now()
+    row = db.get(OperationClaim, session_id)
+    if row is not None:
+        age = (now - row.claimed_at) if row.claimed_at else None
+        if age is not None and age < stale_after:
+            raise OperationInProgress(session_id, row.operation, row.claimed_at)
+        _log(db, session_id, "operation_claim_takeover", None,
+             {"stale_operation": row.operation, "stale_claimed_at":
+              row.claimed_at.isoformat() if row.claimed_at else None,
+              "new_operation": operation})
+        row.operation, row.claimed_at = operation, now
+        db.commit()   # the claim must survive any later rollback
+        return
+    db.add(OperationClaim(session_id=session_id, operation=operation, claimed_at=now))
+    try:
+        db.commit()   # durable BEFORE any side effect
+    except IntegrityError:
+        # concurrent claimer won the race — they hold the operation
+        db.rollback()
+        row = db.get(OperationClaim, session_id)
+        raise OperationInProgress(session_id, row.operation if row else "?",
+                                  row.claimed_at if row else None)
+
+
+def release_operation(db: Session, session_id) -> None:
+    row = db.get(OperationClaim, session_id)
+    if row is not None:
+        db.delete(row)
+        db.commit()
+
+
+def clear_operation_claims(db: Session) -> int:
+    """API startup reconciliation: claims only have meaning while the single
+    API process is alive; anything left over belongs to a dead request."""
+    n = 0
+    for row in db.execute(select(OperationClaim)).scalars().all():
+        db.delete(row)
+        n += 1
+    db.commit()
+    return n
 
 
 def _now():
@@ -160,7 +233,7 @@ def deploy(db: Session, session_id, scenario_id: str, proxmox, resume: bool = Tr
     created = [r for r in resources if r.get("state") == "created"]
     try:
         for i, host in enumerate(spec["topology"]["hosts"]):
-            name = f"{scenario_id}-{host['name']}-{str(session_id)[:8] if session_id else 'adhoc'}"
+            name = _vm_name(scenario_id, host["name"], session_id)
             res = by_host.get(host["name"])
             if res and res.get("state") == "created":
                 continue  # already owned & completed — resume skips it
@@ -181,18 +254,81 @@ def deploy(db: Session, session_id, scenario_id: str, proxmox, resume: bool = Tr
                      {"vmid": vmid, "name": name, "template_vmid": host["template_vmid"]})
                 db.commit()
 
-            # RECONCILE UNCERTAIN OUTCOMES (audit R08): if a previous attempt
-            # crashed after the clone returned, the VM already exists — do NOT
-            # clone again onto it; continue from configuration.
-            if proxmox.vm_status(node, vmid) == "unknown":
-                proxmox.clone_and_wait(node, int(host["template_vmid"]), vmid, name, full=False)
+            # RECONCILE + POSITIVELY IDENTIFY before ANY mutation (audit N01):
+            # a pending VMID is an INTENTION, not proof that the VM currently
+            # occupying that number belongs to this deployment. Uncertain
+            # reads abort the deployment (intent retained); a foreign machine
+            # at the intended VMID receives NO set-config/start/delete call.
+            exists = proxmox.lookup_vm(node, vmid)   # raises when uncertain
+            if exists is None:
+                proxmox.clone_and_wait(node, int(host["template_vmid"]), vmid, name,
+                                       full=False)
+            else:
+                # The VM exists at our intended VMID. Identity read failures
+                # are UNCERTAIN — abort with the intent retained rather than
+                # mutate a VM we cannot positively identify (audit N01). The
+                # documented creation identity (exact clone name + full-session
+                # ownership tag) governs once the read answers again.
+                cfg = proxmox.try_lookup_config(node, vmid)
+                if cfg is None:
+                    pass  # vanished between reads — set_config will fail loudly
+                elif "_unavailable" in (cfg or {}):
+                    _log(db, session_id, "deploy_resume_identity_uncertain", host["name"],
+                         {"vmid": vmid, "error": cfg["_unavailable"],
+                          "note": "refusing to mutate a VM whose identity cannot "
+                                  "be read; pending intent retained for retry"})
+                    raise RuntimeError(
+                        f"cannot verify identity of VMID {vmid} (intended for {name}): "
+                        f"{cfg['_unavailable']} — deployment aborted, intent retained")
+                else:
+                    verdict, why = _classify_identity(cfg, res, session_id)
+                    if verdict != "owned":
+                        raise ForeignResourceError(
+                            f"VMID {vmid} (intended for {name}) is not this deployment's "
+                            f"resource — refusing to mutate it: {why}")
+                    # CONFIG ROUND-TRIP PROBE before mutating (audit N01): the
+                    # resume must not half-configure a VM whose config endpoint
+                    # is failing — probe with the SAME request shape the
+                    # mutation will use, then skip the mutation when it works.
+                    try:
+                        proxmox.post(f"/nodes/{node}/qemu/{vmid}/config",
+                                     tags=_ownership_tag(session_id))
+                    except Exception as e:  # noqa: BLE001
+                        raise RuntimeError(
+                            f"config endpoint failing for VMID {vmid} ({name}) — "
+                            f"resume mutation aborted, intent retained: {e}") from e
+                    # probe succeeded: finish placement (idempotent re-POST)
+                    proxmox.set_config(node, vmid,
+                                       ipconfig0=f"ip={host['ip']}/24,gw={s.range_gateway}",
+                                       net0=_net_spec(s))
+                    cfg2 = proxmox.lookup_config(node, vmid)
+                    net0 = (cfg2 or {}).get("net0", "") if isinstance(cfg2, dict) else ""
+                    if s.range_bridge not in net0:
+                        raise RuntimeError(f"NIC placement validation failed on {name}: "
+                                           f"net0={net0!r} does not use bridge {s.range_bridge}")
+                    proxmox.start_and_wait(node, vmid)
+                    res.update({"state": "created", "ip": host["ip"], "node": node,
+                                "name": name})
+                    created = [r for r in resources if r.get("state") == "created"]
+                    dep.resources = resources
+                    flag_modified(dep, "resources")
+                    _log(db, session_id, "deploy", host["name"],
+                         {"vmid": vmid, "name": name, "linked": True, "net0": net0,
+                          "resumed": True})
+                    db.commit()
+                    continue
             # network placement on the range bridge/VLAN + ownership tag (F06)
             proxmox.set_config(node, vmid,
                                ipconfig0=f"ip={host['ip']}/24,gw={s.range_gateway}",
                                net0=_net_spec(s),
-                               tags=f"srsess={str(session_id)[:8] if session_id else 'adhoc'}")
-            # validate NIC placement (read-back; PVE accepts what it renders)
-            cfg = proxmox.get(f"/nodes/{node}/qemu/{vmid}/config")
+                               tags=_ownership_tag(session_id))
+            # validate NIC placement (read-back; ANY read failure — injected,
+            # transport, 403 — aborts loudly, it is never treated as success)
+            try:
+                cfg = proxmox.get(f"/nodes/{node}/qemu/{vmid}/config")
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(f"NIC placement validation could not read the config "
+                                   f"of {name} (vmid {vmid}): {e}") from e
             net0 = (cfg or {}).get("net0", "") if isinstance(cfg, dict) else ""
             if s.range_bridge not in net0:
                 raise RuntimeError(f"NIC placement validation failed on {name}: "
@@ -228,68 +364,131 @@ def _owned_resources(dep: Deployment) -> list[dict]:
             if r.get("vmid") and r.get("state") in ("pending", "created", "destroy_failed")]
 
 
+def _sid(session_id) -> str:
+    """FULL session identity (32 hex) — collision-resistant, unlike an 8-char
+    prefix (audit N01)."""
+    if session_id is None:
+        return "adhoc"
+    if isinstance(session_id, uuidlib.UUID):
+        return session_id.hex
+    return uuidlib.UUID(str(session_id)).hex
+
+
 def _ownership_tag(session_id) -> str:
-    return f"srsess={str(session_id)[:8] if session_id else 'adhoc'}"
+    """PVE-valid tag (pve-tag-list charset; '=' is rejected by real PVE) that
+    carries the FULL session identity."""
+    return f"srsess-{_sid(session_id)}"
 
 
-def _verify_ownership(proxmox, r: dict, session_id) -> tuple[bool, str]:
-    """Read the VM's config BEFORE deleting (audit R08): delete only on a
-    positive ownership match — the deployment's ownership tag, or the exact
-    resource name this deployment cloned it with (a crash can happen between
-    clone and tag-set). A VM that no longer exists counts as removed; a VM
-    whose identity does not match is FOREIGN and must never be destroyed —
-    VMIDs get reused, and a stale resource row must not kill an unrelated
-    machine."""
-    node = r.get("node") or get_settings().proxmox_node
-    try:
-        cfg = proxmox.get(f"/nodes/{node}/qemu/{r['vmid']}/config")
-    except Exception:
-        return True, "gone"          # 404 — nothing to delete
-    cfg = cfg if isinstance(cfg, dict) else {}
-    tags = str(cfg.get("tags", ""))
-    if _ownership_tag(session_id) in tags:
-        return True, "tag-verified"
+def _vm_name(scenario_id: str, host_name: str, session_id) -> str:
+    """Exact creation identity name: always ends with the full session id so
+    two sessions can never produce the same name; PVE names are <= 63 chars,
+    so the readable prefix is truncated, NEVER the identity suffix."""
+    sid = _sid(session_id)
+    prefix = f"{scenario_id}-{host_name}"
+    max_prefix = 63 - 1 - len(sid)
+    return f"{prefix[:max_prefix].strip('-')}-{sid}"
+
+
+def _parse_tags(cfg: dict) -> set[str]:
+    """EXACT parsed tag set (PVE ';'-separated list) — substring matching can
+    be forged by a longer tag (audit N01)."""
+    return {t.strip() for t in str((cfg or {}).get("tags", "")).split(";") if t.strip()}
+
+
+def _classify_identity(cfg: dict, r: dict, session_id) -> tuple[str, str]:
+    """Pure identity classification of a READ config dict (see
+    _verify_ownership for the policy)."""
+    if _ownership_tag(session_id) in _parse_tags(cfg):
+        return "owned", "tag-verified"
     if r.get("name") and str(cfg.get("name", "")) == str(r["name"]):
-        return True, "name-verified"
-    return False, (f"ownership tag {_ownership_tag(session_id)!r} and name "
-                   f"{r.get('name')!r} not found (tags={tags!r} name={cfg.get('name')!r})")
+        return "owned", "name-verified (clone-before-tag window)"
+    return "foreign", (f"ownership tag {_ownership_tag(session_id)!r} and name "
+                       f"{r.get('name')!r} not found (tags={cfg.get('tags')!r} "
+                       f"name={cfg.get('name')!r})")
+
+
+def _verify_ownership(proxmox, r: dict, session_id) -> tuple[str, str]:
+    """Positively identify a resource BEFORE any mutation (audit N01).
+
+    Returns (verdict, why) with verdict in:
+      'owned'   — exact ownership tag OR exact creation-identity name match
+                  (the name covers the documented clone-before-tag crash
+                  window: the clone itself sets this exact name);
+      'absent'  — PVE CONFIRMED 404 (idempotent removal, no delete needed);
+      'foreign' — the VMID now belongs to someone else: never mutate it.
+
+    Uncertain reads (timeout/403/500/transport) RAISE PveUnavailable — they
+    are NOT absence and NEVER authorize a mutation.
+    """
+    node = r.get("node") or get_settings().proxmox_node
+    cfg = proxmox.lookup_config(node, int(r["vmid"]))   # raises when uncertain
+    if cfg is None:
+        return "absent", "PVE confirms the resource does not exist"
+    return _classify_identity(cfg, r, session_id)
 
 
 def _destroy_owned(db: Session, session_id, dep: Deployment, proxmox) -> dict:
     """Destroy every still-owned resource of ONE deployment with a positive
-    ownership check. Per-resource failures are recorded and RETAINED in the
-    resource list (state destroy_failed) for a later retry (audit R08)."""
+    ownership check BEFORE any mutation (audit N01/N02):
+
+      * uncertain identity read  -> resource RETAINED (state untouched),
+        reported as failed -> teardown incomplete -> lease retained;
+      * confirmed absent         -> idempotent bookkeeping, NO delete call;
+      * foreign                  -> disowned, never mutated;
+      * owned                    -> destroy; per-resource failures are
+        recorded and RETAINED (destroy_failed) for a later retry.
+
+    Every state change is COMMITTED per resource: a later failure or request
+    rollback must not lose the evidence of what was already removed or what
+    remains uncertain (audit N02 item 7)."""
     removed, failed, skipped = [], [], []
     resources = [dict(r) for r in (dep.resources or [])]
-    changed = False
     for r in resources:
         if not (r.get("vmid") and r.get("state") in ("pending", "created", "destroy_failed")):
             continue
-        owned, why = _verify_ownership(proxmox, r, session_id)
-        if not owned:
-            # positively NOT ours (VMID reused by a foreign machine): disown
-            # the row so a later VMID recycling can never delete it either.
+        node = r.get("node") or get_settings().proxmox_node
+        try:
+            verdict, why = _verify_ownership(proxmox, r, session_id)
+        except PveUnavailable as e:
+            # UNCERTAIN: keep the resource owned, keep the lease, tell the truth
+            failed.append({"vmid": r["vmid"], "name": r.get("name"),
+                           "error": f"identity read unavailable: {e}"[:300]})
+            _log(db, session_id, "teardown_identity_unavailable", r.get("host"),
+                 {"vmid": r["vmid"], "error": str(e)[:300]})
+            dep.resources = resources
+            flag_modified(dep, "resources")
+            db.commit()   # evidence survives the request rollback
+            continue
+        if verdict == "absent":
+            r["state"] = "removed"
+            removed.append(r.get("name"))
+            _log(db, session_id, "teardown_already_absent", r.get("host"),
+                 {"vmid": r["vmid"], "note": "confirmed absent — no delete issued"})
+        elif verdict == "foreign":
+            # positively NOT ours (VMID reused): disown so a later recycling
+            # can never delete it either.
             r["state"] = "foreign_released"
             skipped.append({"vmid": r["vmid"], "name": r.get("name"), "why": why})
             _log(db, session_id, "teardown_skipped_foreign", r.get("host"),
                  {"vmid": r["vmid"], "reason": why})
-            changed = True
-            continue
-        try:
-            proxmox.destroy_and_wait(r.get("node") or get_settings().proxmox_node, int(r["vmid"]))
-        except Exception as e:  # noqa: BLE001 — keep going; report per-resource
-            r["state"] = "destroy_failed"
-            failed.append({"vmid": r["vmid"], "name": r.get("name"), "error": str(e)[:300]})
-            _log(db, session_id, "teardown_resource_failed", r.get("host"),
-                 {"vmid": r["vmid"], "error": str(e)[:300]})
-            changed = True
-            continue
-        r["state"] = "removed"
-        removed.append(r["name"])
-        changed = True
-    if changed:
+        else:
+            try:
+                outcome = proxmox.destroy_and_wait(node, int(r["vmid"]))
+            except (PveUnavailable, ProxmoxError) as e:
+                r["state"] = "destroy_failed"
+                failed.append({"vmid": r["vmid"], "name": r.get("name"),
+                               "error": str(e)[:300]})
+                _log(db, session_id, "teardown_resource_failed", r.get("host"),
+                     {"vmid": r["vmid"], "error": str(e)[:300]})
+            else:
+                r["state"] = "removed"
+                removed.append(r.get("name"))
+                _log(db, session_id, "teardown_resource", r.get("host"),
+                     {"vmid": r["vmid"], "outcome": outcome})
         dep.resources = resources
         flag_modified(dep, "resources")
+        db.commit()   # per-resource durable bookkeeping
     return {"removed": removed, "failed": failed, "skipped": skipped}
 
 
@@ -322,7 +521,11 @@ def teardown(db: Session, session_id, scenario_id: str, proxmox) -> dict:
          {"removed": removed, "failed": failed, "skipped_foreign": skipped,
           "complete": complete,
           "deployment_ids": [str(d.deployment_id) for d in deps]})
-    db.flush()
+    # DURABLE BOOKKEEPING (audit N02 item 7): the evidence of what was removed
+    # and what remains uncertain must survive a later request rollback — an
+    # incomplete teardown that "rolled back" would silently re-own nothing
+    # while the machines still exist.
+    db.commit()
     out = {"scenario_id": scenario_id, "action": "teardown", "removed": removed,
            "complete": complete}
     if failed:

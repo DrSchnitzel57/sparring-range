@@ -28,6 +28,12 @@ def extract(path, names, namespace):
 results = {}
 
 # A config-read timeout is incorrectly positive authorization to delete.
+# (Stage 1 update: exercised through the REAL adapter boundary so the probe
+# remains meaningful against the typed-lookup contract; historical pre-fix
+# output is preserved in audit/second-review-results.json and
+# audit/second-review-results-before-fix.json.)
+from infra.proxmox_client import ProxmoxClient as _PC
+
 ns = {"get_settings": lambda: SimpleNamespace(proxmox_node="test")}
 extract("srplatform/scenario_engine/orchestrator.py", {"_ownership_tag", "_verify_ownership"}, ns)
 
@@ -36,15 +42,25 @@ def unavailable(*args, **kwargs):
     raise TimeoutError("simulated management outage")
 
 
-results["ownership_on_read_timeout"] = ns["_verify_ownership"](
-    SimpleNamespace(get=unavailable), {"vmid": 200, "node": "test", "name": "owned"}, "session")
+_pve_ro = object.__new__(_PC)
+_pve_ro.api = SimpleNamespace(get=unavailable)
+_pve_ro.task_timeout = 1
+try:
+    results["ownership_on_read_timeout"] = list(ns["_verify_ownership"](
+        _pve_ro, {"vmid": 200, "node": "test", "name": "owned"}, "session"))
+except Exception as exc:  # post-fix: uncertain reads RAISE, never authorize
+    results["ownership_on_read_timeout"] = f"raised {type(exc).__name__}: {exc}"
 
 # Actual adapter treats an outage as successful no-op destruction.
-from infra.proxmox_client import ProxmoxClient
-
-pve = object.__new__(ProxmoxClient)
+pve = object.__new__(_PC)
 pve.api = SimpleNamespace(get=unavailable)
-results["destroy_on_status_timeout"] = {"returned": pve.destroy_and_wait("test", 200), "raised": False}
+pve.task_timeout = 1
+try:
+    results["destroy_on_status_timeout"] = {"returned": pve.destroy_and_wait("test", 200),
+                                            "raised": False}
+except Exception as exc:  # post-fix: raises instead of silently returning
+    results["destroy_on_status_timeout"] = {"returned": None,
+                                            "raised": f"{type(exc).__name__}: {exc}"}
 
 # Direct stdlib shipper import; interleave two real-format event groups.
 from telemetry.shipper import Spooler, build_command_event, group_event_records

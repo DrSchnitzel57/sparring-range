@@ -32,7 +32,7 @@ def test_m1_launch_clones_from_templates_and_issues_connections(client, users, f
     v = fake_pve.api.vms[vmid]
     assert v["status"] == "running" and v["template"] == 9001
     cfg = v["config"]
-    assert "vmbr" in cfg["net0"] and "srsess=" in cfg["tags"]
+    assert "vmbr" in cfg["net0"] and cfg["tags"].startswith("srsess-")
     assert hosts[0]["ip"] in cfg["ipconfig0"]
     # session is ready and per-host connection capabilities were issued (F08)
     assert out["status"] == "ready"

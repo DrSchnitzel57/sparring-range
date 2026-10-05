@@ -18,9 +18,11 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from srplatform.db.models import Run
@@ -71,12 +73,18 @@ def start_run(db: Session, session_id, scenario_id: str) -> Run:
     token = secrets.token_urlsafe(32)
     run.worker_token = hashlib.sha256(token.encode()).hexdigest()
     db.add(run)
-    db.flush()
-    # DURABLE BEFORE SPAWN (audit R01): the worker's first API request can beat
-    # the caller's request-transaction commit — the run row and its credential
-    # must already be visible, or the worker races its own credential into
-    # nonexistence and every request 401s.
-    db.commit()
+    try:
+        # DURABLE BEFORE SPAWN (audit R01): the run row + credential commit
+        # first so the worker never races its own credential. The partial
+        # unique index (migration 0007) makes the duplicate check ATOMIC —
+        # concurrent /run requests cannot both pass a select-then-insert.
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        existing = active_run_for_session(db, session_id)
+        if existing:
+            return existing
+        raise RunConflict("an active run already exists for this session")
 
     from srplatform.settings import get_settings
     s = get_settings()
@@ -92,14 +100,50 @@ def start_run(db: Session, session_id, scenario_id: str) -> Run:
         db.flush()
         db.commit()
         raise RunConflict(f"worker spawn failed: {e}") from e
-    run.pid, run.pgid = proc.pid, os.getpgid(proc.pid)
-    run.pgid_pstart = pgid_start_time(proc.pid)  # identity guard against PGID reuse
-    run.status, run.started_at = "running", _now()
-    db.flush()
+
+    pgid = os.getpgid(proc.pid)
+    pstart = pgid_start_time(proc.pid)
+    # ATOMIC queued->running transition (audit N02): a concurrent stop/end
+    # flips the row out of 'queued'; this conditional update detects exactly
+    # that and hands the freshly spawned process to the termination path
+    # instead of resurrecting a terminal run. A worker that COMPLETED before
+    # this point also leaves 'queued' — its process is already gone, and
+    # killing its (dead) group is harmless.
+    from sqlalchemy import update
+    res = db.execute(
+        update(Run)
+        .where(Run.run_id == run.run_id, Run.status == "queued")
+        .values(status="running", pid=proc.pid, pgid=pgid, pgid_pstart=pstart,
+                started_at=_now()))
     db.commit()
-    run_registry.add(RunHandle(run_id=str(run.run_id), pid=proc.pid, pgid=run.pgid,
+    if res.rowcount == 0:
+        # run terminated concurrently (cancelled/stopping/completed)
+        term = run_registry.terminate_group(pgid, expected_pstart=pstart)
+        if not term["ok"]:
+            db.execute(update(Run).where(Run.run_id == run.run_id)
+                       .values(status="failed", outcome="worker_failure",
+                               error=f"concurrently terminated but spawned worker "
+                                     f"could not be killed: {term['detail']}"[:1000],
+                               ended_at=_now()))
+            db.commit()
+        raise RunConflict("run was terminated concurrently; spawned worker handed to "
+                          f"termination ({term['detail']})")
+    run.status, run.pid, run.pgid, run.pgid_pstart = "running", proc.pid, pgid, pstart
+    run_registry.add(RunHandle(run_id=str(run.run_id), pid=proc.pid, pgid=pgid,
                                process=proc, meta={"session_id": str(session_id)},
-                               pgid_pstart=run.pgid_pstart))
+                               pgid_pstart=pstart))
+
+    # START/ENGAGE RACE (audit N02): the latch could have been engaged between
+    # the gate check and process registration. Re-check AFTER registration and
+    # kill our own group if so — a start racing an engaged latch never escapes
+    # supervision.
+    if get_supervisor().latch_status()["latched"]:
+        term = run_registry.terminate_group(pgid, expected_pstart=pstart)
+        run.status, run.outcome, run.ended_at = "cancelled", "canceled", _now()
+        run.worker_token = None
+        db.commit()
+        raise GateRefused([f"safety latch engaged during worker start — spawned "
+                           f"worker terminated ({term['detail']})"])
     _watch(proc, str(run.run_id))
     return run
 
@@ -153,6 +197,31 @@ def stop_run(db: Session, run_id) -> dict:
         raise KeyError("run not found")
     if run.status not in ACTIVE:
         return {"ok": True, "status": run.status, "note": "already finished"}
+    if run.status == "queued" and not run.pgid:
+        # SPAWN/STOP RACE (audit N02): the worker may be between Popen and
+        # the spawner's pgid commit. Mark 'stopping' (committed) — the
+        # spawner's queued->running update then FAILS and it terminates the
+        # group itself. Poll briefly so the common case is confirmed here.
+        run.status = "stopping"
+        db.commit()
+        for _ in range(50):
+            db.refresh(run)
+            if run.pgid:
+                break
+            time.sleep(0.1)
+        if run.pgid:
+            res = run_registry.terminate_group(run.pgid, expected_pstart=run.pgid_pstart)
+            if not res["ok"]:
+                run.status = "running"   # stop FAILED — do not lie about state
+                db.flush()
+                return {"ok": False, "status": "running", "detail": res["detail"]}
+            run.status, run.outcome, run.ended_at = "cancelled", "canceled", _now()
+            run.worker_token = None
+            db.flush()
+            return {"ok": True, "status": run.status, "detail": res["detail"]}
+        return {"ok": True, "status": "stopping",
+                "detail": "worker not yet registered; the spawner holds the "
+                          "termination obligation and will kill the group"}
     run.status = "stopping"
     db.flush()
     res = (run_registry.terminate_group(run.pgid, expected_pstart=run.pgid_pstart)
@@ -230,8 +299,18 @@ def reconcile_on_startup() -> dict:
                                                  "recovered": True}))
                 if get_supervisor().latch_status()["latched"]:
                     res = run_registry.terminate_group(run.pgid, expected_pstart=run.pgid_pstart)
-                    run.status, run.outcome, run.ended_at = "cancelled", "canceled", _now()
                     run.worker_token = None
-                    actions.append(f"run {str(run.run_id)[:8]}: latched kill on startup — {res['detail']}")
+                    if res["ok"]:
+                        run.status, run.outcome, run.ended_at = "cancelled", "canceled", _now()
+                        actions.append(f"run {str(run.run_id)[:8]}: latched kill on startup — {res['detail']}")
+                    else:
+                        # NEVER convert a failed termination into 'cancelled'
+                        # (audit N05): the group is still alive — keep it
+                        # registered and report the failure loudly.
+                        run.status, run.outcome = "failed", "worker_failure"
+                        run.error = (f"latched kill on startup FAILED: {res['detail']} — "
+                                     "process group may still be running")
+                        run.ended_at = _now()
+                        actions.append(f"run {str(run.run_id)[:8]}: LATCHED KILL FAILED — {res['detail']}")
         db.flush()
     return {"actions": actions}

@@ -15,6 +15,7 @@ F05 repairs:
 """
 from __future__ import annotations
 
+import re
 import time
 from typing import Protocol
 
@@ -25,6 +26,55 @@ class ProxmoxError(RuntimeError):
 
 class ProxmoxTaskError(ProxmoxError):
     pass
+
+
+class PveHttpError(ProxmoxError):
+    """An HTTP-level PVE error with its status code (mirrors proxmoxer's
+    UnknownStatusCode contract: `.status_code` is the HTTP response)."""
+
+    def __init__(self, status_code: int, message: str = ""):
+        self.status_code = int(status_code)
+        super().__init__(f"PVE HTTP {status_code}: {message}")
+
+
+class PveNotFound(PveHttpError):
+    """CONFIRMED absence: the PVE API answered 404 for this exact resource."""
+
+    def __init__(self, message: str = ""):
+        super().__init__(404, message or "resource does not exist")
+
+
+class PveUnavailable(ProxmoxError):
+    """UNCERTAIN state: transport/timeout/auth/permission/server failure.
+
+    This is NOT absence. Callers must retain the resource and its reservation
+    (audit N01: an outage must never authorize a delete or complete teardown).
+    """
+
+
+def classify_pve_error(exc: Exception) -> ProxmoxError:
+    """Map ANY adapter-layer exception to a typed outcome.
+
+    Only an explicit HTTP 404 is 'absent'. proxmoxer raises
+    PROXMOXER.UnknownStatusCode with `.status_code`; anything carrying a PVE
+    status (401/403/5xx...) or a transport signature is UNCERTAIN — never
+    silently 'missing'. Plain exceptions WITHOUT a PVE/transport signature
+    (e.g. test-injected failures) pass through unclassified so injected
+    failures stay as loud and as typed as the injector wrote them."""
+    if isinstance(exc, (PveHttpError, PveUnavailable)):
+        return exc
+    status = getattr(exc, "status_code", None)
+    if status is not None:
+        try:
+            status = int(status)
+        except (TypeError, ValueError):
+            return PveUnavailable(f"unparseable PVE status {status!r}: {exc}")
+        if status == 404:
+            return PveNotFound(str(exc))
+        return PveUnavailable(f"PVE status {status}: {exc}")
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return PveUnavailable(f"transport failure: {exc}")
+    return exc
 
 
 class ProxmoxLike(Protocol):
@@ -85,7 +135,10 @@ class ProxmoxClient:
             raise ProxmoxTaskError(f"no UPID returned for task on {node}")
         deadline = time.monotonic() + (timeout or self.task_timeout)
         while True:
-            status = self.get(f"/nodes/{node}/tasks/{upid}/status")
+            try:
+                status = self.get(f"/nodes/{node}/tasks/{upid}/status")
+            except Exception as e:  # noqa: BLE001 — the task may still be RUNNING
+                raise classify_pve_error(e) from e
             if isinstance(status, dict) and status.get("status") == "stopped":
                 exit_status = status.get("exitstatus")
                 if exit_status == "OK":
@@ -129,12 +182,58 @@ class ProxmoxClient:
     def set_config(self, node: str, vmid: int, **cfg) -> None:
         self.post(f"/nodes/{node}/qemu/{vmid}/config", **cfg)
 
-    def vm_status(self, node: str, vmid: int) -> str:
+    # --- typed resource lookups (audit N01) ------------------------------------
+    # Contract: return None ONLY on a confirmed 404 from PVE; raise
+    # PveUnavailable on every other failure. "Could not ask" is never "absent".
+    def lookup_vm(self, node: str, vmid: int) -> str | None:
+        """VM status string ('running', 'stopped', ...) or None if PVE
+        CONFIRMS the resource does not exist. Uncertain reads RAISE."""
         try:
             st = self.get(f"/nodes/{node}/qemu/{vmid}/status/current")
-        except Exception:
-            return "unknown"  # 404 / missing resource — callers act idempotently
-        return (st or {}).get("status", "unknown") if isinstance(st, dict) else "unknown"
+        except Exception as e:  # noqa: BLE001 — classified, never swallowed
+            err = classify_pve_error(e)
+            if isinstance(err, PveNotFound):
+                return None
+            raise err from e
+        if not isinstance(st, dict):
+            raise PveUnavailable(f"malformed status response for vmid {vmid}: {st!r}")
+        status = st.get("status")
+        if not status:
+            raise PveUnavailable(f"status response for vmid {vmid} has no status field")
+        return str(status)
+
+    def lookup_config(self, node: str, vmid: int) -> dict | None:
+        """VM config dict, or None on CONFIRMED absence; uncertain reads RAISE.
+
+        Injected test failures (plain exceptions without a PVE status code)
+        surface as PveUnavailable so production code paths stay honest."""
+        try:
+            cfg = self.get(f"/nodes/{node}/qemu/{vmid}/config")
+        except Exception as e:  # noqa: BLE001
+            err = classify_pve_error(e)
+            if isinstance(err, PveNotFound):
+                return None
+            raise err from e
+        if not isinstance(cfg, dict):
+            raise PveUnavailable(f"malformed config response for vmid {vmid}: {cfg!r}")
+        return cfg
+
+    def try_lookup_config(self, node: str, vmid: int) -> dict | None:
+        """Best-effort identity read for RESUME reconciliation: returns the
+        config, None on confirmed absence, or {'_unavailable': str(err)} when
+        the read failed for ANY reason (injected transport failure, 403,
+        timeout). The caller must treat '_unavailable' as UNCERTAIN — never
+        as absence or ownership."""
+        try:
+            return self.lookup_config(node, vmid)
+        except Exception as e:  # noqa: BLE001 — classified uncertainty, not absence
+            return {"_unavailable": str(e)[:300]}
+
+    def vm_status(self, node: str, vmid: int) -> str:
+        """Back-compat wrapper: 'absent' means CONFIRMED 404; uncertainty
+        raises instead of masquerading as 'unknown'."""
+        st = self.lookup_vm(node, vmid)
+        return "absent" if st is None else st
 
     def start(self, node: str, vmid: int) -> str:
         return self.post(f"/nodes/{node}/qemu/{vmid}/status/start")
@@ -158,15 +257,25 @@ class ProxmoxClient:
         upid = self.start(node, vmid)
         self.wait_for_task(node, upid, timeout=timeout)
 
-    def destroy_and_wait(self, node, vmid, force_stop_timeout: int = 60) -> None:
-        st = self.vm_status(node, vmid)
-        if st == "unknown":
-            return  # idempotent: nothing to delete
+    def destroy_and_wait(self, node, vmid, force_stop_timeout: int = 60) -> str:
+        """Confirmed-outcome destroy (audit N01):
+
+        * returns 'already-absent' WITHOUT issuing a delete when PVE confirms
+          the resource does not exist (idempotent);
+        * returns 'destroyed' only after the delete task completed OK;
+        * RAISES PveUnavailable when the pre-delete read is uncertain — the
+          caller must retain the resource and its reservation. An outage is
+          never a successful no-op teardown.
+        """
+        st = self.lookup_vm(node, vmid)   # raises PveUnavailable when uncertain
+        if st is None:
+            return "already-absent"
         if st == "running":
             upid = self.stop(node, vmid, force=True)
             self.wait_for_task(node, upid, timeout=force_stop_timeout)
         upid = self.delete_vm(node, vmid)
         self.wait_for_task(node, upid, timeout=force_stop_timeout)
+        return "destroyed"
 
 
 class FakePVEHttp:
@@ -184,10 +293,24 @@ class FakePVEHttp:
         self.task_polls_needed = 0          # how long tasks stay "running"
         self.fail_task_fragments = ()       # URL fragments whose tasks fail
         self.fail_request_fragments = ()    # raise immediately
+        # audit N01: DISTINCT failure responses per URL fragment — value is an
+        # int (PVE HTTP status) or a ready-made exception instance, e.g.
+        #   http.fail_requests = {"/config": TimeoutError("management outage"),
+        #                         "/status/current": 403}
+        self.fail_requests: dict[str, object] = {}
         self._poll_count: dict[str, int] = {}
 
     def version(self):
         return {"version": "fake-pve"}
+
+    def _maybe_fail(self, path: str) -> None:
+        for frag, failure in self.fail_requests.items():
+            if frag in path:
+                if isinstance(failure, BaseException):
+                    raise failure
+                raise PveHttpError(int(failure), f"injected {path}")
+        if any(f in path for f in self.fail_request_fragments):
+            raise RuntimeError(f"injected request failure for {path}")
 
     def _new_upid(self, path: str) -> str:
         self._upid += 1
@@ -199,6 +322,7 @@ class FakePVEHttp:
 
     def get(self, path, **kw):
         self.requests.append(("GET", path, kw))
+        self._maybe_fail(path)
         if path.startswith("/cluster/resources"):
             return [{"vmid": vmid, "name": v["name"], "node": "fake", "type": "qemu",
                      "status": v["status"]} for vmid, v in self.vms.items()]
@@ -225,13 +349,17 @@ class FakePVEHttp:
             vmid = int(path.split("/qemu/")[1].split("/")[0])
             v = self.vms.get(vmid)
             if not v:
-                raise KeyError(f"no VM {vmid}")  # PVE 404s config of missing resources
-            return dict(v.get("config", {}))
+                raise PveNotFound(f"no VM {vmid}")  # PVE 404s config of missing resources
+            # real PVE config includes the VM's NAME (creation identity);
+            # the fake must model that or identity checks test nothing
+            cfg = dict(v.get("config", {}))
+            cfg.setdefault("name", v.get("name", ""))
+            return cfg
         if "/status/current" in path:
             vmid = int(path.split("/qemu/")[1].split("/")[0])
             v = self.vms.get(vmid)
             if not v:
-                raise KeyError(f"no VM {vmid}")  # PVE raises 404 for missing resources
+                raise PveNotFound(f"no VM {vmid}")  # PVE answers 404 for missing resources
             return {"status": v["status"], "vmid": vmid}
         return {}
 
@@ -241,23 +369,26 @@ class FakePVEHttp:
     CLONE_PARAMS = {"newid", "name", "description", "full", "storage", "target",
                     "format", "snapname"}
 
+    #: PVE pve-tag-list schema: tags are ';'-separated and each tag matches
+    #: [A-Za-z0-9_.+-]+  (characters like '=' are REJECTED by real PVE).
+    TAG_LIST_RE = re.compile(r"^[A-Za-z0-9_.+\-]+(;[A-Za-z0-9_.+\-]+)*$")
+
     def post(self, path, **kw):
         self.requests.append(("POST", path, kw))
-        if any(f in path for f in self.fail_request_fragments):
-            raise RuntimeError(f"injected request failure for {path}")
+        self._maybe_fail(path)
         if "/clone" in path:
             unknown = set(kw) - self.CLONE_PARAMS
             if unknown:
                 # real PVE answers 400 with "unrecognized parameter"
-                raise RuntimeError(f"400 unrecognized parameter(s): {sorted(unknown)}")
+                raise PveHttpError(400, f"unrecognized parameter(s): {sorted(unknown)}")
             if "newid" not in kw:
-                raise RuntimeError("400 missing required parameter 'newid'")
+                raise PveHttpError(400, "missing required parameter 'newid'")
             tpl = int(path.split("/qemu/")[1].split("/")[0])
             new = int(kw["newid"])
             if new in self.vms:
-                raise RuntimeError(f"VMID {new} in use")
+                raise PveHttpError(400, f"VMID {new} in use")
             if tpl not in self.vms:
-                raise RuntimeError(f"template {tpl} not found")
+                raise PveHttpError(400, f"template {tpl} not found")
             # the clone only materializes when the task COMPLETES (async semantics)
             upid = self._new_upid(path)
             self.tasks[upid]["_done_cb"] = lambda: self.vms.setdefault(
@@ -267,7 +398,7 @@ class FakePVEHttp:
             vmid = int(path.split("/qemu/")[1].split("/")[0])
             v = self.vms.get(vmid)
             if not v:
-                raise RuntimeError(f"no VM {vmid}")
+                raise PveNotFound(f"no VM {vmid}")
             upid = self._new_upid(path)
             self.tasks[upid]["_done_cb"] = lambda: v.update(status="running")
             return upid
@@ -275,7 +406,7 @@ class FakePVEHttp:
             vmid = int(path.split("/qemu/")[1].split("/")[0])
             v = self.vms.get(vmid)
             if not v:
-                raise RuntimeError(f"no VM {vmid}")
+                raise PveNotFound(f"no VM {vmid}")
             upid = self._new_upid(path)
             self.tasks[upid]["_done_cb"] = lambda: v.update(status="stopped")
             return upid
@@ -283,18 +414,21 @@ class FakePVEHttp:
             vmid = int(path.split("/qemu/")[1].split("/")[0])
             v = self.vms.get(vmid)
             if not v:
-                raise RuntimeError(f"no VM {vmid}")
+                raise PveNotFound(f"no VM {vmid}")
+            if "tags" in kw and not self.TAG_LIST_RE.match(str(kw["tags"])):
+                # real PVE validates pve-tag-list on PUT (audit N01: validate
+                # request schemas against the supported PVE version)
+                raise PveHttpError(400, f"invalid tags {kw['tags']!r} (pve-tag-list rejected)")
             v.setdefault("config", {}).update(kw)
             return None
         return None
 
     def delete(self, path, **kw):
         self.requests.append(("DELETE", path, kw))
-        if any(f in path for f in self.fail_request_fragments):
-            raise RuntimeError(f"injected request failure for {path}")
+        self._maybe_fail(path)
         vmid = int(path.rsplit("/", 1)[1])
         if vmid not in self.vms:
-            raise RuntimeError(f"no VM {vmid}")  # PVE 404
+            raise PveNotFound(f"no VM {vmid}")  # PVE 404
         upid = self._new_upid(path)
         self.tasks[upid]["_done_cb"] = lambda: self.vms.pop(vmid, None)
         return upid
