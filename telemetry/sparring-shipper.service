@@ -6,16 +6,26 @@ Wants=auditd.service
 [Service]
 Type=simple
 # Input: the REAL audit.log in ENRICHED format (documented in install.sh).
+# /usr/local/bin/sparring-shipper is the shipper installed WITH its
+# `#!/usr/bin/env python3` shebang (audit N08: the installed artifact must be
+# directly executable — a bare .py copy was not).
 ExecStart=/bin/sh -c 'tail -F -n 0 /var/log/audit/audit.log | /usr/local/bin/sparring-shipper'
 Restart=always
 RestartSec=3
 EnvironmentFile=-/etc/sparring-range/shipper.env
 # trust limit: this service sees what a compromised host claims — it is a
-# SINK, give it no more rights than reading the audit log
-DynamicUser=yes
+# SINK, give it no more rights than reading the audit log.
+# Dedicated identity (created by install.sh) — a REAL user, because the read
+# access to the audit log is granted through its group membership (auditd
+# `log_group = adm`, set by install.sh); a dynamic user could not hold that
+# group, so the previous unit could not read the log it exists to ship.
+# No other privileges.
+User=srshipper
+SupplementaryGroups=adm
 ProtectSystem=strict
 ReadWritePaths=/var/lib/sparring-range/shipper
 NoNewPrivileges=yes
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target

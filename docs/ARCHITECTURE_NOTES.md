@@ -41,6 +41,18 @@ door, not a second one.
    (scrypt, stdlib), server-side token expiry/revocation. Service capabilities
    (bastion, telemetry, runner) are separate token scopes; the API is
    fail-closed (anonymous mutation refused; anonymous reads limited).
+6. **Telemetry trust limit (audit N09)** — each deployed clone is enrolled at
+   deploy time with a telemetry capability bound to BOTH the session and the
+   host name; ingest attributes session/host from the capability, never the
+   payload. What CAN be trusted from a range host: that a holder of that
+   host's capability CLAIMED these audit records at ingest time, under a
+   capability valid for exactly one session — revocation on end/reset/teardown
+   means an old clone can never contribute events to a new session. What
+   CANNOT be trusted: the truthfulness of the records themselves — a
+   compromised host controls what its auditd reports (it can omit, reorder or
+   fabricate), so telemetry is attacker-observable evidence of what the host
+   claimed, not ground truth. Verifier-side checks remain the scoring source
+   of record for that reason.
 
 ## Safety controller placement
 

@@ -28,6 +28,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from infra.proxmox_client import PveUnavailable, ProxmoxError
 from srplatform.db.models import (Deployment, Event, OperationClaim, RangeLease,
+                                  ServiceToken,
                                   Session as SessionModel)
 from srplatform.scenario_engine.loader import load_scenario
 from srplatform.settings import get_settings
@@ -119,6 +120,26 @@ def _log(db: Session, session_id, action, host, payload):
     db.add(Event(session_id=session_id, ts=_now(), actor="system", host=host,
                  action_type=action, payload=payload))
     db.flush()
+
+
+def _enroll_telemetry(db: Session, session_id, host: str) -> str:
+    """Per-deployment telemetry enrollment (audit N09): each clone gets a
+    session-AND-host-bound telemetry capability, issued at deploy time. The
+    plaintext is returned ONCE (deploy response / provisioning); the inventory
+    keeps only a reference. Revocation follows the session lifecycle — end,
+    reset and teardown revoke every session capability including these (the
+    same code path), so an old clone can never contribute events to a new
+    session. Trust limit: events from a COMPROMISED host are evidence of what
+    that host CLAIMED under a valid capability, not ground truth."""
+    import uuid as _u
+    token = f"svc-telemetry-{_u.uuid4().hex}"
+    db.add(ServiceToken(token=token, scope="telemetry", session_id=session_id,
+                        host=host))
+    return token
+
+
+def _token_ref(token: str) -> str:
+    return f"...{token[-6:]}"
 
 
 # ------------------------------------------------------------------- lease ---
@@ -231,11 +252,19 @@ def deploy(db: Session, session_id, scenario_id: str, proxmox, resume: bool = Tr
     resources = [dict(r) for r in (dep.resources or [])]
     by_host = {r.get("host"): r for r in resources}
     created = [r for r in resources if r.get("state") == "created"]
+    enrollments: dict[str, str] = {}  # host -> plaintext token (returned ONCE)
     try:
         for i, host in enumerate(spec["topology"]["hosts"]):
             name = _vm_name(scenario_id, host["name"], session_id)
             res = by_host.get(host["name"])
             if res and res.get("state") == "created":
+                if not res.get("telemetry_token_ref"):
+                    # host completed before enrollment existed (resume path)
+                    tok = _enroll_telemetry(db, session_id, host["name"])
+                    res["telemetry_token_ref"] = _token_ref(tok)
+                    enrollments[host["name"]] = tok
+                    dep.resources = resources
+                    flag_modified(dep, "resources")
                 continue  # already owned & completed — resume skips it
             if res and res.get("vmid"):
                 vmid = int(res["vmid"])          # reuse the pending intent's VMID
@@ -309,6 +338,9 @@ def deploy(db: Session, session_id, scenario_id: str, proxmox, resume: bool = Tr
                     proxmox.start_and_wait(node, vmid)
                     res.update({"state": "created", "ip": host["ip"], "node": node,
                                 "name": name})
+                    tok = _enroll_telemetry(db, session_id, host["name"])
+                    res["telemetry_token_ref"] = _token_ref(tok)
+                    enrollments[host["name"]] = tok
                     created = [r for r in resources if r.get("state") == "created"]
                     dep.resources = resources
                     flag_modified(dep, "resources")
@@ -335,6 +367,9 @@ def deploy(db: Session, session_id, scenario_id: str, proxmox, resume: bool = Tr
                                    f"net0={net0!r} does not use bridge {s.range_bridge}")
             proxmox.start_and_wait(node, vmid)
             res.update({"state": "created", "ip": host["ip"], "node": node, "name": name})
+            tok = _enroll_telemetry(db, session_id, host["name"])
+            res["telemetry_token_ref"] = _token_ref(tok)
+            enrollments[host["name"]] = tok
             created = [r for r in resources if r.get("state") == "created"]
             dep.resources = resources
             flag_modified(dep, "resources")
@@ -356,7 +391,7 @@ def deploy(db: Session, session_id, scenario_id: str, proxmox, resume: bool = Tr
         db.commit()   # failure evidence + partial ownership survive the rollback
         raise
     return {"scenario_id": scenario_id, "action": "deploy", "deployment_id": str(dep.deployment_id),
-            "hosts": created}
+            "hosts": created, "telemetry_enrollments": enrollments}
 
 
 def _owned_resources(dep: Deployment) -> list[dict]:

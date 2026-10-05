@@ -148,23 +148,36 @@ def start_run(db: Session, session_id, scenario_id: str) -> Run:
     return run
 
 
-# Environment allowlist handed to the worker process (audit R12: the worker is
-# the least-privileged component — it must NOT inherit the API's DB/Proxmox/
-# owner credentials by an os.environ copy).
-_WORKER_ENV_KEYS = (
-    "PATH", "HOME", "LANG", "LC_ALL", "TZ",
-    "SR_ENV", "SR_API_BASE", "SR_SESSION_ID", "SR_SCENARIO_ID", "SR_RUN_ID",
-    "SR_WORKER_TOKEN", "API_BASE_URL",
-    "RUNNER_TRANSPORT", "RUNNER_SSH_TARGET", "RUNNER_SSH_KEY_PATH",
-    "RUNNER_SSH_KNOWN_HOSTS", "RUNNER_COMMAND_TIMEOUT_S", "RUNNER_MAX_OUTPUT_BYTES",
-    "LLM_BASE_URL", "LLM_MODEL_RED", "LLM_API_KEY", "MODEL_QUEUE_MAX",
-)
+# The worker environment is SERIALIZED from the controller's RESOLVED settings
+# (audit N04): it must not depend on whether the operator supplied a value via
+# os.environ or via dotenv, and it must not inherit anything else. The worker
+# is the least-privileged component — API capability, model endpoint and
+# runner channel ONLY; no DB/Proxmox/owner/bastion credentials.
+_WORKER_SETTING_KEYS = {
+    "SR_ENV": "sr_env",
+    "API_BASE_URL": "api_base_url",
+    "RUNNER_TRANSPORT": "runner_transport",
+    "RUNNER_SSH_TARGET": "runner_ssh_target",
+    "RUNNER_SSH_KEY_PATH": "runner_ssh_key_path",
+    "RUNNER_SSH_KNOWN_HOSTS": "runner_ssh_known_hosts",
+    "RUNNER_COMMAND_TIMEOUT_S": "runner_command_timeout_s",
+    "RUNNER_MAX_OUTPUT_BYTES": "runner_max_output_bytes",
+    "RUNNER_SUPERVISOR_BIN": "runner_supervisor_bin",
+    "LLM_BASE_URL": "llm_base_url",
+    "LLM_MODEL_RED": "llm_model_red",
+    "LLM_API_KEY": "llm_api_key",
+    "LLM_TIMEOUT_S": "llm_timeout_s",
+    "MODEL_QUEUE_MAX": "model_queue_max",
+}
 
 
 def _worker_env(s, token: str, session_id, scenario_id: str, run: Run) -> dict:
     import os as _os
-    env = {k: v for k, v in _os.environ.items() if k in _WORKER_ENV_KEYS}
-    env.setdefault("PATH", _os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"))
+    env = {k: _os.environ.get(k, "") for k in ("PATH", "HOME", "LANG", "LC_ALL", "TZ")}
+    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    env["SR_PROCESS_ROLE"] = "worker"
+    for k, attr in _WORKER_SETTING_KEYS.items():
+        env[k] = str(getattr(s, attr))
     env.update({
         "SR_API_BASE": s.api_base_url,
         "SR_SESSION_ID": str(session_id),

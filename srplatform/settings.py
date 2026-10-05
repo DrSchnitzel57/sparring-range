@@ -3,9 +3,15 @@
 Hard constraint #5: secrets never enter the repo — only .env.example is committed.
 In production mode (SR_ENV=production) placeholder/default secrets are REJECTED at
 startup (audit F23) — misconfiguration fails closed, not open.
+
+Process roles (audit N04): the WORKER is the least-privileged component. It
+validates ONLY what it actually uses (API capability, model endpoint, runner
+channel) and NEVER loads the controller `.env` — the controller serializes the
+worker's settings explicitly into its environment.
 """
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -120,9 +126,34 @@ class Settings(BaseSettings):
     ingest_max_body_events: int = 500
 
 
-def validate_production(s: Settings) -> None:
-    """Fail CLOSED on misconfiguration in production mode (F23)."""
+def process_role() -> str:
+    """Which component this process is (controller | worker). The worker is
+    spawned by the API with SR_PROCESS_ROLE=worker and a SERIALIZED, minimal
+    environment — it must not need, and must not silently load, controller
+    configuration (audit N04)."""
+    return os.environ.get("SR_PROCESS_ROLE", "controller")
+
+
+def validate_production(s: Settings, role: str = "controller") -> None:
+    """Fail CLOSED on misconfiguration in production mode (F23). Validation is
+    ROLE-SCOPED (audit N04): the worker is validated on exactly the capability
+    it holds (API + model + runner channel), never on controller-only secrets
+    it must not possess (Proxmox token, owner DB, bastion pins)."""
     problems = []
+    if role == "worker":
+        if s.runner_transport != "ssh" or not s.runner_ssh_target \
+                or not s.runner_ssh_known_hosts:
+            problems.append("isolated runner not configured (runner_transport=ssh"
+                            " + fixed target + pinned known_hosts)")
+        if not s.llm_base_url or not s.llm_model_red:
+            problems.append("model endpoint not configured (llm_base_url/llm_model_red)")
+        if not s.api_base_url:
+            problems.append("api_base_url missing (worker acts only via its "
+                            "session-scoped API capability)")
+        if problems:
+            raise RuntimeError("production WORKER config invalid:\n  - "
+                               + "\n  - ".join(problems))
+        return
     if not s.proxmox_token_id or s.proxmox_token_secret in ("", "CHANGE_ME"):
         problems.append("Proxmox API token missing")
     if s.proxmox_insecure_lab_override:
@@ -141,7 +172,15 @@ def validate_production(s: Settings) -> None:
 
 @lru_cache
 def get_settings() -> Settings:
-    s = Settings()
+    role = process_role()
+    if role == "worker":
+        # The worker NEVER loads the controller .env (audit N04): whatever the
+        # controller wants the worker to know is serialized explicitly into the
+        # worker's environment by the spawner — no dotenv fallback, no
+        # inherited controller secrets by accident.
+        s = Settings(_env_file=None)
+    else:
+        s = Settings()
     if s.sr_env == "production":
-        validate_production(s)
+        validate_production(s, role)
     return s

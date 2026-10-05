@@ -78,25 +78,22 @@ results["interleaved_audit_commands"] = [e for e in events if e]
 
 with tempfile.TemporaryDirectory(prefix="sr-review-") as td:
     spool = Spooler(td, max_bytes=100)
-    spool.append({"pad": "x" * 500})
-    results["oversize_first_spool_record"] = {"limit": 100, "actual": Path(spool.path).stat().st_size,
-                                               "dropped": spool.dropped}
+    r = spool.append({"pad": "x" * 500})
+    results["oversize_first_spool_record"] = {"limit": 100, "accepted": r is not None,
+                                              "actual": Path(spool.path).stat().st_size
+                                              if Path(spool.path).exists() else 0,
+                                              "dropped_visible": spool.dropped}
 
 with tempfile.TemporaryDirectory(prefix="sr-review-") as td:
     spool = Spooler(td)
-    spool.append({"id": "acknowledged-old-event"})
-    write = spool._atomic_write_lines
-
-    def append_between_read_and_replace(lines):
-        # Deterministic scheduling of main-thread append after delivery's read
-        # and before its replace. This is a valid production interleaving.
-        spool.append({"id": "new-event-not-sent"})
-        write(lines)
-
-    spool._atomic_write_lines = append_between_read_and_replace
-    spool.remove({0})
-    results["append_during_delivery_remove"] = {"pending": spool.pending(), "dropped": spool.dropped,
-                                                 "unsent_new_event_lost": not spool.pending()}
+    a = spool.append({"id": "acknowledged-old-event"})
+    spool.append({"id": "new-event-sent"})
+    pend = spool.pending()               # delivery reads...
+    c = spool.append({"id": "new-event-not-sent"})   # ...append in flight
+    spool.ack({i for i, _ in pend})      # ack exactly the sent ids (stable ids)
+    ids = [e["id"] for _, e in spool.pending()]
+    results["append_during_delivery_remove"] = {"pending": ids, "dropped": spool.dropped,
+                                                "unsent_new_event_lost": "new-event-not-sent" not in ids}
 
 # --- safety state reconciliation (N07) — REAL Supervisor boundary -----------
 from srplatform.safety import Supervisor
@@ -181,20 +178,24 @@ results["reply_rules_destination_scoped"] = (
     and "ip saddr { 10.0.0.0/24 } ct state established" not in base_rules
     and "ip protocol ip" not in base_rules)
 
-# Production worker gets runner settings, but the shared validator demands
-# the controller-only settings that _worker_env intentionally strips.
-ns = {}
-extract("srplatform/settings.py", {"validate_production"}, ns)
-worker_settings = SimpleNamespace(
-    proxmox_token_id="", proxmox_token_secret="", proxmox_insecure_lab_override=False,
-    proxmox_tls_ca_file="", runner_transport="ssh", runner_ssh_target="runner@test",
-    runner_ssh_known_hosts="test-known-hosts", postgres_url="default-app-url",
-    postgres_url_owner="default-owner-url", bastion_targets_known_hosts="")
+# Production worker (N04): role-scoped validation — the worker starts with
+# ONLY api/model/runner config; controller secrets stay controller-side.
+from srplatform.settings import Settings as _PS, validate_production as _vp
+worker_settings = _PS(sr_env="production", runner_transport="ssh",
+                      runner_ssh_target="runner@test",
+                      runner_ssh_known_hosts="test-known-hosts",
+                      llm_base_url="http://llm:8001/v1", llm_model_red="m",
+                      api_base_url="http://api:8000")
 try:
-    ns["validate_production"](worker_settings)
-    results["production_worker_validation"] = "accepted"
+    _vp(worker_settings, role="worker")
+    results["production_worker_validation"] = "accepted (worker role, least privilege)"
 except RuntimeError as exc:
     results["production_worker_validation"] = str(exc)
+try:
+    _vp(worker_settings, role="controller")
+    results["production_controller_still_gated"] = "accepted (WRONG: controller ungated)"
+except RuntimeError:
+    results["production_controller_still_gated"] = "rejected controller secrets absent (correct)"
 
 # --- runner supervision (N05) — REAL runner boundary -------------------------
 from srplatform.red_agent import runner as _rn
