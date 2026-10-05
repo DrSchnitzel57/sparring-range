@@ -60,10 +60,12 @@ class RedAgentKilled(Exception):
 class RedAgentLoop:
     def __init__(self, session_id: str, scenario_id: str, transport, llm, runner,
                  max_steps: int = 20, compress_after: int = 8, keep_recent: int = 6):
-        from srplatform.scenario_engine.loader import load_scenario
-
         self.session_id = session_id
-        self.scenario = load_scenario(scenario_id)
+        # audit N10: objectives/targets resolve from the session's IMMUTABLE
+        # snapshot via the API capability — never from the mutable YAML.
+        self.scenario = transport.scenario_spec(session_id)
+        if str(self.scenario.get("id", scenario_id)) != str(scenario_id):
+            raise RuntimeError("scenario snapshot does not match the session's scenario id")
         self.transport = transport
         self.llm = llm  # needs .complete(system, user) -> str
         self.runner = runner  # isolated runner adapter: .run(cmd) -> RunResult|(code,out)

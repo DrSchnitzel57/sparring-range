@@ -878,10 +878,12 @@ def test_r12_golden_image_calls_the_real_installer():
         "golden image must call the real installer (unit + format + spool)"
     installer = (REPO / "telemetry/install.sh").read_text()
     assert "sparring-shipper.service" in installer and "systemd" in installer.lower()
-    # the runbook must not claim the golden image installs vulnerable services
+    # the runbook must state the HONEST provisioning contract (audit N10):
+    # services are a versioned prebuilt-template requirement with enforced
+    # readiness — never "cloud-init applied" claims deploy does not perform
     runbook = (REPO / "docs/OPERATOR_RUNBOOK.md").read_text()
-    assert "vulnerable scenario services are NOT part of" in runbook or \
-        "belong to per-host scenario cloud-init" in runbook
+    assert "PREBUILT-TEMPLATE REQUIREMENT" in runbook and "VERIFIES readiness" in runbook
+    assert "belong to per-host scenario cloud-init" not in runbook
 
 
 # =========================================================================== #

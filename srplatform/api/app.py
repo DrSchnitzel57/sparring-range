@@ -353,6 +353,20 @@ def launch_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
         except orchestrator.ForeignResourceError as e:
             raise HTTPException(409, {"error": "foreign_resource", "detail": str(e)[:500]})
 
+        # SERVICE READINESS GATE (audit N10 item 4): the session reaches
+        # `ready` only after the declared per-host services are verified
+        # present on the owned inventory (when the management channel is
+        # configured). Failure is explicit — machines stay deployed for a
+        # documented retry, the session does NOT pretend to be ready.
+        from srplatform import verification_service
+        readiness = verification_service.readiness_checks(db, sess.session_id)
+        if readiness["enforced"] and not readiness["ok"]:
+            db.add(Event(session_id=sess.session_id, ts=_now(), actor="system",
+                         action_type="readiness_failed", payload=readiness))
+            raise HTTPException(409, {"error": "readiness_failed",
+                                      "reason": readiness["reason"],
+                                      "checks": readiness["checks"]})
+
         # member-specific host connection capabilities (F08)
         s = get_settings()
         instructions = []
@@ -370,7 +384,8 @@ def launch_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
         db.flush()
         _ok = True
         return {"session_id": str(sess.session_id), "status": sess.status,
-                "deployment": result, "connections": instructions}
+                "deployment": result, "connections": instructions,
+                "readiness": readiness}
     finally:
         _release_claim_safely(db, sess.session_id, _ok)
 
@@ -699,6 +714,26 @@ def run_complete(run_id: uuid.UUID, result: dict,
 # --- trusted verification (backend executes; request is not a result) ----------
 class VerifierCheckIn(BaseModel):
     objective_id: str
+
+
+@app.get("/sessions/{session_id}/scenario")
+def session_scenario(session_id: uuid.UUID,
+                     p: Principal = Depends(principal), db: Session = Depends(get_db)):
+    """The session's IMMUTABLE scenario snapshot (audit N10): the worker and
+    every consumer resolve objectives/targets from the bytes captured at
+    session creation — never from the mutable current YAML. The run-scoped
+    runner token may read only its own session's snapshot."""
+    from srplatform import verification_service
+    if p.kind == "service":
+        if p.scope != "runner" or str(p.session_id) != str(session_id):
+            raise HTTPException(403, "runner token does not match this session")
+    else:
+        _get_session(db, p, session_id)
+    try:
+        spec = verification_service.scenario_spec(db, session_id)
+    except ValueError:
+        raise HTTPException(404, "session not found")
+    return {"session_id": str(session_id), "scenario": spec}
 
 
 @app.post("/sessions/{session_id}/verifier_checks")

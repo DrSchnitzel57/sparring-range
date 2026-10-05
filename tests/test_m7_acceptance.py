@@ -88,22 +88,28 @@ def test_m7_progress_is_per_domain_from_snapshots_over_multiple_sessions(client,
         if "awk" in command:
             return 0, ""
         if "list-unit-files" in command:
-            return 0, "sshd.service enabled enabled\n"
+            return 0, "sshd.service enabled enabled\nnginx.service enabled enabled\n"
         return 1, "no"
     verification_service.set_verifier_exec(healthy)
     c1 = client.post(f"/sessions/{s1}/score", headers=users["member"]).json()
     assert c1["earned"] == 15
+    # end + teardown session 1 (releases the single-active-range lease and
+    # its deployment) before session 2 launches — scoring only addresses the
+    # session's OWN active deployment (audit N11)
+    assert client.post(f"/sessions/{s1}/end", headers=users["member"]).status_code == 200
+    assert client.post(f"/sessions/{s1}/teardown", headers=users["member"]).status_code == 200
 
     # session 2: web01 up, sshd gone -> partial domain coverage
     s2 = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                      headers=users["member"]).json()["session_id"]
-    client.post(f"/sessions/{s2}/launch", headers=users["member"])
+    r2 = client.post(f"/sessions/{s2}/launch", headers=users["member"])
+    assert r2.status_code == 200, r2.text
 
     def degraded(host, command):
         if "awk" in command:
             return 0, "hacker\n"          # rogue admin present -> lose identify
         if "list-unit-files" in command:
-            return 0, "sshd.service enabled enabled\n"
+            return 0, "sshd.service enabled enabled\nnginx.service enabled enabled\n"
         return 1, "no"
     verification_service.set_verifier_exec(degraded)
     c2 = client.post(f"/sessions/{s2}/score", headers=users["member"]).json()

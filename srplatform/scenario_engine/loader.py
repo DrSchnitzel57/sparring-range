@@ -27,6 +27,18 @@ PHASES = ["recon", "initial-access", "priv-esc", "lateral", "persistence", "obje
 SCENARIO_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 TECHNIQUE_RE = re.compile(r"^T\d{4}(\.\d{3})?$")
 
+# Provisioning contract (audit N10 item 4): scenario host `services` are a
+# VERSIONED PREBUILT-TEMPLATE REQUIREMENT — the golden template for the host
+# must provide these units, and launch VERIFIES readiness (service_present
+# against the owned inventory) before a session reaches `ready`. Names are
+# validated against this registry: listing a service name no longer silently
+# ignores it.
+SUPPORTED_SERVICES: dict[str, str] = {
+    "http": "nginx",     # golden linux template serves HTTP via nginx
+    "mysql": "mysql",
+    "ssh": "sshd",
+}
+
 
 class ScenarioError(ValueError):
     def __init__(self, issues: list[str]):
@@ -51,6 +63,17 @@ class Host(Strict):
     def _hostname(cls, v: str) -> str:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", v):
             raise ValueError("host name must be a bare hostname")
+        return v
+
+    @field_validator("services")
+    @classmethod
+    def _services(cls, v: list[str]) -> list[str]:
+        unknown = sorted(set(v) - set(SUPPORTED_SERVICES))
+        if unknown:
+            raise ValueError(
+                f"unsupported service(s) {unknown} — the provisioning contract supports "
+                f"{sorted(SUPPORTED_SERVICES)} (extend SUPPORTED_SERVICES and the golden "
+                "template together; readiness is enforced at launch)")
         return v
 
 

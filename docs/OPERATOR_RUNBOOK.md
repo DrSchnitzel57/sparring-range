@@ -55,8 +55,15 @@ the harness cannot honestly close them.
 
 1. **[LIVE GATE]** Build golden images: `infra/images/provision-linux-golden.sh`
   (telemetry pipeline via `telemetry/install.sh` — auditd rules, ENRICHED
-  format, shipper + systemd unit; vulnerable scenario services are NOT part of
-  the golden image, they belong to per-host scenario cloud-init) or
+  format, shipper + systemd unit). Scenario host `services` are a VERSIONED
+  PREBUILT-TEMPLATE REQUIREMENT (audit N10): the golden template must provide
+  the mapped units (`http`→nginx, `mysql`→mysql, `ssh`→sshd — see
+  `SUPPORTED_SERVICES`), and `launch` VERIFIES readiness on the owned
+  inventory before a session reaches `ready` (unknown/failed readiness keeps
+  the session out of `ready` with explicit reasons; dev mode without a
+  management channel reports the relaxation in the launch response).
+  Unsupported service names are rejected at scenario validation, never
+  silently ignored. Or
   `infra/images/golden-linux.pkr.hcl` (hashicorp packer plugin; transfers the
   files properly — run `packer validate` against your PVE). Convert to
   template (`qm template <vmid>`); record VMIDs in `.env`

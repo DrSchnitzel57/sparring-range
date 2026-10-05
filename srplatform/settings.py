@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     # --- Verifier management exec (trusted backend only, F01/F10) --------------
     verifier_ssh_user: str = "root"
     verifier_ssh_key_path: str = ""
+    # PINNED management host keys (audit N11): required in production — the
+    # verifier never does trust-on-first-use against range hosts.
+    verifier_ssh_known_hosts: str = ""
     verifier_exec_timeout_s: int = 30
 
     # --- Deploy (M1) ---
@@ -166,6 +169,9 @@ def validate_production(s: Settings, role: str = "controller") -> None:
         problems.append("database credentials are placeholders")
     if s.bastion_targets_known_hosts == "":
         problems.append("bastion_targets_known_hosts required (no TOFU to range hosts)")
+    if s.verifier_ssh_known_hosts == "":
+        problems.append("verifier_ssh_known_hosts required (pinned management "
+                        "host keys — no TOFU, audit N11)")
     if problems:
         raise RuntimeError("production config invalid:\n  - " + "\n  - ".join(problems))
 

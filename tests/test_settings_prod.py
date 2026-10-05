@@ -15,6 +15,7 @@ def _prod(**overrides):
         runner_transport="ssh", runner_ssh_target="runner@10.66.0.9",
         runner_ssh_key_path="/etc/sr/runner", runner_ssh_known_hosts="/etc/sr/kh",
         verifier_ssh_key_path="/etc/sr/verifier",
+        verifier_ssh_known_hosts="/etc/sr/vkh",
         bastion_targets_known_hosts="/etc/sr/tkh",
     )
     base.update(overrides)

@@ -15,6 +15,7 @@ class Transport(Protocol):
     def events_since(self, session_id: str, after_event_id: int) -> list[dict]: ...
     def latest_events(self, session_id: str, n: int = 50) -> list[dict]: ...
     def verify_objective(self, session_id: str, objective_id: str) -> dict: ...
+    def scenario_spec(self, session_id: str) -> dict: ...
     def get_agent_state(self, session_id: str) -> dict | None: ...
     def save_agent_state(self, session_id: str, summary: str | None, summary_upto: int | None,
                          current_phase: str | None) -> None: ...
@@ -65,6 +66,13 @@ class HttpTransport:
         r = self.client.post(f"/sessions/{session_id}/verifier_checks", json={"objective_id": objective_id})
         return r.json() if r.status_code == 200 else {"error": f"verifier check rejected: {r.status_code}"}
 
+    def scenario_spec(self, session_id: str) -> dict:
+        """Session snapshot from the API (audit N10) — the worker never reads
+        the mutable scenario file."""
+        r = self.client.get(f"/sessions/{session_id}/scenario")
+        r.raise_for_status()
+        return r.json()["scenario"]
+
     def get_agent_state(self, session_id: str) -> dict | None:
         r = self.client.get(f"/agent_state/{session_id}")
         return r.json() if r.status_code == 200 else None
@@ -94,6 +102,11 @@ class TestClientTransport:
         r = self.c.post(f"/sessions/{session_id}/verifier_checks",
                         json={"objective_id": objective_id}, headers=self.headers)
         return r.json() if r.status_code == 200 else {"error": f"verifier check rejected: {r.status_code}"}
+
+    def scenario_spec(self, session_id: str) -> dict:
+        r = self.c.get(f"/sessions/{session_id}/scenario", headers=self.headers)
+        r.raise_for_status()
+        return r.json()["scenario"]
 
     def get_agent_state(self, session_id: str) -> dict | None:
         r = self.c.get(f"/agent_state/{session_id}", headers=self.headers)

@@ -28,6 +28,14 @@ class FlagFilePresent(Verifier):
         code, out = _run(ctx, host, f"cat {shlex.quote(path)}")
         if code is None:
             return None, {"host": host, "path": path}, f"exec failed: {out[:120]}"
+        # Distinguish UNAVAILABLE from ABSENT (audit N10 item 5): a transport
+        # or channel failure (verifier-exec sentinel exits or ssh's own
+        # failures) is UNKNOWN — it must never score as "flag absent" (red
+        # denied the point) or as a pass. A genuine non-zero `cat` exit is a
+        # real answer: the file is not readable.
+        if code in (124, 125, 126, 127, 254, 255):
+            return None, {"host": host, "path": path, "exit_code": code}, \
+                f"verification channel unavailable (exit {code}): {out[:120]}"
         passed = code == 0 and out.strip() != ""
         proven = None
         if expected_content is not None:

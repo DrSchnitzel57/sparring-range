@@ -11,6 +11,7 @@ host-state doubles); production uses SSH with the management key.
 """
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
 from datetime import datetime, timezone
@@ -40,8 +41,21 @@ def _ssh_exec(host: str, command: str) -> tuple[int, str]:
     s = get_settings()
     if not s.verifier_ssh_key_path:
         return 126, "[verifier-exec] management key not configured (VERIFIER_SSH_KEY_PATH)"
+    if not s.verifier_ssh_known_hosts:
+        # audit N11: no TOFU for management SSH — an unpinned channel can be
+        # silently redirected and its output would be indistinguishable from
+        # truth. Missing pin file is a VISIBLE unavailable, never an attempt.
+        return 125, ("[verifier-exec] VERIFIER_SSH_KNOWN_HOSTS not configured — "
+                     "refusing unpinned management SSH (unknown, not attempted)")
+    if not os.path.exists(s.verifier_ssh_known_hosts):
+        return 125, (f"[verifier-exec] known-hosts file {s.verifier_ssh_known_hosts} "
+                     "missing — unknown, not attempted")
     cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-           "-o", "StrictHostKeyChecking=no",  # lab inventory, pinned via inventory freshness
+           # PINNED host keys (audit N11): a changed or missing key makes ssh
+           # fail LOUDLY (exit 255 + offending key message) — the verifier
+           # maps that to `unknown`, never to a pass.
+           "-o", "StrictHostKeyChecking=yes",
+           "-o", f"UserKnownHostsFile={s.verifier_ssh_known_hosts}",
            "-i", s.verifier_ssh_key_path, f"{s.verifier_ssh_user}@{host}", command]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=s.verifier_exec_timeout_s)
@@ -50,22 +64,92 @@ def _ssh_exec(host: str, command: str) -> tuple[int, str]:
         return 124, f"[verifier-exec] {e}"
 
 
-def host_map_for(db: Session, session_id) -> dict[str, str]:
-    """Logical scenario hostname -> concrete address, from the session's owned
-    deployment resources (F19: never depend on accidental DNS)."""
+def active_deployment(db: Session, session_id) -> Deployment | None:
+    """The session's CURRENT generation deployment: the newest one that is
+    `ready`. A failed/torn-down deployment is a different generation and its
+    (possibly reused, possibly foreign) resources must not be verified."""
     if session_id is None:
-        return {}
-    dep = db.execute(select(Deployment).where(Deployment.session_id == session_id)
-                     .order_by(Deployment.created_at.desc())).scalars().first()
+        return None
+    return db.execute(select(Deployment)
+                      .where(Deployment.session_id == session_id,
+                             Deployment.status == "ready")
+                      .order_by(Deployment.created_at.desc())).scalars().first()
+
+
+def host_map_for(db: Session, session_id) -> dict[str, str]:
+    """Logical scenario hostname -> concrete address, from ACTIVE, POSITIVELY
+    OWNED resources of the correct deployment generation only (audit N11):
+    `state == created` rows of the ready deployment. Pending intents, failed
+    destructions and foreign/uncertain entries are filtered; a missing or
+    stale inventory yields an EMPTY map — verification then reports unknown
+    with NO DNS fallback and NO SSH attempt."""
+    dep = active_deployment(db, session_id)
     if not dep:
         return {}
-    return {r["host"]: r["ip"] for r in (dep.resources or []) if r.get("host") and r.get("ip")}
+    return {r["host"]: r["ip"] for r in (dep.resources or [])
+            if r.get("host") and r.get("ip") and r.get("state") == "created"}
+
+
+_NOT_OWNED = "[verifier-exec] target not in the session's owned active inventory — " \
+             "no DNS fallback, no SSH attempt (unknown)"
 
 
 def _resolve(exec_fn: VerifierExec, hmap: dict[str, str]) -> VerifierExec:
     def resolved(host: str, command: str) -> tuple[int, str]:
-        return exec_fn(hmap.get(host, host), command)
+        addr = hmap.get(host)
+        if addr is None:
+            # audit N11: the OLD `hmap.get(host, host)` fell back to the RAW
+            # name — a DNS lookup of a stale/foreign name and an SSH attempt
+            # at whatever answered. Resolution is now inventory-only.
+            return 254, _NOT_OWNED
+        return exec_fn(addr, command)
     return resolved
+
+
+def _deployment_identity(db: Session, session_id) -> dict:
+    dep = active_deployment(db, session_id)
+    return {"deployment_id": str(dep.deployment_id) if dep else None,
+            "deployment_status": dep.status if dep else None,
+            "deployment_created_at": dep.created_at.isoformat() if dep else None}
+
+
+def readiness_checks(db: Session, session_id) -> dict:
+    """Service-readiness gate for the provisioning contract (audit N10 item
+    4): every service declared by the session's snapshot topology must be
+    PRESENT (service_present against the owned active inventory) before the
+    session reaches `ready`. When the management exec channel is not
+    configured (dev mode), enforcement is skipped but VISIBLE — it never
+    silently passes as 'ready without readiness'."""
+    from srplatform.scenario_engine.loader import SUPPORTED_SERVICES
+    spec = scenario_spec(db, session_id)
+    hosts = (spec.get("topology") or {}).get("hosts", [])
+    declared = [(h["name"], svc) for h in hosts for svc in h.get("services", [])]
+    if not declared:
+        return {"enforced": True, "ok": True, "checks": [],
+                "reason": "no services declared"}
+    hmap = host_map_for(db, session_id)
+    exec_fn = _exec_override or _ssh_exec
+    if _exec_override is None:
+        s = get_settings()
+        if (not s.verifier_ssh_key_path or not s.verifier_ssh_known_hosts
+                or not os.path.exists(s.verifier_ssh_known_hosts)):
+            return {"enforced": False, "ok": True, "checks": [],
+                    "reason": "management exec channel not configured — dev-mode "
+                              "relaxation, visible in this response (production "
+                              "refuses `ready` without readiness)"}
+    v = registry.get("service_present")
+    ctx = Context(exec=_resolve(exec_fn, hmap), hosts=hmap)
+    items, ok = [], True
+    for host, svc in declared:
+        unit = SUPPORTED_SERVICES.get(svc, svc)
+        outcome = v.evaluate(ctx, host=host, service=unit)
+        if outcome.status != "passed":
+            ok = False
+        items.append({"host": host, "service": svc, "unit": unit,
+                      "status": outcome.status, "evidence": outcome.evidence,
+                      "error": outcome.error})
+    return {"enforced": True, "ok": ok, "checks": items,
+            "reason": None if ok else "declared services not ready on the owned inventory"}
 
 
 def check_objective(db: Session, session_id, objective_id: str) -> dict:
@@ -84,6 +168,11 @@ def check_objective(db: Session, session_id, objective_id: str) -> dict:
                host=(obj.get("args") or {}).get("host"), action_type="verifier",
                payload={"objective": objective_id, "verifier": obj["verifier"],
                         "verifier_version": v.version,
+                        # audit N11: evidence records WHICH deployment/target
+                        # was addressed — a later report can be attributed.
+                        "deployment": _deployment_identity(db, session_id),
+                        "target": host_map_for(db, session_id).get(
+                            (obj.get("args") or {}).get("host", "")),
                         "status": outcome.status, "passed": outcome.status == "passed",
                         "expected": outcome.expected,
                         "args_digest": outcome.args_digest,
@@ -107,6 +196,14 @@ def build_scorecard(db: Session, session_id) -> dict:
     checks = (spec.get("scoring") or {}).get("blue_checks", [])
     exec_fn = _exec_override or _ssh_exec
     hmap = host_map_for(db, session_id)
+    # LIVE RESCORE GUARD (audit N11): scoring addresses live hosts — it is
+    # only meaningful while the session still owns an ACTIVE deployment.
+    # After teardown (or with a stale/foreign inventory) refuse explicitly
+    # rather than SSH at whatever answers the reused addresses.
+    if checks and not hmap:
+        raise RuntimeError("no active owned deployment inventory for this session — "
+                           "live rescore refused (historical score_snapshot remains "
+                           "read-only available); no SSH attempted")
     ctx = Context(exec=_resolve(exec_fn, hmap), hosts=hmap)
 
     items, earned, total = [], 0, 0
@@ -140,6 +237,7 @@ def build_scorecard(db: Session, session_id) -> dict:
 
     snapshot = {"scenario_id": scenario_id, "earned": earned, "total": total,
                 "status": scorecard_status, "items": items,
+                "deployment": _deployment_identity(db, session_id),
                 "rubric_version": spec.get("rubric_version", spec.get("version", 1))}
     ev = Event(session_id=session_id, ts=datetime.now(timezone.utc), actor="system",
                action_type="score_snapshot", payload={"scorecard": snapshot,
