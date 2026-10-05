@@ -98,40 +98,88 @@ with tempfile.TemporaryDirectory(prefix="sr-review-") as td:
     results["append_during_delivery_remove"] = {"pending": spool.pending(), "dropped": spool.dropped,
                                                  "unsent_new_event_lost": not spool.pending()}
 
-# Missing file is treated as a healthy fresh store even if DB is unreadable.
-ns = {}
-extract("srplatform/safety/__init__.py", {"Supervisor"}, ns)
-sup = object.__new__(ns["Supervisor"])
-sup._read_state = lambda: ({}, None)
-sup._db_read_state = lambda: (None, "simulated DB outage")
-results["missing_file_and_unreadable_db"] = sup.latch_status()
+# --- safety state reconciliation (N07) — REAL Supervisor boundary -----------
+from srplatform.safety import Supervisor
+from tests.helpers import FakeDatapath  # non-noop mechanism double
 
-ns = {"hashlib": hashlib, "json": json, "BASELINE_TABLE": "sr_range_baseline",
-      "EMERGENCY_TABLE": "sr_emergency"}
-extract("srplatform/safety/datapath.py", {"config_identity", "NftDatapath"}, ns)
-settings = SimpleNamespace(range_bridge="vmbr1", range_vlan=66, range_cidr="10.66.0.0/24",
-                           management_cidr="10.0.0.0/24", bastion_address="10.66.0.2",
-                           proxmox_node="test", range_bridge_ports="tap1", api_base_url="http://10.0.0.1:8000")
-before = ns["config_identity"](settings)
-settings.range_bridge_ports = "tap2"
-settings.api_base_url = "http://10.0.0.2:9999"
-results["network_change_keeps_proof_identity"] = before == ns["config_identity"](settings)
-nft = object.__new__(ns["NftDatapath"])
-nft.s = settings
+with tempfile.TemporaryDirectory(prefix="sr-review-") as td:
+    sup = Supervisor(datapath=FakeDatapath(), state_file=f"{td}/s.json")
+    sup._db_read_state = lambda: (None, "simulated DB outage")
+    # Missing file + unreadable DB: post-fix this is LOST state -> latched.
+    results["missing_file_and_unreadable_db"] = sup.latch_status()
+
+    # No evidence anywhere -> latched until documented initialization.
+    sup2 = Supervisor(datapath=FakeDatapath(), state_file=f"{td}/s2.json")
+    sup2._db_read_state = lambda: (None, None)
+    results["no_evidence_anywhere"] = sup2.latch_status()["latched"]
+    sup2.initialize_state(reason="probe")
+    results["no_evidence_after_init"] = sup2.latch_status()["latched"]
+
+    # Stale DB cannot outrank a newer file-mirror record.
+    import time as _t
+    from srplatform.safety.datapath import config_identity as _ci
+    sup3 = Supervisor(datapath=FakeDatapath(), state_file=f"{td}/s3.json")
+    now = _t.time()
+    ident = _ci(sup3.settings)
+    sup3._records_reader = lambda: [{"kind": "engage", "ok": True,
+                                     "config_identity": ident, "recorded_at": now - 100}]
+    Path(f"{td}/s3.json.records").write_text(json.dumps(
+        {"kind": "release", "ok": True, "config_identity": ident,
+         "recorded_at": now}) + "\n")
+    results["stale_db_outranks_file"] = sup3._latest_records()["release"]["recorded_at"] == now
+
+    # Record persistence failure is retained and denies starts.
+    sup4 = Supervisor(datapath=FakeDatapath(), state_file=f"{td}/nodir/s4.json")
+    sup4._db_read_state = lambda: ({"latched": False, "latched_at": None, "reason": None}, None)
+    import srplatform.db.session as _dbs
+
+    class _Boom:
+        def __enter__(self):
+            raise RuntimeError("db down")
+
+        def __exit__(self, *a):
+            return False
+
+    _orig_db = _dbs.db
+    _dbs.db = lambda: _Boom()
+    try:
+        sup4.record("baseline_check", True, {})
+    finally:
+        _dbs.db = _orig_db
+    results["record_persistence_failure_retained"] = bool(sup4._record_failures)
+
+# --- datapath verification (N06) — REAL NftDatapath boundary -----------------
+from srplatform.safety import datapath as _dp
+from srplatform.safety import firewall as _fw
+from srplatform.settings import Settings as _S
+
+settings = _S(sr_env="dev", range_bridge="vmbr1", range_bridge_ports="tap1",
+              api_base_url="http://10.0.0.1:8000")
+before = _dp.config_identity(settings)
+alt = settings.model_copy(update={"range_bridge_ports": "tap2",
+                                  "api_base_url": "http://10.0.0.2:9999"})
+results["network_change_keeps_proof_identity"] = before == _dp.config_identity(alt)
+
 # No forward hook: rules in an ordinary unreferenced chain do not filter.
-nft.list_table = lambda table: '''table inet sr_range_baseline {
- chain range_forward {
-  meta nfproto ipv4 drop
-  meta nfproto ipv6 drop
-  ip saddr @range_hosts ip daddr @range_hosts accept
- }
-}'''
-results["unhooked_baseline_accepted"] = nft.baseline_status()
-settings.range_bridge_ports = ""
-nft.table_exists = lambda table: False
-nft.render_emergency = lambda **kwargs: "stubbed nft transaction"
-nft._run_nft_stdin = lambda ruleset: (0, "")
-results["missing_bridge_ports_apply"] = nft.apply_emergency()
+nft = _dp.NftDatapath(settings)
+_unhooked = {"nftables": [{"table": {"family": "inet", "name": "sr_range_baseline"}},
+                          {"chain": {"family": "inet", "table": "sr_range_baseline",
+                                     "name": "range_forward", "handle": 2}}]}
+nft._run_nft = lambda args: (0, json.dumps(_unhooked)) if "-j" in args else (0, "x")
+results["unhooked_baseline_accepted"] = nft.baseline_status()["ok"]
+
+# Missing port declarations: post-fix apply REFUSES full success.
+nft2 = _dp.NftDatapath(settings.model_copy(update={"range_bridge_ports": ""}))
+nft2._run_nft_stdin = lambda ruleset: (0, "")
+nft2._run_nft = lambda args: (0, "")
+results["missing_bridge_ports_apply"] = {"ok": nft2.apply_emergency()["ok"]}
+
+# Blanket established accept / wrong reply direction (N06 item 4):
+base_rules = _fw.render_baseline_ruleset(settings)
+results["reply_rules_destination_scoped"] = (
+    'ct state established,related ip daddr 10.0.0.0/24 iifname "vmbr1" accept' in base_rules
+    and "ip saddr { 10.0.0.0/24 } ct state established" not in base_rules
+    and "ip protocol ip" not in base_rules)
 
 # Production worker gets runner settings, but the shared validator demands
 # the controller-only settings that _worker_env intentionally strips.
@@ -147,5 +195,30 @@ try:
     results["production_worker_validation"] = "accepted"
 except RuntimeError as exc:
     results["production_worker_validation"] = str(exc)
+
+# --- runner supervision (N05) — REAL runner boundary -------------------------
+from srplatform.red_agent import runner as _rn
+
+_op = _rn._new_op_id()
+
+
+class _DeadRemote:
+    def cancel_remote(self, op_id, timeout_s=10):
+        return False
+
+
+_rn._register(_op, {"kind": "remote", "state": "running", "remote": True,
+                    "runner": _DeadRemote(), "proc": None})
+_cancel = _rn.cancel_active()
+results["cancel_unconfirmed_never_silent"] = {
+    "reported_ok": _cancel["ok"], "cancelled": _cancel["ops"][0]["cancelled"],
+    "still_tracked": _op in _rn._ACTIVE}
+_rn._finish_op(_op)
+
+# Bounded streaming: the reader caps output at the configured maximum.
+import inspect as _inspect
+results["runner_output_bound_streamed"] = (
+    "_bounded_reader" in _inspect.getsource(_rn)
+    and "communicate" not in _inspect.getsource(_rn.LocalDevRunner.run))
 
 print(json.dumps(results, indent=2))

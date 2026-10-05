@@ -55,6 +55,84 @@ def _api_port(s: Settings) -> int:
     return 443 if p.scheme == "https" else 80
 
 
+def _api_host(s: Settings) -> str:
+    """The API destination as CONFIGURED (hostname or literal). Evidence and
+    proof identity bind to this, not to a resolved snapshot (audit N07)."""
+    from urllib.parse import urlparse
+    return urlparse(s.api_base_url).hostname or ""
+
+
+def _api_port(s: Settings) -> int:
+    """Ingest port comes from the configured API URL — never a hardcoded 8000."""
+    from urllib.parse import urlparse
+    p = urlparse(s.api_base_url)
+    if p.port:
+        return int(p.port)
+    return 443 if p.scheme == "https" else 80
+
+
+def bridge_ports(s: Settings) -> list[str]:
+    """DECLARED bridge ports (tap/vnet members). Empty means the operator has
+    not declared the topology — emergency coverage is then INCOMPLETE (audit
+    N06: this must prevent full-success, not ride along as a warning)."""
+    return [p.strip() for p in (s.range_bridge_ports or "").split(",") if p.strip()]
+
+
+def discover_bridge_ports(s: Settings) -> list[str] | None:
+    """DISCOVERED bridge ports from /sys. The controller executes through
+    `nft_command_prefix` (e.g. `sudo -n` or a test namespace wrapper), so
+    when a direct read fails the inventory is read THROUGH that same
+    prefix — coverage is always verified in the namespace where the rules
+    will actually live. None = cannot determine (not 'empty')."""
+    import re
+    import shlex
+    import subprocess
+    from pathlib import Path
+    br = s.range_bridge
+    d = Path("/sys/class/net") / br / "brif"
+    try:
+        return sorted(p.name for p in d.iterdir())
+    except OSError:
+        pass
+    if not re.fullmatch(r"[A-Za-z0-9_.+-]+", br):
+        return None
+    prefix = shlex.split(s.nft_command_prefix) if s.nft_command_prefix else []
+    if not prefix:
+        return None
+    try:
+        r = subprocess.run(prefix + ["ls", str(d)], capture_output=True,
+                           text=True, timeout=10)
+        if r.returncode != 0:
+            return None
+        return sorted(x for x in r.stdout.split() if x)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def validate_port_coverage(s: Settings) -> tuple[bool, str]:
+    """Emergency/baseline L2 coverage follows the ACTUAL selected topology
+    (audit N06 item 3): the declared port list must be non-empty and must
+    cover every port currently attached to the range bridge. Ports created
+    AFTER evidence was recorded invalidate the proof."""
+    declared = bridge_ports(s)
+    if not declared:
+        return False, ("RANGE_BRIDGE_PORTS not configured — same-bridge L2 "
+                       "coverage cannot be established")
+    discovered = discover_bridge_ports(s)
+    if discovered is None:
+        return False, (f"cannot read {s.range_bridge} port inventory "
+                       f"(/sys/class/net/{s.range_bridge}/brif) — coverage unverified")
+    missing = sorted(set(discovered) - set(declared))
+    if missing:
+        return False, (f"bridge ports attached to {s.range_bridge} are NOT in "
+                       f"RANGE_BRIDGE_PORTS (evidence predates topology change): {missing}")
+    unknown = sorted(set(declared) - set(discovered))
+    if unknown:
+        return False, (f"RANGE_BRIDGE_PORTS lists ports not attached to {s.range_bridge} "
+                       f"(stale inventory): {unknown}")
+    return True, f"port inventory matches {s.range_bridge}: {sorted(discovered)}"
+
+
 def render_baseline_ruleset(s: Settings | None = None) -> str:
     s = s or get_settings()
     bridge = s.range_bridge
@@ -84,21 +162,34 @@ table inet {BASELINE_TABLE} {{
     # packets not originating from the range bridge are none of our business
     iifname != "{bridge}" return
 
-    # established/related ONLY for control-plane return traffic (replies to
-    # management SSH in and to API ingest) — a blanket accept here would let
-    # any pre-existing range-originated tunnel survive the deny (audit R05)
-    ct state established,related ip saddr {{ {mgmt}, {ctrl} }} accept
+    # established/related ONLY for control-plane return traffic — each reply
+    # direction is EXPLICIT (audit N06 item 4). The chain only filters
+    # packets ARRIVING on the range bridge (first rule returns otherwise),
+    # so the replies that need accepting are the range->control-plane ones:
+    #   * replies to management SSH (mgmt -> range:22): the reply is
+    #     range -> mgmt and arrives on the range bridge;
+    #   * continuations toward the API ingest endpoint (range -> ctrl:port).
+    # Replies FROM the control plane arrive on other interfaces and return
+    # untouched. A blanket established accept would let pre-existing
+    # range-originated tunnels survive the deny (audit R05).
+    ct state established,related ip daddr {mgmt} iifname "{bridge}" accept
+    ct state established,related ip daddr {ctrl} iifname "{bridge}" accept
 
-    # IPv4: intra-range operation is allowed (scenario hosts must talk) —
-    # DESTINATION-CONSTRAINED: range -> range only, not range -> anything
-    ip protocol ip ip saddr @range_hosts ip daddr @range_hosts accept
+    # IPv4 intra-range operation is allowed (scenario hosts must talk) —
+    # DESTINATION-CONSTRAINED: range -> range only, not range -> anything.
+    # NOTE: the UPPER-LAYER protocol field is deliberately NOT used as an
+    # "is IPv4" test (audit N06: the old generic use was a mistake; the
+    # chain is already IPv4-scoped by its matches).
+    ip saddr @range_hosts ip daddr @range_hosts accept
     # ...range hosts shipping telemetry/events to the control plane API...
-    ip protocol tcp ip daddr {ctrl} tcp dport {api_port} accept
+    ip protocol tcp ip daddr {ctrl} tcp dport {api_port} ct state new accept
     # ...control-plane management NEW connections, only to management port...
-    ip protocol tcp ip saddr {mgmt} ip daddr @range_hosts tcp dport 22 accept
+    ip protocol tcp ip saddr {mgmt} ip daddr @range_hosts tcp dport 22 ct state new accept
 
     # EXPLICIT DENY: no internet, no DNS, no DHCP, no update proxies, and
-    # no IPv6 whatsoever from the range. This is the hard constraint.
+    # no IPv6 whatsoever from the range — including connections that existed
+    # BEFORE this table was installed (no established escape). This is the
+    # hard constraint.
     meta nfproto ipv4 drop
     meta nfproto ipv6 drop
   }}
@@ -106,18 +197,24 @@ table inet {BASELINE_TABLE} {{
 """
 
 
-def render_emergency_ruleset(s: Settings | None = None, drop_existing: bool = False) -> str:
+def render_emergency_ruleset(s: Settings | None = None, drop_existing: bool = False,
+                             drop_inet: bool | None = None,
+                             drop_bridge: bool | None = None) -> str:
+    """Emergency drop for BOTH families. `drop_existing` (legacy) deletes both
+    tables first; the datapath now passes per-family flags so the transaction
+    only deletes tables that ACTUALLY exist (audit N06 item 5: with exactly
+    one table present, deleting the missing one aborted the whole
+    replacement)."""
     s = s or get_settings()
     bridge = s.range_bridge
-    # delete-if-present lines are emitted ONLY when the tables actually exist;
-    # together with the replacements they form ONE atomic `nft -f` transaction
-    # (audit R05: no gap between remove and load, and a failed load keeps the
-    # previous protection instead of removing it).
     deletes = ""
-    if drop_existing:
-        deletes = (f"delete table inet {EMERGENCY_TABLE}\n"
-                   f"delete table bridge {EMERGENCY_TABLE}_l2\n")
-    ports = [p.strip() for p in (s.range_bridge_ports or "").split(",") if p.strip()]
+    want_inet = drop_inet if drop_inet is not None else drop_existing
+    want_bridge = drop_bridge if drop_bridge is not None else drop_existing
+    if want_inet:
+        deletes += f"delete table inet {EMERGENCY_TABLE}\n"
+    if want_bridge:
+        deletes += f"delete table bridge {EMERGENCY_TABLE}_l2\n"
+    ports = bridge_ports(s)
     port_set = ""
     if ports:
         elems = ", ".join(f'"{p}"' for p in ports)
@@ -158,13 +255,17 @@ table bridge {EMERGENCY_TABLE}_l2 {{
 """
 
 
-def render_emergency_removal(s: Settings | None = None) -> str:
-    """ONE atomic removal of BOTH emergency families (audit R05: removing only
-    the inet table left the L2 emergency installed while release reported
-    success)."""
-    return (f"#!/usr/sbin/nft -f\n"
-            f"delete table inet {EMERGENCY_TABLE}\n"
-            f"delete table bridge {EMERGENCY_TABLE}_l2\n")
+def render_emergency_removal(drop_inet: bool = True, drop_bridge: bool = True) -> str:
+    """ONE atomic removal of the emergency families that EXIST (audit N06 item
+    5: unconditionally deleting both tables aborted the transaction when one
+    was absent; N06 also keeps both families removed together — removing only
+    inet left the L2 drop installed while release reported success)."""
+    lines = ["#!/usr/sbin/nft -f"]
+    if drop_inet:
+        lines.append(f"delete table inet {EMERGENCY_TABLE}")
+    if drop_bridge:
+        lines.append(f"delete table bridge {EMERGENCY_TABLE}_l2")
+    return "\n".join(lines) + "\n"
 
 
 def main(argv: list[str]) -> int:

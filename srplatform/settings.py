@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     runner_ssh_target: str = ""       # e.g. runner@10.66.0.9 — fixed destination
     runner_ssh_key_path: str = ""     # dedicated low-privilege key, NOT root
     runner_ssh_known_hosts: str = ""  # pinned host key file (TOFU not accepted in prod)
+    # path of the runner-side supervisor ON THE RUNNER (infra/runner/
+    # runner_supervise.sh installed as this command; absolute path preferred)
+    runner_supervisor_bin: str = "runner-supervisor"
     runner_command_timeout_s: int = 120
     runner_max_output_bytes: int = 8000
 

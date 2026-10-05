@@ -910,6 +910,32 @@ def safety_datapath_proof(body: DatapathProofIn, p: Principal = Depends(operator
     return {"ok": True, "ttl_h": sup.settings.safety_evidence_max_age_h}
 
 
+class KillswitchTestIn(BaseModel):
+    commands_stopped: bool
+    datapath_isolated: bool
+    detail: dict = Field(default_factory=dict)
+
+
+@app.post("/safety/killswitch-test")
+def safety_killswitch_test(body: KillswitchTestIn, p: Principal = Depends(operator)):
+    """RECORD the operator's killswitch acceptance test (audit N07): during a
+    real engagement the operator observed (a) model/worker commands CEASED
+    (runner cancellation effective) and (b) datapath ISOLATION held (including
+    same-bridge). Both observations are mandatory; a partial test records
+    ok=false and therefore never authorizes a start. The record binds to the
+    current config identity and is invalidated by the next engage/release —
+    release can never reuse an old datapath proof."""
+    ok = bool(body.commands_stopped and body.datapath_isolated)
+    sup = get_supervisor()
+    sup.record("killswitch_test", ok,
+               {"commands_stopped": body.commands_stopped,
+                "datapath_isolated": body.datapath_isolated,
+                "detail": body.detail, "by": p.username})
+    return {"ok": ok,
+            "note": "recorded" if ok else "recorded as FAILED — starts stay denied "
+                    "until a complete test passes"}
+
+
 # --- agent_state (worker-scoped working memory) ---------------------------------
 class AgentStateIn(BaseModel):
     summary: str | None = None

@@ -244,9 +244,11 @@ def test_r04_release_invalidates_previously_valid_evidence(tmp_path, monkeypatch
         from tests.helpers import FakeDatapath
 
         sup = Supervisor(datapath=FakeDatapath(), state_file=str(tmp_path / "s.json"))
+        sup.initialize_state(reason="test bootstrap")
         # valid, fresh evidence recorded BEFORE an engage/release cycle
         sup.record("baseline_check", True, {})
         sup.record("datapath_proof", True, {})
+        sup.record("killswitch_test", True, {})
         ok, why = sup.start_gate()
         assert ok, f"fresh evidence should pass the gate pre-cycle: {why}"
 
@@ -412,8 +414,12 @@ def test_r05_baseline_render_is_destination_constrained_and_port_aware(monkeypat
         base = render_baseline_ruleset()
         assert "ip saddr @range_hosts ip daddr @range_hosts accept" in base
         assert "tcp dport 9999" in base, "ingest port must come from settings"
-        assert "ct state established,related ip saddr {" in base, \
-            "established accept must be source-scoped, not blanket"
+        # audit N06: reply directions are EXPLICIT (replies to control paths
+        # arrive on the range bridge, destination-scoped) — no blanket
+        # established accept, and no mistaken `ip protocol ip`
+        assert 'ct state established,related ip daddr 10.0.0.0/24 iifname "vmbr1" accept' in base
+        assert 'ct state established,related ip daddr 10.9.8.7 iifname "vmbr1" accept' in base
+        assert "ip protocol ip" not in base, "ip protocol is the UPPER-LAYER field, not 'is IPv4'"
     finally:
         get_settings.cache_clear()
 
@@ -434,41 +440,63 @@ def test_r05_emergency_render_uses_port_topology_and_atomic_removal(monkeypatch)
         get_settings.cache_clear()
 
 
-def test_r05_controller_applies_atomically_and_verifies_both_families():
+def test_r05_controller_applies_atomically_and_verifies_both_families(monkeypatch):
+    import json as _json
     from srplatform.safety import datapath as dp
+    from srplatform.safety import firewall
+    from srplatform.settings import get_settings
 
     nft = dp.NftDatapath.__new__(dp.NftDatapath)
-    from srplatform.settings import get_settings
     nft.s = get_settings()
+    # coverage validated independently (its own tests); focus: atomicity
+    monkeypatch.setattr(firewall, "validate_port_coverage", lambda s: (True, "ports ok"))
     calls = {"stdin": [], "run": []}
-
-    def fake_stdin(ruleset):
-        calls["stdin"].append(ruleset)
-        is_pure_removal = "delete table" in ruleset and "table inet sr_emergency {" not in ruleset
-        if is_pure_removal:
-            state["tables"] -= {f"inet {dp.EMERGENCY_TABLE}", f"bridge {dp.EMERGENCY_TABLE}_l2"}
-        return 0, ""
-
     state = {"tables": {f"inet {dp.EMERGENCY_TABLE}", f"bridge {dp.EMERGENCY_TABLE}_l2",
                         f"inet {dp.BASELINE_TABLE}"}}
 
+    def fake_stdin(ruleset):
+        calls["stdin"].append(ruleset)
+        if "table inet sr_emergency {" in ruleset:  # apply transaction
+            state["tables"] |= {f"inet {dp.EMERGENCY_TABLE}", f"bridge {dp.EMERGENCY_TABLE}_l2"}
+        elif "delete table" in ruleset:            # pure removal transaction
+            for line in ruleset.splitlines():
+                if line.startswith("delete table "):
+                    state["tables"].discard(line.split("delete table ")[1].strip())
+        return 0, ""
+
     def fake_run(args):
         calls["run"].append(args)
-        if args[:2] == ["-nn", "list"]:
-            return (0, "chain range_forward { meta nfproto ipv4 drop; meta nfproto ipv6 drop;"
-                       " ip saddr @range_hosts ip daddr @range_hosts accept }") \
-                if args[-1] in state["tables"] else (1, "nope")
+        if args[:2] == ["-nn", "list"] or args[:3] == ["-nn", "-j", "list"]:
+            name = args[-1]
+            if name not in state["tables"]:
+                return 1, "nope"
+            if "-j" in args:
+                fam = name.split()[0]
+                # REAL nft JSON: flat entries — table, then chain with hook
+                doc = {"nftables": [
+                    {"table": {"family": fam, "name": name.split()[1], "handle": 1}},
+                    {"chain": {"family": fam, "table": name.split()[1], "name": "c",
+                               "handle": 2, "type": "filter", "hook": "forward",
+                               "prio": -150, "policy": "accept"}}]}
+                return 0, _json.dumps(doc)
+            return 0, f"table {name}"
         return 0, ""
 
     nft._run_nft_stdin = fake_stdin
     nft._run_nft = fake_run
+    nft.baseline_status = lambda: {"ok": True, "detail": "baseline ok (faked)",
+                                   "mechanism": "nft"}
 
     res = nft.apply_emergency()
-    assert res["ok"]
+    assert res["ok"], res
     assert len(calls["stdin"]) == 1, "apply must be ONE atomic nft -f transaction"
     assert "delete table inet" in calls["stdin"][0], "existing tables replaced atomically"
+    # post-apply BOTH families verified hooked
+    checked = [a[-1] for a in calls["run"] if a[:3] == ["-nn", "-j", "list"]]
+    assert f"inet {dp.EMERGENCY_TABLE}" in checked and f"bridge {dp.EMERGENCY_TABLE}_l2" in checked
 
-    # removal: one atomic transaction covering BOTH families, then verification
+    # removal: BASELINE CHECKED FIRST, one atomic transaction covering BOTH
+    # families, then verification
     res = nft.remove_emergency()
     assert res["ok"], res
     removal = calls["stdin"][-1]
@@ -476,6 +504,109 @@ def test_r05_controller_applies_atomically_and_verifies_both_families():
     assert "delete table bridge sr_emergency_l2" in removal
     checked = [a[-1] for a in calls["run"] if a[:2] == ["-nn", "list"]]
     assert f"inet {dp.EMERGENCY_TABLE}" in checked and f"bridge {dp.EMERGENCY_TABLE}_l2" in checked
+
+
+def test_r06_apply_refused_without_port_coverage(monkeypatch):
+    """Audit N06 item 1: missing/stale port coverage must PREVENT a
+    full-success emergency — a warning riding with ok=true was the fail-open
+    the probe reproduced (missing_bridge_ports_apply)."""
+    from srplatform.safety import datapath as dp
+    from srplatform.safety import firewall
+    from srplatform.settings import get_settings
+
+    nft = dp.NftDatapath.__new__(dp.NftDatapath)
+    nft.s = get_settings()
+    monkeypatch.setattr(firewall, "validate_port_coverage",
+                        lambda s: (False, "RANGE_BRIDGE_PORTS not configured"))
+    applied = []
+    nft._run_nft_stdin = lambda rs: (applied.append(rs) or (0, ""))
+    res = nft.apply_emergency()
+    assert res["ok"] is False
+    assert applied == [], "no nft transaction may run when coverage is unestablished"
+
+
+def test_r06_table_presence_combinations(monkeypatch):
+    """Audit N06 item 5: apply/release are atomic for neither/inet-only/
+    bridge-only/both — only EXISTING tables are deleted."""
+    import json as _json
+    from srplatform.safety import datapath as dp
+    from srplatform.safety import firewall
+    from srplatform.settings import get_settings
+
+    for inet_present, bridge_present in ((False, False), (True, False),
+                                         (False, True), (True, True)):
+        nft = dp.NftDatapath.__new__(dp.NftDatapath)
+        nft.s = get_settings()
+        monkeypatch.setattr(firewall, "validate_port_coverage",
+                            lambda s: (True, "ports ok"))
+        state = {"tables": set()}
+        if inet_present:
+            state["tables"].add(f"inet {dp.EMERGENCY_TABLE}")
+        if bridge_present:
+            state["tables"].add(f"bridge {dp.EMERGENCY_TABLE}_l2")
+        txns = []
+
+        def fake_stdin(ruleset):
+            txns.append(ruleset)
+            if "table inet sr_emergency {" in ruleset:
+                state["tables"] |= {f"inet {dp.EMERGENCY_TABLE}",
+                                    f"bridge {dp.EMERGENCY_TABLE}_l2"}
+            elif "delete table" in ruleset:
+                for line in ruleset.splitlines():
+                    if line.startswith("delete table "):
+                        state["tables"].discard(line.split("delete table ")[1].strip())
+            return 0, ""
+
+        def fake_run(args):
+            if args[:2] == ["-nn", "list"] or args[:3] == ["-nn", "-j", "list"]:
+                name = args[-1]
+                if name not in state["tables"]:
+                    return 1, "nope"
+                if "-j" in args:
+                    fam = name.split()[0]
+                    doc = {"nftables": [
+                        {"table": {"family": fam, "name": name.split()[1],
+                                   "handle": 1}},
+                        {"chain": {"family": fam, "table": name.split()[1],
+                                   "name": "c", "handle": 2, "type": "filter",
+                                   "hook": "forward", "prio": -150,
+                                   "policy": "accept"}}]}
+                    return 0, _json.dumps(doc)
+                return 0, f"table {name}"
+            return 0, ""
+
+        nft._run_nft_stdin = fake_stdin
+        nft._run_nft = fake_run
+        nft.baseline_status = lambda: {"ok": True, "detail": "faked", "mechanism": "nft"}
+
+        res = nft.apply_emergency()
+        assert res["ok"], (inet_present, bridge_present, res)
+        txn = txns[-1]
+        assert (("delete table inet" in txn) == inet_present), txn
+        assert (("delete table bridge" in txn) == bridge_present), txn
+
+        res = nft.remove_emergency()
+        assert res["ok"], (inet_present, bridge_present, res)
+        assert not state["tables"], state["tables"]
+
+
+def test_r06_release_refuses_and_retains_when_baseline_unverified(monkeypatch):
+    """Audit N06 item 6: emergency protection is never dropped before the
+    baseline is verified; a failed baseline check retains the emergency."""
+    from srplatform.safety import datapath as dp
+    from srplatform.safety import firewall
+    from srplatform.settings import get_settings
+
+    nft = dp.NftDatapath.__new__(dp.NftDatapath)
+    nft.s = get_settings()
+    monkeypatch.setattr(firewall, "validate_port_coverage", lambda s: (True, "ok"))
+    stdin_calls = []
+    nft._run_nft_stdin = lambda rs: (stdin_calls.append(rs) or (0, ""))
+    nft.table_exists = lambda t: True
+    nft.baseline_status = lambda: {"ok": False, "detail": "baseline broken", "mechanism": "nft"}
+    res = nft.remove_emergency()
+    assert res["ok"] is False
+    assert stdin_calls == [], "emergency removal ran despite unverified baseline"
 
 
 def test_r05_baseline_verification_checks_rules_not_just_table():
@@ -490,25 +621,231 @@ def test_r05_baseline_verification_checks_rules_not_just_table():
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0
-                    or not __import__("shutil").which("nft"),
-                    reason="needs root + nft")
-def test_r05_real_nft_apply_remove_roundtrip():
-    """Real nftables round-trip on this host (tables are range-scoped names;
-    no real interfaces match, so host traffic is unaffected)."""
+                    or not __import__("shutil").which("nft")
+                    or not __import__("shutil").which("ip"),
+                    reason="needs root + nft + iproute2")
+def test_r05_real_nft_apply_remove_roundtrip(tmp_path):
+    """Real nftables round-trip INSIDE A DISPOSABLE NETWORK NAMESPACE with a
+    disposable bridge — never the developer's real range namespace (audit
+    N06: privileged tests only in disposable test namespaces)."""
+    import subprocess as sp
+    import uuid
     from srplatform.safety import datapath as dp
-    from srplatform.settings import get_settings
+    from srplatform.settings import Settings
 
-    nft = dp.NftDatapath(get_settings())
+    ns = f"srtest{uuid.uuid4().hex[:8]}"
+    br, p1, p2 = "srbr0", "srp1", "srp2"
+
+    def ip(*args, check=True):
+        return sp.run(["ip", *args], capture_output=True, text=True, check=check)
+
+    ip("netns", "add", ns)
     try:
+        def n(*args, check=True):
+            return ip("netns", "exec", ns, "ip", *args, check=check)
+
+        n("link", "add", br, "type", "bridge")
+        n("link", "add", p1, "type", "veth", "peer", "name", f"{p1}e")
+        n("link", "add", p2, "type", "veth", "peer", "name", f"{p2}e")
+        n("link", "set", p1, "master", br)
+        n("link", "set", p2, "master", br)
+        for d in (p1, f"{p1}e", p2, f"{p2}e", br):
+            n("link", "set", d, "up")
+
+        s = Settings(sr_env="dev", range_bridge=br, range_bridge_ports=f"{p1},{p2}",
+                     api_base_url="http://10.66.0.1:8000", datapath_controller="nft",
+                     nft_command_prefix=f"ip netns exec {ns} ", safety_state_file=str(tmp_path / "st"))
+        nft = dp.NftDatapath(s)
+        try:
+            res = nft.apply_emergency()
+            assert res["ok"], res
+            assert nft.table_exists(f"inet {dp.EMERGENCY_TABLE}")
+            assert nft.table_exists(f"bridge {dp.EMERGENCY_TABLE}_l2")
+            # JSON verification sees the REAL hooked chains
+            base = nft.baseline_status()
+            assert base["ok"] is False and "ABSENT" in base["detail"]
+            # release REFUSES while the baseline is absent (removing the
+            # emergency with no deny behind it would open the range)
+            refused = nft.remove_emergency()
+            assert refused["ok"] is False and "baseline" in refused["detail"].lower()
+            assert nft.table_exists(f"inet {dp.EMERGENCY_TABLE}")
+            # install the baseline, THEN release atomically
+            code, out = nft._run_nft_stdin(nft.render_baseline())
+            assert code == 0, out
+        finally:
+            res = nft.remove_emergency() if nft.table_exists(
+                f"inet {dp.EMERGENCY_TABLE}") else {"ok": True}
+        assert res["ok"], res
+        assert not nft.table_exists(f"inet {dp.EMERGENCY_TABLE}")
+        assert not nft.table_exists(f"bridge {dp.EMERGENCY_TABLE}_l2")
+        # baseline survives the emergency removal (release never strips the deny)
+        assert nft.baseline_status()["ok"] is True
+    finally:
+        ip("netns", "del", ns, check=False)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0
+                    or not __import__("shutil").which("nft")
+                    or not __import__("shutil").which("ip"),
+                    reason="needs root + nft + iproute2")
+def test_r06_disposable_netns_packet_semantics(tmp_path, monkeypatch):
+    """Audit N06 packet evidence in DISPOSABLE namespaces: with the rendered
+    baseline applied, intra-range IPv4 is allowed, range WAN egress and IPv6
+    are dropped, routed management SSH into the range works INCLUDING its
+    replies (the reply-direction rule the review found missing), range->API
+    ingest works while other control-plane ports are dropped, and the
+    emergency drop severs intra-range traffic."""
+    import subprocess as sp
+    import uuid
+    from srplatform.safety import datapath as dp
+    from srplatform.safety import firewall
+    from srplatform.settings import Settings
+
+    uid = uuid.uuid4().hex[:6]
+    ns, RANGE1, RANGE2, WAN, MGMT, SRV = (f"sr_{u}{uid}" for u in
+                                          ("rt", "r1", "r2", "wn", "mg", "sv"))
+    R1_IP, R2_IP, GW_IP = "10.66.0.10", "10.66.0.11", "10.66.0.1"
+    WAN_GW, WAN_IP = "10.99.0.1", "10.99.0.20"
+    MGMT_GW, MGMT_IP = "10.0.0.1", "10.0.0.2"
+    SRV_GW, SRV_IP, API_PORT = "10.88.0.1", "10.88.0.2", 8000
+    br = "srbr0"
+
+    def ip(*args, check=True):
+        return sp.run(["ip", *args], capture_output=True, text=True, check=check)
+
+    def inns(target, *args, check=True):
+        return ip("netns", "exec", target, "ip", *args, check=check)
+
+    def sysctl_ns(target, key, value):
+        # /proc/sys must be the namespace's own — remount proc privately
+        path = "/proc/sys/" + key.replace(".", "/")
+        return ip("netns", "exec", target, "unshare", "-m", "--mount-proc",
+                  "sh", "-c", f"echo {value} > {path}")
+
+    created = []
+    try:
+        for name in (ns, RANGE1, RANGE2, WAN, MGMT, SRV):
+            ip("netns", "add", name)
+            created.append(name)
+
+        def link_pair(a_ns, a_name, b_ns, b_name, a_ip=None, b_ip=None, via=None):
+            ip("link", "add", f"x{a_name}", "type", "veth", "peer", "name", f"x{b_name}")
+            ip("link", "set", f"x{a_name}", "netns", a_ns)
+            ip("link", "set", f"x{b_name}", "netns", b_ns)
+            inns(a_ns, "link", "set", f"x{a_name}", "name", a_name)
+            inns(b_ns, "link", "set", f"x{b_name}", "name", b_name)
+            for t, d in ((a_ns, a_name), (b_ns, b_name)):
+                inns(t, "link", "set", d, "up")
+            if a_ip:
+                inns(a_ns, "addr", "add", a_ip, "dev", a_name)
+            if b_ip:
+                inns(b_ns, "addr", "add", b_ip, "dev", b_name)
+            if via:
+                inns(b_ns, "route", "add", "default", "via", via, check=False)
+
+        # router: bridge with two range hosts
+        inns(ns, "link", "add", br, "type", "bridge")
+        inns(ns, "addr", "add", f"{GW_IP}/24", "dev", br)
+        inns(ns, "link", "set", br, "up")
+        sysctl_ns(ns, "net.ipv4.ip_forward", 1)
+        for name, ipaddr in ((RANGE1, R1_IP), (RANGE2, R2_IP)):
+            a = f"v{name[3:5]}"
+            ip("link", "add", f"x{a}", "type", "veth", "peer", "name", f"y{a}")
+            ip("link", "set", f"x{a}", "netns", ns)
+            ip("link", "set", f"y{a}", "netns", name)
+            inns(ns, "link", "set", f"x{a}", "name", a)
+            inns(ns, "link", "set", a, "master", br)
+            inns(ns, "link", "set", a, "up")
+            inns(name, "link", "set", f"y{a}", "name", "eth0")
+            inns(name, "link", "set", "eth0", "up")
+            inns(name, "addr", "add", f"{ipaddr}/24", "dev", "eth0")
+            inns(name, "route", "add", "default", "via", GW_IP)
+        # WAN, management and API server: routed through the router netns
+        link_pair(ns, "wan0", WAN, "eth0", a_ip=f"{WAN_GW}/24", b_ip=f"{WAN_IP}/24",
+                  via=WAN_GW)
+        link_pair(ns, "mgmt0", MGMT, "eth0", a_ip=f"{MGMT_GW}/24", b_ip=f"{MGMT_IP}/24",
+                  via=MGMT_GW)
+        link_pair(ns, "srv0", SRV, "eth0", a_ip=f"{SRV_GW}/24", b_ip=f"{SRV_IP}/24",
+                  via=SRV_GW)
+
+        s = Settings(sr_env="dev", range_bridge=br, range_cidr="10.66.0.0/24",
+                     management_cidr="10.0.0.0/24", range_bridge_ports="",
+                     api_base_url=f"http://{SRV_IP}:{API_PORT}", datapath_controller="nft",
+                     nft_command_prefix=f"ip netns exec {ns} ",
+                     safety_state_file=str(tmp_path / "st"))
+        nft = dp.NftDatapath(s)
+        monkeypatch.setattr(firewall, "validate_port_coverage",
+                            lambda s_: (True, "netns test"))
+
+        def ping(target, src=RANGE1, v6=False):
+            args = ["-6"] if v6 else []
+            r = ip("netns", "exec", src, "ping", *args, "-c", "1", "-W", "2",
+                   target, check=False)
+            return r.returncode == 0
+
+        def tcp_probe(target_ns, hostport, expect, timeout=3):
+            return ip("netns", "exec", target_ns, "python3", "-c",
+                        "import socket\n"
+                        "try:\n"
+                        f"    s=socket.create_connection(('{hostport[0]}',{hostport[1]}),{timeout})\n"
+                        "    d=s.recv(32)\n"
+                        "    print('OPEN', d.decode())\n"
+                        "except Exception:\n"
+                        "    print('BLOCKED')", check=False)
+
+        # listeners (background, inside their netns)
+        def listener(netns, bind, port, reply):
+            return sp.Popen(["ip", "netns", "exec", netns, "python3", "-c",
+                             "import socket\n"
+                             "s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+                             f"s.bind(('{bind}',{port})); s.listen(1)\n"
+                             "c,_=s.accept(); c.sendall(b'" + reply + "'); c.close()"],
+                            stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+
+        # 1. baseline applied and STRUCTURALLY verified against real nft
+        code, out = nft._run_nft_stdin(nft.render_baseline())
+        assert code == 0, out
+        status = nft.baseline_status()
+        assert status["ok"] is True, status["detail"]
+
+        # 2. intra-range IPv4 allowed
+        assert ping(R2_IP), "intra-range IPv4 must be allowed"
+        # 3. range WAN egress dropped (including pre-existing routes)
+        assert not ping(WAN_IP), "range WAN egress must be dropped"
+        # 4. IPv6 dropped
+        assert not ping("fd00:66::2", v6=True), "range IPv6 must be dropped"
+
+        # 5. routed management SSH into the range, replies included
+        l = listener(RANGE1, R1_IP, 22, "banner")
+        try:
+            import time
+            time.sleep(0.4)
+            r = tcp_probe(MGMT, (R1_IP, 22), "banner")
+            assert "OPEN" in r.stdout and "banner" in r.stdout, \
+                f"management SSH flow (incl. replies) must work: {r.stdout}{r.stderr}"
+        finally:
+            l.terminate(); l.wait(timeout=5)
+
+        # 6. range -> API ingest allowed with replies; other ports dropped
+        l = listener(SRV, SRV_IP, API_PORT, "ok")
+        try:
+            import time
+            time.sleep(0.4)
+            r = tcp_probe(RANGE2, (SRV_IP, API_PORT), "ok")
+            assert "OPEN" in r.stdout and "ok" in r.stdout, \
+                f"range->API ingest flow must work: {r.stdout}{r.stderr}"
+        finally:
+            l.terminate(); l.wait(timeout=5)
+        r = tcp_probe(RANGE2, (SRV_IP, 9999), "BLOCKED", timeout=2)
+        assert "BLOCKED" in r.stdout, "non-ingest control-plane ports must be dropped"
+
+        # 7. EMERGENCY severs intra-range traffic
         res = nft.apply_emergency()
         assert res["ok"], res
-        assert nft.table_exists(f"inet {dp.EMERGENCY_TABLE}")
-        assert nft.table_exists(f"bridge {dp.EMERGENCY_TABLE}_l2")
+        assert not ping(R2_IP), "emergency must sever intra-range traffic"
     finally:
-        # remove unconditionally via the controller's ONE atomic transaction
-        nft._run_nft_stdin(nft.render_emergency_removal())
-    assert not nft.table_exists(f"inet {dp.EMERGENCY_TABLE}")
-    assert not nft.table_exists(f"bridge {dp.EMERGENCY_TABLE}_l2")
+        for name in created:
+            ip("netns", "del", name, check=False)
 
 
 # =========================================================================== #
@@ -811,7 +1148,9 @@ def test_r01_real_worker_end_to_end_over_http(migrated_db, test_db_url_owner, tm
     monkeypatch.setenv("SAFETY_STATE_FILE", str(tmp_path / "safety.json"))
     monkeypatch.setenv("RUNNER_TRANSPORT", "local-dev")
     get_settings.cache_clear()
-    set_supervisor(Supervisor(datapath=NoopDatapath(), state_file=str(tmp_path / "s.json")))
+    sup = Supervisor(datapath=NoopDatapath(), state_file=str(tmp_path / "s.json"))
+    sup.initialize_state(reason="test fixture initialization")
+    set_supervisor(sup)
 
     fake_model = FakeOpenAI()
     fake_model.start()
@@ -922,7 +1261,9 @@ def test_r02_bastion_token_login_binds_owner_key(migrated_db, test_db_url_owner,
     monkeypatch.setenv("SAFETY_STATE_FILE", str(tmp_path / "safety.json"))
     monkeypatch.setenv("BASTION_AUTHORIZED_KEYS_FILE", str(keys_file))
     get_settings.cache_clear()
-    set_supervisor(Supervisor(datapath=NoopDatapath(), state_file=str(tmp_path / "s.json")))
+    sup = Supervisor(datapath=NoopDatapath(), state_file=str(tmp_path / "s.json"))
+    sup.initialize_state(reason="test fixture initialization")
+    set_supervisor(sup)
 
     port = _free_port()
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))

@@ -84,6 +84,7 @@ class Supervisor:
         self.datapath = datapath if datapath is not None else get_datapath(self.settings)
         self.state_file = Path(state_file or self.settings.safety_state_file)
         self._mirror_dh = None  # test hook: shared dict mirroring DB records
+        self._records_reader = None  # test hook: callable -> DB record dicts
 
     # ---------------------------------------------------------------- latch ---
     def _read_state(self) -> tuple[dict, str | None]:
@@ -145,9 +146,13 @@ class Supervisor:
             return None, f"state DB mirror unreadable: {e}"
 
     def latch_status(self) -> dict:
-        """CONSERVATIVE reconciliation of the durable stores (audit R04):
+        """CONSERVATIVE reconciliation of the durable stores (audit N04/N07):
         latched if EITHER store says so; if BOTH are unreadable, FAIL CLOSED.
-        Persistence problems are exposed, never hidden."""
+        A MISSING file is only a legitimate fresh-install when the DB mirror
+        positively confirms it (a row with latched=False, or a recorded
+        release). Missing file + unreadable DB = LOST STATE, not 'not
+        latched' — losing the file during a DB outage must not forget an
+        engagement."""
         st, file_err = self._read_state()
         db_st, db_err = self._db_read_state()
         problems = [p for p in (file_err, db_err) if p]
@@ -155,6 +160,20 @@ class Supervisor:
             return {"latched": True, "latched_at": None,
                     "reason": "safety state stores unreadable — failing closed",
                     "persistence_error": "; ".join(problems)}
+        file_missing = not st and not file_err
+        db_missing = db_st is None and not db_err
+        if file_missing and db_err:
+            return {"latched": True, "latched_at": None,
+                    "reason": "state file missing and DB mirror unreadable — "
+                              "cannot prove release; failing closed",
+                    "persistence_error": "; ".join(problems)}
+        if file_missing and db_missing:
+            # neither store has ANY evidence — first install or lost state.
+            # Fail closed until an operator initializes explicitly.
+            return {"latched": True, "latched_at": None,
+                    "reason": "no safety state in any durable store — first install "
+                              "or lost state; run the documented safety initialization",
+                    "persistence_error": "no affirmative release evidence"}
         db_latched = bool((db_st or {}).get("latched"))
         latched = bool(st.get("latched")) or db_latched
         out = {"latched": latched,
@@ -164,59 +183,97 @@ class Supervisor:
             out["persistence_error"] = "; ".join(problems)
         return out
 
+    def initialize_state(self, reason: str = "documented first-install initialization") -> dict:
+        """Explicit first-install bootstrap (audit N07: define explicit
+        first-install initialization instead of treating missing state as a
+        healthy fresh store). Writes an affirmative NOT-latched record to
+        BOTH durable stores."""
+        file_err, mirror_err = self._write_state({"latched": False, "reason": reason,
+                                                  "initialized": True})
+        self.record("state_initialize", not file_err, {"reason": reason,
+                                                       "file_error": file_err,
+                                                       "mirror_error": mirror_err})
+        return {"ok": not file_err, "file_error": file_err, "mirror_error": mirror_err}
+
     # --------------------------------------------------------------- records ---
     def record(self, kind: str, ok: bool, detail: dict | None = None) -> None:
-        """Append a safety record (baseline_check|datapath_proof|engage|release).
-        Records are never rewritten; validity is derived from the newest ones."""
+        """Append a safety record (baseline_check|datapath_proof|killswitch_test|
+        engage|release). Records are never rewritten; validity is derived from
+        the newest ones. Persistence failures are RETAINED for start_gate
+        (audit N07: a record that could not be persisted must deny starts,
+        not silently vanish)."""
         identity = config_identity(self.settings)
         if self._mirror_dh is not None:
             self._mirror_dh.append({"kind": kind, "ok": ok, "config_identity": identity,
                                     "detail": detail or {}, "recorded_at": time.time()})
+        self._record_failures = list(getattr(self, "_record_failures", []))
         try:
             from srplatform.db.models import SafetyRecord
             from srplatform.db.session import db
             with db() as s:
                 s.add(SafetyRecord(kind=kind, ok=ok, config_identity=identity,
                                    detail=detail or {}))
-        except Exception:
-            pass  # record also lives in the file mirror for restart-durability
-        self._append_file_record(kind, ok, identity, detail)
+        except Exception as e:  # noqa: BLE001 — observable, never swallowed
+            self._record_failures.append(f"db record '{kind}': {e}")
+        ferr = self._append_file_record(kind, ok, identity, detail)
+        if ferr:
+            self._record_failures.append(ferr)
 
-    def _append_file_record(self, kind, ok, identity, detail) -> None:
+    def _append_file_record(self, kind, ok, identity, detail) -> str | None:
         try:
             p = self.state_file.parent / (self.state_file.name + ".records")
             p.parent.mkdir(parents=True, exist_ok=True)
             with p.open("a") as f:
                 f.write(json.dumps({"kind": kind, "ok": ok, "config_identity": identity,
                                     "detail": detail or {}, "recorded_at": time.time()}) + "\n")
-        except OSError:
-            pass
+            return None
+        except OSError as e:
+            return f"file record '{kind}' write failed: {e}"
 
     def _latest_records(self) -> dict:
-        """Newest record per kind, from DB when reachable else file mirror."""
+        """Newest record per kind by TIMESTAMP, MERGING the DB and the file
+        mirror (audit N07: preferring the DB whenever any row exists let an
+        engage/release recorded only to the file during a DB outage be
+        forgotten once the DB became reachable again)."""
         out: dict[str, dict] = {}
-        try:
-            from sqlalchemy import select
-            from srplatform.db.models import SafetyRecord
-            from srplatform.db.session import db
-            with db() as s:
-                rows = s.execute(select(SafetyRecord).order_by(SafetyRecord.record_id)).scalars().all()
-                for r in rows:
-                    out[r.kind] = {"kind": r.kind, "ok": r.ok, "config_identity": r.config_identity,
-                                   "recorded_at": r.recorded_at.timestamp() if r.recorded_at else 0}
-            if out:
-                return out
-        except Exception:
-            pass
+
+        def consider(rec: dict) -> None:
+            kind = rec.get("kind")
+            if not kind:
+                return
+            cur = out.get(kind)
+            if cur is None or float(rec.get("recorded_at", 0)) >= float(cur.get("recorded_at", 0)):
+                out[kind] = rec
+
+        def db_records() -> list[dict]:
+            try:
+                from sqlalchemy import select
+                from srplatform.db.models import SafetyRecord
+                from srplatform.db.session import db
+                with db() as s:
+                    rows = s.execute(select(SafetyRecord).order_by(
+                        SafetyRecord.record_id)).scalars().all()
+                    return [{"kind": r.kind, "ok": r.ok, "config_identity": r.config_identity,
+                             "recorded_at": r.recorded_at.timestamp() if r.recorded_at else 0}
+                            for r in rows]
+            except Exception:
+                return []  # file mirror below still contributes
+        if self._records_reader is not None:
+            try:
+                for r in self._records_reader():
+                    consider(r)
+            except Exception:
+                pass
+        else:
+            for r in db_records():
+                consider(r)
         if self._mirror_dh is not None:
             for r in self._mirror_dh:
-                out[r["kind"]] = r
-            return out
+                consider(r)
         try:
             p = self.state_file.parent / (self.state_file.name + ".records")
             for line in p.read_text().splitlines():
-                r = json.loads(line)
-                out[r["kind"]] = r
+                consider(json.loads(line))
         except (OSError, json.JSONDecodeError):
             pass
         return out
@@ -236,11 +293,12 @@ class Supervisor:
         # check / datapath proof recorded BEFORE that event says nothing about
         # the current state and must not re-authorize a start.
         rec_ts = float(rec.get("recorded_at", 0))
-        for gate in ("engage", "release"):
-            g = recs.get(gate)
-            if g and float(g.get("recorded_at", 0)) >= rec_ts:
-                return False, (f"{kind} record predates the last {gate} — "
-                               "evidence invalidated, re-run the check")
+        if kind not in ("engage", "release"):
+            for gate in ("engage", "release"):
+                g = recs.get(gate)
+                if g and float(g.get("recorded_at", 0)) >= rec_ts:
+                    return False, (f"{kind} record predates the last {gate} — "
+                                   "evidence invalidated, re-run the check")
         age_h = (time.time() - rec_ts) / 3600
         if age_h > self.settings.safety_evidence_max_age_h:
             return False, f"{kind} record is stale ({age_h:.0f}h > {self.settings.safety_evidence_max_age_h}h)"
@@ -354,18 +412,32 @@ class Supervisor:
         return False, f"unknown runner transport '{t}'"
 
     def start_gate(self) -> tuple[bool, list[str]]:
-        """Every /run passes through this. Returns (allowed, reasons)."""
+        """Every /run passes through this. Returns (allowed, reasons).
+
+        Audit N07: a start additionally requires a SUCCESSFUL killswitch test
+        (command cessation + datapath isolation observed during an actual
+        engagement) bound to the current configuration identity — baseline
+        and proof records alone never proved the stop/isolation mechanism
+        works. Persistence failures also deny (state/evidence that cannot be
+        established cannot authorize a start)."""
         reasons: list[str] = []
         st = self.latch_status()
         if st["latched"]:
             reasons.append(f"SAFETY LATCHED since {st['latched_at']} ({st['reason']}) — "
                            "operator release required")
+        if st.get("persistence_error"):
+            reasons.append(f"safety state persistence problem: {st['persistence_error']}")
+        if getattr(self, "_record_failures", []):
+            reasons.append("safety record persistence failed since startup: "
+                           + "; ".join(self._record_failures[-3:]) +
+                           " — re-run the checks with working storage")
         runner_ok, why = self.runner_available()
         if not runner_ok:
             reasons.append(f"runner unavailable: {why}")
         dp_available = getattr(self.datapath, "mechanism", None) != "noop" or self.settings.sr_env == "production"
         for kind, label in (("baseline_check", "baseline verification"),
-                            ("datapath_proof", "operator datapath proof")):
+                            ("datapath_proof", "operator datapath proof"),
+                            ("killswitch_test", "killswitch stop/isolation test")):
             ok, why_r = self._record_fresh(kind)
             if not ok and dp_available:
                 reasons.append(f"{label}: {why_r}")

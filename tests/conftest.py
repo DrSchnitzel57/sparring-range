@@ -247,8 +247,12 @@ def client(env_dirs, clean_singletons, fake_pve, test_db_url_owner):
 
     wipe_data(test_db_url_owner)
     deps.set_proxmox(fake_pve)
-    set_supervisor(Supervisor(datapath=NoopDatapath(),
-                              state_file=str(env_dirs / "safety_state.json")))
+    sup = Supervisor(datapath=NoopDatapath(),
+                     state_file=str(env_dirs / "safety_state.json"))
+    # audit N07: missing state is LOST state, not a healthy fresh store —
+    # tests explicitly initialize the documented first-install state
+    sup.initialize_state(reason="test fixture initialization")
+    set_supervisor(sup)
     from srplatform.api.app import app
     import os as _os
     with TestClient(app, raise_server_exceptions=_os.environ.get("SR_TEST_RAISE") == "1") as c:
