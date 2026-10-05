@@ -185,6 +185,7 @@ class Run(Base):
     outcome: Mapped[str | None] = mapped_column(Text)
     pid: Mapped[int | None] = mapped_column(BigInteger)
     pgid: Mapped[int | None] = mapped_column(BigInteger)
+    pgid_pstart: Mapped[int | None] = mapped_column(BigInteger)  # leader start-time (R03 reuse guard)
     worker_token: Mapped[str | None] = mapped_column(Text)
     result: Mapped[dict | None] = mapped_column(JSONB)
     error: Mapped[str | None] = mapped_column(Text)

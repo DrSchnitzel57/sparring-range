@@ -3,9 +3,23 @@ designated isolated runner, never in the control-plane API environment.
 
 Transport: SSH to a FIXED destination (from settings), dedicated low-privilege
 user, pinned host key (StrictHostKeyChecking=yes — no TOFU, no `known_hosts=None`),
-BatchMode. Bounded time and output; cancellation kills the runner-side process
-group. There is deliberately NO fallback to a local shell: if the runner is
-unavailable, execution fails and the run fails visibly.
+BatchMode. Bounded time and output. There is deliberately NO fallback to a
+local shell: if the runner is unavailable, execution fails and the run fails
+visibly.
+
+CANCELLATION / STOP SEMANTICS (audit R03):
+  * Every command runs in its OWN process group and is registered in a
+    module-level handle set while executing.
+  * The worker installs a SIGTERM handler that calls `cancel_active()`, so
+    stopping the worker (which SIGTERMs its process group) also terminates the
+    CURRENTLY RUNNING command group — nothing survives the advertised stop.
+  * LOCAL transport: killing the group is authoritative.
+  * REMOTE (SSH) transport: killing the local ssh client does NOT by itself
+    kill a detached remote process. The remote command is started as the
+    session leader (`exec`) so the SIGHUP on transport loss reaches it, which
+    is best-effort, NOT a guarantee. A real cancel-and-acknowledge operation
+    protocol on the runner remains an explicit LIVE GATE (docs/ARCHITECTURE_
+    NOTES.md); no claim of remote group cancellation is made here.
 
 `LocalDevRunner` exists solely for developer machines (SR_ENV=dev, explicit
 `runner_transport=local-dev`) and refuses to run anything in production mode —
@@ -17,9 +31,57 @@ import os
 import shlex
 import signal
 import subprocess
+import threading
 from dataclasses import dataclass
 
 from srplatform.settings import Settings, get_settings
+
+# --------------------------------------------------------------- supervision
+# Command handles are supervised HERE (in the worker process), so that the
+# worker's stop path can terminate the actual command group — the API kills
+# the worker's group, the worker's signal handler kills command groups (R03).
+_ACTIVE_LOCK = threading.Lock()
+_ACTIVE: set[subprocess.Popen] = set()
+
+
+def _spawn_monitored(argv: list[str], **kw) -> subprocess.Popen:
+    proc = subprocess.Popen(argv, start_new_session=True, **kw)
+    with _ACTIVE_LOCK:
+        _ACTIVE.add(proc)
+    return proc
+
+
+def _finish(proc: subprocess.Popen) -> None:
+    with _ACTIVE_LOCK:
+        _ACTIVE.discard(proc)
+
+
+def cancel_active() -> int:
+    """Kill every command process group currently supervised by this process.
+    Returns how many groups were signalled."""
+    with _ACTIVE_LOCK:
+        procs = list(_ACTIVE)
+    n = 0
+    for p in procs:
+        _kill_group(p)
+        n += 1
+    return n
+
+
+def install_cancellation_handlers() -> None:
+    """Called by the worker: SIGTERM (graceful stop) and exit paths must not
+    leave command processes behind."""
+    import atexit
+    import sys
+
+    def _term(signum, frame):
+        try:
+            cancel_active()
+        finally:
+            sys.exit(143)
+
+    signal.signal(signal.SIGTERM, _term)
+    atexit.register(cancel_active)
 
 
 class RunnerUnavailable(RuntimeError):
@@ -75,10 +137,10 @@ class SshRunner(Runner):
         # remote login shell parses — so the model command must be quoted to
         # arrive at `bash -lc` as exactly one argument (no injection into the
         # transport layer; the command is still a full shell command ON the runner).
-        remote_cmd = f"bash -lc {shlex.quote(command)}"
+        remote_cmd = f"exec bash -lc {shlex.quote(command)}"
         full = self._base_cmd() + [remote_cmd]
-        proc = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, start_new_session=True)
+        proc = _spawn_monitored(full, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True)
         timed_out = False
         try:
             out, _ = proc.communicate(timeout=t)
@@ -90,7 +152,9 @@ class SshRunner(Runner):
             except Exception:
                 out = ""
         except OSError as e:
+            _finish(proc)
             return RunResult(exit_code=-1, output="", error=f"runner spawn failed: {e}")
+        _finish(proc)
         out = (out or "")[: self.s.runner_max_output_bytes]
         if timed_out:
             return RunResult(exit_code=124, output=out + "\n[runner] command timed out",
@@ -118,8 +182,8 @@ class LocalDevRunner(Runner):
         if self.s.sr_env == "production":
             raise RunnerUnavailable("local-dev runner is forbidden in production")
         t = timeout or self.s.runner_command_timeout_s
-        proc = subprocess.Popen(["/bin/bash", "-lc", command], stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        proc = _spawn_monitored(["/bin/bash", "-lc", command], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
         timed_out = False
         try:
             out, _ = proc.communicate(timeout=t)
@@ -130,6 +194,7 @@ class LocalDevRunner(Runner):
                 out, _ = proc.communicate(timeout=5)
             except Exception:
                 out = ""
+        _finish(proc)
         out = (out or "")[: self.s.runner_max_output_bytes]
         return RunResult(exit_code=124 if timed_out else proc.returncode,
                          output=out, timed_out=timed_out)

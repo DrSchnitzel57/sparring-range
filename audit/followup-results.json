@@ -1,44 +1,74 @@
 {
   "worker_bearer_auth": {
+    "status": "accepted",
+    "scope": "runner",
+    "session_bound": "sess-1"
+  },
+  "worker_credential_revoked_when_run_inactive": {
     "status": 401,
-    "detail": "authentication required",
-    "setup": "Run token exists only in runs; no WebToken/ServiceToken, matching start_run"
+    "detail": "run credential revoked (run is no longer active)"
   },
   "blue_expect_absent": {
     "arguments_received_by_verifier": [
       {
-        "host": "h"
+        "host": "h",
+        "expect": "absent"
       }
     ],
-    "recorded_expected": "true"
+    "recorded_expected": "absent"
   },
   "syscall_first_audit_record": [
     {
       "kind": "command",
       "ts": "2026-10-04T13:20:00+00:00",
-      "uid": null,
-      "comm": null,
-      "exe": null,
+      "uid": "1000",
+      "comm": "id",
+      "exe": "/usr/bin/id",
       "argv": "id",
-      "audit_key": null,
+      "audit_key": "sparring_cmd",
       "source_id": "101",
       "boot_id": "b",
       "raw": {
         "types": [
           "EXECVE",
-          "PROCTITLE"
+          "PROCTITLE",
+          "SYSCALL"
         ],
-        "syscall": {}
+        "syscall": {
+          "ts": 1791120000.1,
+          "uid": "1000",
+          "comm": "id",
+          "exe": "/usr/bin/id",
+          "key": "sparring_cmd"
+        }
       }
     }
   ],
-  "last_group_flushed_at_eof": [],
+  "last_group_flushed_at_eof": [
+    {
+      "source_id": 101,
+      "records": {
+        "EXECVE": {
+          "ts": 1791120000.1,
+          "argc": "1",
+          "a0": "id"
+        },
+        "PROCTITLE": {
+          "ts": 1791120000.1,
+          "proctitle": "6964"
+        }
+      }
+    }
+  ],
   "gateway_timeout": {
-    "worker_alive": false,
-    "next_request_completed": false
+    "worker_alive": true,
+    "next_request_completed": true
   },
   "gate_after_release_with_preexisting_evidence": [
-    true,
-    []
+    false,
+    [
+      "baseline verification: baseline_check record predates the last release \u2014 evidence invalidated, re-run the check",
+      "operator datapath proof: datapath_proof record predates the last release \u2014 evidence invalidated, re-run the check"
+    ]
   ]
 }

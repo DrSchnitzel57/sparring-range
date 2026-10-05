@@ -116,8 +116,12 @@ class ProxmoxClient:
 
     def clone_template(self, node: str, template_vmid: int, new_vmid: int, name: str,
                        full: bool = False, storage: str | None = None) -> str:
-        """Linked clone (full=False). Returns the UPID — CALLER MUST wait_for_task."""
-        kwargs: dict = {"newvmid": new_vmid, "name": name, "full": 1 if full else 0}
+        """Linked clone (full=False). Returns the UPID — CALLER MUST wait_for_task.
+
+        The documented PVE parameter for the destination id is `newid`
+        (https://pve.proxmox.com/pve-docs/api-viewer POST /nodes/{node}/qemu/{vmid}/clone);
+        `newvmid` is NOT a parameter and real PVE rejects it."""
+        kwargs: dict = {"newid": new_vmid, "name": name, "full": 1 if full else 0}
         if storage:
             kwargs["storage"] = storage
         return self.post(f"/nodes/{node}/qemu/{template_vmid}/clone", **kwargs)
@@ -220,7 +224,9 @@ class FakePVEHttp:
         if path.endswith("/config"):
             vmid = int(path.split("/qemu/")[1].split("/")[0])
             v = self.vms.get(vmid)
-            return dict(v.get("config", {})) if v else {}
+            if not v:
+                raise KeyError(f"no VM {vmid}")  # PVE 404s config of missing resources
+            return dict(v.get("config", {}))
         if "/status/current" in path:
             vmid = int(path.split("/qemu/")[1].split("/")[0])
             v = self.vms.get(vmid)
@@ -229,13 +235,25 @@ class FakePVEHttp:
             return {"status": v["status"], "vmid": vmid}
         return {}
 
+    #: documented POST /nodes/{node}/qemu/{vmid}/clone parameters (PVE API viewer).
+    #: The fake REJECTS anything else so adapter tests cannot agree with an
+    #: invented parameter name (audit R06: `newvmid` vs documented `newid`).
+    CLONE_PARAMS = {"newid", "name", "description", "full", "storage", "target",
+                    "format", "snapname"}
+
     def post(self, path, **kw):
         self.requests.append(("POST", path, kw))
         if any(f in path for f in self.fail_request_fragments):
             raise RuntimeError(f"injected request failure for {path}")
         if "/clone" in path:
+            unknown = set(kw) - self.CLONE_PARAMS
+            if unknown:
+                # real PVE answers 400 with "unrecognized parameter"
+                raise RuntimeError(f"400 unrecognized parameter(s): {sorted(unknown)}")
+            if "newid" not in kw:
+                raise RuntimeError("400 missing required parameter 'newid'")
             tpl = int(path.split("/qemu/")[1].split("/")[0])
-            new = int(kw["newvmid"])
+            new = int(kw["newid"])
             if new in self.vms:
                 raise RuntimeError(f"VMID {new} in use")
             if tpl not in self.vms:

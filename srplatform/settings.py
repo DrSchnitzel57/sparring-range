@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     # --- Range network (control-plane-side view) ---
     range_bridge: str = "vmbr1"
     range_vlan: int = 66
+    # Bridge PORTS (tap/vnet members) — the bridge-family emergency rules must
+    # match ports, not the bridge master (audit R05). Comma-separated; provision
+    # from `ls /sys/class/net/<bridge>/brif/`.
+    range_bridge_ports: str = ""
     range_cidr: str = "10.66.0.0/24"
     range_gateway: str = "10.66.0.1"
     bastion_address: str = "10.66.0.2"

@@ -23,7 +23,7 @@ from fastapi import Depends, Header, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from srplatform.db.models import ServiceToken, User, WebToken
+from srplatform.db.models import Run, ServiceToken, User, WebToken
 
 # scrypt parameters (interactive login: ~100ms class costs)
 _SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2**15, 8, 1
@@ -117,6 +117,16 @@ def _principal_from_token(db: Session, token: str) -> Principal:
         if not _live(st):
             raise HTTPException(401, "service token expired or revoked")
         return Principal(kind="service", scope=st.scope, session_id=st.session_id, host=st.host)
+    # run-scoped red-worker credential (audit R01): the run manager stores ONLY
+    # the sha256 of the token the worker was spawned with. It authenticates as
+    # the `runner` capability bound to that run's session, and dies with the
+    # run: a finished/cancelled/failed run's credential is REVOKED here.
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    run = db.execute(select(Run).where(Run.worker_token == digest)).scalars().first()
+    if run is not None:
+        if run.status not in ("queued", "running"):
+            raise HTTPException(401, "run credential revoked (run is no longer active)")
+        return Principal(kind="service", scope="runner", session_id=run.session_id)
     raise HTTPException(401, "authentication required")
 
 

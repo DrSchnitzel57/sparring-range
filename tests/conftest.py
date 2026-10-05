@@ -57,9 +57,11 @@ def _admin_sql(sql: str) -> None:
     if url:
         from sqlalchemy import create_engine, text
 
-        eng = create_engine(url)
+        # AUTOCOMMIT: CREATE/DROP DATABASE and role ops cannot run inside a
+        # transaction block (psycopg2 ActiveSqlTransaction otherwise).
+        eng = create_engine(url).execution_options(isolation_level="AUTOCOMMIT")
         try:
-            with eng.begin() as conn:
+            with eng.connect() as conn:
                 conn.execute(text(sql))
         finally:
             eng.dispose()
@@ -226,7 +228,8 @@ def wipe_data(db_url_owner: str) -> None:
     from sqlalchemy import create_engine, text
     eng = create_engine(db_url_owner)
     tables = ("events", "sessions", "agent_state", "login_tokens", "service_tokens",
-              "deployments", "runs", "safety_records", "recordings", "range_lease", "users")
+              "deployments", "runs", "safety_records", "safety_state", "recordings",
+              "range_lease", "users")
     with eng.begin() as c:
         c.execute(text("TRUNCATE " + ", ".join(tables) + " CASCADE"))
     eng.dispose()

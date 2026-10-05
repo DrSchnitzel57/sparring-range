@@ -115,8 +115,11 @@ def build_scorecard(db: Session, session_id) -> dict:
         points = int(chk.get("points", 0))
         total += points
         v = registry.get(chk["verifier"])
+        # `expect` (polarity) MUST reach the verifier: an `expect: absent`
+        # check scores the INVERSE condition; dropping it silently would
+        # reward the vulnerability and penalize its removal (audit R09).
         args = {k: val for k, val in chk.items()
-                if k not in ("verifier", "points", "domain", "expect", "description")}
+                if k not in ("verifier", "points", "domain", "description")}
         outcome = v.evaluate(ctx, **args)
         awarded = points if outcome.status == "passed" else 0
         earned += awarded

@@ -74,14 +74,21 @@ class ScriptedHostExec:
         return self.default
 
 
-def make_runner_token(session_id: str) -> str:
-    """Issue a run-scoped runner service token for a session (test stand-in for
-    what start_run does; plaintext rows are how ServiceToken auth works)."""
+def make_runner_token(session_id: str, scenario_id: str = "test") -> str:
+    """Issue a REAL run-scoped worker credential for the session — the exact
+    format `start_run` issues (sha256 stored on a Run row), NOT a test-only
+    ServiceToken stand-in (audit R01: tests must not inject a credential
+    format production never creates)."""
+    import hashlib
+    import secrets
     import uuid as _uuid
+
+    from srplatform.db.models import Run
     from srplatform.db.session import db as db_ctx
-    from srplatform.db.models import ServiceToken
-    tok = f"svc-runner-test-{_uuid.uuid4().hex}"
+    tok = secrets.token_urlsafe(32)
     with db_ctx() as s:
-        s.add(ServiceToken(token=tok, scope="runner", session_id=_uuid.UUID(session_id)))
+        s.add(Run(session_id=_uuid.UUID(session_id), scenario_id=scenario_id,
+                  status="running",
+                  worker_token=hashlib.sha256(tok.encode()).hexdigest()))
         s.commit()
     return tok

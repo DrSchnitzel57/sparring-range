@@ -36,8 +36,12 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install -r requirements.lock
           .venv/bin/pip install --no-deps -e .
+      - name: Install nftables (real ruleset parser + privileged round-trip)
+        run: sudo apt-get update && sudo apt-get install -y nftables
       - name: Unit tests (no infrastructure)
         run: .venv/bin/python -m pytest -m "not db and not browser and not live" -q
+      - name: nft apply/remove round-trip against the real kernel (privileged)
+        run: sudo env "PATH=$PATH" .venv/bin/python -m pytest tests/test_followup_regressions.py -k real_nft -q
       - name: Database + adapter tests (disposable PostgreSQL 16)
         run: .venv/bin/python -m pytest -m "db or adapter" -q
       - name: Import sanity (entrypoints import without services)

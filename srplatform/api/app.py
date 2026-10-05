@@ -263,7 +263,14 @@ def launch_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
     from srplatform.scenario_engine import orchestrator
     from srplatform.api.deps import get_proxmox
 
-    sess = _get_session(db, p, session_id)
+    sess = db.get(SessionModel, session_id)
+    if sess is None:
+        raise HTTPException(404, "session not found")
+    require_session_access(db, p, sess)
+    # ROW LOCK serializes concurrent launch requests for the same session
+    # (audit R08) — two simultaneous POSTs must not double-deploy.
+    db.execute(select(SessionModel).where(SessionModel.session_id == session_id)
+               .with_for_update())
     if sess.status in ("complete", "failed"):
         raise HTTPException(409, f"session is {sess.status}")
     try:
@@ -296,9 +303,10 @@ def launch_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
 def end_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
                 db: Session = Depends(get_db)):
     """Idempotent finalize (F11/F13): stop worker, collect TRUSTED final score,
-    append snapshot + end evidence, revoke session capabilities, release the
-    lease when resources are accounted for. VMs are retained unless teardown
-    is explicitly requested (documented decision)."""
+    append snapshot + end evidence, revoke session capabilities. The lease is
+    released ONLY when no owned machine remains (audit R07): VMs are retained
+    unless teardown is explicitly requested, and while they hold the range's
+    static addresses the reservation must stay with this session."""
     from srplatform import verification_service
     from srplatform.scenario_engine import orchestrator
 
@@ -309,7 +317,12 @@ def end_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
 
     active = runs_svc.active_run_for_session(db, sess.session_id)
     if active:
-        runs_svc.stop_run(db, active.run_id)
+        stopped = runs_svc.stop_run(db, active.run_id)
+        if not stopped.get("ok"):
+            # cancellation FAILED — do not finalize as safely stopped (R07)
+            raise HTTPException(409, {"error": "worker_stop_failed",
+                                      "detail": stopped.get("detail"),
+                                      "note": "session NOT ended; retry or engage killswitch"})
 
     try:
         scorecard = verification_service.build_scorecard(db, sess.session_id)
@@ -318,9 +331,23 @@ def end_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
                      action_type="score_unavailable", payload={"error": str(e)[:500]}))
         scorecard = {"status": "unscored", "error": str(e)[:300]}
 
-    run = db.execute(select(Run).where(Run.session_id == sess.session_id)
-                     .order_by(Run.started_at.desc())).scalars().first()
-    red_complete = bool(run and run.result and run.result.get("complete"))
+    # red_verified_complete is RECONSTRUCTED from trusted verifier events —
+    # every objective of the session's snapshot must have a passed verifier
+    # result. The worker's self-reported `complete` flag is never trusted (R07).
+    red_complete = False
+    try:
+        spec = verification_service.scenario_spec(db, sess.session_id)
+        objective_ids = {o["id"] for o in spec.get("red", {}).get("objectives", [])}
+        passed = set()
+        for ev in db.execute(select(Event).where(
+                Event.session_id == sess.session_id,
+                Event.action_type == "verifier")).scalars():
+            pl = ev.payload or {}
+            if pl.get("passed") and pl.get("objective"):
+                passed.add(pl["objective"])
+        red_complete = bool(objective_ids) and objective_ids.issubset(passed)
+    except Exception:  # noqa: BLE001 — spec unreadable => cannot claim complete
+        red_complete = False
 
     sess.status = "complete"
     sess.outcome = "red_complete" if red_complete else "incomplete"
@@ -340,12 +367,21 @@ def end_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
                                                     ServiceToken.revoked_at.is_(None))).scalars():
         st.revoked_at = _now()
 
-    # release the reservation — resources remain owned/recorded for teardown
-    orchestrator.release_lease(db, sess.session_id)
+    # release the reservation ONLY when nothing owned remains (audit R07):
+    # retained VMs keep the range reserved so the next launch cannot collide
+    # with their static addresses.
+    residual = orchestrator._residual_resources(db, sess.session_id)
+    if residual:
+        note = (f"{len(residual)} owned machine(s) still exist — range reservation "
+                "RETAINED until teardown removes them")
+    else:
+        orchestrator.release_lease(db, sess.session_id)
+        note = "lease released (no residual resources)"
     db.flush()
     return {"ok": True, "status": sess.status, "outcome": sess.outcome,
             "scorecard_status": scorecard.get("status"),
-            "earned": scorecard.get("earned"), "total": scorecard.get("total")}
+            "earned": scorecard.get("earned"), "total": scorecard.get("total"),
+            "lease_released": not residual, "note": note}
 
 
 @app.post("/sessions/{session_id}/score")
@@ -378,7 +414,11 @@ def _teardown_common(db, sess, p):
     from srplatform.scenario_engine import orchestrator
     from srplatform.api.deps import get_proxmox
     t = orchestrator.teardown(db, sess.session_id, sess.scenario_id, get_proxmox())
-    orchestrator.release_lease(db, sess.session_id)
+    # release the reservation ONLY on a COMPLETE teardown (audit R07): failed
+    # destroys keep the range reserved so the addresses cannot be reused while
+    # the machines still exist.
+    if t.get("complete", True):
+        orchestrator.release_lease(db, sess.session_id)
     return t
 
 
@@ -398,7 +438,13 @@ def reset_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
     active = runs_svc.active_run_for_session(db, sess.session_id)
     if active:
         raise HTTPException(409, "stop the active run before reset")
-    return orchestrator.reset(db, sess.session_id, sess.scenario_id, get_proxmox())
+    try:
+        # orchestrator.reset ACQUIRES/VERIFIES the global lease first (R07)
+        return orchestrator.reset(db, sess.session_id, sess.scenario_id, get_proxmox())
+    except orchestrator.LeaseConflict as e:
+        raise HTTPException(409, {"error": "range_busy", "holder_session": e.holder_session_id})
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
 
 
 # --- deploy (legacy wrappers — still session-bound + authenticated) ------------
@@ -475,13 +521,16 @@ def stop_run(run_id: uuid.UUID, p: Principal = Depends(any_member), db: Session 
 def run_complete(run_id: uuid.UUID, result: dict,
                  x_worker_token: str | None = Header(default=None),
                  db: Session = Depends(get_db)):
-    """Worker callback — authenticated by the one-shot run capability."""
+    """Worker callback — authenticated by the one-shot run capability. A
+    terminal run's state is FINAL: a late callback gets 409, never a rewrite."""
     try:
         run = runs_svc.complete_run(db, str(run_id), x_worker_token or "", result)
     except PermissionError:
         raise HTTPException(403, "bad worker token")
     except KeyError:
         raise HTTPException(404, "run not found")
+    except runs_svc.RunStateError as e:
+        raise HTTPException(409, str(e))
     return {"ok": True, "status": run.status}
 
 
@@ -634,10 +683,13 @@ def killswitch(p: Principal = Depends(operator)):
         with db() as s:
             for r in s.execute(sa_select(Run).where(Run.status.in_(("queued", "running")))).scalars():
                 if r.pgid:
-                    extra.append((str(r.run_id), int(r.pgid)))
+                    extra.append((str(r.run_id), int(r.pgid), r.pgid_pstart))
     except Exception:
-        pass
-    return get_supervisor().engage(reason=f"killswitch by {p.username}") | {"recovered_groups": extra}
+        pass  # the latch still engages; the DB problem is visible in the result below
+    # recovered groups are PASSED TO THE KILL (audit R03) — reporting them as
+    # "recovered_groups" without terminating them was the fail-open bug.
+    return get_supervisor().engage(reason=f"killswitch by {p.username}",
+                                   extra_groups=extra)
 
 
 @app.post("/safety/killswitch-release")
@@ -656,9 +708,16 @@ class BaselineCheckIn(BaseModel):
 
 @app.post("/safety/baseline-check")
 def safety_baseline_check(body: BaselineCheckIn, p: Principal = Depends(operator)):
-    """Run the backend's baseline verification and record the outcome."""
+    """Run the backend's baseline verification and record the outcome.
+
+    Audit R04: an operator attestation may record a FAILED check honestly, but
+    can never override a failed live backend check to `ok=True` — that turned
+    the evidence trail into a rubber stamp."""
     sup = get_supervisor()
     live = sup.datapath.baseline_status()
+    if body.ok and not live["ok"]:
+        raise HTTPException(409, "cannot record a passed baseline check while the live "
+                                 "verification FAILS — fix the datapath and re-check")
     ok = live["ok"] if body.ok is None else bool(body.ok)
     sup.record("baseline_check", ok, {"source": "operator", "live": live})
     return {"ok": ok, "live": live}
@@ -671,14 +730,18 @@ class DatapathProofIn(BaseModel):
 
 @app.post("/safety/datapath-proof")
 def safety_datapath_proof(body: DatapathProofIn, p: Principal = Depends(operator)):
-    """RECORD the operator's live datapath proof. This stores an attestation
-    of the probes the operator actually ran from a range VM — a handwritten
-    'ok' with no probe detail is rejected structurally (the schema requires
-    the observations); the TRUTH of those observations is the operator's
-    trusted statement, which is why this endpoint is operator-only."""
+    """RECORD the operator's live datapath proof. The schema requires the
+    observations AND requires them to describe FAILED egress — an observation
+    of reachable internet is structurally rejected (audit R04). The TRUTH of
+    isolated observations remains the operator's trusted statement, which is
+    why this endpoint is operator-only."""
+    from srplatform.safety import probes_attest_isolation
     needed = {"ping", "dns"}
     if not needed.issubset({k.lower() for k in body.probes}):
         raise HTTPException(422, "probes must include ping and dns observations")
+    ok, reasons = probes_attest_isolation(body.probes)
+    if not ok:
+        raise HTTPException(422, {"error": "probes do not attest isolation", "reasons": reasons})
     sup = get_supervisor()
     sup.record("datapath_proof", True, {"probes": body.probes, "vm": body.vm_hostname,
                                         "by": p.username})
@@ -762,9 +825,15 @@ def get_token(token: str, p: Principal = Depends(service("bastion")),
         raise HTTPException(404, "token not found")
     if t.expires_at is not None and t.expires_at < _now():
         raise HTTPException(404, "token expired")
+    # The bastion must bind the login to the OWNER'S provisioned public key
+    # (audit R02): resolve the member identity server-side. The keys file is
+    # keyed by username, so the response carries the authenticated username,
+    # never just an opaque id the bastion cannot map.
+    owner = db.get(User, t.user_id) if t.user_id else None
     return {"token": t.token, "session_id": str(t.session_id) if t.session_id else None,
             "target_host": t.target_host, "target_port": int(t.target_port),
-            "user_id": str(t.user_id) if t.user_id else None}
+            "user_id": str(t.user_id) if t.user_id else None,
+            "username": owner.username if owner else None}
 
 
 # --- telemetry ingest (host-bound capability; source identity dedup) --------------

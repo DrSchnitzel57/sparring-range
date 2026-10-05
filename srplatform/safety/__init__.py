@@ -37,6 +37,45 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# -------------------------------------------------------------------------- #
+# Datapath-proof attestation schema (audit R04)                              #
+# The operator endpoint stays a trust boundary, but the SCHEMA distinguishes #
+# "isolation observed" from "egress reachable": observations that describe  #
+# working connectivity are structurally rejected, not silently recorded.     #
+# -------------------------------------------------------------------------- #
+ISOLATION_MARKERS = (
+    "100% packet loss", "100.0% packet loss", "unreachable", "fail", "failures",
+    "timed out", "timeout", "no route to host", "no default route", "no answer",
+    "no servers could be reached", "server fail", "nxdomain", "servfail",
+    "network is unreachable", "could not resolve", "no such device",
+)
+# regexes, NOT substrings: "0% packet loss" is a substring of "100% packet loss"
+REACHABILITY_MARKERS = (
+    r"(?<!\d)0(\.0)?% packet loss", r"bytes from", r"default via",
+    r"answers:", r"status: resolved", r"connected to", r"established",
+)
+
+
+def probes_attest_isolation(probes: dict) -> tuple[bool, list[str]]:
+    """True only when EVERY probe observation describes FAILED egress and at
+    least one probe exists. Ambiguous observations are rejected (fail closed)."""
+    import re as _re
+    reasons: list[str] = []
+    if not probes:
+        return False, ["no probe observations supplied"]
+    for name, value in probes.items():
+        v = str(value).lower()
+        reach = [m for m in REACHABILITY_MARKERS if _re.search(m, v)]
+        if reach:
+            reasons.append(f"probe '{name}' describes REACHABLE egress ({reach[0]!r}) — "
+                           "this endpoint records successful ISOLATION only")
+            continue
+        if not any(m in v for m in ISOLATION_MARKERS):
+            reasons.append(f"probe '{name}' observation {str(value)[:80]!r} does not clearly "
+                           "attest failed egress (quote the tool output, e.g. '100% packet loss')")
+    return (not reasons), reasons
+
+
 class Supervisor:
     def __init__(self, datapath: DatapathController | None = None,
                  settings: Settings | None = None,
@@ -47,41 +86,83 @@ class Supervisor:
         self._mirror_dh = None  # test hook: shared dict mirroring DB records
 
     # ---------------------------------------------------------------- latch ---
-    def _read_state(self) -> dict:
+    def _read_state(self) -> tuple[dict, str | None]:
+        """(state, error). error is set for CORRUPT/UNREADABLE files — a missing
+        file is the legitimate fresh-install state (not latched)."""
         try:
-            return json.loads(self.state_file.read_text())
-        except (OSError, json.JSONDecodeError):
-            return {"latched": False}
+            return json.loads(self.state_file.read_text()), None
+        except FileNotFoundError:
+            return {}, None
+        except (OSError, json.JSONDecodeError) as e:
+            return {}, f"state file unreadable: {e}"
 
-    def _write_state(self, state: dict) -> None:
+    def _write_state(self, state: dict) -> tuple[str | None, str | None]:
+        """Persist the latch to BOTH durable stores. Returns
+        (file_error, db_error): the FILE is the primary durable store — its
+        failure means the latch may not survive; the DB mirror failure must
+        still be EXPOSED, never swallowed (audit R04)."""
         state = dict(state, updated_at=_now().isoformat())
         tmp = self.state_file.with_suffix(".tmp")
+        file_err: str | None = None
         try:
             tmp.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(json.dumps(state))
             os.replace(tmp, self.state_file)
-        except OSError:
-            pass  # latch also mirrors to DB; a lost file must not abort engagement
-        self._db_write_state(state)
+        except OSError as e:
+            file_err = f"state file write failed: {e}"
+        return file_err, self._db_write_state(state)
 
-    def _db_write_state(self, state: dict) -> None:
+    def _db_write_state(self, state: dict) -> str | None:
         try:
             from srplatform.db.models import SafetyState
             from srplatform.db.session import db
             with db() as s:
                 row = s.get(SafetyState, 1)
                 if row is None:
-                    return
+                    row = SafetyState(id=1)  # mirror must EXIST to be consulted
+                    s.add(row)
                 row.latched = bool(state.get("latched"))
                 row.latched_at = _now() if state.get("latched") else None
                 row.reason = state.get("reason")
-        except Exception:
-            pass  # file is the durable store; DB mirror is best-effort
+            return None
+        except Exception as e:  # noqa: BLE001 — reported, never silent
+            return f"state DB mirror write failed: {e}"
+
+    def _db_read_state(self) -> tuple[dict | None, str | None]:
+        """(row-or-None, error). None means 'no mirror row', not 'not latched'
+        when the read itself failed."""
+        try:
+            from srplatform.db.models import SafetyState
+            from srplatform.db.session import db
+            with db() as s:
+                row = s.get(SafetyState, 1)
+                if row is None:
+                    return None, None
+                return ({"latched": bool(row.latched),
+                         "latched_at": row.latched_at.isoformat() if row.latched_at else None,
+                         "reason": row.reason}), None
+        except Exception as e:  # noqa: BLE001
+            return None, f"state DB mirror unreadable: {e}"
 
     def latch_status(self) -> dict:
-        st = self._read_state()
-        return {"latched": bool(st.get("latched")), "latched_at": st.get("latched_at"),
-                "reason": st.get("reason")}
+        """CONSERVATIVE reconciliation of the durable stores (audit R04):
+        latched if EITHER store says so; if BOTH are unreadable, FAIL CLOSED.
+        Persistence problems are exposed, never hidden."""
+        st, file_err = self._read_state()
+        db_st, db_err = self._db_read_state()
+        problems = [p for p in (file_err, db_err) if p]
+        if file_err and db_err:
+            return {"latched": True, "latched_at": None,
+                    "reason": "safety state stores unreadable — failing closed",
+                    "persistence_error": "; ".join(problems)}
+        db_latched = bool((db_st or {}).get("latched"))
+        latched = bool(st.get("latched")) or db_latched
+        out = {"latched": latched,
+               "latched_at": st.get("latched_at") or (db_st or {}).get("latched_at"),
+               "reason": st.get("reason") or (db_st or {}).get("reason")}
+        if problems:
+            out["persistence_error"] = "; ".join(problems)
+        return out
 
     # --------------------------------------------------------------- records ---
     def record(self, kind: str, ok: bool, detail: dict | None = None) -> None:
@@ -141,7 +222,8 @@ class Supervisor:
         return out
 
     def _record_fresh(self, kind: str) -> tuple[bool, str]:
-        rec = self._latest_records().get(kind)
+        recs = self._latest_records()
+        rec = recs.get(kind)
         if not rec:
             return False, f"no {kind} record"
         if not rec.get("ok"):
@@ -149,37 +231,57 @@ class Supervisor:
         identity = config_identity(self.settings)
         if rec.get("config_identity") != identity:
             return False, f"{kind} record predates a configuration/network change (identity mismatch)"
-        age_h = (time.time() - float(rec.get("recorded_at", 0))) / 3600
+        # ENGAGE/RELEASE INVALIDATE PRIOR EVIDENCE (audit R04): a killswitch
+        # engagement or release means the datapath changed — every baseline
+        # check / datapath proof recorded BEFORE that event says nothing about
+        # the current state and must not re-authorize a start.
+        rec_ts = float(rec.get("recorded_at", 0))
+        for gate in ("engage", "release"):
+            g = recs.get(gate)
+            if g and float(g.get("recorded_at", 0)) >= rec_ts:
+                return False, (f"{kind} record predates the last {gate} — "
+                               "evidence invalidated, re-run the check")
+        age_h = (time.time() - rec_ts) / 3600
         if age_h > self.settings.safety_evidence_max_age_h:
             return False, f"{kind} record is stale ({age_h:.0f}h > {self.settings.safety_evidence_max_age_h}h)"
         return True, "fresh"
 
     # ------------------------------------------------------------ operations ---
-    def kill_workers(self, extra_groups: list[tuple[str, int]] | None = None) -> dict:
-        """Terminate all supervised worker process groups. extra_groups lets the
-        caller pass groups recovered from durable run state after an API restart."""
+    def kill_workers(self, extra_groups: list[tuple] | None = None) -> dict:
+        """Terminate all supervised worker process groups. extra_groups lets
+        the caller pass groups recovered from durable run state after an API
+        restart — as (run_id, pgid) or (run_id, pgid, pgid_pstart) tuples."""
         results = []
         for h in run_registry.active():
-            r = run_registry.terminate_group(h.pgid)
+            r = run_registry.terminate_group(h.pgid, expected_pstart=h.pgid_pstart)
             results.append({"run_id": h.run_id, **r})
-        for run_id, pgid in (extra_groups or []):
+        for entry in (extra_groups or []):
+            run_id, pgid = entry[0], int(entry[1])
+            pstart = entry[2] if len(entry) > 2 else None
             if any(h.run_id == run_id for h in run_registry.active()):
                 continue
-            r = run_registry.terminate_group(int(pgid))
+            r = run_registry.terminate_group(pgid, expected_pstart=pstart)
             results.append({"run_id": run_id, **r})
         ok = all(r["ok"] for r in results) if results else True
         return {"ok": ok, "results": results,
                 "detail": f"{sum(1 for r in results if not r['ok'])} of {len(results)} worker terminations failed"}
 
-    def engage(self, reason: str = "killswitch") -> dict:
+    def engage(self, reason: str = "killswitch",
+               extra_groups: list[tuple] | None = None) -> dict:
         """The killswitch (hard constraint #2). Each layer attempted independently
         and reported truthfully; the latch is persisted FIRST so a crash in the
-        middle cannot forget the engagement."""
-        self._write_state({"latched": True, "reason": reason})
+        middle cannot forget the engagement. An exception in worker termination
+        can NEVER prevent the datapath half from executing (audit R03)."""
+        file_err, mirror_err = self._write_state({"latched": True, "reason": reason})
+        persist_err = file_err or mirror_err
 
-        # (a) stop red agent workers (from the live registry; the API layer adds
-        #     groups recovered from durable run rows for cross-restart coverage)
-        workers = self.kill_workers()
+        # (a) stop red agent workers (live registry + groups recovered from
+        #     durable run rows for cross-restart coverage)
+        try:
+            workers = self.kill_workers(extra_groups=extra_groups)
+        except Exception as e:  # noqa: BLE001 — must not block the datapath half
+            workers = {"ok": False, "results": [],
+                       "detail": f"worker termination raised: {e}"}
 
         # (b) drop the range datapath — independent of (a)
         try:
@@ -187,8 +289,11 @@ class Supervisor:
         except Exception as e:  # noqa: BLE001
             datapath = {"ok": False, "detail": f"datapath controller raised: {e}", "mechanism": "unknown"}
 
-        full_ok = workers["ok"] and datapath["ok"]
-        self.record("engage", full_ok, {"workers": workers, "datapath": datapath, "reason": reason})
+        # the LATCH ITSELF failing to persist durably (file) is a layer failure;
+        # a DB-mirror-only failure is exposed as a warning, not a false "partial"
+        full_ok = workers["ok"] and datapath["ok"] and not file_err
+        self.record("engage", full_ok, {"workers": workers, "datapath": datapath, "reason": reason,
+                                        **({"state_persistence": persist_err} if persist_err else {})})
         result = {
             "killswitch": "engaged" if full_ok else "engaged-partial",
             "latched": True,
@@ -197,8 +302,11 @@ class Supervisor:
             "actions": [f"{r['run_id']}: {r['detail']}" for r in workers["results"]]
                        + [f"datapath: {datapath['detail']}"],
         }
+        if persist_err:
+            result["state_persistence_error"] = persist_err
         if not full_ok:
             result["warning"] = ("PARTIAL engagement — at least one layer failed. "
+                                 + (f"LATCH PERSISTENCE PROBLEM: {persist_err}. " if persist_err else "")
                                  + ("Worker termination failed; network IS severed." if datapath["ok"] else
                                     "Datapath drop FAILED — range traffic may still flow; "
                                     "run infra/firewall/killswitch.sh on the Proxmox host NOW."))
@@ -206,17 +314,25 @@ class Supervisor:
 
     def release(self) -> dict:
         """Operator release: remove ONLY the emergency ruleset, preserve the
-        baseline deny, then invalidate evidence (fresh checks required)."""
+        baseline deny, then invalidate evidence (fresh checks required — the
+        release RECORD is the cutoff that `_record_fresh` enforces)."""
         try:
             datapath = self.datapath.remove_emergency()
         except Exception as e:  # noqa: BLE001
             datapath = {"ok": False, "detail": f"datapath controller raised: {e}", "mechanism": "unknown"}
         if datapath["ok"]:
-            self._write_state({"latched": False})
-            self.record("release", True, {"datapath": datapath})
-            return {"killswitch": "released", "datapath": datapath,
-                    "note": "baseline egress-deny must still be active (verified above); "
-                            "evidence invalidated — run baseline check + datapath proof before the next start"}
+            file_err, mirror_err = self._write_state({"latched": False})
+            persist_err = file_err or mirror_err
+            self.record("release", not file_err,
+                        {"datapath": datapath,
+                         **({"state_persistence": persist_err} if persist_err else {})})
+            out = {"killswitch": "released", "datapath": datapath,
+                   "note": "baseline egress-deny must still be active (verified above); "
+                           "evidence invalidated — run baseline check + datapath proof before the next start"}
+            if persist_err:
+                out["state_persistence_error"] = persist_err
+                out["warning"] = f"released, but state persistence reported: {persist_err}"
+            return out
         self.record("release", False, {"datapath": datapath})
         return {"killswitch": "still-engaged", "datapath": datapath,
                 "warning": "emergency ruleset removal FAILED — remaining latched"}

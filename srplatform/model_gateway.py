@@ -17,7 +17,7 @@ from __future__ import annotations
 import heapq
 import itertools
 import threading
-from concurrent.futures import Future
+from concurrent.futures import CancelledError, Future, InvalidStateError
 
 
 class QueueFull(RuntimeError):
@@ -68,20 +68,38 @@ class ModelGateway:
             return len(self._q)
 
     def _run(self):
+        # The worker thread is the ONLY consumer; a task exception, a cancelled
+        # Future or a lost set_result must NEVER kill it — one dead thread
+        # permanently stalls every queued model request (audit R10).
         while True:
-            with self._lock:
-                while not self._q:
-                    self._has_work.wait()
-                priority, _, name, fn, args, kwargs, fut = heapq.heappop(self._q)
-            if fut.cancelled():
-                continue
             try:
-                fut.set_result(fn(*args, **kwargs))
-                self.metrics["completed"] += 1
-            except Exception as e:  # noqa: BLE001
-                fut.set_exception(e)
+                with self._lock:
+                    while not self._q:
+                        self._has_work.wait()
+                    priority, _, name, fn, args, kwargs, fut = heapq.heappop(self._q)
+                # Correct Future state machine: PENDING -> RUNNING, or refuse
+                # to start work whose caller already cancelled.
+                if not fut.set_running_or_notify_cancel():
+                    continue
+                try:
+                    result = fn(*args, **kwargs)
+                except BaseException as e:  # noqa: BLE001 — task failure is data
+                    self.metrics["failed"] += 1
+                    self.metrics["last_error"] = str(e)[:200]
+                    try:
+                        fut.set_exception(e)
+                    except (InvalidStateError, CancelledError):
+                        pass  # caller timed out and cancelled mid-run: result is moot
+                else:
+                    self.metrics["completed"] += 1
+                    try:
+                        fut.set_result(result)
+                    except (InvalidStateError, CancelledError):
+                        pass  # cancelled while running — nobody is waiting anymore
+            except Exception:  # noqa: BLE001 — the loop itself must survive anything
                 self.metrics["failed"] += 1
-                self.metrics["last_error"] = str(e)[:200]
+                self.metrics["last_error"] = "gateway loop internal error"
+                continue
 
 
 _gateway: ModelGateway | None = None

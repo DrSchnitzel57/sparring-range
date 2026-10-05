@@ -24,21 +24,78 @@ def extract(path, names, namespace):
     exec(compile(ast.fix_missing_locations(unit), path, "exec"), namespace)
 
 
-# Auth lookup cannot resolve the real start_run credential, which is only in Run.
+# Auth lookup: POST-FIX, _principal_from_token resolves the run-scoped
+# credential (sha256 on Run) as a session-bound runner capability, and revokes
+# it once the run is inactive. Probe both states with explicit stubs.
 class HTTPError(Exception):
     def __init__(self, status, detail):
         self.status, self.detail = status, detail
 
 
+import hashlib as _hashlib
+
+
+class _Scalars:
+    def __init__(self, row):
+        self._row = row
+
+    def first(self):
+        return self._row
+
+
+class _Result:
+    def __init__(self, row):
+        self._row = row
+
+    def scalars(self):
+        return _Scalars(self._row)
+
+
+def _make_auth_db(run_row):
+    return SimpleNamespace(get=lambda table, token: None,
+                           execute=lambda q: _Result(run_row))
+
+
+class _SelectStub:
+    def __init__(self, model):
+        pass
+
+    def where(self, *a):
+        return self
+
+
+class _AnyAttr:
+    def __getattr__(self, _name):
+        return _AnyAttr()
+
+    def __eq__(self, _other):
+        return self
+
+    def __hash__(self):
+        return 0
+
+
 auth_ns = {"HTTPException": HTTPError, "WebToken": object(), "ServiceToken": object(),
-           "User": object(), "Principal": SimpleNamespace}
+           "User": object(), "Principal": SimpleNamespace, "Run": _AnyAttr(),
+           "hashlib": _hashlib, "select": _SelectStub}
 extract("srplatform/api/auth.py", {"_principal_from_token"}, auth_ns)
+TOKEN = "run-scoped-token"
+ACTIVE_RUN = SimpleNamespace(status="running", session_id="sess-1",
+                             worker_token=_hashlib.sha256(TOKEN.encode()).hexdigest())
+CANCELLED_RUN = SimpleNamespace(status="cancelled", session_id="sess-1",
+                                worker_token=ACTIVE_RUN.worker_token)
 try:
-    auth_ns["_principal_from_token"](SimpleNamespace(get=lambda table, token: None), "run-scoped-token")
-    results["worker_bearer_auth"] = "accepted"
+    p = auth_ns["_principal_from_token"](_make_auth_db(ACTIVE_RUN), TOKEN)
+    results["worker_bearer_auth"] = {"status": "accepted", "scope": p.scope,
+                                     "session_bound": p.session_id}
 except HTTPError as exc:
-    results["worker_bearer_auth"] = {"status": exc.status, "detail": exc.detail,
-                                   "setup": "Run token exists only in runs; no WebToken/ServiceToken, matching start_run"}
+    results["worker_bearer_auth"] = {"status": exc.status, "detail": exc.detail}
+try:
+    auth_ns["_principal_from_token"](_make_auth_db(CANCELLED_RUN), TOKEN)
+    results["worker_credential_revoked_when_run_inactive"] = "accepted (WRONG)"
+except HTTPError as exc:
+    results["worker_credential_revoked_when_run_inactive"] = {
+        "status": exc.status, "detail": exc.detail}
 
 # Real scorecard function, fake database and verifier, captures arguments received.
 received = []
@@ -99,19 +156,37 @@ results["gateway_timeout"] = {"worker_alive": gateway._worker.is_alive(),
                               "next_request_completed": next_future.done()}
 threading.excepthook = original_hook
 
-# Exact release/record-fresh/start_gate functions with no filesystem or database.
+# Exact release/record-fresh/start_gate functions with no filesystem or
+# database — but with a MODELLED record store: release() appends a `release`
+# record, and the fixed _record_fresh must treat it as the invalidation cutoff
+# (the old code appended the record and ignored it).
 import time
 safety_ns = {"time": time, "config_identity": lambda settings: "current"}
 extract("srplatform/safety/__init__.py", {"Supervisor"}, safety_ns)
 sup = object.__new__(safety_ns["Supervisor"])
 sup.settings = SimpleNamespace(sr_env="production", safety_evidence_max_age_h=24)
 sup.datapath = SimpleNamespace(mechanism="nft", remove_emergency=lambda: {"ok": True})
-sup._write_state = lambda state: None
-sup.record = lambda *args, **kwargs: None
+sup._write_state = lambda state: (None, None)
 sup.latch_status = lambda: {"latched": False}
 sup.runner_available = lambda: (True, "stubbed configured runner")
-sup._latest_records = lambda: {k: {"ok": True, "config_identity": "current", "recorded_at": time.time()}
-                               for k in ("baseline_check", "datapath_proof")}
+_store = [{"kind": k, "ok": True, "config_identity": "current",
+           "recorded_at": time.time() - 3600} for k in ("baseline_check", "datapath_proof")]
+
+
+def _record(kind, ok, detail=None):
+    _store.append({"kind": kind, "ok": ok, "config_identity": "current",
+                   "recorded_at": time.time()})
+
+
+def _latest():
+    out = {}
+    for r in _store:
+        out[r["kind"]] = r
+    return out
+
+
+sup.record = _record
+sup._latest_records = _latest
 sup.release()
 results["gate_after_release_with_preexisting_evidence"] = sup.start_gate()
 

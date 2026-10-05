@@ -4,21 +4,26 @@
 #
 # What must be true of every Linux golden image:
 #   * auditd installed and running with the repo's rules (telemetry/auditd.rules)
-#   * the telemetry shipper installed (telemetry/shipper.py) pointing at the API
+#   * the telemetry shipper installed as a systemd SERVICE (via
+#     telemetry/install.sh — the single installer; copying the .py alone does
+#     NOT create the unit, the ENRICHED format or the spool dir — audit R12)
 #   * no WAN egress needed or expected (range VLAN default-deny)
 #   * a flag-writing convention for verifiers (flags land in /root/flag_*.txt)
+#
+# NOTE ON SCOPE: this script does NOT install vulnerable scenario services.
+# Vulnerable services belong to the SCENARIO deployment (cloud-init per host),
+# not the golden template — the runbook is aligned with this.
 set -euo pipefail
 
 apt-get install -y auditd audispd-plugins
 
-# install the repo's audit rules (copied into this VM by Drew or pulled via scp
-# from the control plane — the range has no internet, remember)
-install -m 0640 telemetry/auditd.rules /etc/audit/rules.d/50-sparring.rules
+# ONE installer for the whole pipeline: rules + ENRICHED log_format + shipper
+# + systemd unit + spool directory + per-clone configuration placeholders.
+# (telemetry/install.sh is idempotent and is what the unit tests exercise.)
+bash telemetry/install.sh
 
-# install the shipper as a systemd service
-install -m 0755 telemetry/shipper.py /usr/local/bin/sparring-shipper
 install -d /etc/sparring-range
 cp infra/cloud-init/golden-linux.yaml /etc/sparring-range/cloud-init-baked.yaml 2>/dev/null || true
 
-systemctl enable auditd
+systemctl enable auditd sparring-shipper
 echo "[golden] done. Snapshot this VM as a Proxmox template; put its VMID in .env."

@@ -46,18 +46,31 @@ def _ctrl_addr(s: Settings) -> str:
         ) from e
 
 
+def _api_port(s: Settings) -> int:
+    """Ingest port comes from the configured API URL — never a hardcoded 8000."""
+    from urllib.parse import urlparse
+    p = urlparse(s.api_base_url)
+    if p.port:
+        return int(p.port)
+    return 443 if p.scheme == "https" else 80
+
+
 def render_baseline_ruleset(s: Settings | None = None) -> str:
     s = s or get_settings()
     bridge = s.range_bridge
     vlan = s.range_vlan
     mgmt = s.management_cidr
     ctrl = _ctrl_addr(s)
-    api_port = 8000
+    api_port = _api_port(s)
     return f"""#!/usr/sbin/nft -f
 # sparring-range baseline egress-deny — RENDERED, do not edit by hand.
 # python -m srplatform.safety.firewall baseline   regenerates this.
 # Scope: forwarded traffic ON {bridge} (VLAN {vlan}) only — host management,
 # other bridges and the control plane's own traffic are untouched (returns).
+# VLAN NOTE: {vlan} is enforced by the VLAN-aware bridge itself (each VM NIC
+# is attached with tag={vlan}); forwarded packets reach these hooks already
+# untagged, so the ruleset scopes by BRIDGE + range CIDR, and cross-VLAN
+# separation is the bridge's VLAN filtering — not a match that belongs here.
 table inet {BASELINE_TABLE} {{
   set range_hosts {{
     type ipv4_addr
@@ -71,12 +84,14 @@ table inet {BASELINE_TABLE} {{
     # packets not originating from the range bridge are none of our business
     iifname != "{bridge}" return
 
-    # established/related covers replies to management-initiated sessions
-    # (verifier/runner/bastion management SSH in) and to the API ingest
-    ct state established,related accept
+    # established/related ONLY for control-plane return traffic (replies to
+    # management SSH in and to API ingest) — a blanket accept here would let
+    # any pre-existing range-originated tunnel survive the deny (audit R05)
+    ct state established,related ip saddr {{ {mgmt}, {ctrl} }} accept
 
-    # IPv4: intra-range operation is allowed (scenario hosts must talk)...
-    ip protocol ip ip saddr @range_hosts accept
+    # IPv4: intra-range operation is allowed (scenario hosts must talk) —
+    # DESTINATION-CONSTRAINED: range -> range only, not range -> anything
+    ip protocol ip ip saddr @range_hosts ip daddr @range_hosts accept
     # ...range hosts shipping telemetry/events to the control plane API...
     ip protocol tcp ip daddr {ctrl} tcp dport {api_port} accept
     # ...control-plane management NEW connections, only to management port...
@@ -91,29 +106,65 @@ table inet {BASELINE_TABLE} {{
 """
 
 
-def render_emergency_ruleset(s: Settings | None = None) -> str:
+def render_emergency_ruleset(s: Settings | None = None, drop_existing: bool = False) -> str:
     s = s or get_settings()
     bridge = s.range_bridge
+    # delete-if-present lines are emitted ONLY when the tables actually exist;
+    # together with the replacements they form ONE atomic `nft -f` transaction
+    # (audit R05: no gap between remove and load, and a failed load keeps the
+    # previous protection instead of removing it).
+    deletes = ""
+    if drop_existing:
+        deletes = (f"delete table inet {EMERGENCY_TABLE}\n"
+                   f"delete table bridge {EMERGENCY_TABLE}_l2\n")
+    ports = [p.strip() for p in (s.range_bridge_ports or "").split(",") if p.strip()]
+    port_set = ""
+    if ports:
+        elems = ", ".join(f'"{p}"' for p in ports)
+        port_set = f"""  set sr_ports {{
+    type ifname
+    elements = {{ {elems} }}
+  }}
+"""
+    match_iif = "iifname @sr_ports drop" if ports else f'iifname "{bridge}" drop'
+    match_oif = "oifname @sr_ports drop" if ports else f'oifname "{bridge}" drop'
     return f"""#!/usr/sbin/nft -f
 # sparring-range EMERGENCY datapath drop — RENDERED. Severs all range datapath
 # traffic on {bridge}: L3 (inet forward, INCLUDING established — no state
 # escape) AND same-bridge L2 (bridge family). Strictly range-scoped: host
 # management, the control plane, and unrelated bridges keep working.
-table inet {EMERGENCY_TABLE} {{
+#
+# BRIDGE-FAMILY TOPOLOGY (audit R05): in the bridge family the forward hook
+# sees the bridge PORTS (tap/vnet devices), not the bridge master. Matching
+# iifname/oifname "{bridge}" alone would NOT drop same-bridge VM-to-VM frames.
+# Configure RANGE_BRIDGE_PORTS with every tap/vnet attached to {bridge}
+# (Proxmox: `ls /sys/class/net/{bridge}/brif/`) so the port set below matches
+# the real topology; without it this render covers the master only and the
+# controller reports that honestly instead of claiming same-bridge coverage.
+{deletes}table inet {EMERGENCY_TABLE} {{
   chain drop_in {{
-    type filter hook forward priority -100; policy accept;
+    type filter hook forward priority -150; policy accept;
     iifname "{bridge}" drop
     oifname "{bridge}" drop
   }}
 }}
 table bridge {EMERGENCY_TABLE}_l2 {{
-  chain drop_bridge {{
-    type filter hook forward priority -100; policy accept;
-    iifname "{bridge}" drop
-    oifname "{bridge}" drop
+{port_set}  chain drop_bridge {{
+    type filter hook forward priority -150; policy accept;
+    {match_iif}
+    {match_oif}
   }}
 }}
 """
+
+
+def render_emergency_removal(s: Settings | None = None) -> str:
+    """ONE atomic removal of BOTH emergency families (audit R05: removing only
+    the inet table left the L2 emergency installed while release reported
+    success)."""
+    return (f"#!/usr/sbin/nft -f\n"
+            f"delete table inet {EMERGENCY_TABLE}\n"
+            f"delete table bridge {EMERGENCY_TABLE}_l2\n")
 
 
 def main(argv: list[str]) -> int:

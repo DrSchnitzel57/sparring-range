@@ -56,11 +56,36 @@ services:
   api:
     build: { context: ., dockerfile: infra/dev/Dockerfile }
     command: uvicorn srplatform.api.app:app --host 0.0.0.0 --port 8000
-    env_file: .env
+    # NO env_file: the whole .env contains the OWNER URL and Proxmox secrets —
+    # loading it here contradicted the credential split this file claims
+    # (audit R12). The API gets an EXPLICIT, auditable variable set; secrets
+    # are interpolated from the invoking shell, never committed.
     environment:
+      SR_ENV: ${SR_ENV:-dev}
       # app-role ONLY — the owner URL must not exist in the runtime environment
       POSTGRES_URL: postgresql+psycopg2://sr_app:${SR_DEV_APP_PASSWORD:-devapp}@postgres:5432/sparring_range
+      DB_APP_ROLE: sr_app
+      API_BASE_URL: http://localhost:8000
+      API_ALLOWED_ORIGINS: ${API_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      BOOTSTRAP_OPERATOR_USERNAME: ${BOOTSTRAP_OPERATOR_USERNAME:-drew}
+      RANGE_BRIDGE: ${RANGE_BRIDGE:-vmbr1}
+      RANGE_VLAN: ${RANGE_VLAN:-66}
+      RANGE_CIDR: ${RANGE_CIDR:-10.66.0.0/24}
+      MANAGEMENT_CIDR: ${MANAGEMENT_CIDR:-10.0.0.0/24}
+      DATAPATH_CONTROLLER: ${DATAPATH_CONTROLLER:-noop}   # dev compose has no privileged nft path
+      SAFETY_STATE_FILE: /var/lib/sparring-range/safety_state.json
+      RECORDINGS_DIR: /var/lib/sparring-range/recordings
+      BASTION_ADDRESS: ${BASTION_ADDRESS:-10.66.0.2}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:8001/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL_RED: ${LLM_MODEL_RED:-qwen2.5-14b-instruct}
+      LLM_MODEL_COACH: ${LLM_MODEL_COACH:-qwen2.5-32b-instruct}
+      RUNNER_TRANSPORT: ${RUNNER_TRANSPORT:-local-dev}
     ports: ["127.0.0.1:8000:8000"]
+    volumes:
+      # the API registers recordings written by the bastion — the shared path
+      # must actually be shared (audit R12)
+      - recordings:/var/lib/sparring-range/recordings
     depends_on:
       migrate: { condition: service_completed_successfully }
       postgres: { condition: service_healthy }
@@ -74,6 +99,11 @@ services:
     command: python -m srplatform.bastion.proxy
     environment:
       API_BASE_URL: http://api:8000
+      # bastion capability + key material (audit R12: the documented shared
+      # wiring must exist in THIS stack, not only in the runbook)
+      SR_BASTION_TOKEN: ${SR_DEV_BASTION_TOKEN:-}
+      BASTION_AUTHORIZED_KEYS_FILE: /etc/sparring-range/authorized_keys
+      BASTION_TARGETS_KNOWN_HOSTS: /etc/sparring-range/target_known_hosts
       RECORDINGS_DIR: /var/lib/sparring-range/recordings
       BASTION_HOST_KEY_PATH: /etc/sparring-range/bastion_ed25519
       BASTION_LISTEN_HOST: 0.0.0.0

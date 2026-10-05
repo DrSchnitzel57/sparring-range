@@ -27,8 +27,12 @@ def main() -> int:
 
     from srplatform.model_gateway import PRIORITY_RED, get_model_gateway
     from srplatform.red_agent.loop import RedAgentLoop
-    from srplatform.red_agent.runner import get_runner
+    from srplatform.red_agent.runner import get_runner, install_cancellation_handlers
     from srplatform.red_agent.transport import HttpTransport
+
+    # Stopping THIS worker (process-group SIGTERM from the API) must also stop
+    # the command currently running in the runner's own group (audit R03).
+    install_cancellation_handlers()
 
     transport = HttpTransport(api, token=token)
 

@@ -99,10 +99,12 @@ def test_m0_release_requires_datapath_and_invalidates_evidence(tmp_path):
     out = sup.release()
     assert out["killswitch"] == "released"
     assert sup.latch_status()["latched"] is False
-    # after release, the gate demands FRESH evidence (mechanism != noop):
+    # after release, the gate DEMANDS FRESH evidence (mechanism != noop) —
+    # unconditional: a conditional assertion here once let the test pass when
+    # the claimed invalidation did not happen (follow-up review R04)
     allowed, reasons = sup.start_gate()
-    if not allowed:
-        assert any("baseline verification" in r or "datapath proof" in r for r in reasons)
+    assert not allowed, "release must invalidate evidence — start cannot stay authorized"
+    assert any("baseline verification" in r or "datapath proof" in r for r in reasons), reasons
 
 
 # --- criterion 3 -----------------------------------------------------------------

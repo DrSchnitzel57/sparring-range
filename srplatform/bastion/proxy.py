@@ -101,7 +101,18 @@ class BastionProxy:
         keys = self._auth_keys.get(username)
         if not keys:
             return False
-        pub = key.render_public_key().decode() if hasattr(key, "render_public_key") else str(key)
+        # asyncssh renamed the renderer across versions; try both, then str()
+        pub = None
+        for renderer in ("render_public_key", "export_public_key"):
+            fn = getattr(key, renderer, None)
+            if fn is not None:
+                try:
+                    pub = fn().decode()
+                    break
+                except Exception:  # noqa: BLE001
+                    pub = None
+        if pub is None:
+            pub = str(key)
         return any(pub.split()[:2] == k.split()[:2] for k in keys)
 
     async def start(self, host: str | None = None, port: int | None = None) -> int:
@@ -238,8 +249,11 @@ async def api_resolve_token(token: str) -> dict | None:
         if r.status_code != 200:
             return None
         data = r.json()
-        owner = data.get("user_id")
-        data["username"] = None  # server binds ownership; key check falls back to token owner lookup
+        # The API resolves the OWNER's authenticated username server-side
+        # (audit R02); the key check binds the login to that member's
+        # provisioned key. A token with no resolvable owner cannot authorize
+        # any key — fail closed rather than fall through.
+        data["username"] = data.get("username")
         return data
 
 

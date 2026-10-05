@@ -85,9 +85,13 @@ class NftDatapath:
         from srplatform.safety.firewall import render_baseline_ruleset
         return render_baseline_ruleset(self.s)
 
-    def render_emergency(self) -> str:
+    def render_emergency(self, drop_existing: bool = False) -> str:
         from srplatform.safety.firewall import render_emergency_ruleset
-        return render_emergency_ruleset(self.s)
+        return render_emergency_ruleset(self.s, drop_existing=drop_existing)
+
+    def render_emergency_removal(self) -> str:
+        from srplatform.safety.firewall import render_emergency_removal
+        return render_emergency_removal()
 
     # --- privileged execution (single constrained mechanism) -------------------
     def _run_nft(self, args: list[str]) -> tuple[int, str]:
@@ -102,25 +106,57 @@ class NftDatapath:
             return 124, "nft timed out"
 
     def table_exists(self, table: str) -> bool:
-        code, out = self._run_nft(["-nn", "list", "table", f"inet {table}"])
+        code, out = self._run_nft(["-nn", "list", "table", table])
         return code == 0
 
+    def list_table(self, table: str) -> str | None:
+        code, out = self._run_nft(["-nn", "list", "table", table])
+        return out if code == 0 else None
+
+    # Rules whose PRESENCE defines the baseline guarantee — checking table
+    # existence alone was the audit R05 fail-open (an empty table "verified").
+    REQUIRED_BASELINE_RULES = (
+        "chain range_forward",
+        "meta nfproto ipv4 drop",
+        "meta nfproto ipv6 drop",
+        "ip saddr @range_hosts ip daddr @range_hosts accept",
+    )
+
     def baseline_status(self) -> dict:
-        ok = self.table_exists(BASELINE_TABLE)
-        return {"ok": ok,
-                "detail": f"inet table {BASELINE_TABLE} {'present' if ok else 'ABSENT — range egress deny NOT active'}",
+        listing = self.list_table(f"inet {BASELINE_TABLE}")
+        if listing is None:
+            return {"ok": False,
+                    "detail": f"inet table {BASELINE_TABLE} ABSENT — range egress deny NOT active",
+                    "mechanism": "nft"}
+        missing = [r for r in self.REQUIRED_BASELINE_RULES if r not in listing]
+        if missing:
+            return {"ok": False,
+                    "detail": f"{BASELINE_TABLE} exists but REQUIRED rules are missing: {missing} "
+                              "— re-render and re-apply the baseline",
+                    "mechanism": "nft"}
+        return {"ok": True, "detail": f"inet table {BASELINE_TABLE} present with required rules",
                 "mechanism": "nft"}
 
     def apply_emergency(self) -> dict:
-        ruleset = self.render_emergency()
-        # idempotent: create-or-replace OUR tables only — delete-then-load in
-        # one pass, never a global flush, never touching other tables.
-        self._run_nft(["delete", "table", f"inet {EMERGENCY_TABLE}"])       # ok if absent
-        self._run_nft(["delete", "table", f"bridge {EMERGENCY_TABLE}_l2"])  # ok if absent
+        s = self.s
+        if not [p for p in (s.range_bridge_ports or "").split(",") if p.strip()]:
+            # Without the port topology the bridge-family rules cannot drop
+            # same-bridge frames — say so instead of claiming the guarantee.
+            l2_note = ("WARNING: RANGE_BRIDGE_PORTS not configured — same-bridge L2 drop "
+                       "covers the bridge master only; provision the port list!")
+        else:
+            l2_note = f"inet + bridge families on {s.range_bridge} ports"
+        # ATOMIC (audit R05): delete-if-present + replacement in ONE `nft -f`
+        # transaction. A failed load applies NOTHING — the previous ruleset
+        # (and its protection) stays intact instead of being removed first.
+        drop_existing = self.table_exists(f"inet {EMERGENCY_TABLE}") or \
+            self.table_exists(f"bridge {EMERGENCY_TABLE}_l2")
+        ruleset = self.render_emergency(drop_existing=drop_existing)
         code, out = self._run_nft_stdin(ruleset)
         if code != 0:
-            return {"ok": False, "detail": f"emergency apply failed: {out}", "mechanism": "nft"}
-        return {"ok": True, "detail": f"emergency drop applied on {self.s.range_bridge} (inet + bridge families)",
+            return {"ok": False, "detail": f"emergency apply failed (nothing changed): {out}",
+                    "mechanism": "nft"}
+        return {"ok": True, "detail": f"emergency drop applied atomically ({l2_note})",
                 "mechanism": "nft"}
 
     def _run_nft_stdin(self, ruleset: str) -> tuple[int, str]:
@@ -135,17 +171,25 @@ class NftDatapath:
             return 124, "nft timed out"
 
     def remove_emergency(self) -> dict:
-        # remove ONLY our emergency table; baseline remains (never "off" == deny flip)
-        code, out = self._run_nft(["delete", "table", f"inet {EMERGENCY_TABLE}"])
+        # ATOMIC removal of BOTH emergency families (audit R05: the old code
+        # deleted only inet and reported success with the L2 drop still active),
+        # then VERIFY both are gone before claiming release. Baseline remains.
+        code, out = self._run_nft_stdin(self.render_emergency_removal())
         if code != 0 and "No such file or directory" not in out and "does not exist" not in out:
             return {"ok": False, "detail": f"emergency remove failed: {out}", "mechanism": "nft"}
+        for fam_table in (f"inet {EMERGENCY_TABLE}", f"bridge {EMERGENCY_TABLE}_l2"):
+            if self.table_exists(fam_table):
+                return {"ok": False,
+                        "detail": f"{fam_table} STILL INSTALLED after removal — not released",
+                        "mechanism": "nft"}
         base = self.baseline_status()
         if not base["ok"]:
             return {"ok": False,
-                    "detail": "emergency table removed, but baseline egress-deny is NOT active — "
+                    "detail": "emergency tables removed, but baseline egress-deny is NOT active — "
                               "re-render/re-apply baseline immediately",
                     "mechanism": "nft"}
-        return {"ok": True, "detail": "emergency removed; baseline deny preserved", "mechanism": "nft"}
+        return {"ok": True, "detail": "both emergency families removed and verified; "
+                                      "baseline deny preserved", "mechanism": "nft"}
 
 
 def get_datapath(settings: Settings | None = None) -> DatapathController:

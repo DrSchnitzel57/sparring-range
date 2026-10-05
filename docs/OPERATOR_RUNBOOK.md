@@ -54,7 +54,9 @@ the harness cannot honestly close them.
 ## 3. Deployment / golden images
 
 1. **[LIVE GATE]** Build golden images: `infra/images/provision-linux-golden.sh`
-  (vulnerable services + telemetry via `telemetry/install.sh`) or
+  (telemetry pipeline via `telemetry/install.sh` — auditd rules, ENRICHED
+  format, shipper + systemd unit; vulnerable scenario services are NOT part of
+  the golden image, they belong to per-host scenario cloud-init) or
   `infra/images/golden-linux.pkr.hcl` (hashicorp packer plugin; transfers the
   files properly — run `packer validate` against your PVE). Convert to
   template (`qm template <vmid>`); record VMIDs in `.env`
