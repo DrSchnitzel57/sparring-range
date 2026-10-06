@@ -148,11 +148,12 @@ def start_run(db: Session, session_id, scenario_id: str) -> Run:
     return run
 
 
-# The worker environment is SERIALIZED from the controller's RESOLVED settings
+# The worker environment is serialized from the controller's RESOLVED settings
 # (audit N04): it must not depend on whether the operator supplied a value via
 # os.environ or via dotenv, and it must not inherit anything else. The worker
-# is the least-privileged component — API capability, model endpoint and
-# runner channel ONLY; no DB/Proxmox/owner/bastion credentials.
+# is the least-privileged component — API capability and runner channel ONLY;
+# no DB/Proxmox/owner/bastion credentials AND no model endpoint credential
+# (audit Stage 5: red turns are scheduled through the API's shared gateway).
 _WORKER_SETTING_KEYS = {
     "SR_ENV": "sr_env",
     "API_BASE_URL": "api_base_url",
@@ -163,11 +164,6 @@ _WORKER_SETTING_KEYS = {
     "RUNNER_COMMAND_TIMEOUT_S": "runner_command_timeout_s",
     "RUNNER_MAX_OUTPUT_BYTES": "runner_max_output_bytes",
     "RUNNER_SUPERVISOR_BIN": "runner_supervisor_bin",
-    "LLM_BASE_URL": "llm_base_url",
-    "LLM_MODEL_RED": "llm_model_red",
-    "LLM_API_KEY": "llm_api_key",
-    "LLM_TIMEOUT_S": "llm_timeout_s",
-    "MODEL_QUEUE_MAX": "model_queue_max",
 }
 
 

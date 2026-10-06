@@ -59,6 +59,10 @@ def get_coach_llm():
             from srplatform.settings import get_settings
 
             llm = LLM(model=get_settings().llm_model_coach)
+            # Endpoint liveness probe OUTSIDE the gateway (audit Stage 5):
+            # probing THROUGH the scheduler would make the probe itself wait
+            # behind queued red turns, inflating the interactive hint bound
+            # it is supposed to protect.
             llm.complete("ping", "ping")  # prove the endpoint answers or fall back
             _coach_llm = llm
         except Exception:

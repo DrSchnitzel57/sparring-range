@@ -25,7 +25,6 @@ def main() -> int:
         print("[worker] missing SR_* environment — refusing to run", file=sys.stderr)
         return 2
 
-    from srplatform.model_gateway import PRIORITY_RED, get_model_gateway
     from srplatform.red_agent.loop import RedAgentLoop
     from srplatform.red_agent.runner import get_runner, install_cancellation_handlers
     from srplatform.red_agent.transport import HttpTransport
@@ -44,17 +43,19 @@ def main() -> int:
         print(f"[worker] runner unavailable: {e}", file=sys.stderr)
         return 3
 
-    # Model through the bounded gateway (priority: red turn)
-    from srplatform.red_agent.llm import LLM
-    llm = LLM()
-    gateway = get_model_gateway()
-
-    class GatewayLLM:
+    # Model calls go through the API's ONE SHARED SCHEDULER (audit Stage 5):
+    # the run capability posts to /internal/model/complete and the API's
+    # gateway orders it against interactive hints/AARs across processes. The
+    # worker holds NO model endpoint credential at all.
+    class ApiModel:
         def complete(self, system, user):
-            fut = gateway.submit(PRIORITY_RED, "red-turn", llm.complete, system, user)
-            return gateway.wait(fut, timeout=600)
+            r = httpx.post(f"{api}/internal/model/complete",
+                           json={"name": "red-turn", "system": system, "user": user},
+                           headers={"Authorization": f"Bearer {token}"}, timeout=900)
+            r.raise_for_status()
+            return r.json()["text"]
 
-    loop = RedAgentLoop(session_id, scenario_id, transport, GatewayLLM(), runner)
+    loop = RedAgentLoop(session_id, scenario_id, transport, ApiModel(), runner)
     try:
         result = loop.run()
     except Exception as e:  # noqa: BLE001 — the API needs a truthful failure

@@ -72,7 +72,6 @@ def test_worker_role_validates_only_its_own_capability(tmp_path, monkeypatch):
     worker = Settings(sr_env="production", runner_transport="ssh",
                       runner_ssh_target="runner@10.66.0.9",
                       runner_ssh_known_hosts="/etc/sr/known_hosts",
-                      llm_base_url="http://llm:8001/v1", llm_model_red="m",
                       api_base_url="http://api:8000")
     validate_production(worker, role="worker")  # no proxmox/db/bastion needed
     with pytest.raises(RuntimeError, match="WORKER config"):
@@ -97,7 +96,6 @@ def test_worker_never_loads_controller_dotenv(tmp_path, monkeypatch):
         "SR_ENV": "production", "SR_PROCESS_ROLE": "worker",
         "RUNNER_TRANSPORT": "ssh", "RUNNER_SSH_TARGET": "runner@10.0.0.9",
         "RUNNER_SSH_KNOWN_HOSTS": str(tmp_path / "kh"),
-        "LLM_BASE_URL": "http://llm:8001/v1", "LLM_MODEL_RED": "m",
         "API_BASE_URL": "http://api:8000",
     }.items():
         monkeypatch.setenv(k, v)
@@ -124,14 +122,15 @@ def test_worker_env_serializes_resolved_settings(tmp_path, monkeypatch):
     try:
         from srplatform.api.runs import _worker_env
         s = st.Settings(sr_env="dev", runner_ssh_target="runner@10.66.0.9",
-                        runner_ssh_known_hosts="/etc/sr/kh",
-                        llm_base_url="http://llm:8001/v1")
+                        runner_ssh_known_hosts="/etc/sr/kh")
         run = type("R", (), {"run_id": uuid.uuid4()})()
         env = _worker_env(s, "tok-123", uuid.uuid4(), "quick-win-01", run)
         assert env["SR_PROCESS_ROLE"] == "worker"
         assert env["RUNNER_SSH_TARGET"] == "runner@10.66.0.9"
         assert env["RUNNER_SSH_KNOWN_HOSTS"] == "/etc/sr/kh"
-        assert env["LLM_BASE_URL"] == "http://llm:8001/v1"
+        # no model endpoint credential crosses to the worker (Stage 5): red
+        # turns are scheduled through the API's shared gateway
+        assert not any(k.startswith("LLM_") for k in env)
         assert env["SR_WORKER_TOKEN"] == "tok-123"
         joined = " ".join(env.values())
         assert "must-not-cross" not in joined and "owner:secret" not in joined

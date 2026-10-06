@@ -57,17 +57,31 @@ def compress_timeline(events: list[dict], max_lines: int = 80) -> tuple[str, dic
                          + (f" @{host}" if host else ""))
             detections.append(e)
         elif kind == "command" and actor == "telemetry":
+            # UNATTRIBUTED ACTIVITY (audit Stage 5): auditd shows that A
+            # process ran on the host — not WHO ran it. A compromised host's
+            # telemetry (or the attacker's own commands) must never count as
+            # a defender response; it is rendered as activity on record only.
             telemetry_hosts.add(host or "?")
-            responses.append((ts, host, e))
             lines.append(f"[{stamp}#{e.get('event_id')}] AUDITD {host}: "
-                         f"{str(p.get('argv') or p.get('comm'))[:70]}")
+                         f"{str(p.get('argv') or p.get('comm'))[:70]} "
+                         f"[unattributed activity — not defender-attributed]")
+        elif kind == "detection" and actor == "telemetry":
+            # detection events are RENDERED explicitly (audit Stage 5)
+            telemetry_hosts.add(host or "?")
+            lines.append(f"[{stamp}#{e.get('event_id')}] DETECT {host}: "
+                         f"watch {p.get('audit_key') or '?'} "
+                         f"{str(p.get('argv') or p.get('comm') or '')[:50]} "
+                         f"[watch hit — unattributed until correlated]")
         elif kind in CONNECTION_NOISE:
             continue  # connection lifecycle is NOT investigation (F12)
         elif kind == "remediation":
             responses.append((ts, host, e))
             wins.append(e)
+            # a member's remediation STATEMENT is a CLAIM until the scorecard
+            # verifies host state (audit Stage 5)
             lines.append(f"[{stamp}#{e.get('event_id')}] BLUE REMEDIATION {host or ''}: "
-                         f"{str(p.get('action') or p.get('command') or '')[:70]}")
+                         f"{str(p.get('action') or p.get('command') or '')[:70]} "
+                         f"[claim — verified only via scorecard state]")
         elif actor.startswith("blue:") and kind in RESPONSE_KINDS:
             responses.append((ts, host, e))
             lines.append(f"[{stamp}#{e.get('event_id')}] BLUE {p.get('command') or kind}")

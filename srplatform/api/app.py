@@ -694,6 +694,37 @@ def stop_run(run_id: uuid.UUID, p: Principal = Depends(any_member), db: Session 
     return runs_svc.stop_run(db, run_id)
 
 
+class ModelCompleteIn(BaseModel):
+    name: str = "red-turn"
+    system: str
+    user: str
+
+
+@app.post("/internal/model/complete")
+def internal_model_complete(body: ModelCompleteIn, p: Principal = Depends(service("runner"))):
+    """ONE SHARED MODEL SCHEDULER (audit Stage 5): the worker's red turns are
+    scheduled through the SAME gateway that serves interactive hints and AARs
+    in this process — an interactive hint jumps the queue ahead of queued red
+    turns ACROSS PROCESSES. The run-scoped capability is the authorization;
+    no direct model credential ever reaches the worker. A running request is
+    never preempted (documented bound); queue overflow is a visible 503."""
+    from srplatform.model_gateway import PRIORITY_RED, QueueFull, get_model_gateway
+    from srplatform.red_agent.llm import LLM
+    if len(body.system) + len(body.user) > 200_000:
+        raise HTTPException(413, "model request too large")
+    s = get_settings()
+    llm = LLM()
+    try:
+        fut = get_model_gateway().submit(PRIORITY_RED, f"{p.session_id}:{body.name}",
+                                         llm.complete, body.system, body.user)
+        text = get_model_gateway().wait(fut, s.llm_timeout_s + s.model_hint_max_wait_s + 60)
+    except QueueFull:
+        raise HTTPException(503, "model gateway saturated — retry the turn shortly")
+    except TimeoutError:
+        raise HTTPException(504, "model turn exceeded its bound")
+    return {"text": text}
+
+
 @app.post("/internal/runs/{run_id}/complete")
 def run_complete(run_id: uuid.UUID, result: dict,
                  x_worker_token: str | None = Header(default=None),

@@ -37,10 +37,17 @@ def test_timeline_response_must_be_correlated_same_host_within_window():
     assert len(idx["misses"]) == 0 and len(idx["telemetry_gaps"]) == 1
     assert "no telemetry received" in idx["telemetry_gaps"][0]["reason"]
 
+    # Same-host telemetry closes the GAP (the host reports) but is UNATTRIBUTED
+    # activity — it is NOT a defender response (Stage 5: the attacker's own
+    # commands on the host must never earn blue credit).
     events.append(ev(4, 20, "telemetry", "command", "web01", {"argv": "cat /var/log/auth.log"}))
     _, idx = compress_timeline(events)
-    assert len(idx["misses"]) == 0            # now correlated on the right host
-    assert len(idx["telemetry_gaps"]) == 0
+    assert len(idx["misses"]) == 1            # still uncorrelated: no defender attribution
+    assert len(idx["telemetry_gaps"]) == 0    # telemetry coverage exists now
+    # a defender-ATTRIBUTED action on the right host within the window correlates
+    events.append(ev(5, 25, "blue:amy", "command", "web01", {"command": "ps aux"}))
+    _, idx = compress_timeline(events)
+    assert len(idx["misses"]) == 0
 
     # telemetry exists on this host but NO response AFTER the objective -> miss
     # (activity precedes the compromise — it cannot be the investigation)

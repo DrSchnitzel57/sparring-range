@@ -101,6 +101,10 @@ def build_aar(events: list[dict], scenario: dict, scorecard: dict | None,
         "- Telemetry covered all hosts with confirmed red activity."
     won_section = "\n".join(f"- {format_citation(e)}" for e in idx["wins"][-10:]) or \
         "- No explicit remediation actions were recorded (absence of evidence — not a statement about your work)."
+    if idx["wins"]:
+        won_section += ("\n(Recorded remediations are defender-ATTRIBUTED CLAIMS; host-state "
+                        "verification follows the scorecard items above — a claim alone "
+                        "earns no state credit.)")
 
     # failure-weighted study priority: observed-in-evidence first, then declared,
     # tie-broken deterministically; misses/lost points raise everything equally

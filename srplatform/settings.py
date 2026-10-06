@@ -148,11 +148,10 @@ def validate_production(s: Settings, role: str = "controller") -> None:
                 or not s.runner_ssh_known_hosts:
             problems.append("isolated runner not configured (runner_transport=ssh"
                             " + fixed target + pinned known_hosts)")
-        if not s.llm_base_url or not s.llm_model_red:
-            problems.append("model endpoint not configured (llm_base_url/llm_model_red)")
         if not s.api_base_url:
             problems.append("api_base_url missing (worker acts only via its "
-                            "session-scoped API capability)")
+                            "session-scoped API capability — including model "
+                            "scheduling, audit Stage 5)")
         if problems:
             raise RuntimeError("production WORKER config invalid:\n  - "
                                + "\n  - ".join(problems))
