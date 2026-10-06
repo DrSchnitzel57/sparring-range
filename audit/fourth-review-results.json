@@ -1,0 +1,7 @@
+{
+  "ssh_exit_code": 0,
+  "cancel_state": null,
+  "supervisor_control_calls": [],
+  "operation_still_in_local_inventory": false,
+  "loop_maps_result_to": "completed"
+}
