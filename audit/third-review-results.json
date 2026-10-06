@@ -1,0 +1,40 @@
+{
+  "checked_in_unit_identity_test": "passed",
+  "truncated_counter_reuses_id": {
+    "old_id": 1,
+    "new_id": 1,
+    "pending_after_old_ack": [],
+    "drops": 0
+  },
+  "append_after_torn_tail": {
+    "pending": [],
+    "valid_event_physically_present": true,
+    "drops": 2
+  },
+  "expected_baseline_control": {
+    "ok": true,
+    "detail": "inet table sr_range_baseline structurally verified (hook, scope, ordering, sets, terminal drops)",
+    "mechanism": "nft"
+  },
+  "extra_ipv4_allow_accepted": {
+    "ok": true,
+    "detail": "inet table sr_range_baseline structurally verified (hook, scope, ordering, sets, terminal drops)",
+    "mechanism": "nft"
+  },
+  "widened_range_set_accepted": {
+    "ok": true,
+    "detail": "inet table sr_range_baseline structurally verified (hook, scope, ordering, sets, terminal drops)",
+    "mechanism": "nft"
+  },
+  "production_readiness_without_management_key": {
+    "enforced": false,
+    "ok": true,
+    "checks": [],
+    "reason": "management exec channel not configured \u2014 dev-mode relaxation, visible in this response (production refuses `ready` without readiness)"
+  },
+  "reader_deadline_overrun": {
+    "deadline_seconds": 0.05,
+    "elapsed_seconds": 0.531,
+    "readiness_boundary": "adapter for Windows pipe; actual blocking TextIOWrapper read"
+  }
+}
