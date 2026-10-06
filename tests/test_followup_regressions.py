@@ -872,6 +872,61 @@ def test_r12_compose_splits_credentials_and_wires_bastion():
     assert "BASTION_TARGETS_KNOWN_HOSTS" in benv
 
 
+def test_stage5_compose_seeds_bastion_key_volume():
+    """Stage 5 item 3: the bastion-keys volume and recordings dir must be
+    POPULATED by a seed step, with wiring consistent with what the bastion
+    reads. (docker compose config / fresh-volume boot: BLOCKED here — no
+    docker — so this YAML-level check is the honest substitute.)"""
+    import yaml
+
+    compose = yaml.safe_load((REPO / "docker-compose.yml").read_text())
+    services = compose["services"]
+    seed = services.get("seed-bastion-keys")
+    assert seed, "no compose seed step provisions the bastion-keys volume"
+    assert seed.get("restart") == "no"
+    assert any("seed_bastion_keys" in str(a) for a in seed.get("command", [])), \
+        "seed step does not run the seed script"
+
+    bastion = services["bastion"]
+    benv = bastion["environment"]
+    seed_vols = [str(v) for v in seed.get("volumes", [])]
+
+    # seed writes into the SAME volume the bastion reads, at the exact parent
+    # dirs of the bastion's key paths
+    keys_mounts = [v for v in seed_vols if v.startswith("bastion-keys:")]
+    assert keys_mounts, "seed does not mount the bastion-keys volume"
+    keys_dest = keys_mounts[0].split(":")[1]
+    for k in ("BASTION_AUTHORIZED_KEYS_FILE", "BASTION_TARGETS_KNOWN_HOSTS",
+              "BASTION_HOST_KEY_PATH"):
+        assert str(benv[k]).rsplit("/", 1)[0] == keys_dest, \
+            f"{k} lives outside the seeded bastion-keys mount"
+    rec_mounts = [v for v in seed_vols if v.startswith("recordings:")]
+    assert rec_mounts, "seed does not mount the recordings volume"
+    assert rec_mounts[0].split(":")[1] == benv["RECORDINGS_DIR"], \
+        "seeded recordings path != bastion RECORDINGS_DIR"
+
+    # operator key material is bind-mounted READ-ONLY (never written back)
+    assert any(v.endswith(":ro") for v in seed_vols), \
+        "operator key dir must be mounted read-only"
+    # the bastion only starts after a SUCCESSFUL seed
+    dep = bastion.get("depends_on", {}).get("seed-bastion-keys", {})
+    assert dep.get("condition") == "service_completed_successfully", \
+        "bastion must wait for the seed step to succeed"
+
+    # volume wiring consistency: every named volume used is declared, every
+    # declared volume is actually used (bind mounts/vars excluded)
+    declared = set(compose.get("volumes", {}))
+    used = {str(v).split(":")[0] for s in services.values() for v in s.get("volumes", [])
+            if not str(v).startswith((".", "/", "$"))}
+    assert used <= declared, f"services use undeclared volumes: {used - declared}"
+    assert declared <= used, f"declared-but-never-mounted volumes: {declared - used}"
+
+    # the seed script exists and fails loudly (no silent keyless bastion)
+    script = (REPO / "infra/dev/seed_bastion_keys.sh").read_text()
+    for needle in ("authorized_keys", "target_known_hosts", "ERROR", "exit 1"):
+        assert needle in script, f"seed script missing: {needle}"
+
+
 def test_r12_golden_image_calls_the_real_installer():
     script = (REPO / "infra/images/provision-linux-golden.sh").read_text()
     assert "telemetry/install.sh" in script, \

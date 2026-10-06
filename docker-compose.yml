@@ -6,6 +6,8 @@
 #   bootstrap-roles     one-shot: creates the sr_app role (owner is created by initdb)
 #   migrate             one-shot: Alembic upgrade head — THE ONLY service that sees
 #                       the owner (DDL) credentials
+#   seed-bastion-keys   one-shot: populates the bastion-keys volume + recordings
+#                       dir from operator-supplied files (never committed)
 #   api                 the single front door; app-role credentials ONLY
 #   bastion             recording SSH proxy; talks to the API over HTTP only
 #
@@ -51,6 +53,21 @@ services:
       DB_APP_ROLE: sr_app
     depends_on:
       bootstrap-roles: { condition: service_completed_successfully }
+    restart: "no"
+
+  seed-bastion-keys:
+    # Stage 5 item 3: declaring the bastion-keys volume is NOT provisioning it.
+    # This one-shot copies the operator-supplied member keys + pinned target
+    # host keys (bind-mounted read-only; NEVER committed) into the shared
+    # volumes and creates the recordings dir. Fails loudly with a runbook
+    # pointer when a file is missing or empty — the bastion must never start
+    # silently with no key material.
+    build: { context: ., dockerfile: infra/dev/Dockerfile }
+    command: ["sh", "infra/dev/seed_bastion_keys.sh"]
+    volumes:
+      - ${SR_DEPLOY_KEYS_DIR:-./deploy/bastion}:/operator-keys:ro
+      - bastion-keys:/etc/sparring-range
+      - recordings:/var/lib/sparring-range/recordings
     restart: "no"
 
   api:
@@ -114,6 +131,7 @@ services:
       - bastion-keys:/etc/sparring-range
     depends_on:
       api: { condition: service_started }
+      seed-bastion-keys: { condition: service_completed_successfully }
 
 volumes:
   pgdata:

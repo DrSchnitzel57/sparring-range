@@ -4,6 +4,51 @@ Everything here reflects the code as shipped. Steps marked **[LIVE GATE]**
 require Drew's R740/model/range VMs and remain unaccepted until executed —
 the harness cannot honestly close them.
 
+## 0. Fresh-stack bootstrap (dev compose: empty deployment → running stack)
+
+One documented, idempotent path: compose seed step + `rangectl bootstrap`.
+
+1. `cp .env.example .env` (compose dev passwords have documented defaults;
+   `SR_ENV=production` refuses placeholders).
+2. Operator-supplied key material in `./deploy/bastion/` (override the dir
+   with `SR_DEPLOY_KEYS_DIR`). **Secret material — never commit it** (this
+   directory is not in `.gitignore`; keep it outside the repo or ignore it
+   yourself):
+   - `authorized_keys` — one `"<username> <algo> <base64>"` line per member
+     (exactly the format `BASTION_AUTHORIZED_KEYS_FILE` is read in
+     `srplatform/bastion/proxy.py`).
+   - `target_known_hosts` — pinned range-host keys
+     (`ssh-keyscan -p 22 <range-host> > deploy/bastion/target_known_hosts`).
+   - **[DEV-ONLY substitution]** with no range hosts yet, generate a
+     placeholder pin:
+     `ssh-keygen -q -t ed25519 -N '' -f /tmp/devtarget && printf 'target01 %s\n' "$(cat /tmp/devtarget.pub)" > deploy/bastion/target_known_hosts`
+     — DEV ONLY: production refuses TOFU, so placeholder pins must never ship;
+     re-key against real host keys before any member session.
+3. `docker compose up -d` — postgres → bootstrap-roles → migrate →
+   **seed-bastion-keys** (copies both files into the `bastion-keys` volume at
+   `/etc/sparring-range/{authorized_keys,target_known_hosts}` and creates the
+   recordings dir; exits 1 with a runbook pointer if a file is missing or
+   empty) → api → bastion.
+4. `rangectl bootstrap --telemetry-host web01 [--telemetry-host ...]`
+   (password via `--password`, `$BOOTSTRAP_OPERATOR_PASSWORD`, or prompt):
+   creates the operator via `POST /auth/bootstrap`, mints the bastion +
+   per-host telemetry capabilities via `POST /admin/service_tokens` (printed
+   ONCE, recorded 0600 in `~/.rangectl/bootstrap.json`), validates the key
+   material and ensures the recordings dir. **Re-running is a no-op**: a
+   closed bootstrap and already-minted capabilities are reported, never
+   re-minted (the state file is the mint ledger — deleting it re-mints).
+5. Wire the minted bastion capability: set `SR_DEV_BASTION_TOKEN` in `.env`,
+   then `docker compose up -d bastion` (recreate). Until then the bastion
+   serves member-key auth but cannot resolve session tokens.
+6. `rangectl login && rangectl readyz` — readyz reports migration version,
+   runner config, `recordings_writable` and safety state.
+
+**Verification status (honest):** the seed script, the bootstrap path and the
+volume/env wiring are covered by `tests/test_stage5_bootstrap.py` and the
+compose YAML tests in `tests/test_followup_regressions.py`. `docker compose
+config` and a fresh-volume boot could NOT be executed in the authoring
+environment (docker not installed) — recorded as BLOCKED, not passed.
+
 ## 1. One-time setup (control plane host)
 
 1. `.env` from `.env.example` (all variables documented there). `SR_ENV=production`
@@ -13,6 +58,7 @@ the harness cannot honestly close them.
    sanctioned non-HTTP operation; app role has no DDL and cannot
    UPDATE/DELETE/TRUNCATE `events` — trigger + grants).
 3. Bootstrap the operator (works only while NO account has a password):
+   `rangectl bootstrap` (idempotent full path — see §0) or raw
    `curl -X POST $API/auth/bootstrap -d '{"username":"drew","password":"<10+ chars>"}'`
    Later accounts: `POST /users` (operator token) — members get real
    passwords; username knowledge is never authentication.
@@ -157,3 +203,5 @@ the harness cannot honestly close them.
   checklist-driven. `POSTGRES` cluster default collation must be UTF8-safe
   (tests create with explicit ENCODING).
 - All **[LIVE GATE]** items above.
+- `docker compose config` + fresh-volume boot of §0: **BLOCKED** in the
+  authoring environment (no docker); validated by YAML-parsing tests only.
