@@ -2,13 +2,20 @@
 
 Replaces the daemon-thread + arbitrary-PID model:
   * /run validates everything BEFORE spawning (safety latch/evidence, runner
-    availability, session exists/matches, no duplicate active run).
+    availability, session exists/matches, no duplicate active run) — and the
+    whole validate→spawn window participates in the SAME durable operation
+    claim used by end/reset/teardown (audit T02): a run can never slip its
+    worker between teardown's "no active worker" check and its release.
   * Each run is a subprocess in its OWN process group; the API registers the
     handle and a watchdog thread finalizes state if the worker dies uncleanly.
   * The worker authenticates back to the API with a one-shot run-scoped token
     (only its sha256 is stored) limited to its own session's evidence plane.
-  * Termination kills the process GROUP (command descendants), never the API,
-    and works after an API restart via recovered pid/pgid rows.
+  * Termination kills the process GROUP (worker), and — for REMOTE commands —
+    the durable `run_operations` inventory is cancelled through the runner
+    control channel with CONFIRMED cessation (audit T01). A worker exiting
+    proves nothing about remote work; unconfirmed cessation becomes
+    'cancel-unknown': visible, blocks new commands, retains the reservation,
+    and is retried by startup recovery. 'stopping' is never a success.
 """
 from __future__ import annotations
 
@@ -25,13 +32,20 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from srplatform.db.models import Run
+from srplatform.db.models import Run, RunOperation
 from srplatform.db.session import db as db_ctx
 from srplatform.safety import get_supervisor
 from srplatform.safety.runregistry import (RunHandle, pgid_alive, pgid_matches_identity,
                                            pgid_start_time, run_registry)
 
-ACTIVE = ("queued", "running")
+# ONE consistent operation state machine (audit T02): every lifecycle check,
+# uniqueness lookup, active-run lookup and restart recovery treats these
+# states as ACTIVE (a run whose work is not confirmed finished). 'stopping'
+# and 'cancel-unknown' are NOT finished and NOT success.
+ACTIVE = ("queued", "running", "stopping", "cancel-unknown")
+# states a stop attempt may legitimately act on (retryable) vs final states
+STOPPABLE = ACTIVE
+TERMINAL = ("completed", "failed", "cancelled")
 
 
 def _now():
@@ -55,9 +69,88 @@ class GateRefused(RuntimeError):
 def active_run_for_session(db: Session, session_id) -> Run | None:
     return db.execute(select(Run).where(Run.session_id == session_id,
                                          Run.status.in_(ACTIVE))
-                      .order_by(Run.started_at.desc())).scalars().first()
+                      .order_by(Run.started_at.desc().nullslast())).scalars().first()
 
 
+# ------------------------------------------------------- remote cancellation --
+def _control_runner():
+    """Runner adapter used for AUTHORITATIVE remote cancellation over the
+    control channel (independent of any worker). None when the transport has
+    no remote channel (local-dev). Construction failure is NOT silence: the
+    caller reports it as unconfirmed."""
+    from srplatform.settings import get_settings
+    s = get_settings()
+    if s.runner_transport != "ssh":
+        return None
+    from srplatform.red_agent.runner import SshRunner
+    return SshRunner(s)   # raises RunnerUnavailable when misconfigured
+
+
+def cancel_remote_operations(db: Session, run: Run, runner=None,
+                             timeout_s: float = 15.0) -> dict:
+    """Cancel every UNRESOLVED remote operation of a run through the runner
+    control channel and CONFIRM cessation (audit T01). Rows are only marked
+    completed when the runner confirms; otherwise they stay visible as
+    'cancel-unknown' — never dropped from the inventory, and RETRIED by every
+    later stop/recovery until confirmed. Returns a truthful per-op summary;
+    ok=True only when nothing remains unconfirmed."""
+    ops = db.execute(select(RunOperation).where(
+        RunOperation.run_id == run.run_id,
+        RunOperation.state.in_(("active", "cancel-unknown")),
+        RunOperation.kind == "remote")).scalars().all()
+    if not ops:
+        return {"ok": True, "ops": [], "detail": "no unresolved remote operations"}
+    if runner is None:
+        try:
+            runner = _control_runner()
+        except Exception as e:  # noqa: BLE001 — misconfigured channel = unconfirmed
+            for o in ops:
+                o.state = "cancel-unknown"
+            db.commit()
+            return {"ok": False,
+                    "ops": [{"op_id": o.op_id, "cancelled": False,
+                             "detail": f"control channel unavailable: {e}"} for o in ops],
+                    "detail": "remote cancellation UNAVAILABLE — cessation unconfirmed"}
+    if runner is None:  # local-dev transport: remote ops cannot exist, but if
+        for o in ops:   # a stale row does, it is unconfirmed, never silent
+            o.state = "cancel-unknown"
+        db.commit()
+        return {"ok": False, "ops": [], "detail": "remote op rows exist but transport has no remote channel"}
+    results = []
+    for o in ops:
+        try:
+            confirmed = bool(runner.cancel_remote(o.op_id, timeout_s=timeout_s))
+        except Exception as e:  # noqa: BLE001
+            confirmed = False
+            detail = f"control channel error: {e}"[:200]
+        else:
+            detail = ("runner confirmed cessation" if confirmed
+                      else "runner did NOT confirm cessation")
+        o.state = "completed" if confirmed else "cancel-unknown"
+        if confirmed:
+            o.ended_at = _now()
+        results.append({"op_id": o.op_id, "cancelled": confirmed, "detail": detail})
+        db.commit()   # each verdict is durable as it is made
+    ok = all(r["cancelled"] for r in results)
+    return {"ok": ok, "ops": results,
+            "detail": "all remote operations confirmed gone" if ok else
+                      f"{sum(1 for r in results if not r['cancelled'])} remote operation(s) "
+                      "UNCONFIRMED — reservation retained"}
+
+
+def cancel_all_active_remote_operations(runner=None) -> dict:
+    """Killswitch/startup helper: cancel remote ops of every active run."""
+    actions = []
+    with db_ctx() as db:
+        runs = db.execute(select(Run).where(Run.status.in_(ACTIVE))).scalars().all()
+        for run in runs:
+            res = cancel_remote_operations(db, run, runner=runner)
+            actions.append({"run_id": str(run.run_id), **res})
+    ok = all(a["ok"] for a in actions) if actions else True
+    return {"ok": ok, "actions": actions}
+
+
+# ------------------------------------------------------------------ start ----
 def start_run(db: Session, session_id, scenario_id: str) -> Run:
     # ---- duplicate guard: repeated /run on an active run does NOT spawn ----
     existing = active_run_for_session(db, session_id)
@@ -76,8 +169,8 @@ def start_run(db: Session, session_id, scenario_id: str) -> Run:
     try:
         # DURABLE BEFORE SPAWN (audit R01): the run row + credential commit
         # first so the worker never races its own credential. The partial
-        # unique index (migration 0007) makes the duplicate check ATOMIC —
-        # concurrent /run requests cannot both pass a select-then-insert.
+        # unique index (migrations 0007/0008) makes the duplicate check
+        # ATOMIC — concurrent /run requests cannot both pass select-then-insert.
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -105,11 +198,7 @@ def start_run(db: Session, session_id, scenario_id: str) -> Run:
     pstart = pgid_start_time(proc.pid)
     # ATOMIC queued->running transition (audit N02): a concurrent stop/end
     # flips the row out of 'queued'; this conditional update detects exactly
-    # that and hands the freshly spawned process to the termination path
-    # instead of resurrecting a terminal run. A worker that COMPLETED before
-    # this point also leaves 'queued' — its process is already gone, and
-    # killing its (dead) group is harmless.
-    from sqlalchemy import update
+    # that and hands the freshly spawned process to the termination path.
     res = db.execute(
         update(Run)
         .where(Run.run_id == run.run_id, Run.status == "queued")
@@ -117,14 +206,25 @@ def start_run(db: Session, session_id, scenario_id: str) -> Run:
                 started_at=_now()))
     db.commit()
     if res.rowcount == 0:
-        # run terminated concurrently (cancelled/stopping/completed)
+        # run terminated concurrently (stopping/cancelled/cancel-unknown).
+        # PERSIST the outcome (audit T02): the termination obligation must
+        # not depend on this request surviving. Success -> terminal cancelled
+        # WITH the process identity retained; failure -> cancel-unknown so
+        # recovery retries the kill, never a silent 'stopping' row.
         term = run_registry.terminate_group(pgid, expected_pstart=pstart)
-        if not term["ok"]:
+        if term["ok"]:
             db.execute(update(Run).where(Run.run_id == run.run_id)
-                       .values(status="failed", outcome="worker_failure",
+                       .values(status="cancelled", outcome="canceled",
+                               pid=proc.pid, pgid=pgid, pgid_pstart=pstart,
+                               error=f"terminated concurrently during spawn: {term['detail']}"[:1000],
+                               ended_at=_now(), worker_token=None))
+            db.commit()
+        else:
+            db.execute(update(Run).where(Run.run_id == run.run_id)
+                       .values(status="cancel-unknown", outcome="worker_failure",
+                               pid=proc.pid, pgid=pgid, pgid_pstart=pstart,
                                error=f"concurrently terminated but spawned worker "
-                                     f"could not be killed: {term['detail']}"[:1000],
-                               ended_at=_now()))
+                                     f"could not be killed: {term['detail']}"[:1000]))
             db.commit()
         raise RunConflict("run was terminated concurrently; spawned worker handed to "
                           f"termination ({term['detail']})")
@@ -136,14 +236,20 @@ def start_run(db: Session, session_id, scenario_id: str) -> Run:
     # START/ENGAGE RACE (audit N02): the latch could have been engaged between
     # the gate check and process registration. Re-check AFTER registration and
     # kill our own group if so — a start racing an engaged latch never escapes
-    # supervision.
+    # supervision. A FAILED kill is never reported as cancelled (audit T02).
     if get_supervisor().latch_status()["latched"]:
         term = run_registry.terminate_group(pgid, expected_pstart=pstart)
-        run.status, run.outcome, run.ended_at = "cancelled", "canceled", _now()
-        run.worker_token = None
+        if term["ok"]:
+            run.status, run.outcome, run.ended_at = "cancelled", "canceled", _now()
+            run.worker_token = None
+        else:
+            run.status, run.outcome = "cancel-unknown", "worker_failure"
+            run.error = (f"latch engaged during spawn and the kill FAILED: "
+                         f"{term['detail']} — worker group may still be running")
         db.commit()
         raise GateRefused([f"safety latch engaged during worker start — spawned "
-                           f"worker terminated ({term['detail']})"])
+                           f"worker termination {'confirmed' if term['ok'] else 'UNCONFIRMED'} "
+                           f"({term['detail']})"])
     _watch(proc, str(run.run_id))
     return run
 
@@ -192,79 +298,128 @@ def _watch(proc: subprocess.Popen, run_id: str) -> None:
             run = s.get(Run, run_id)
             if run is None:
                 return
-            if run.status in ACTIVE:  # worker never reported → unclean death
-                run.status = "failed"
-                run.outcome = "worker_failure"
-                run.error = f"worker exited {code} without reporting"
-                run.ended_at = _now()
+            if run.status in ("queued", "running"):
+                # worker never reported and NO stop owns this row (a
+                # 'stopping'/'cancel-unknown' row belongs to the stop/recovery
+                # path — finalizing it here would race the authoritative
+                # cessation check). LOCAL containment died with the worker;
+                # REMOTE work must be confirmed through the control channel
+                # before anything is called finished (audit T01).
+                remote = cancel_remote_operations(s, run)
+                if remote["ok"]:
+                    run.status = "failed"
+                    run.outcome = "worker_failure"
+                    run.error = f"worker exited {code} without reporting"
+                    run.ended_at = _now()
+                else:
+                    run.status = "cancel-unknown"
+                    run.error = (f"worker exited {code} without reporting and remote "
+                                 f"cessation is UNCONFIRMED: {remote['detail']}")
     threading.Thread(target=_j, daemon=True, name=f"run-watch-{run_id[:8]}").start()
 
 
-def stop_run(db: Session, run_id) -> dict:
+# ------------------------------------------------------------------- stop ----
+def stop_run(db: Session, run_id, runner=None) -> dict:
+    """Authoritative stop (audit T01/T02): the run becomes 'cancelled' ONLY
+    when the worker group is confirmed dead AND every remote operation is
+    confirmed gone. A failed kill never sets cancelled; 'stopping' is an
+    intermediate state that is never reported as success (ok=False)."""
     run = db.get(Run, run_id)
     if run is None:
         raise KeyError("run not found")
-    if run.status not in ACTIVE:
+    if run.status in TERMINAL:
         return {"ok": True, "status": run.status, "note": "already finished"}
-    if run.status == "queued" and not run.pgid:
+
+    # CONDITIONAL transition into stopping (audit T02): concurrent stops
+    # converge on one attempt; a terminal row can never be dragged back.
+    was_queued = run.status == "queued"
+    db.execute(update(Run).where(Run.run_id == run_id,
+                                 Run.status.in_(("queued", "running")))
+               .values(status="stopping"))
+    db.commit()   # 'stopping' must be durable BEFORE the spawner race resolves
+    db.refresh(run)
+
+    if was_queued and not run.pgid:
         # SPAWN/STOP RACE (audit N02): the worker may be between Popen and
-        # the spawner's pgid commit. Mark 'stopping' (committed) — the
-        # spawner's queued->running update then FAILS and it terminates the
-        # group itself. Poll briefly so the common case is confirmed here.
-        run.status = "stopping"
-        db.commit()
+        # the spawner's pgid commit. The spawner's queued->running update
+        # FAILS and it persists the terminal outcome itself. Poll briefly;
+        # an unresolved race is NOT a success — the obligation is retained.
         for _ in range(50):
             db.refresh(run)
-            if run.pgid:
+            if run.pgid or run.status not in ("stopping", "queued"):
                 break
             time.sleep(0.1)
-        if run.pgid:
-            res = run_registry.terminate_group(run.pgid, expected_pstart=run.pgid_pstart)
-            if not res["ok"]:
-                run.status = "running"   # stop FAILED — do not lie about state
-                db.flush()
-                return {"ok": False, "status": "running", "detail": res["detail"]}
-            run.status, run.outcome, run.ended_at = "cancelled", "canceled", _now()
-            run.worker_token = None
-            db.flush()
-            return {"ok": True, "status": run.status, "detail": res["detail"]}
-        return {"ok": True, "status": "stopping",
-                "detail": "worker not yet registered; the spawner holds the "
-                          "termination obligation and will kill the group"}
-    run.status = "stopping"
-    db.flush()
-    res = (run_registry.terminate_group(run.pgid, expected_pstart=run.pgid_pstart)
-           if run.pgid else {"ok": True, "detail": "no pgid"})
-    if not res["ok"]:
-        run.status = "running"  # stop FAILED — do not lie about state
-        db.flush()
-        return {"ok": False, "status": "running", "detail": res["detail"]}
-    run.status, run.outcome, run.ended_at = "cancelled", "canceled", _now()
-    run.worker_token = None  # credential dies with the run (one-shot, R01)
-    db.flush()
-    return {"ok": True, "status": run.status}
+        if run.status in TERMINAL:
+            return {"ok": True, "status": run.status,
+                    "detail": "spawner completed the termination"}
+        if not run.pgid:
+            return {"ok": False, "status": run.status,
+                    "detail": "worker not yet registered; the spawner or startup "
+                              "recovery retains the termination obligation — NOT confirmed"}
+
+    # 1. LOCAL containment: kill the worker's process group, confirmed.
+    group_res = (run_registry.terminate_group(run.pgid, expected_pstart=run.pgid_pstart)
+                 if run.pgid else {"ok": True, "detail": "no worker pgid recorded"})
+
+    # 2. REMOTE containment: cancel + confirm every active remote operation.
+    remote = cancel_remote_operations(db, run, runner=runner)
+
+    if group_res["ok"] and remote["ok"]:
+        res = db.execute(update(Run).where(Run.run_id == run_id,
+                                           Run.status.in_(ACTIVE))
+                         .values(status="cancelled", outcome="canceled",
+                                 ended_at=_now(), worker_token=None))
+        db.commit()
+        out = {"ok": True, "status": "cancelled", "detail": group_res["detail"]}
+        if res.rowcount == 0:   # lost a race to a terminal transition
+            db.refresh(run)
+            out["status"] = run.status
+        return out
+    # NEVER convert a failed/unconfirmed termination into 'cancelled'.
+    detail = (f"worker group: {group_res['detail']}; remote: {remote['detail']}")
+    db.execute(update(Run).where(Run.run_id == run_id, Run.status.in_(ACTIVE))
+               .values(status="cancel-unknown",
+                       error=f"stop UNCONFIRMED — {detail}"[:1000]))
+    db.commit()
+    return {"ok": False, "status": "cancel-unknown", "detail": detail}
 
 
+# ---------------------------------------------------------------- complete ---
 def complete_run(db: Session, run_id: str, worker_token: str, result: dict) -> Run:
-    """Worker callback (authenticated by the run-scoped capability)."""
+    """Worker callback (authenticated by the run-scoped capability). The
+    terminal transition is ATOMIC (audit T02): one conditional UPDATE binds
+    token consumption + terminal state, so a concurrent stop can never have
+    its cancellation overwritten by a late callback (or vice versa)."""
     run = db.get(Run, run_id)
     if run is None:
         raise KeyError("run not found")
     if run.worker_token is None:
-        # credential was already consumed (or the run predates it): ONE-SHOT.
         raise PermissionError("worker credential already consumed")
-    if hashlib.sha256(worker_token.encode()).hexdigest() != run.worker_token:
+    token_hash = hashlib.sha256(worker_token.encode()).hexdigest()
+    if token_hash != run.worker_token:
         raise PermissionError("bad worker token")
-    if run.status not in ACTIVE:
-        # Terminal state is FINAL (audit R01): a late callback can never
-        # resurrect or rewrite a cancelled/failed/completed run.
+    outcome = str(result.get("outcome", "incomplete"))[:64]
+    if outcome == "cancel_unconfirmed":
+        # the worker itself could not confirm remote cessation (audit T01):
+        # visible, blocks new commands, recovery retries — never 'completed'.
+        status, ended = "cancel-unknown", None
+    elif outcome == "worker_failure":
+        status, ended = "failed", _now()
+    else:
+        status, ended = "completed", _now()
+    res = db.execute(
+        update(Run)
+        .where(Run.run_id == run_id, Run.worker_token == token_hash,
+               Run.status.in_(("queued", "running")))
+        .values(status=status, outcome=outcome, result=result,
+                ended_at=ended, worker_token=None))
+    db.commit()
+    if res.rowcount == 0:
+        db.refresh(run)
+        if run.worker_token is None:
+            raise PermissionError("worker credential already consumed")
         raise RunStateError(f"run already {run.status}")
-    run.status = "completed" if result.get("outcome") != "worker_failure" else "failed"
-    run.outcome = str(result.get("outcome", "incomplete"))[:64]
-    run.result = result
-    run.ended_at = _now()
-    run.worker_token = None  # ONE-SHOT: the callback consumes the credential
-    db.flush()
+    db.refresh(run)
     return run
 
 
@@ -273,11 +428,15 @@ def verify_worker_token(run: Run, token: str | None) -> bool:
                 and hashlib.sha256(token.encode()).hexdigest() == run.worker_token)
 
 
+# ------------------------------------------------------------- reconciliation
 def reconcile_on_startup() -> dict:
     """After an API restart: any run still marked active whose process group is
-    gone is failed; groups still alive are RE-REGISTERED (so the killswitch can
-    reach them) and terminated if the safety latch is engaged (the latch never
-    forgets)."""
+    gone is failed — AFTER remote operations are confirmed cancelled (audit
+    T01: a worker exiting does not prove remote cessation; unconfirmed work
+    stays visible as 'cancel-unknown' and keeps blocking). Groups still alive
+    are RE-REGISTERED (so the killswitch can reach them) and terminated if the
+    safety latch is engaged (the latch never forgets). 'stopping' and
+    'cancel-unknown' rows are retried, never skipped (audit T02)."""
     from srplatform.db.models import Event
     actions = []
     with db_ctx() as db:
@@ -287,7 +446,41 @@ def reconcile_on_startup() -> dict:
             if run.pgid:
                 alive = pgid_alive(run.pgid)
                 identity_ok = pgid_matches_identity(run.pgid, run.pgid_pstart)
-            if not alive or not identity_ok:
+            if alive and identity_ok:
+                # SURVIVING GROUP RE-ENTER SUPERVISION (audit R03): without
+                # this the killswitch would only report the group, never kill
+                # it.
+                run_registry.add(RunHandle(run_id=str(run.run_id), pid=run.pid,
+                                           pgid=run.pgid, process=None,
+                                           pgid_pstart=run.pgid_pstart,
+                                           meta={"session_id": str(run.session_id),
+                                                 "recovered": True}))
+                if get_supervisor().latch_status()["latched"]:
+                    res = run_registry.terminate_group(run.pgid, expected_pstart=run.pgid_pstart)
+                    remote = cancel_remote_operations(db, run)
+                    run.worker_token = None
+                    if res["ok"] and remote["ok"]:
+                        run.status, run.outcome, run.ended_at = "cancelled", "canceled", _now()
+                        actions.append(f"run {str(run.run_id)[:8]}: latched kill on startup — {res['detail']}")
+                    else:
+                        # NEVER convert a failed termination into 'cancelled'
+                        # (audit N05/T01): the work is still out there.
+                        run.status = "cancel-unknown"
+                        run.error = (f"latched kill on startup UNCONFIRMED: {res['detail']}; "
+                                     f"remote: {remote['detail']}")
+                        actions.append(f"run {str(run.run_id)[:8]}: LATCHED KILL UNCONFIRMED — {res['detail']}")
+                continue
+            # worker gone (or identity mismatch — never signal a reused PGID)
+            remote = cancel_remote_operations(db, run)
+            if not remote["ok"]:
+                run.status = "cancel-unknown"
+                run.error = (f"reconciled after API restart: worker gone but remote "
+                             f"cessation UNCONFIRMED: {remote['detail']}")
+                db.add(Event(session_id=run.session_id, ts=_now(), actor="system",
+                             action_type="run_reconciled",
+                             payload={"run_id": str(run.run_id), "note": run.error}))
+                actions.append(f"run {str(run.run_id)[:8]}: cancel-unknown (remote unconfirmed)")
+            else:
                 run.status, run.outcome = "failed", "worker_failure"
                 run.error = ("reconciled after API restart: worker gone" if not alive
                              else "reconciled after API restart: recorded process-group "
@@ -298,28 +491,5 @@ def reconcile_on_startup() -> dict:
                              action_type="run_reconciled",
                              payload={"run_id": str(run.run_id), "note": run.error}))
                 actions.append(f"run {str(run.run_id)[:8]}: failed (worker gone)")
-            else:
-                # SURVIVING GROUP RE-ENTER SUPERVISION (audit R03): without this
-                # the killswitch would only report the group, never kill it.
-                run_registry.add(RunHandle(run_id=str(run.run_id), pid=run.pid,
-                                           pgid=run.pgid, process=None,
-                                           pgid_pstart=run.pgid_pstart,
-                                           meta={"session_id": str(run.session_id),
-                                                 "recovered": True}))
-                if get_supervisor().latch_status()["latched"]:
-                    res = run_registry.terminate_group(run.pgid, expected_pstart=run.pgid_pstart)
-                    run.worker_token = None
-                    if res["ok"]:
-                        run.status, run.outcome, run.ended_at = "cancelled", "canceled", _now()
-                        actions.append(f"run {str(run.run_id)[:8]}: latched kill on startup — {res['detail']}")
-                    else:
-                        # NEVER convert a failed termination into 'cancelled'
-                        # (audit N05): the group is still alive — keep it
-                        # registered and report the failure loudly.
-                        run.status, run.outcome = "failed", "worker_failure"
-                        run.error = (f"latched kill on startup FAILED: {res['detail']} — "
-                                     "process group may still be running")
-                        run.ended_at = _now()
-                        actions.append(f"run {str(run.run_id)[:8]}: LATCHED KILL FAILED — {res['detail']}")
         db.flush()
     return {"actions": actions}

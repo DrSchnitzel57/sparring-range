@@ -158,8 +158,13 @@ class RangeLease(Base):
 class OperationClaim(Base):
     """Durable per-session operation claim (audit N02): survives the intent
     commits that release normal row locks. One row per session — the session's
-    lifecycle operations (launch/deploy/reset/teardown/end) serialize on it.
-    Cleared at API startup; stale claims are taken over with loud evidence."""
+    lifecycle operations (launch/deploy/reset/teardown/end/run) serialize on
+    it. Cleared at API startup; stale claims are taken over with loud
+    evidence.
+
+    OWNER FENCING (audit T02): every acquire mints an owner token. Release
+    only deletes the row it still owns — a stale request whose claim was
+    taken over can never erase the REPLACEMENT request's ownership."""
 
     __tablename__ = "operation_claims"
 
@@ -169,6 +174,7 @@ class OperationClaim(Base):
     operation: Mapped[str] = mapped_column(Text, nullable=False)
     claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),
                                                  server_default=func.now(), nullable=False)
+    owner: Mapped[str | None] = mapped_column(Text)  # fencing token (audit T02)
 
 
 class Deployment(Base):
@@ -212,9 +218,45 @@ class Run(Base):
     __table_args__ = (
         # DATABASE-ENFORCED single active run per session (audit N02): a
         # select-then-insert duplicate check races; a partial unique index
-        # cannot. Concurrent /run requests resolve to exactly one worker.
+        # cannot. Concurrent /run requests resolve to exactly one active
+        # worker. 'cancel-unknown' is ACTIVE for this purpose (audit T02):
+        # unconfirmed cessation blocks new runs until recovery confirms it.
         Index("uq_runs_one_active_per_session", "session_id", unique=True,
-              postgresql_where=text("status IN ('queued', 'running', 'stopping')")),
+              postgresql_where=text("status IN ('queued', 'running', 'stopping', 'cancel-unknown')")),
+    )
+
+
+class RunOperation(Base):
+    """Durable COMMAND-operation inventory (audit T01): the identity of every
+    dispatched red-agent command is persisted BEFORE dispatch, associated with
+    its run and the deployment generation it was dispatched against. After a
+    worker death the API recovers the operation rows and cancels the remote
+    work through the runner control channel — no pidfiles, no information
+    supplied by a test. A row stays 'active' until cessation is CONFIRMED;
+    an unconfirmed cancellation is retained as 'cancel-unknown', never
+    dropped from the inventory."""
+
+    __tablename__ = "run_operations"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("runs.run_id"),
+                                              nullable=False)
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True),
+                                                  ForeignKey("sessions.session_id"),
+                                                  nullable=False)
+    deployment_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    op_id: Mapped[str] = mapped_column(Text, nullable=False)   # runner operation identity
+    kind: Mapped[str] = mapped_column(Text, nullable=False)    # local | remote
+    # active -> dispatched, cessation unconfirmed; completed -> worker reported
+    # the result; cancel-unknown -> cancellation attempted but NOT confirmed
+    state: Mapped[str] = mapped_column(Text, nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),
+                                                 server_default=func.now(), nullable=False)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("uq_run_operations_op", "run_id", "op_id", unique=True),
+        Index("run_operations_active_idx", "run_id", "state"),
     )
 
 

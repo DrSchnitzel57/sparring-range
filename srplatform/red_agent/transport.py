@@ -19,6 +19,10 @@ class Transport(Protocol):
     def get_agent_state(self, session_id: str) -> dict | None: ...
     def save_agent_state(self, session_id: str, summary: str | None, summary_upto: int | None,
                          current_phase: str | None) -> None: ...
+    # durable command-operation inventory (audit T01) — implemented by the
+    # real transports; the loop degrades visibly when absent (test doubles)
+    def register_operation(self, op_uuid: str, kind: str = "remote") -> None: ...
+    def complete_operation(self, op_uuid: str, state: str = "completed") -> None: ...
 
 
 PAGE = 1000
@@ -46,11 +50,32 @@ def _save_state_sync(client, session_id: str, summary, summary_upto, current_pha
 
 
 class HttpTransport:
-    def __init__(self, base_url: str, token: str | None = None):
+    def __init__(self, base_url: str, token: str | None = None,
+                 run_id: str | None = None):
         import httpx
 
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         self.client = httpx.Client(base_url=base_url, timeout=30, headers=headers)
+        self.token = token
+        self.run_id = run_id   # audit T01: durable operation plane binding
+
+    # ---- durable command-operation inventory (audit T01) --------------------
+    def register_operation(self, op_uuid: str, kind: str = "remote") -> None:
+        """Persist BEFORE dispatch: the API records the operation against the
+        run + deployment generation. A failure here is FATAL to the command —
+        dispatching work the API cannot later recover/cancel is forbidden."""
+        if not self.run_id:
+            return
+        self.client.post(f"/internal/runs/{self.run_id}/operations",
+                         json={"op_id": op_uuid, "kind": kind},
+                         headers={"X-Worker-Token": self.token or ""}).raise_for_status()
+
+    def complete_operation(self, op_uuid: str, state: str = "completed") -> None:
+        if not self.run_id:
+            return
+        self.client.post(f"/internal/runs/{self.run_id}/operations/{op_uuid}/done",
+                         json={"state": state},
+                         headers={"X-Worker-Token": self.token or ""}).raise_for_status()
 
     def log_event(self, event: dict) -> None:
         self.client.post("/events", json=event).raise_for_status()
@@ -84,9 +109,28 @@ class HttpTransport:
 class TestClientTransport:
     """Same surface, in-process (tests) — hits the REAL endpoints and DB."""
 
-    def __init__(self, test_client, token: str | None = None):
+    def __init__(self, test_client, token: str | None = None,
+                 run_id: str | None = None):
         self.c = test_client
+        self.token = token
+        self.run_id = run_id
         self.headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+    def register_operation(self, op_uuid: str, kind: str = "remote") -> None:
+        if not self.run_id:
+            return
+        r = self.c.post(f"/internal/runs/{self.run_id}/operations",
+                        json={"op_id": op_uuid, "kind": kind},
+                        headers={"X-Worker-Token": self.token or ""})
+        r.raise_for_status()
+
+    def complete_operation(self, op_uuid: str, state: str = "completed") -> None:
+        if not self.run_id:
+            return
+        r = self.c.post(f"/internal/runs/{self.run_id}/operations/{op_uuid}/done",
+                        json={"state": state},
+                        headers={"X-Worker-Token": self.token or ""})
+        r.raise_for_status()
 
     def log_event(self, event: dict) -> None:
         self.c.post("/events", json=event, headers=self.headers).raise_for_status()

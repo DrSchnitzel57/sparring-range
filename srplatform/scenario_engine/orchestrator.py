@@ -67,7 +67,11 @@ CLAIM_STALE_AFTER = timedelta(minutes=30)
 
 
 def claim_operation(db: Session, session_id, operation: str,
-                    stale_after: timedelta = CLAIM_STALE_AFTER) -> None:
+                    stale_after: timedelta = CLAIM_STALE_AFTER) -> str:
+    """Acquire the durable operation claim and return the OWNER TOKEN
+    (audit T02). Release is fenced on this token: a request whose claim was
+    taken over (stale window) can never delete the replacement's row."""
+    owner = uuidlib.uuid4().hex
     now = _now()
     row = db.get(OperationClaim, session_id)
     if row is not None:
@@ -78,10 +82,11 @@ def claim_operation(db: Session, session_id, operation: str,
              {"stale_operation": row.operation, "stale_claimed_at":
               row.claimed_at.isoformat() if row.claimed_at else None,
               "new_operation": operation})
-        row.operation, row.claimed_at = operation, now
+        row.operation, row.claimed_at, row.owner = operation, now, owner
         db.commit()   # the claim must survive any later rollback
-        return
-    db.add(OperationClaim(session_id=session_id, operation=operation, claimed_at=now))
+        return owner
+    db.add(OperationClaim(session_id=session_id, operation=operation,
+                          claimed_at=now, owner=owner))
     try:
         db.commit()   # durable BEFORE any side effect
     except IntegrityError:
@@ -90,13 +95,22 @@ def claim_operation(db: Session, session_id, operation: str,
         row = db.get(OperationClaim, session_id)
         raise OperationInProgress(session_id, row.operation if row else "?",
                                   row.claimed_at if row else None)
+    return owner
 
 
-def release_operation(db: Session, session_id) -> None:
+def release_operation(db: Session, session_id, owner: str | None = None) -> bool:
+    """Release the claim. WITH an owner token the delete is FENCED (audit T02):
+    it only removes the row this request still owns — a stale request whose
+    claim was taken over returns False and erases nothing. Without a token
+    (startup reconciliation only) the row is removed unconditionally."""
     row = db.get(OperationClaim, session_id)
-    if row is not None:
-        db.delete(row)
-        db.commit()
+    if row is None:
+        return False
+    if owner is not None and row.owner != owner:
+        return False   # someone else holds it now — never erase their ownership
+    db.delete(row)
+    db.commit()
+    return True
 
 
 def clear_operation_claims(db: Session) -> int:

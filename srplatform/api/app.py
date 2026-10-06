@@ -281,9 +281,10 @@ def _revoke_session_capabilities(db, session_id, reason: str) -> int:
 
 
 def _stop_active_run_or_conflict(db, sess):
-    """Teardown/reset precondition (audit N03): the worker must be stopped and
-    CONFIRMED dead before its machines/lease are released. A failed stop is a
-    conflict, never a silent continue."""
+    """Teardown/reset precondition (audit N03/T01): the worker AND its remote
+    commands must be stopped and CONFIRMED dead before its machines/lease are
+    released. 'stopping' and 'cancel-unknown' are NOT confirmed — a failed or
+    unconfirmed stop is a conflict, never a silent continue."""
     active = runs_svc.active_run_for_session(db, sess.session_id)
     if not active:
         return
@@ -291,14 +292,16 @@ def _stop_active_run_or_conflict(db, sess):
     if not stopped.get("ok"):
         raise HTTPException(409, {"error": "worker_stop_failed",
                                   "run_id": str(active.run_id),
+                                  "status": stopped.get("status"),
                                   "detail": stopped.get("detail"),
                                   "note": "range NOT torn down; retry or engage killswitch"})
 
 
-def _release_claim_safely(db, session_id, succeeded: bool) -> None:
+def _release_claim_safely(db, session_id, succeeded: bool, owner: str | None = None) -> None:
     """Release the durable operation claim WITHOUT ever rolling back the
     request's own successful writes (the request transaction commits after
-    the route returns).
+    the route returns). The release is FENCED on the owner token (audit T02):
+    a request whose claim was taken over cannot erase the replacement.
 
     On SUCCESS the claim delete rides the request transaction — atomic and
     race-free. On FAILURE the transaction is discarded by the request
@@ -310,11 +313,11 @@ def _release_claim_safely(db, session_id, succeeded: bool) -> None:
     from srplatform.scenario_engine import orchestrator
     try:
         if succeeded:
-            orchestrator.release_operation(db, session_id)
+            orchestrator.release_operation(db, session_id, owner)
         else:
             from srplatform.db.session import db as db_ctx
             with db_ctx() as s2:
-                orchestrator.release_operation(s2, session_id)
+                orchestrator.release_operation(s2, session_id, owner)
     except Exception:  # noqa: BLE001 — recovery is startup/stale-window anyway
         pass
 
@@ -338,7 +341,7 @@ def launch_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
     # lease/deploy commits used to surrender — two simultaneous launches can
     # no longer both pass the lease check.
     try:
-        orchestrator.claim_operation(db, sess.session_id, "launch")
+        _claim_owner = orchestrator.claim_operation(db, sess.session_id, "launch")
     except orchestrator.OperationInProgress as e:
         raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
     _ok = False
@@ -387,7 +390,7 @@ def launch_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
                 "deployment": result, "connections": instructions,
                 "readiness": readiness}
     finally:
-        _release_claim_safely(db, sess.session_id, _ok)
+        _release_claim_safely(db, sess.session_id, _ok, _claim_owner)
 
 
 @app.post("/sessions/{session_id}/end")
@@ -406,7 +409,7 @@ def end_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
         return {"ok": True, "status": "complete", "note": "already ended (idempotent)",
                 "outcome": sess.outcome}
     try:
-        orchestrator.claim_operation(db, sess.session_id, "end")
+        _claim_owner = orchestrator.claim_operation(db, sess.session_id, "end")
     except orchestrator.OperationInProgress as e:
         raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
     _ok = False
@@ -415,7 +418,7 @@ def end_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
         _ok = True
         return out
     finally:
-        _release_claim_safely(db, sess.session_id, _ok)
+        _release_claim_safely(db, sess.session_id, _ok, _claim_owner)
 
 
 def _end_session_inner(db, sess, p, verification_service, orchestrator):
@@ -547,7 +550,7 @@ def teardown_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
     from srplatform.scenario_engine import orchestrator
     sess = _get_session(db, p, session_id)
     try:
-        orchestrator.claim_operation(db, sess.session_id, "teardown")
+        _claim_owner = orchestrator.claim_operation(db, sess.session_id, "teardown")
     except orchestrator.OperationInProgress as e:
         raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
     _ok = False
@@ -556,7 +559,7 @@ def teardown_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
         _ok = True
         return out
     finally:
-        _release_claim_safely(db, sess.session_id, _ok)
+        _release_claim_safely(db, sess.session_id, _ok, _claim_owner)
 
 
 @app.post("/sessions/{session_id}/reset")
@@ -566,7 +569,7 @@ def reset_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
     from srplatform.api.deps import get_proxmox
     sess = _get_session(db, p, session_id)
     try:
-        orchestrator.claim_operation(db, sess.session_id, "reset")
+        _claim_owner = orchestrator.claim_operation(db, sess.session_id, "reset")
     except orchestrator.OperationInProgress as e:
         raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
     _ok = False
@@ -585,7 +588,7 @@ def reset_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
         except RuntimeError as e:
             raise HTTPException(409, str(e))
     finally:
-        _release_claim_safely(db, sess.session_id, _ok)
+        _release_claim_safely(db, sess.session_id, _ok, _claim_owner)
 
 
 # --- deploy (legacy wrapper — SAME invariants as /launch, audit N03) -------------
@@ -609,7 +612,7 @@ def deploy_scenario(scenario_id: str, body: DeployIn, p: Principal = Depends(any
         raise HTTPException(409, f"session is {sess.status} — use the documented "
                                  "reset/relaunch transitions, not raw deploy")
     try:
-        orchestrator.claim_operation(db, sess.session_id, "deploy")
+        _claim_owner = orchestrator.claim_operation(db, sess.session_id, "deploy")
     except orchestrator.OperationInProgress as e:
         raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
     _ok = False
@@ -622,7 +625,7 @@ def deploy_scenario(scenario_id: str, body: DeployIn, p: Principal = Depends(any
         _ok = True
         return out
     finally:
-        _release_claim_safely(db, sess.session_id, _ok)
+        _release_claim_safely(db, sess.session_id, _ok, _claim_owner)
 
 
 @app.get("/scenarios")
@@ -643,34 +646,55 @@ def run_scenario(scenario_id: str, body: RunIn, p: Principal = Depends(any_membe
     sess = _get_session(db, p, body.session_id)
     if sess.scenario_id != scenario_id:
         raise HTTPException(422, f"session runs scenario '{sess.scenario_id}'")
-    if sess.status not in ("ready", "running"):
-        raise HTTPException(409, f"session is {sess.status} — launch it first")
-    # DEPLOYMENT/RESERVATION checks come BEFORE the safety gate so clients see
-    # the actionable 409 ("not launched / no reservation") rather than a
-    # confusing 423 that mixes in dev-mode evidence relaxations (audit N03).
-    lease = orchestrator.current_lease(db)
-    if not lease or lease["session_id"] != str(sess.session_id):
-        raise HTTPException(409, {"error": "no_current_reservation",
-                                  "note": "the range lease is not held by this session — "
-                                          "launch it again before starting a run"})
-    dep = db.execute(select(Deployment).where(Deployment.session_id == sess.session_id,
-                                              Deployment.scenario_id == sess.scenario_id,
-                                              Deployment.status == "ready")
-                     .order_by(Deployment.created_at.desc())).scalars().first()
-    if dep is None:
-        raise HTTPException(409, {"error": "no_ready_deployment",
-                                  "note": "no ready owned deployment for this session — "
-                                          "launch it first"})
+    # LIFECYCLE COORDINATION (audit T02): /run participates in the SAME
+    # durable operation claim as end/reset/teardown. Without it a run could
+    # pass the lease/deployment checks, pause, and spawn its worker AFTER
+    # teardown's "no active worker" check while the machines and lease are
+    # being released.
     try:
-        run = runs_svc.start_run(db, sess.session_id, scenario_id)
-    except runs_svc.GateRefused as e:
-        raise HTTPException(423, {"error": "safety_gate", "reasons": e.reasons})
-    except runs_svc.RunConflict as e:
-        raise HTTPException(409, str(e))
-    sess.status = "running"
-    db.flush()
-    return {"ok": True, "run_id": str(run.run_id), "status": run.status,
-            "session_id": str(body.session_id)}
+        _claim_owner = orchestrator.claim_operation(db, sess.session_id, "run")
+    except orchestrator.OperationInProgress as e:
+        raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
+    _ok = False
+    try:
+        # REJECT STALE OBSERVATIONS (audit T02): every precondition is
+        # re-read AFTER the claim is held — what was true before the claim
+        # says nothing about now.
+        db.expire_all()
+        sess = _get_session(db, p, body.session_id)
+        if sess.scenario_id != scenario_id:
+            raise HTTPException(422, f"session runs scenario '{sess.scenario_id}'")
+        if sess.status not in ("ready", "running"):
+            raise HTTPException(409, f"session is {sess.status} — launch it first")
+        # DEPLOYMENT/RESERVATION checks come BEFORE the safety gate so clients see
+        # the actionable 409 ("not launched / no reservation") rather than a
+        # confusing 423 that mixes in dev-mode evidence relaxations (audit N03).
+        lease = orchestrator.current_lease(db)
+        if not lease or lease["session_id"] != str(sess.session_id):
+            raise HTTPException(409, {"error": "no_current_reservation",
+                                      "note": "the range lease is not held by this session — "
+                                              "launch it again before starting a run"})
+        dep = db.execute(select(Deployment).where(Deployment.session_id == sess.session_id,
+                                                  Deployment.scenario_id == sess.scenario_id,
+                                                  Deployment.status == "ready")
+                         .order_by(Deployment.created_at.desc())).scalars().first()
+        if dep is None:
+            raise HTTPException(409, {"error": "no_ready_deployment",
+                                      "note": "no ready owned deployment for this session — "
+                                              "launch it first"})
+        try:
+            run = runs_svc.start_run(db, sess.session_id, scenario_id)
+        except runs_svc.GateRefused as e:
+            raise HTTPException(423, {"error": "safety_gate", "reasons": e.reasons})
+        except runs_svc.RunConflict as e:
+            raise HTTPException(409, str(e))
+        sess.status = "running"
+        db.flush()
+        _ok = True
+        return {"ok": True, "run_id": str(run.run_id), "status": run.status,
+                "session_id": str(body.session_id)}
+    finally:
+        _release_claim_safely(db, sess.session_id, _ok, _claim_owner)
 
 
 @app.get("/runs/{run_id}")
@@ -740,6 +764,76 @@ def run_complete(run_id: uuid.UUID, result: dict,
     except runs_svc.RunStateError as e:
         raise HTTPException(409, str(e))
     return {"ok": True, "status": run.status}
+
+
+# --- durable command-operation inventory (audit T01) ----------------------------
+class OperationIn(BaseModel):
+    op_id: str = Field(min_length=8, max_length=64)
+    kind: str = "remote"          # remote | local
+
+
+class OperationDoneIn(BaseModel):
+    state: str = "completed"      # completed | cancel-unknown
+
+
+def _require_worker(db, run_id: uuid.UUID, token: str | None):
+    run = db.get(Run, run_id)
+    if run is None:
+        raise HTTPException(404, "run not found")
+    if not runs_svc.verify_worker_token(run, token):
+        raise HTTPException(403, "bad worker token")
+    return run
+
+
+@app.post("/internal/runs/{run_id}/operations", status_code=201)
+def register_run_operation(run_id: uuid.UUID, body: OperationIn,
+                           x_worker_token: str | None = Header(default=None),
+                           db: Session = Depends(get_db)):
+    """Persist a command operation BEFORE dispatch, associated with the run
+    and the CURRENT deployment generation (audit T01). This is what lets the
+    API recover and cancel the operation after worker death — the identity is
+    never only in the worker's memory."""
+    from srplatform import verification_service
+    from srplatform.db.models import RunOperation
+    run = _require_worker(db, run_id, x_worker_token)
+    if run.status not in runs_svc.ACTIVE:
+        raise HTTPException(409, f"run is {run.status}")
+    if body.kind not in ("remote", "local"):
+        raise HTTPException(422, "kind must be remote or local")
+    existing = db.execute(select(RunOperation).where(RunOperation.run_id == run_id,
+                                                     RunOperation.op_id == body.op_id)
+                          ).scalars().first()
+    if existing:
+        return {"ok": True, "id": existing.id, "idempotent": True}
+    dep = verification_service.active_deployment(db, run.session_id)
+    op = RunOperation(run_id=run.run_id, session_id=run.session_id,
+                      deployment_id=dep.deployment_id if dep else None,
+                      op_id=body.op_id, kind=body.kind, state="active")
+    db.add(op)
+    db.commit()
+    return {"ok": True, "id": op.id}
+
+
+@app.post("/internal/runs/{run_id}/operations/{op_id}/done")
+def complete_run_operation(run_id: uuid.UUID, op_id: str, body: OperationDoneIn,
+                           x_worker_token: str | None = Header(default=None),
+                           db: Session = Depends(get_db)):
+    """Worker reports the operation finished. 'completed' is only accepted
+    from the worker; unconfirmed cancellations are set by the API's own
+    recovery paths and are never downgraded here."""
+    from sqlalchemy import update as sa_update
+    from srplatform.db.models import RunOperation
+    _require_worker(db, run_id, x_worker_token)
+    if body.state not in ("completed", "cancel-unknown"):
+        raise HTTPException(422, "state must be completed or cancel-unknown")
+    res = db.execute(sa_update(RunOperation)
+                     .where(RunOperation.run_id == run_id,
+                            RunOperation.op_id == op_id,
+                            RunOperation.state == "active")
+                     .values(state=body.state,
+                             ended_at=_now() if body.state == "completed" else None))
+    db.commit()
+    return {"ok": True, "updated": res.rowcount}
 
 
 # --- trusted verification (backend executes; request is not a result) ----------
@@ -909,15 +1003,32 @@ def killswitch(p: Principal = Depends(operator)):
     extra = []
     try:
         with db() as s:
-            for r in s.execute(sa_select(Run).where(Run.status.in_(("queued", "running")))).scalars():
+            for r in s.execute(sa_select(Run).where(
+                    Run.status.in_(runs_svc.ACTIVE))).scalars():
                 if r.pgid:
                     extra.append((str(r.run_id), int(r.pgid), r.pgid_pstart))
     except Exception:
         pass  # the latch still engages; the DB problem is visible in the result below
     # recovered groups are PASSED TO THE KILL (audit R03) — reporting them as
     # "recovered_groups" without terminating them was the fail-open bug.
-    return get_supervisor().engage(reason=f"killswitch by {p.username}",
-                                   extra_groups=extra)
+    result = get_supervisor().engage(reason=f"killswitch by {p.username}",
+                                     extra_groups=extra)
+    # REMOTE containment (audit T01): killing local workers proves nothing
+    # about commands already dispatched to the isolated runner. Every active
+    # remote operation is cancelled through the control channel and the
+    # verdict is reported truthfully (unconfirmed stays visible).
+    try:
+        remote = runs_svc.cancel_all_active_remote_operations()
+        result["remote_operations"] = remote
+        if not remote["ok"]:
+            result["killswitch"] = "engaged-partial"
+            result.setdefault("warning", "")
+            result["warning"] += (" Remote command cessation UNCONFIRMED — "
+                                  "range reservation retained. ")
+    except Exception as e:  # noqa: BLE001 — visible, never silent
+        result["remote_operations"] = {"ok": False, "detail": f"remote cancellation raised: {e}"}
+        result["killswitch"] = "engaged-partial"
+    return result
 
 
 @app.post("/safety/killswitch-release")

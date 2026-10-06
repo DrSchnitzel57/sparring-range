@@ -56,6 +56,8 @@ from srplatform.settings import Settings, get_settings
 # registering under the supervision lock).
 _ACTIVE_LOCK = threading.Lock()
 _ACTIVE: dict[str, dict] = {}   # op_id -> {kind, proc?, pgid?, remote?, state}
+# set by the atexit handler when a cancellation could NOT be confirmed
+stop_unconfirmed: dict | None = None
 
 
 def _new_op_id() -> str:
@@ -168,18 +170,41 @@ def cancel_active(timeout_s: float = 10.0) -> dict:
 
 def install_cancellation_handlers() -> None:
     """Called by the worker: SIGTERM (graceful stop) and exit paths must not
-    leave command processes behind."""
+    leave command processes behind.
+
+    AUDIT T01: `cancel_active()` returning an unconfirmed summary must NOT be
+    discarded. An unconfirmed cancellation is printed to stderr (the API
+    captures worker output) and the worker exits 144 — a distinct code so
+    "stopped cleanly" and "stop UNCONFIRMED" are distinguishable. The API
+    still treats remote cessation authoritatively through the durable
+    operation inventory; this handler is the LOCAL containment layer."""
     import atexit
     import sys
 
+    def _report(summary: dict) -> int:
+        if summary.get("ok"):
+            return 0
+        print(f"[worker] cancellation UNCONFIRMED: {summary.get('detail')} "
+              f"ops={summary.get('ops')}", file=sys.stderr, flush=True)
+        return 1
+
     def _term(signum, frame):
+        code = 143
         try:
-            cancel_active()
+            if _report(cancel_active()):
+                code = 144
         finally:
-            sys.exit(143)
+            sys.exit(code)
 
     signal.signal(signal.SIGTERM, _term)
-    atexit.register(cancel_active)
+
+    def _atexit():
+        summary = cancel_active()
+        _report(summary)
+        global stop_unconfirmed
+        if not summary.get("ok"):
+            stop_unconfirmed = summary
+    atexit.register(_atexit)
 
 
 class RunnerUnavailable(RuntimeError):
@@ -198,32 +223,46 @@ class RunResult:
 
 
 def _bounded_reader(proc: subprocess.Popen, max_bytes: int,
-                    deadline: float | None = None) -> str:
-    """Streaming capture with a HARD byte bound (audit N05: communicate()
-    buffered arbitrary output before truncating — the claimed bound did not
-    exist). Reads until EOF or deadline; keeps at most max_bytes. Raises
-    TimeoutError when the deadline passes."""
+                    deadline: float | None = None) -> tuple[bytes, bool]:
+    """Streaming capture with a HARD BYTE bound and an INDEPENDENT DEADLINE
+    (audit N05/T07).
+
+    T07 fixes: reads are BYTE-ORIENTED via os.read on the raw descriptor —
+    select() guarantees data is ready, and os.read returns whatever is
+    available instead of blocking for a full buffer (the old buffered
+    `stream.read(4096)` could wait indefinitely for more characters after a
+    small write from a long-silent child). The deadline is checked on every
+    loop iteration, so a one-byte-then-silence child is cut off at the
+    deadline, and the PARTIAL output captured so far is RETURNED, never
+    discarded. Returns (bytes, timed_out)."""
+    import os as _os
     import select
     import time
-    chunks: list[str] = []
-    kept = 0
-    stream = proc.stdout
+    fd = proc.stdout.fileno()
+    buf = bytearray()
     while True:
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError("output read deadline passed")
-            ready, _, _ = select.select([stream], [], [], min(remaining, 0.5))
-            if not ready:
-                continue
-        chunk = stream.read(4096)
-        if not chunk:
+                return bytes(buf), True
+            wait = min(remaining, 0.5)
+        else:
+            wait = 0.5
+        ready, _, _ = select.select([fd], [], [], wait)
+        if not ready:
+            continue
+        try:
+            chunk = _os.read(fd, 65536)
+        except (BlockingIOError, InterruptedError):
+            continue
+        except OSError:
             break
-        if kept >= max_bytes:
-            continue  # drain without keeping (prevents pipe deadlock)
-        chunks.append(chunk[: max_bytes - kept])
-        kept += len(chunks[-1])
-    return "".join(chunks)
+        if not chunk:
+            break  # EOF
+        if len(buf) < max_bytes:
+            buf.extend(chunk[: max_bytes - len(buf)])
+        # past the bound: keep draining (prevents pipe deadlock) without keeping
+    return bytes(buf), False
 
 
 class Runner:
@@ -303,9 +342,10 @@ class SshRunner(Runner):
             time.sleep(0.5)
         return False
 
-    def run(self, command: str, timeout: int | None = None) -> RunResult:
+    def run(self, command: str, timeout: int | None = None,
+            op_id: str | None = None) -> RunResult:
         t = timeout or self.s.runner_command_timeout_s
-        op_id = _new_op_id()
+        op_id = op_id or _new_op_id()
         _register(op_id, {"kind": "remote", "state": "pending", "remote": True,
                           "runner": self})
         # The supervisor starts the job (own process group, tracked pidfile)
@@ -316,7 +356,7 @@ class SshRunner(Runner):
         full = self._base_cmd() + [remote_cmd]
         try:
             proc = subprocess.Popen(full, stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True,
+                                    stderr=subprocess.STDOUT,
                                     start_new_session=True)
         except OSError as e:
             _finish_op(op_id)
@@ -326,25 +366,25 @@ class SshRunner(Runner):
         with _ACTIVE_LOCK:
             cancelled_early = (_ACTIVE.get(op_id) or {}).get("state") == "cancelled-before-attach"
         timed_out = False
+        raw = b""
         if cancelled_early:
-            out = ""
+            raw = b""
         else:
             import time as _time
-            try:
-                out = _bounded_reader(proc, self.s.runner_max_output_bytes,
-                                      deadline=_time.monotonic() + t)
-            except TimeoutError:
-                timed_out = True
-                out = ""
-            except OSError as e:
-                _finish_op(op_id)
-                return RunResult(exit_code=-1, output="", error=f"runner read failed: {e}",
-                                 op_id=op_id)
+            raw, timed_out = _bounded_reader(proc, self.s.runner_max_output_bytes,
+                                             deadline=_time.monotonic() + t)
         # bounded wait for exit (the reader already drained; guard stragglers)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            timed_out = True
+        if not timed_out:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _kill_group(proc)
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+        else:
             _kill_group(proc)
             try:
                 proc.wait(timeout=5)
@@ -353,7 +393,7 @@ class SshRunner(Runner):
         with _ACTIVE_LOCK:
             entry = _ACTIVE.pop(op_id, None)
         cancel_state = (entry or {}).get("state")
-        out = (out or "")[: self.s.runner_max_output_bytes]
+        out = raw.decode("utf-8", "replace")[: self.s.runner_max_output_bytes]
         if timed_out:
             # the LOCAL ssh client died — the REMOTE job needs the supervisor
             confirmed = self.cancel_remote(op_id, timeout_s=10)
@@ -368,6 +408,19 @@ class SshRunner(Runner):
             return RunResult(exit_code=code, output=out, cancelled=False, op_id=op_id,
                              cancel_state="unknown",
                              error="remote cessation UNCONFIRMED — report partial stop")
+        if code == 255:
+            # SSH TRANSPORT LOSS (audit T01): the command connection died for
+            # a reason we cannot distinguish from the remote job's own exit —
+            # the remote job may still be running. Cancellation must go
+            # through the supervisor; ordinary disconnect is never treated as
+            # remote cessation.
+            confirmed = self.cancel_remote(op_id, timeout_s=10)
+            return RunResult(exit_code=code, output=out, op_id=op_id,
+                             cancelled=confirmed,
+                             cancel_state="confirmed" if confirmed else "unknown",
+                             error=None if confirmed else
+                             ("ssh transport lost and remote cessation UNCONFIRMED "
+                              "— report partial stop"))
         return RunResult(exit_code=code, output=out, op_id=op_id)
 
     def health(self) -> tuple[bool, str]:
@@ -387,35 +440,31 @@ class LocalDevRunner(Runner):
         if self.s.sr_env == "production":
             raise RunnerUnavailable("local-dev runner is forbidden in production")
 
-    def run(self, command: str, timeout: int | None = None) -> RunResult:
+    def run(self, command: str, timeout: int | None = None,
+            op_id: str | None = None) -> RunResult:
         if self.s.sr_env == "production":
             raise RunnerUnavailable("local-dev runner is forbidden in production")
         t = timeout or self.s.runner_command_timeout_s
-        op_id = _new_op_id()
+        op_id = op_id or _new_op_id()
         _register(op_id, {"kind": "local", "state": "pending", "remote": False})
         try:
             proc = subprocess.Popen(["/bin/bash", "-lc", command], stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True,
+                                    stderr=subprocess.STDOUT,
                                     start_new_session=True)
         except OSError as e:
             _finish_op(op_id)
             return RunResult(exit_code=-1, output="", error=f"spawn failed: {e}", op_id=op_id)
         _attach_proc(op_id, proc)
         timed_out = False
-        try:
-            import time as _time
-            out = _bounded_reader(proc, self.s.runner_max_output_bytes,
-                                  deadline=_time.monotonic() + t)
-            proc.wait(timeout=5)
-        except TimeoutError:
-            timed_out = True
-            _kill_group(proc)
+        import time as _time
+        raw, timed_out = _bounded_reader(proc, self.s.runner_max_output_bytes,
+                                         deadline=_time.monotonic() + t)
+        if not timed_out:
             try:
                 proc.wait(timeout=5)
-            except Exception:
-                pass
-        except subprocess.TimeoutExpired:
-            timed_out = True
+            except subprocess.TimeoutExpired:
+                timed_out = True
+        if timed_out:
             _kill_group(proc)
             try:
                 proc.wait(timeout=5)
@@ -424,9 +473,10 @@ class LocalDevRunner(Runner):
         with _ACTIVE_LOCK:
             entry = _ACTIVE.pop(op_id, None)
         cancelled = (entry or {}).get("state") in ("cancelled", "cancelled-before-attach")
+        out = raw.decode("utf-8", "replace")[: self.s.runner_max_output_bytes]
         return RunResult(exit_code=124 if timed_out else proc.returncode,
-                         output=(out or "")[: self.s.runner_max_output_bytes],
-                         timed_out=timed_out, cancelled=cancelled, op_id=op_id,
+                         output=out, timed_out=timed_out, cancelled=cancelled,
+                         op_id=op_id,
                          cancel_state="confirmed" if cancelled else None)
 
     def health(self) -> tuple[bool, str]:

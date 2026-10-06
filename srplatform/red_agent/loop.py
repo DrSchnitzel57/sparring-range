@@ -16,6 +16,8 @@ replayed. DONE is only success when ALL objectives are verifier-confirmed
 from __future__ import annotations
 
 import hashlib
+import inspect
+import uuid as uuidlib
 from datetime import datetime, timezone
 
 from srplatform.red_agent.phases import PhaseMachine
@@ -69,11 +71,35 @@ class RedAgentLoop:
         self.transport = transport
         self.llm = llm  # needs .complete(system, user) -> str
         self.runner = runner  # isolated runner adapter: .run(cmd) -> RunResult|(code,out)
+        # production runners accept a durable operation identity (audit T01);
+        # scripted test doubles may not — detect once, never silently drop the
+        # op_id from a runner that DOES support it.
+        try:
+            self._runner_has_op_id = "op_id" in inspect.signature(runner.run).parameters
+        except (TypeError, ValueError):
+            self._runner_has_op_id = False
         self.max_steps = max_steps
         self.compress_after = compress_after
         self.keep_recent = keep_recent
         self.achieved: set[str] = set()
         self._op_seq = 0
+
+    # ------------------------------------------------- durable operation plane
+    def _op_kind(self) -> str:
+        return "remote" if getattr(self.runner, "mechanism", "") == "ssh" else "local"
+
+    def _register_operation(self, op_uuid: str) -> None:
+        """Persist the command operation identity BEFORE dispatch (audit T01).
+        Only the real transports (worker path) implement this; test doubles
+        without the API plane skip it visibly, never silently in production."""
+        fn = getattr(self.transport, "register_operation", None)
+        if fn is not None:
+            fn(op_uuid, self._op_kind())
+
+    def _complete_operation(self, op_uuid: str, state: str) -> None:
+        fn = getattr(self.transport, "complete_operation", None)
+        if fn is not None:
+            fn(op_uuid, state)
 
     # ------------------------------------------------------------------ helpers
     def _log(self, actor, action_type, payload, phase=None, mitre=None, raw_ref=None, host=None,
@@ -221,19 +247,51 @@ class RedAgentLoop:
 
             # --- intent BEFORE execution (F14): a crash cannot erase that we
             # --- dispatched this command, and restart will not replay it blind.
+            # --- DURABLE OPERATION IDENTITY (audit T01): the runner operation
+            # --- id is persisted through the API BEFORE dispatch, associated
+            # --- with this run and its deployment generation, so the API can
+            # --- recover and cancel it after worker death.
             self._op_seq += 1
             op_id = self._op_seq
-            self._log("red", "action_intent", {"op_id": op_id, "command": tc.command,
+            op_uuid = uuidlib.uuid4().hex
+            self._register_operation(op_uuid)
+            self._log("red", "action_intent", {"op_id": op_id, "op_uuid": op_uuid,
+                                               "command": tc.command,
                                                "thought": tc.thought}, phase=pm.phase)
 
-            res = self.runner.run(tc.command)
+            if self._runner_has_op_id:
+                res = self.runner.run(tc.command, op_id=op_uuid)
+            else:
+                res = self.runner.run(tc.command)
             code, out = self._runner_result(res)
+            cancel_state = getattr(res, "cancel_state", None)
 
             self._log("red", "action_result",
-                      {"op_id": op_id, "command": tc.command, "exit_code": code,
-                       "output": out[:4000], "timed_out": getattr(res, "timed_out", False)},
+                      {"op_id": op_id, "op_uuid": op_uuid, "command": tc.command,
+                       "exit_code": code, "output": out[:4000],
+                       "timed_out": getattr(res, "timed_out", False),
+                       # audit T01: the remote operation identity and its
+                       # cancellation verdict are RETAINED in the evidence —
+                       # an unconfirmed stop is never reduced to exit/output.
+                       "cancel_state": cancel_state,
+                       "error": getattr(res, "error", None)},
                       phase=pm.phase,
                       raw_output_hash=hashlib.sha256(out.encode()).hexdigest()[:16])
+            self._complete_operation(op_uuid,
+                                     "cancel-unknown" if cancel_state == "unknown"
+                                     else "completed")
+
+            # audit T01: an UNCONFIRMED remote cancellation halts the loop —
+            # further commands against a range with unknown live work are
+            # forbidden; the worker reports the run as cancel_unconfirmed.
+            if cancel_state == "unknown":
+                self._log("red", "agent_note",
+                          {"op_uuid": op_uuid,
+                           "note": "remote cessation UNCONFIRMED — halting loop; "
+                                   "no further commands until recovery confirms"},
+                          phase=pm.phase)
+                outcome = "cancel_unconfirmed"
+                break
 
             # trusted verification after every action; results come from the
             # backend (actor system) and drive phase advancement

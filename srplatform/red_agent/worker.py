@@ -33,7 +33,7 @@ def main() -> int:
     # the command currently running in the runner's own group (audit R03).
     install_cancellation_handlers()
 
-    transport = HttpTransport(api, token=token)
+    transport = HttpTransport(api, token=token, run_id=run_id)
 
     # Runner is resolved NOW — no local fallback, hard failure if unavailable.
     try:
@@ -66,6 +66,10 @@ def main() -> int:
     print(json.dumps({"run_id": run_id, **{k: result[k] for k in
                                            ("steps", "phase", "achieved", "complete", "outcome")
                                            if k in result}}))
+    if result.get("outcome") == "cancel_unconfirmed":
+        # audit T01: remote cessation could not be confirmed — distinct exit
+        # status so "stopped cleanly" is never confused with "unknown"
+        return 4
     return 0
 
 
