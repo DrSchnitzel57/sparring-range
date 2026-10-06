@@ -189,6 +189,12 @@ environment (docker not installed) — recorded as BLOCKED, not passed.
   metadata; live dashboard polls `/live` (cursor-tailed); report page GETs
   the PERSISTED AAR (generation is explicit); progress reads
   `v_score_items` (trusted snapshots only).
+- Checked-in browser E2E (opt-in): `pytest -m browser`
+  (`tests/test_stage5_browser_e2e.py`) drives the REAL app against the REAL
+  API + worker with controlled doubles (PVE/model/runner/verifier/datapath);
+  needs `playwright-cli`, `web/node_modules`, and ports 8010/3000 free — it
+  SKIPS honestly otherwise. **[LIVE GATE]** the same workflow against the
+  deployed stack (real PVE hosts, real bastion recording playback).
 
 ## 8. Upgrades / migrations
 

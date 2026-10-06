@@ -1,10 +1,22 @@
 # Follow-up review remediation (R01–R12)
 
+> **Correction (second follow-up review, `docs/SECOND_FOLLOWUP_REVIEW.md` at
+> `18377c6`):** the "all twelve acceptance blockers were repaired" verdict
+> above was OVERCLAIMED. The review demonstrated that several fixes had
+> fail-open paths (R04/R05/R07/R08 equivalents → N01–N03, N07), that some
+> "live gates" were actually missing implementation (remote cancellation →
+> N05, the installed telemetry unit → N09, provisioning readiness → N11), and
+> that in-process proofs stood in for cross-process contracts (→ N08, F18).
+> The R-table below stands as historical record of what was attempted; the
+> authoritative current status is the N-table in `docs/FINDINGS_CHECKLIST.md`.
+> The "live gates that remain" items 4 (cross-process scheduling), 5
+> (enrollment binding) and 7 (browser E2E) were subsequently IMPLEMENTED with
+> automated evidence (Stages 3–5) — they are no longer mere deferrals.
+
 Executed October 5, 2026, against `docs/FOLLOWUP_REVIEW.md` (reviewed at
-`bd93f0d`). All twelve acceptance blockers were repaired in focused changes
-with production-boundary regression tests, per the review's recommended
-instruction: failing boundary regressions first, then the process/datapath
-stop boundary and session/resource invariants, then one real
+`bd93f0d`), with production-boundary regression tests, per the review's
+recommended instruction: failing boundary regressions first, then the
+process/datapath stop boundary and session/resource invariants, then one real
 worker→API→runner→verifier practice loop with safe external substitutes.
 
 **Suite status: 78 passed** (47 pre-existing + 31 new) against a real
