@@ -96,6 +96,15 @@ environment (docker not installed) — recorded as BLOCKED, not passed.
   `baseline-check` + operator `datapath-proof` exist that match the current
   config identity (`/safety/status` shows `config_identity` — any bridge/CIDR
   change invalidates both).
+- LIVE TOPOLOGY + EFFECTIVE POLICY (audit T03): with the nft controller the
+  start gate ALSO re-discovers the bridge's port inventory THROUGH the
+  configured `NFT_COMMAND_PREFIX` namespace (never the local `/sys`) and
+  refuses if it no longer matches the recorded evidence — a port attached
+  after the proof denies new runs. `baseline-check` compares the EFFECTIVE
+  policy (exact ordered rule list + exact `range_hosts` set membership via
+  `nft -j`), so an inserted accept, a reordered rule or a widened CIDR all
+  fail; an inspection that can neither confirm presence nor absence
+  (unpermitted/transport error) is `unknown` — never ABSENT, and never ok.
 
 ## 3. Deployment / golden images
 
@@ -171,6 +180,20 @@ environment (docker not installed) — recorded as BLOCKED, not passed.
   run-scoped capability token (sha256 stored). Stop = killpg; a worker that
   dies uncleanly is failed by the watchdog; API restart reconciles
   (`reconcile_on_startup` fails gone workers, kills live ones when latched).
+- AUTHORITATIVE STOP / CANCEL-UNKNOWN (audit T01/T02): a run row only becomes
+  `cancelled` when BOTH the local process group and every registered REMOTE
+  operation are confirmed gone. A failed/unconfirmable remote cancel moves
+  the run to `cancel-unknown` (DB-enforced, one per session): the lease and
+  operation inventory are RETAINED, new runs/launches are refused, and every
+  stop attempt + API restart retries the remote cancellation. Only an
+  operator killswitch release (with evidence) clears the state. The runner
+  side is `infra/runner/runner_supervise.sh`: it tracks the command's whole
+  descendant tree by `SR_OP_ID` environment identity (immune to PID reuse),
+  refuses delayed starts after a cancel via tombstones, and exits 144 when
+  cessation cannot be confirmed — the worker maps that to `cancel_unconfirmed`
+  (exit 4), never to a clean stop. SSH transport loss mid-command (client
+  exit 255) is treated the same way: cancel the remote operation, do not
+  report the run from output/exit-code alone.
 - Model outages are recorded events (`model_unavailable`), never silent
   successes; the gateway is bounded priority (hints > red > AAR) with
   visible overflow 503s.

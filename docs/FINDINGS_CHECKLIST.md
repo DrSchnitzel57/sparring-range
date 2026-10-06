@@ -112,3 +112,26 @@ needs live hardware for full acceptance (the automated part is still green).
 | Fresh-stack bootstrap | compose `seed-bastion-keys` one-shot populates the key volume + recordings dir (loud failure on missing material); `rangectl bootstrap` idempotently provisions operator + capabilities; runbook §0 documents the whole path incl. DEV-ONLY substitutions | `tests/test_stage5_bootstrap.py` (real CLI core + real seed script + bastion key resolution + mint-once DB count), `test_stage5_compose_seeds_bastion_key_volume` | ☑ (`docker compose config` + fresh-volume boot: BLOCKED here — no docker — operator gate) |
 | Browser E2E workflow | checked-in `pytest -m browser`: REAL Next.js app + REAL uvicorn API + REAL worker; login → launch → connection instructions → captured command (session-bound telemetry) → start red → end (confirm dialog) → explicit AAR with trusted scorecard → progress | `tests/test_stage5_browser_e2e.py` (green twice consecutively; controlled doubles only for PVE/model/runner/verifier/datapath) | ☑ (E2E against the deployed R740 stack ☑+E) |
 | Full safe practice loop | capture → deterministic verification → score → report → cleanup with revocation and historical-score checks | `test_full_practice_loop_capture_verify_score_report_cleanup` + the browser E2E above | ☑ (real PVE/R740/GPU/Windows ☑+E) |
+
+## Third follow-up review remediation (T01–T08, docs/THIRD_FOLLOWUP_REVIEW.md)
+
+Baseline reviewed `0b0d726`; fixed in four staged commits (`77c7971`,
+`5c4caf6`, `f5c5ffd`, `370d23c`). Labels are deliberately separated:
+**impl** = production code implements it; **auto** = automatically verified
+by a production-boundary regression in this environment; **HW** = the
+residual claim needs hardware unreachable here (never counted as done).
+
+| T | Finding | Fix (production code) | Automated evidence | impl | auto | HW |
+|---|---------|----------------------|--------------------|------|------|----|
+| T01 | remote child survives leader exit; stop reported success without remote confirmation | supervisor descendant tracking by `SR_OP_ID` + tombstones; 255→cancel; exit 144; `cancel_remote_operations` retries incl. `cancel-unknown` | `tests/test_third_followup_lifecycle.py` (7 T01 tests: real script + real descendants + production recovery) | ☑ | ☑ | real-SSH loss on R740 runner |
+| T02 | lifecycle races; false `cancelled` | conditional transitions + `cancel-unknown` (migration 0008), owner-fenced claims, run participates in claims | 6 T02 tests incl. barrier-synchronized run-vs-teardown | ☑ | ☑ | — |
+| T03 | substring baseline check accepted policy-weakening edits | EXACT effective-policy + set-membership verification; tri-state inspection; port-scoped established rules; prefix-namespace discovery; live topology in start gate | `tests/test_third_followup_firewall.py` (probe's nft JSON fixtures rejected; REAL-packet netns test: pre-established range→mgmt:8080 flow dies, intended flows live) | ☑ | ☑ | packet truth on R740 bridge |
+| T04 | deploy ignored the session snapshot | `deploy()` resolves `scenario_spec` (session bytes) | T04 test: YAML edited post-creation; real launch+reset clone calls still snapshot-shaped | ☑ | ☑ | — |
+| T05 | tokens issued, never installed | durable enrollment phases provisioned+confirmed through the management channel; token recovery; readiness gate; installer text | 4 T05 tests (captured provisioning, real ingest round trip, resume-with-same-token, 409+DB on unconfirmed) | ☑ | ☑ | real auditd/Sysmon streams on VMs |
+| T06 | production skipped readiness; reset skipped launch workflow | relaxation requires dev mode; production missing key/pins-file enforced; shared `_finalize_ready` for launch+reset; durable failure state | 3 T06 tests (route status + DB state; reset credential rotation + revoked old) | ☑ | ☑ | — |
+| T07 | buffered reads blocked past deadline | select + `os.read` byte-oriented bounded reader | 3 T07 tests (sparse/silent/multibyte, partial retained) | ☑ | ☑ | Windows pipes (documented) |
+| T08 | spool crash recovery reused IDs, lost post-tail events | atomic durable counter + recovery from outstanding max; quarantine-once tail repair | `tests/test_third_followup_spool.py` (7 crash-injection tests on the real Spooler) | ☑ | ☑ | — |
+
+Completion evidence: `docs/THIRD_FOLLOWUP_COMPLETION_REPORT.md` (commands,
+environment, commits, outcomes) and the dated addendum in
+`docs/SECOND_FOLLOWUP_COMPLETION_REPORT.md`.

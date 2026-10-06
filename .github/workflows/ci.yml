@@ -40,8 +40,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y nftables
       - name: Unit tests (no infrastructure)
         run: .venv/bin/python -m pytest -m "not db and not browser and not live" -q
-      - name: nft apply/remove round-trip against the real kernel (privileged)
-        run: sudo env "PATH=$PATH" .venv/bin/python -m pytest tests/test_followup_regressions.py -k real_nft -q
+      - name: "Real-datapath tests against the kernel (privileged: nft round-trip + netns packet flows)"
+        run: sudo env "PATH=$PATH" .venv/bin/python -m pytest -m "not db and not browser and not live" -k "real_nft or netns" -q
       - name: Database + adapter tests (disposable PostgreSQL 16)
         run: .venv/bin/python -m pytest -m "db or adapter" -q
       - name: Import sanity (entrypoints import without services)
@@ -64,3 +64,51 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci
       - run: npm run build
+
+  browser-e2e:
+    # Real Chromium drives the built web app against the real API + worker
+    # (controlled PVE/model/runner/verifier/datapath). Opt-in locally, but
+    # WIRED HERE so the checked-in E2E cannot silently rot (audit T05 note:
+    # this proves the UI/API/worker integration, NOT real host enrollment —
+    # that path is the netns + management-channel tests).
+    needs: [python, frontend]
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci_admin_pw
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-retries 10
+    env:
+      SR_PG_ADMIN_URL: postgresql+psycopg2://postgres:ci_admin_pw@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install locked dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.lock
+          .venv/bin/pip install --no-deps -e .
+      - name: Build the web app (the E2E drives the real Next build)
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+      - name: Install playwright-cli + Chromium
+        run: |
+          npm install -g @playwright/cli
+          npx playwright install --with-deps chromium
+      - name: Browser E2E (real Chromium + API + worker)
+        run: .venv/bin/python -m pytest tests/test_stage5_browser_e2e.py -m browser -q

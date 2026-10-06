@@ -109,3 +109,43 @@ the [LIVE GATE] items above (real PVE/R740 packet truth, real runner cancel,
 real telemetry streams, compose boot) are unexecuted because the hardware is
 not reachable from this environment. The runbook marks exactly those as the
 remaining acceptance steps; nothing is claimed on their behalf.
+
+---
+
+## Addendum — 2026-10-06 (third follow-up, `docs/THIRD_FOLLOWUP_REVIEW.md`)
+
+This report's historical evidence is preserved as written. The third review
+(baseline `0b0d726`) correctly found that three claims above were
+**OVERCLAIMS** — the mechanism existed but was not wired into the production
+path, and the tests proved the helper, not the route:
+
+* **Snapshot deployment (T04) was NOT fully implemented at `0b0d726`.** The
+  worker/verifier/scoring used the session snapshot, but
+  `orchestrator.deploy()` still called `load_scenario(scenario_id)` — editing
+  the source YAML after session creation changed the DEPLOYED topology
+  independently of the graded spec. The prior "immutable snapshot" claim held
+  for execution/grading only, not provisioning.
+* **Host provisioning / telemetry enrollment (T05) was NOT fully
+  implemented at `0b0d726`.** Deployment issued a `ServiceToken` and returned
+  it, but no code wrote the clone's `shipper.env`, started the service, or
+  confirmed delivery — the installer left `PROVISION-PER-DEPLOYMENT` /
+  `SET-PER-CLONE` and delegated the software step to the operator. "Enrolled"
+  meant "token issued", which the review rightly refused to count.
+* **Authoritative stop/recovery (T01/T02) was NOT fully implemented at
+  `0b0d726`.** A remote command could survive leader exit; an unconfirmed
+  remote stop could still be reported as `cancelled`, and unknown remote
+  operations were dropped from the inventory instead of being retried and
+  held. Streaming reads could also block past their deadline (T07).
+
+Also corrected: effective-policy verification accepted an inserted accept and
+a widened `range_hosts` set (T03); production could reach `ready` with the
+readiness check silently unenforced and reset skipped the readiness/credential
+workflow (T06); spool crash recovery could reuse record IDs and lose events
+appended after a torn tail (T08).
+
+Each is now implemented in the production path with a production-boundary
+regression (route status + database/external state asserted). See
+`docs/THIRD_FOLLOWUP_COMPLETION_REPORT.md` for the per-finding result and the
+commands/commit that demonstrate it. The hardware gates (real PVE/R740 packet
+truth, real Kali runner transport loss, real auditd/Sysmon streams, docker
+compose boot) remain unexecuted here and are unchanged by this addendum.
