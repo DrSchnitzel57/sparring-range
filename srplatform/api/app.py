@@ -813,10 +813,24 @@ class OperationIn(BaseModel):
 
 class OperationDoneIn(BaseModel):
     state: str = "completed"      # completed | cancel-unknown
+    detail: str | None = None     # truthful containment verdict (audit T-04)
 
 
 def _require_worker(db, run_id: uuid.UUID, token: str | None):
     run = db.get(Run, run_id)
+    if run is None:
+        raise HTTPException(404, "run not found")
+    if not runs_svc.verify_worker_token(run, token):
+        raise HTTPException(403, "bad worker token")
+    return run
+
+
+def _require_worker_locked(db, run_id: uuid.UUID, token: str | None):
+    """Worker-authenticated run lookup holding the ROW LOCK until the request
+    transaction ends (audit T-04): serializes operation registration against
+    the guarded terminal transitions in stop_run/complete_run."""
+    run = db.execute(select(Run).where(Run.run_id == run_id)
+                     .with_for_update()).scalar_one_or_none()
     if run is None:
         raise HTTPException(404, "run not found")
     if not runs_svc.verify_worker_token(run, token):
@@ -831,12 +845,22 @@ def register_run_operation(run_id: uuid.UUID, body: OperationIn,
     """Persist a command operation BEFORE dispatch, associated with the run
     and the CURRENT deployment generation (audit T01). This is what lets the
     API recover and cancel the operation after worker death — the identity is
-    never only in the worker's memory."""
+    never only in the worker's memory.
+
+    SERIALIZED WITH STOP/FINALIZATION (audit T-04): registration holds the
+    run row lock and is REFUSED for any status beyond queued/running — a
+    stopping or cancel-unknown run is owned by the termination path, and an
+    operation registered after the stop's containment pass could otherwise
+    survive a 'cancelled' run. The guarded terminal transitions refuse to
+    finalize while any operation is unresolved, so both sides of the race
+    resolve to 'no active operation on a terminal run'."""
     from srplatform import verification_service
     from srplatform.db.models import RunOperation
-    run = _require_worker(db, run_id, x_worker_token)
-    if run.status not in runs_svc.ACTIVE:
-        raise HTTPException(409, f"run is {run.status}")
+    run = _require_worker_locked(db, run_id, x_worker_token)
+    if run.status not in runs_svc.SPAWNNABLE:
+        raise HTTPException(409, f"run is {run.status} — new command registration "
+                                 "is refused until the termination path resolves "
+                                 "every operation")
     if body.kind not in ("remote", "local"):
         raise HTTPException(422, "kind must be remote or local")
     existing = db.execute(select(RunOperation).where(RunOperation.run_id == run_id,
@@ -859,7 +883,9 @@ def complete_run_operation(run_id: uuid.UUID, op_id: str, body: OperationDoneIn,
                            db: Session = Depends(get_db)):
     """Worker reports the operation finished. 'completed' is only accepted
     from the worker; unconfirmed cancellations are set by the API's own
-    recovery paths and are never downgraded here."""
+    recovery paths and are never downgraded here. The containment verdict
+    (surviving-descendant containment, unconfirmed-stop reason) is PERSISTED
+    with the row (audit T-04)."""
     from sqlalchemy import update as sa_update
     from srplatform.db.models import RunOperation
     _require_worker(db, run_id, x_worker_token)
@@ -870,6 +896,7 @@ def complete_run_operation(run_id: uuid.UUID, op_id: str, body: OperationDoneIn,
                             RunOperation.op_id == op_id,
                             RunOperation.state == "active")
                      .values(state=body.state,
+                             detail=str(body.detail)[:2000] if body.detail else None,
                              ended_at=_now() if body.state == "completed" else None))
     db.commit()
     return {"ok": True, "updated": res.rowcount}
@@ -1240,6 +1267,45 @@ def get_token(token: str, p: Principal = Depends(service("bastion")),
             "username": owner.username if owner else None}
 
 
+# --- enrollment confirmation (host-originated, audit T-05) ----------------------
+class EnrollConfirmIn(BaseModel):
+    nonce: str = Field(min_length=8, max_length=64)
+    machine_id: str | None = None
+    boot_id: str | None = None
+
+
+@app.post("/enroll/confirm", status_code=201)
+def enroll_confirm(body: EnrollConfirmIn, p: Principal = Depends(service("telemetry")),
+                   db: Session = Depends(get_db)):
+    """AUTHENTICATED ENROLLMENT CALLBACK FROM THE PROVISIONED HOST (audit
+    T-05): the installed shipper proves its own delivery path by presenting
+    its capability (session + host bound by the token — never by the body)
+    AND the fresh enrollment nonce provisioned with it. This is what turns
+    'service is active' into 'telemetry from THIS host can actually arrive';
+    a controller-side or test-side synthetic POST for a different enrollment
+    is rejected here. Repeated confirmations are idempotent."""
+    import secrets as _secrets
+    tok = db.execute(select(ServiceToken)
+                     .where(ServiceToken.scope == "telemetry",
+                            ServiceToken.session_id == p.session_id,
+                            ServiceToken.host == p.host,
+                            ServiceToken.revoked_at.is_(None),
+                            ServiceToken.enroll_nonce.isnot(None))
+                     .order_by(ServiceToken.created_at.desc())).scalars().first()
+    if tok is None or not _secrets.compare_digest(tok.enroll_nonce or "", body.nonce):
+        raise HTTPException(403, "no enrollment pending for this capability/nonce")
+    if tok.enroll_confirmed_at is None:
+        tok.enroll_confirmed_at = _now()
+        _log_event(db, p.session_id, "system", p.host, "telemetry_enroll_confirmed",
+                   {"deployment_id": (str(tok.enrollment_deployment_id)
+                                      if tok.enrollment_deployment_id else None),
+                    "machine_id": body.machine_id, "boot_id": body.boot_id,
+                    "note": "authenticated callback from the provisioned host — "
+                            "API address, token and delivery path PROVEN"})
+        db.commit()
+    return {"ok": True, "confirmed_at": tok.enroll_confirmed_at.isoformat()}
+
+
 # --- telemetry ingest (host-bound capability; source identity dedup) --------------
 class AuditdRecord(BaseModel):
     ts: str | datetime | None = None
@@ -1284,6 +1350,32 @@ def ingest_auditd(body: AuditdBatch, p: Principal = Depends(service("telemetry")
                     "argv": rec.argv, "audit_key": rec.audit_key, "source_id": sid, "raw": rec.raw},
                    ts=_parse_ts(rec.ts))
         accepted += 1
+    # CAPTURE ACCEPTANCE (audit T-05): if this batch carries the enrollment's
+    # capture-probe marker, a harmless command has been observed AS AN AUDIT
+    # EVENT THROUGH THE INSTALLED SERVICE under its actual identity — the
+    # input path and command capture are proven, not assumed.
+    if accepted:
+        tok = db.execute(select(ServiceToken)
+                         .where(ServiceToken.scope == "telemetry",
+                                ServiceToken.session_id == p.session_id,
+                                ServiceToken.host == p.host,
+                                ServiceToken.revoked_at.is_(None),
+                                ServiceToken.enroll_nonce.isnot(None),
+                                ServiceToken.enroll_capture_at.is_(None))
+                         .order_by(ServiceToken.created_at.desc())).scalars().first()
+        if tok is not None:
+            from srplatform.scenario_engine.orchestrator import capture_marker
+            marker = capture_marker(tok.enroll_nonce)
+            for rec in body.events:
+                if rec.argv and marker in rec.argv:
+                    tok.enroll_capture_at = _now()
+                    _log_event(db, p.session_id, "system", p.host,
+                               "telemetry_capture_verified",
+                               {"marker": marker,
+                                "note": "harmless command observed through the "
+                                        "installed service — capture PROVEN"})
+                    db.commit()
+                    break
     return {"ok": True, "accepted": accepted, "duplicates": dupes}
 
 

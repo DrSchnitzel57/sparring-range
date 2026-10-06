@@ -136,34 +136,51 @@ def _log(db: Session, session_id, action, host, payload):
     db.flush()
 
 
-def _enroll_telemetry(db: Session, session_id, host: str) -> str:
-    """Per-deployment telemetry enrollment (audit N09): each clone gets a
-    session-AND-host-bound telemetry capability, issued at deploy time. The
-    plaintext is returned ONCE (deploy response / provisioning); the inventory
-    keeps only a reference. Revocation follows the session lifecycle — end,
-    reset and teardown revoke every session capability including these (the
-    same code path), so an old clone can never contribute events to a new
-    session. Trust limit: events from a COMPROMISED host are evidence of what
-    that host CLAIMED under a valid capability, not ground truth."""
+def _enroll_telemetry(db: Session, session_id, host: str,
+                      deployment_id=None) -> tuple[str, str]:
+    """Per-deployment telemetry enrollment (audit N09/T-05): each clone gets
+    a session-AND-host-bound telemetry capability AND a FRESH ENROLLMENT
+    NONCE, issued at deploy time. The plaintext token+nonce are returned ONCE
+    (provisioning); the inventory keeps only a reference. Revocation follows
+    the session lifecycle — end, reset and teardown revoke every session
+    capability including these (the same code path), so an old clone can
+    never contribute events to a new session. Trust limit: events from a
+    COMPROMISED host are evidence of what that host CLAIMED under a valid
+    capability, not ground truth."""
     import uuid as _u
     token = f"svc-telemetry-{_u.uuid4().hex}"
+    nonce = _u.uuid4().hex
     db.add(ServiceToken(token=token, scope="telemetry", session_id=session_id,
-                        host=host))
-    return token
+                        host=host, enroll_nonce=nonce,
+                        enrollment_deployment_id=deployment_id))
+    return token, nonce
 
 
 def _token_ref(token: str) -> str:
     return f"...{token[-6:]}"
 
 
-# ------------------------------------------------- telemetry enrollment (T05) --
-# Token ISSUANCE is not enrollment. Each clone must be PROVISIONED with its
-# session-bound capability through the management channel and the running
-# service CONFIRMED, with the phase persisted per resource so an interrupted
-# or lost-response provisioning resumes safely instead of re-issuing blindly.
+# ------------------------------------------------- telemetry enrollment (T05/T-05) --
+# Token ISSUANCE is not enrollment, and a RUNNING SERVICE is not evidence.
+# Each clone must be PROVISIONED with its session-bound capability through
+# the management channel, and enrollment advances only on DISTINCT evidence:
 #
-# Phases: (none) -> pending_token -> provisioned -> confirmed
+#   provisioned          — env written + service enabled/restarted (channel rc 0)
+#   service_running      — `systemctl is-active` answers active
+#   delivery_confirmed   — an AUTHENTICATED callback bound to a fresh nonce
+#                          arrived FROM THE PROVISIONED HOST (proves the API
+#                          address, the token and the delivery path)
+#   confirmed            — a harmless capture probe was OBSERVED AS AN AUDIT
+#                          EVENT THROUGH THE INSTALLED SERVICE (proves the
+#                          input path and command capture)
+#
+# Phases: (none) -> pending_token -> provisioned -> service_running ->
+#         delivery_confirmed -> confirmed
 #         failure states: provision_failed / confirm_failed / unconfigured
+# The phase is persisted per resource so an interrupted or lost-response
+# provisioning resumes safely instead of re-issuing blindly.
+import time as _time
+
 _enrollment_exec = None  # fn(addr, command) -> (code, out); test/operator hook
 
 
@@ -195,27 +212,38 @@ def _enrollment_channel():
     return None
 
 
-def _recover_telemetry_token(db: Session, session_id, host: str) -> str | None:
-    """Recover the issued plaintext after a lost deployment response: the
-    ServiceToken row IS the durable record (plaintext primary key), so a
-    retry resumes enrollment for the SAME capability instead of issuing a
-    second one."""
-    return db.execute(select(ServiceToken.token)
-                      .where(ServiceToken.session_id == session_id,
-                             ServiceToken.host == host,
-                             ServiceToken.scope == "telemetry",
-                             ServiceToken.revoked_at.is_(None))
-                      .order_by(ServiceToken.created_at.desc())).scalars().first()
+def _recover_telemetry_token(db: Session, session_id, host: str) -> tuple[str, str] | None:
+    """Recover the issued plaintext + nonce after a lost deployment response:
+    the ServiceToken row IS the durable record (plaintext primary key), so a
+    retry resumes enrollment for the SAME capability and the SAME enrollment
+    nonce instead of issuing a second one."""
+    row = db.execute(select(ServiceToken.token, ServiceToken.enroll_nonce)
+                     .where(ServiceToken.session_id == session_id,
+                            ServiceToken.host == host,
+                            ServiceToken.scope == "telemetry",
+                            ServiceToken.revoked_at.is_(None))
+                     .order_by(ServiceToken.created_at.desc())).first()
+    return (row[0], row[1]) if row else None
 
 
-def _provision_command(host: str, token: str, s) -> str:
+def capture_marker(nonce: str) -> str:
+    """The harmless capture-probe marker (audit T-05): a unique token carried
+    in the argv of a harmless command executed on the host. Observing it as
+    an audit event THROUGH the installed service is the only evidence that
+    command capture works."""
+    return f"SR-CAPTURE-{nonce[:12]}"
+
+
+def _provision_command(host: str, token: str, nonce: str, s) -> str:
     """The per-clone provisioning command the golden image's installer
-    contract expects: write the REAL env file (no placeholders), restrict it
-    to the service identity, and enable+restart the enrolled service."""
+    contract expects: write the REAL env file (no placeholders, including the
+    enrollment nonce), restrict it to the service identity, and enable+
+    restart the enrolled service."""
     import shlex
     env = (f"SR_API_URL={s.api_base_url}\n"
            f"SR_TELEMETRY_TOKEN={token}\n"
            f"SR_HOST={host}\n"
+           f"SR_ENROLL_NONCE={nonce}\n"
            f"SR_SPOOL_DIR=/var/lib/sparring-range/shipper\n")
     return ("install -d -m 0750 /etc/sparring-range && "
             f"printf '%s' {shlex.quote(env)} > /etc/sparring-range/shipper.env && "
@@ -225,57 +253,119 @@ def _provision_command(host: str, token: str, s) -> str:
             "systemctl restart sparring-shipper")
 
 
+def _enrollment_evidence(db: Session, session_id, host: str, attr: str):
+    """Newest un-revoked telemetry capability's evidence timestamp."""
+    return db.execute(select(getattr(ServiceToken, attr))
+                      .where(ServiceToken.session_id == session_id,
+                             ServiceToken.host == host,
+                             ServiceToken.scope == "telemetry",
+                             ServiceToken.revoked_at.is_(None))
+                      .order_by(ServiceToken.created_at.desc())
+                      .limit(1)).scalars().first()
+
+
+def _wait_for_enrollment_evidence(db: Session, session_id, host: str, attr: str,
+                                  timeout_s: float, poll_s: float = 0.25):
+    """Bounded wait for the HOST-ORIGINATED evidence (the API routes set it
+    when the provisioned host calls in). Returns the timestamp or None —
+    a timeout is a VISIBLE enrollment failure, never an assumed pass."""
+    deadline = _time.monotonic() + max(0.0, timeout_s)
+    while True:
+        db.expire_all()   # the callback lands on another session — read fresh
+        val = _enrollment_evidence(db, session_id, host, attr)
+        if val is not None or _time.monotonic() >= deadline:
+            return val
+        _time.sleep(poll_s)
+
+
 def _enroll_host_telemetry(db: Session, dep: Deployment, res: dict, resources: list,
                            session_id, host_name: str, ip: str | None, s,
                            out: dict) -> str:
-    """Drive ONE host's enrollment as far as the channel allows, committing
+    """Drive ONE host's enrollment as far as the EVIDENCE allows, committing
     the phase after every step (crash/lost-response resumes, never repeats
-    token issuance). Returns the resulting phase."""
+    token issuance). A phase advances ONLY on its distinct evidence:
+    provisioning rc, service-active, the host's authenticated nonce callback
+    (delivery), and an audit event through the installed service (capture).
+    `systemctl is-active` alone proves NOTHING about delivery — a shipper
+    with a wrong API address, a rejected token or an unreadable input stays
+    visibly stuck (audit T-05)."""
     enroll = dict(res.get("telemetry_enroll") or {})
     if enroll.get("phase") == "confirmed":
         return "confirmed"
-    tok = _recover_telemetry_token(db, session_id, host_name)
-    if tok is None:
-        tok = _enroll_telemetry(db, session_id, host_name)
+
+    def persist(**kw) -> str:
+        enroll.update(kw)
+        res["telemetry_enroll"] = enroll
+        dep.resources = resources
+        flag_modified(dep, "resources")
+        db.commit()
+        return enroll["phase"]
+
+    recovered = _recover_telemetry_token(db, session_id, host_name)
+    if recovered is None:
+        tok, nonce = _enroll_telemetry(db, session_id, host_name, dep.deployment_id)
         res["telemetry_token_ref"] = _token_ref(tok)
         dep.resources = resources
         flag_modified(dep, "resources")
         db.commit()
-    enroll = {"phase": "pending_token", "token_ref": _token_ref(tok)}
+    else:
+        tok, nonce = recovered
+        if not nonce:   # capability issued before the nonce contract: rotate
+            row = db.execute(select(ServiceToken).where(
+                ServiceToken.token == tok)).scalar_one()
+            row.enroll_nonce = uuidlib.uuid4().hex
+            db.commit()
+            nonce = row.enroll_nonce
+    persist(phase="pending_token", token_ref=_token_ref(tok))
     out[host_name] = tok  # plaintext returned to the deployment response
     chan = _enrollment_channel()
     if chan is None or not ip:
-        enroll["phase"] = "unconfigured"
-        enroll["note"] = ("provisioning channel not configured — dev-mode "
-                          "relaxation, visible in readiness")
-        res["telemetry_enroll"] = enroll
-        dep.resources = resources
-        flag_modified(dep, "resources")
-        db.commit()
-        return "unconfigured"
-    code, tail = chan(ip, _provision_command(host_name, tok, s))
+        return persist(phase="unconfigured",
+                       note="provisioning channel not configured — dev-mode "
+                            "relaxation, visible in readiness")
+    code, tail = chan(ip, _provision_command(host_name, tok, nonce, s))
     if code != 0:
-        enroll.update(phase="provision_failed", error=str(tail)[:200])
-        res["telemetry_enroll"] = enroll
-        dep.resources = resources
-        flag_modified(dep, "resources")
-        db.commit()
-        return "provision_failed"
-    enroll.update(phase="provisioned", provisioned_at=_now().isoformat())
-    res["telemetry_enroll"] = enroll
-    dep.resources = resources
-    flag_modified(dep, "resources")
-    db.commit()
+        return persist(phase="provision_failed", error=str(tail)[:200])
+    persist(phase="provisioned", provisioned_at=_now().isoformat())
     code, tail = chan(ip, "systemctl is-active --quiet sparring-shipper")
-    if code == 0:
-        enroll.update(phase="confirmed", confirmed_at=_now().isoformat())
-    else:
-        enroll.update(phase="confirm_failed", error=str(tail)[:200])
-    res["telemetry_enroll"] = enroll
-    dep.resources = resources
-    flag_modified(dep, "resources")
-    db.commit()
-    return enroll["phase"]
+    if code != 0:
+        return persist(phase="confirm_failed", stage="service_running",
+                       error=f"service not active: {str(tail)[:200]}")
+    persist(phase="service_running", service_running_at=_now().isoformat())
+
+    # DELIVERY (audit T-05): the provisioned host must call BACK,
+    # authenticated by its capability and bound to the fresh nonce. A service
+    # that is merely active with a wrong API address / rejected token /
+    # blocked delivery never produces this evidence.
+    confirmed_at = _wait_for_enrollment_evidence(
+        db, session_id, host_name, "enroll_confirmed_at", s.enroll_confirm_timeout_s)
+    if confirmed_at is None:
+        return persist(phase="confirm_failed", stage="delivery_confirmed",
+                       error="service active but NO authenticated enrollment "
+                             "callback arrived from the provisioned host — API "
+                             "address, token or delivery path is broken "
+                             f"(timeout {s.enroll_confirm_timeout_s}s)")
+    persist(phase="delivery_confirmed", delivery_confirmed_at=confirmed_at.isoformat())
+
+    # CAPTURE (audit T-05): execute a harmless command and require its audit
+    # event THROUGH THE INSTALLED SERVICE. Delivery working while capture is
+    # broken (unreadable audit input, wrong unit identity) is NOT a healthy
+    # evidence stream.
+    marker = capture_marker(nonce)
+    code, tail = chan(ip, f"/bin/true {marker}")
+    if code != 0:
+        return persist(phase="confirm_failed", stage="capture_probe",
+                       error=f"capture probe failed on host: {str(tail)[:200]}")
+    capture_at = _wait_for_enrollment_evidence(
+        db, session_id, host_name, "enroll_capture_at", s.enroll_capture_timeout_s)
+    if capture_at is None:
+        return persist(phase="confirm_failed", stage="capture_verified",
+                       error="delivery confirmed but the capture probe produced "
+                             "NO audit event through the installed service — "
+                             "command capture is broken (input unreadable?) "
+                             f"(timeout {s.enroll_capture_timeout_s}s)")
+    return persist(phase="confirmed", confirmed_at=capture_at.isoformat(),
+                   capture_verified_at=capture_at.isoformat())
 
 
 # ------------------------------------------------------------------- lease ---

@@ -29,7 +29,9 @@ range host is evidence of what that host CLAIMED at that time, not truth —
 see docs/ARCHITECTURE_NOTES.md.
 
 Configuration (env or /etc/sparring-range/shipper.env):
-  SR_API_URL, SR_TELEMETRY_TOKEN, SR_HOST, SR_SPOOL_DIR, SR_SPOOL_MAX_BYTES
+  SR_API_URL, SR_TELEMETRY_TOKEN, SR_HOST, SR_SPOOL_DIR, SR_SPOOL_MAX_BYTES,
+  SR_ENROLL_NONCE (provisioned per enrollment; triggers the authenticated
+  delivery confirmation from the host — audit T-05)
 """
 from __future__ import annotations
 
@@ -71,10 +73,18 @@ def _decode_unquoted(v: str, argv_field: bool = False) -> str:
                 return dec
         return v
     if re.fullmatch(r"[0-9a-fA-F]{2,}", v) and len(v) % 2 == 0 and not re.search(r"[g-zG-Z]", v):
+        # Hex-LOOKING unquoted values are not all encoded strings: SYSCALL's
+        # arch=c000003e is a NUMBER, and decoding it yields NUL/control bytes
+        # that make the event's JSONB payload UNSTORABLE (the whole ingest
+        # fails — audit T-05, caught by the installed-shipper test). Decode
+        # only when the result is printable text; otherwise keep the literal.
         try:
-            return bytes.fromhex(v).decode("utf-8", "replace")
+            dec = bytes.fromhex(v).decode("utf-8", "replace")
         except ValueError:
             return v
+        if dec and all(c.isprintable() or c == " " for c in dec):
+            return dec
+        return v
     return v
 
 
@@ -482,6 +492,63 @@ def ship_events(api: str, token: str, events: list[dict]) -> bool:
         return False
 
 
+def confirm_enrollment(api: str, token: str, nonce: str, host: str,
+                       machine_id: str, boot_id: str) -> bool:
+    """HOST-ORIGINATED enrollment confirmation (audit T-05): the installed
+    service proves its OWN delivery path — authenticated by the provisioned
+    capability and bound to the fresh enrollment nonce. A controller-side
+    claim that 'systemctl is-active' passed proves nothing about delivery."""
+    req = urllib.request.Request(
+        f"{api}/enroll/confirm",
+        data=json.dumps({"nonce": nonce, "host": host,
+                         "machine_id": machine_id, "boot_id": boot_id}).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status < 400
+    except (urllib.error.URLError, OSError, urllib.error.HTTPError):
+        return False
+
+
+class EnrollmentConfirmer:
+    """Retries the authenticated enrollment callback with visible backoff.
+    Success means: this host, this capability, this nonce reached the API —
+    the enrollment's DELIVERY evidence. Failure stays on stderr (the unit's
+    journal) and the phase never advances on the controller side."""
+
+    def __init__(self, api: str, token: str, nonce: str, host: str,
+                 machine_id: str, boot_id: str, max_backoff_s: float = 30.0,
+                 max_attempts: int = 60, sleeper=time.sleep):
+        self.api, self.token, self.nonce, self.host = api, token, nonce, host
+        self.machine_id, self.boot_id = machine_id, boot_id
+        self.max_backoff_s = max_backoff_s
+        self.max_attempts = max_attempts
+        self._sleep = sleeper
+        self.confirmed = threading.Event()
+        self.gave_up = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True,
+                                       name="shipper-enroll-confirm")
+
+    def _run(self):
+        backoff = 1.0
+        for attempt in range(1, self.max_attempts + 1):
+            if confirm_enrollment(self.api, self.token, self.nonce, self.host,
+                                  self.machine_id, self.boot_id):
+                self.confirmed.set()
+                return
+            print(f"[shipper] enrollment confirmation failed (attempt {attempt}); "
+                  f"retry in {backoff:.0f}s — delivery NOT yet proven", file=sys.stderr)
+            self._sleep(backoff)
+            backoff = min(backoff * 2, self.max_backoff_s)
+        self.gave_up.set()
+        print("[shipper] enrollment confirmation ABANDONED — enrollment cannot "
+              "reach delivery-confirmed", file=sys.stderr)
+
+    def start(self):
+        self.thread.start()
+
+
 class DeliveryLoop:
     """Spool delivery INDEPENDENT of incoming activity (audit R11): a periodic
     background flush means a spooled record is delivered after connectivity
@@ -548,6 +615,10 @@ def main() -> None:
     ap.add_argument("--close-after-s", type=float, default=2.0,
                     help="bounded completion timeout: an event with no further "
                          "records for this long is deliverable while input stays open")
+    ap.add_argument("--enroll-nonce", default=os.environ.get("SR_ENROLL_NONCE"),
+                    help="fresh enrollment nonce provisioned with the capability; "
+                         "when set, the service confirms its own delivery path "
+                         "(audit T-05)")
     args = ap.parse_args()
     if not all([args.api, args.token, args.host]):
         print("shipper requires --api/--token/--host (or SR_* env)", file=sys.stderr)
@@ -568,6 +639,14 @@ def main() -> None:
     delivery = DeliveryLoop(args.api, args.token, spool)
     delivery.start()  # drains anything spooled during a previous outage,
                       # and keeps retrying while stdin blocks idle
+
+    # HOST-ORIGINATED ENROLLMENT CONFIRMATION (audit T-05): when provisioned
+    # with a nonce, the installed service itself proves the delivery path.
+    confirmer = None
+    if args.enroll_nonce:
+        confirmer = EnrollmentConfirmer(args.api, args.token, args.enroll_nonce,
+                                        args.host, machine_id, boot_id)
+        confirmer.start()
 
     exit_code = 0
     try:

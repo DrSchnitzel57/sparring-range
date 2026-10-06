@@ -36,8 +36,13 @@ PY = __import__("sys").executable
 def local_supervisor(tmp_path, monkeypatch):
     """SshRunner whose control/start channels execute the REAL
     runner_supervise.sh locally (SSH seam only). Returns
-    (runner, state_dir, script)."""
+    (runner, state_dir, script). Containment is the production contract:
+    a delegated cgroup v2 root is required (skips with an explicit reason
+    when the host does not delegate one — the supervisor refuses uncontained
+    starts, audit T-04)."""
+    from tests.helpers import cgroup_containment_root
     monkeypatch.setenv("RUNNER_SUPERVISOR_STATE", str(tmp_path / "jobs"))
+    monkeypatch.setenv("RUNNER_CGROUP_ROOT", cgroup_containment_root())
     kh = tmp_path / "known_hosts"
     kh.write_text("runner.invalid ssh-ed25519 AAAAfake\n")
     key = tmp_path / "id_ed25519"

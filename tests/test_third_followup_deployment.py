@@ -81,29 +81,84 @@ def test_t04_launch_and_reset_use_the_session_snapshot_not_live_yaml(
 # --------------------------------------------------------------------------- #
 
 class ScriptedChannel:
-    """Records every provisioning command; scripts exit codes per pattern."""
+    """Records every provisioning command; scripts exit codes per pattern.
 
-    def __init__(self, fail=(), ok_code=0):
+    With a `host_client` (the in-process API client) it also SIMULATES THE
+    PROVISIONED HOST's side of the enrollment contract (audit T-05): after
+    provisioning, the installed service sends its AUTHENTICATED NONCE
+    CALLBACK (/enroll/confirm), and the capture probe's harmless command
+    arrives as an AUDIT EVENT (/ingest/auditd) carrying the marker. Those —
+    not `systemctl is-active` — are the evidence enrollment advances on.
+    `confirm`/`deliver_capture` toggle the two evidence paths to model a
+    service that runs while its delivery or capture path is broken."""
+
+    def __init__(self, fail=(), ok_code=0, host_client=None,
+                 confirm=True, deliver_capture=True):
         self.commands = []
         self.fail = fail          # substrings whose command returns 1
         self.ok_code = ok_code
+        self.host_client = host_client
+        self.confirm = confirm
+        self.deliver_capture = deliver_capture
+        self.provisioned_env = None
 
     def __call__(self, addr, command):
         self.commands.append((addr, command))
         for pat in self.fail:
             if pat in command:
                 return 1, f"scripted failure for {pat!r}"
+        if "shipper.env" in command:
+            self.provisioned_env = self._env_of(command)
+            if self.host_client is not None and self.confirm:
+                self._host_confirm(self.provisioned_env)
         if "is-active" in command:
             return self.ok_code, "active\n"
+        if "SR-CAPTURE-" in command:
+            if self.host_client is not None and self.deliver_capture:
+                self._host_capture(command)
+            return 0, ""
         if "list-unit-files" in command:
             return 0, "nginx.service enabled enabled\nssh.service enabled enabled\n"
         return 0, ""
 
+    @staticmethod
+    def _env_of(command):
+        part = next(s for s in command.split("&&") if "printf" in s)
+        return shlex.split(part)[2]
+
+    @staticmethod
+    def _env_value(env, key):
+        for line in env.splitlines():
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1]
+        return None
+
+    def _host_confirm(self, env):
+        import uuid as _u
+        tok = self._env_value(env, "SR_TELEMETRY_TOKEN")
+        nonce = self._env_value(env, "SR_ENROLL_NONCE")
+        r = self.host_client.post("/enroll/confirm",
+                                  json={"nonce": nonce, "machine_id": "test-clone",
+                                        "boot_id": _u.uuid4().hex},
+                                  headers={"Authorization": f"Bearer {tok}"})
+        self.last_confirm_status = r.status_code
+
+    def _host_capture(self, command):
+        import uuid as _u
+        marker = next(w for w in command.split() if w.startswith("SR-CAPTURE-"))
+        env = self.provisioned_env or ""
+        tok = self._env_value(env, "SR_TELEMETRY_TOKEN")
+        r = self.host_client.post(
+            "/ingest/auditd",
+            json={"events": [{"kind": "command", "argv": f"/bin/true {marker}",
+                              "source_id": _u.uuid4().hex, "boot_id": "b1"}]},
+            headers={"Authorization": f"Bearer {tok}"})
+        self.last_capture_status = r.status_code
+
     def provision_env(self):
         for _, cmd in self.commands:
             if "shipper.env" in cmd:
-                part = next(s for s in cmd.split("&&") if "printf" in s)
-                return shlex.split(part)[2]
+                return self._env_of(cmd)
         return None
 
 
@@ -130,7 +185,7 @@ def _enroll_state(client, sid, host):
 def test_t05_enrollment_provisions_env_and_confirms_service(
         client, users, fake_pve, enrollment_channel):
     from srplatform import verification_service
-    chan = ScriptedChannel()
+    chan = ScriptedChannel(host_client=client)
     enrollment_channel.set_enrollment_exec(chan)
     verification_service.set_verifier_exec(chan)
 
@@ -141,18 +196,24 @@ def test_t05_enrollment_provisions_env_and_confirms_service(
     token = out["deployment"]["telemetry_enrollments"]["web01"]
 
     # the REAL provisioning contract: env file written with the session-bound
-    # capability, no placeholders, service enabled+restarted, then confirmed
+    # capability AND a fresh enrollment nonce, no placeholders, service
+    # enabled+restarted
     env = chan.provision_env()
     assert env is not None and "shipper.env" in " ".join(c for _, c in chan.commands)
     assert f"SR_TELEMETRY_TOKEN={token}" in env
     assert "SR_HOST=web01" in env and "SR_API_URL=" in env
-    assert "PROVISION-PER-DEPLOYMENT" not in env and "SET-PER-CLONE" not in env
+    assert "SR_ENROLL_NONCE=" in env and "PROVISION-PER-DEPLOYMENT" not in env \
+        and "SET-PER-CLONE" not in env
     assert any("systemctl enable --now sparring-shipper" in c for _, c in chan.commands)
     assert any("is-active" in c for _, c in chan.commands)
 
-    # DURABLE phase in the deployment inventory (not just the response)
+    # DURABLE phase in the deployment inventory (not just the response):
+    # confirmed ONLY because the host's authenticated callback (delivery) and
+    # the capture probe's audit event (capture) were both observed (T-05).
     st = _enroll_state(client, sid, "web01")
     assert st.get("phase") == "confirmed", st
+    assert "stage" not in st, st   # no failure stage on the happy path
+    assert st.get("delivery_confirmed_at") and st.get("capture_verified_at")
 
     # readiness was ENFORCED and passed with the enrollment confirmed
     assert out["readiness"]["enforced"] and out["readiness"]["ok"]
@@ -193,8 +254,9 @@ def test_t05_interrupted_provisioning_resumes_with_the_same_token(
         assert s.get(SessionModel, uuid.UUID(sid)).status != "ready"
 
     # channel repaired — the retry (idempotent deploy path) must RESUME:
-    # recover the issued token, provision, confirm.
-    good = ScriptedChannel()
+    # recover the issued token AND nonce, provision, and advance on the
+    # host's delivery + capture evidence.
+    good = ScriptedChannel(host_client=client)
     enrollment_channel.set_enrollment_exec(good)
     verification_service.set_verifier_exec(good)
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
@@ -206,6 +268,8 @@ def test_t05_interrupted_provisioning_resumes_with_the_same_token(
             ServiceToken.scope == "telemetry")).scalars().all()
         assert len(tokens) == 1, "retry must NOT issue a second capability"
         assert f"SR_TELEMETRY_TOKEN={tokens[0].token}" in good.provision_env()
+        assert tokens[0].enroll_nonce in good.provision_env(), \
+            "retry must resume with the SAME enrollment nonce"
 
 
 def test_t05_unconfirmed_service_blocks_ready(client, users, fake_pve,

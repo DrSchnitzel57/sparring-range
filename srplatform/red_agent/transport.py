@@ -22,7 +22,8 @@ class Transport(Protocol):
     # durable command-operation inventory (audit T01) — implemented by the
     # real transports; the loop degrades visibly when absent (test doubles)
     def register_operation(self, op_uuid: str, kind: str = "remote") -> None: ...
-    def complete_operation(self, op_uuid: str, state: str = "completed") -> None: ...
+    def complete_operation(self, op_uuid: str, state: str = "completed",
+                           detail: str | None = None) -> None: ...
 
 
 PAGE = 1000
@@ -70,11 +71,12 @@ class HttpTransport:
                          json={"op_id": op_uuid, "kind": kind},
                          headers={"X-Worker-Token": self.token or ""}).raise_for_status()
 
-    def complete_operation(self, op_uuid: str, state: str = "completed") -> None:
+    def complete_operation(self, op_uuid: str, state: str = "completed",
+                           detail: str | None = None) -> None:
         if not self.run_id:
             return
         self.client.post(f"/internal/runs/{self.run_id}/operations/{op_uuid}/done",
-                         json={"state": state},
+                         json={"state": state, "detail": detail},
                          headers={"X-Worker-Token": self.token or ""}).raise_for_status()
 
     def log_event(self, event: dict) -> None:
@@ -124,11 +126,12 @@ class TestClientTransport:
                         headers={"X-Worker-Token": self.token or ""})
         r.raise_for_status()
 
-    def complete_operation(self, op_uuid: str, state: str = "completed") -> None:
+    def complete_operation(self, op_uuid: str, state: str = "completed",
+                           detail: str | None = None) -> None:
         if not self.run_id:
             return
         r = self.c.post(f"/internal/runs/{self.run_id}/operations/{op_uuid}/done",
-                        json={"state": state},
+                        json={"state": state, "detail": detail},
                         headers={"X-Worker-Token": self.token or ""})
         r.raise_for_status()
 

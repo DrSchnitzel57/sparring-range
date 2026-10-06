@@ -148,7 +148,9 @@ def readiness_checks(db: Session, session_id) -> dict:
     s = get_settings()
     chan_ok, chan_why = management_channel_configured()
 
-    # TELEMETRY ENROLLMENT (audit T05): every created clone must be confirmed.
+    # TELEMETRY ENROLLMENT (audit T05/T-05): every created clone must be
+    # CONFIRMED — which now means host-originated delivery AND capture were
+    # observed, not that a service merely runs.
     enroll_items = []
     dep = active_deployment(db, session_id)
     if dep is not None:
@@ -199,7 +201,8 @@ def readiness_checks(db: Session, session_id) -> dict:
         if declared and any(i["status"] != "passed" for i in items):
             reasons.append("declared services not ready on the owned inventory")
         if enroll_enforced and not all(e["ok"] for e in enroll_items):
-            reasons.append("telemetry enrollment not confirmed on every created clone")
+            reasons.append("telemetry enrollment not confirmed (host-originated "
+                           "delivery + capture) on every created clone")
     return {"enforced": True, "ok": ok, "checks": items, "enrollments": enroll_items,
             "reason": "; ".join(reasons) or None}
 

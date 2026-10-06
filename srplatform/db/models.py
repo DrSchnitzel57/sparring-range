@@ -138,6 +138,15 @@ class ServiceToken(Base):
     scope: Mapped[str] = mapped_column(Text, nullable=False)  # bastion|telemetry|runner|score
     session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("sessions.session_id"))
     host: Mapped[str | None] = mapped_column(Text)
+    # TELEMETRY ENROLLMENT (audit T-05): a fresh nonce issued with the token,
+    # the deployment generation it belongs to, and the two DISTINCT evidence
+    # timestamps — the authenticated callback FROM THE PROVISIONED HOST
+    # (delivery_confirmed) and the first audit event observed THROUGH THE
+    # INSTALLED SERVICE (capture_verified). A running service proves neither.
+    enroll_nonce: Mapped[str | None] = mapped_column(Text)
+    enrollment_deployment_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    enroll_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    enroll_capture_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -250,6 +259,9 @@ class RunOperation(Base):
     # active -> dispatched, cessation unconfirmed; completed -> worker reported
     # the result; cancel-unknown -> cancellation attempted but NOT confirmed
     state: Mapped[str] = mapped_column(Text, nullable=False, default="active")
+    # truthful completion/containment detail (audit T-04): surviving-descendant
+    # containment verdicts and unconfirmed-stop reasons are RETAINED here.
+    detail: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),
                                                  server_default=func.now(), nullable=False)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -55,6 +55,7 @@ if [ ! -f /etc/sparring-range/shipper.env ]; then
 SR_API_URL=http://CONTROL-PLANE-ADDRESS:8000
 SR_TELEMETRY_TOKEN=PROVISION-PER-DEPLOYMENT
 SR_HOST=SET-PER-CLONE
+SR_ENROLL_NONCE=PROVISION-PER-ENROLLMENT
 SR_SPOOL_DIR=/var/lib/sparring-range/shipper
 EOF
   chmod 0640 /etc/sparring-range/shipper.env
@@ -65,9 +66,12 @@ systemctl daemon-reload
 systemctl enable auditd sparring-shipper
 echo "[install] telemetry pipeline installed. Restart auditd + shipper at next boot (golden image) or now:"
 echo "  systemctl restart auditd sparring-shipper"
-echo "[install] ENROLLMENT (audit N09/T05): golden images must NOT ship live tokens."
+echo "[install] ENROLLMENT (audit N09/T05/T-05): golden images must NOT ship live tokens."
 echo "  The CONTROL PLANE provisions /etc/sparring-range/shipper.env per clone"
 echo "  at deploy time over the pinned management channel (SR_API_URL, SR_HOST,"
-echo "  session-bound SR_TELEMETRY_TOKEN), enables+restarts the service and"
-echo "  confirms it before the session reaches ready. Tokens are revoked on"
-echo "  session end/reset/teardown. The placeholders above are intentional."
+echo "  session-bound SR_TELEMETRY_TOKEN, fresh SR_ENROLL_NONCE), enables+restarts"
+echo "  the service, and enrollment advances ONLY on distinct evidence: service"
+echo "  active -> the host's AUTHENTICATED NONCE CALLBACK (delivery proven) ->"
+echo "  a capture probe OBSERVED AS AN AUDIT EVENT through the installed service"
+echo "  (capture proven). Tokens are revoked on session end/reset/teardown. The"
+echo "  placeholders above are intentional."

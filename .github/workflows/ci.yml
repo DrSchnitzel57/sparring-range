@@ -38,6 +38,18 @@ jobs:
           .venv/bin/pip install --no-deps -e .
       - name: Install nftables (real ruleset parser + privileged round-trip)
         run: sudo apt-get update && sudo apt-get install -y nftables
+      - name: Delegate a cgroup v2 subtree for runner containment tests
+        # The supervisor REFUSES to start work without authoritative cgroup
+        # containment (audit T-04); where none is delegated the tests SKIP
+        # with an explicit reason. Delegate one so they actually run here.
+        run: |
+          if [ "$(stat -fc %T /sys/fs/cgroup)" = "cgroup2fs" ]; then
+            sudo mkdir -p /sys/fs/cgroup/srrunner
+            sudo chown "$USER" /sys/fs/cgroup/srrunner
+            echo "RUNNER_CGROUP_ROOT=/sys/fs/cgroup/srrunner" >> "$GITHUB_ENV"
+          else
+            echo "no cgroup v2 on this host — containment tests will skip"
+          fi
       - name: Unit tests (no infrastructure)
         run: .venv/bin/python -m pytest -m "not db and not browser and not live" -q
       - name: "Real-datapath tests against the kernel (privileged: nft round-trip + netns packet flows)"

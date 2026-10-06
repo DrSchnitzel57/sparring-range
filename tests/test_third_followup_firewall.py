@@ -260,17 +260,24 @@ def test_t03_discovery_uses_prefix_namespace_even_when_local_bridge_exists(monke
     assert "LOCALtap9" not in (ports or [])
 
 
+@pytest.mark.db  # uses the client fixture (real DB for the safety-record mirror)
 def test_t03_start_gate_requires_live_topology_match(client, users, env_dirs, monkeypatch):
     """Config-string equality is not live coverage: a port attached AFTER
-    the evidence was recorded must deny new runs."""
+    the evidence was recorded must deny new runs. The live re-check runs for
+    the NFT controller, so the double must carry that mechanism (the previous
+    double's 'test-fake' mechanism silently skipped the very check under
+    test — the assertion could never fire)."""
     from srplatform.safety import Supervisor, set_supervisor
     from srplatform.safety import firewall
     from srplatform.settings import get_settings
     from tests.helpers import FakeDatapath as FakeDP
 
+    class NftFakeDP(FakeDP):
+        mechanism = "nft"
+
     monkeypatch.setenv("RANGE_BRIDGE_PORTS", "tap1,tap2")
     get_settings.cache_clear()
-    sup = Supervisor(datapath=FakeDP(ok=True),
+    sup = Supervisor(datapath=NftFakeDP(ok=True),
                      state_file=str(env_dirs / "safety_state.json"))
     set_supervisor(sup)
     sup.initialize_state(reason="test")

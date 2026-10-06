@@ -46,10 +46,26 @@ ACTIVE = ("queued", "running", "stopping", "cancel-unknown")
 # states a stop attempt may legitimately act on (retryable) vs final states
 STOPPABLE = ACTIVE
 TERMINAL = ("completed", "failed", "cancelled")
+# a run may only spawn/register commands while it is one of these (audit
+# T-04): 'stopping'/'cancel-unknown' runs must NOT accept new work — the
+# stop/recovery path owns them until every operation is resolved.
+SPAWNNABLE = ("queued", "running")
+# operation states that mean "remote work may still exist"
+UNRESOLVED_OPS = ("active", "cancel-unknown")
 
 
 def _now():
     return datetime.now(timezone.utc)
+
+
+def _unresolved_ops_exists():
+    """Correlated EXISTS over unresolved operations of the UPDATE's run row
+    (audit T-04): a terminal transition is a SINGLE statement that also
+    requires 'no operation may still be live' — a registration cannot slip
+    between a check and the transition."""
+    return select(RunOperation.id).where(
+        RunOperation.run_id == Run.run_id,
+        RunOperation.state.in_(UNRESOLVED_OPS)).exists()
 
 
 class RunConflict(RuntimeError):
@@ -362,19 +378,28 @@ def stop_run(db: Session, run_id, runner=None) -> dict:
                  if run.pgid else {"ok": True, "detail": "no worker pgid recorded"})
 
     # 2. REMOTE containment: cancel + confirm every active remote operation.
-    remote = cancel_remote_operations(db, run, runner=runner)
-
-    if group_res["ok"] and remote["ok"]:
-        res = db.execute(update(Run).where(Run.run_id == run_id,
-                                           Run.status.in_(ACTIVE))
-                         .values(status="cancelled", outcome="canceled",
-                                 ended_at=_now(), worker_token=None))
-        db.commit()
-        out = {"ok": True, "status": "cancelled", "detail": group_res["detail"]}
-        if res.rowcount == 0:   # lost a race to a terminal transition
+    #    The terminal transition is GUARDED (audit T-04): one statement that
+    #    also requires "no operation may still be live". A registration that
+    #    races this stop either lands before the cancel (and is cancelled
+    #    too) or sees a non-SPAWNNABLE status and is refused — never an
+    #    active row on a cancelled run.
+    remote = {"ok": True, "detail": "no remote pass"}
+    for _attempt in range(3):
+        remote = cancel_remote_operations(db, run, runner=runner)
+        if group_res["ok"] and remote["ok"]:
+            res = db.execute(update(Run).where(Run.run_id == run_id,
+                                               Run.status.in_(ACTIVE),
+                                               ~_unresolved_ops_exists())
+                             .values(status="cancelled", outcome="canceled",
+                                     ended_at=_now(), worker_token=None))
+            db.commit()
+            if res.rowcount:
+                return {"ok": True, "status": "cancelled", "detail": group_res["detail"]}
             db.refresh(run)
-            out["status"] = run.status
-        return out
+            if run.status in TERMINAL:
+                return {"ok": True, "status": run.status,
+                        "detail": "another request finalized the run"}
+            continue    # an operation slipped in — cancel it, then retry
     # NEVER convert a failed/unconfirmed termination into 'cancelled'.
     detail = (f"worker group: {group_res['detail']}; remote: {remote['detail']}")
     db.execute(update(Run).where(Run.run_id == run_id, Run.status.in_(ACTIVE))
@@ -389,7 +414,13 @@ def complete_run(db: Session, run_id: str, worker_token: str, result: dict) -> R
     """Worker callback (authenticated by the run-scoped capability). The
     terminal transition is ATOMIC (audit T02): one conditional UPDATE binds
     token consumption + terminal state, so a concurrent stop can never have
-    its cancellation overwritten by a late callback (or vice versa)."""
+    its cancellation overwritten by a late callback (or vice versa).
+
+    FINALIZATION GATE (audit T-04): NO terminal state — success or failure —
+    while remote operations remain unresolved. Any straggler is first taken
+    through authoritative containment; an unconfirmed verdict leaves the run
+    'cancel-unknown' (visible, blocking, retried by recovery). The worker's
+    reported outcome never outranks the containment verdict."""
     run = db.get(Run, run_id)
     if run is None:
         raise KeyError("run not found")
@@ -403,21 +434,43 @@ def complete_run(db: Session, run_id: str, worker_token: str, result: dict) -> R
         # the worker itself could not confirm remote cessation (audit T01):
         # visible, blocks new commands, recovery retries — never 'completed'.
         status, ended = "cancel-unknown", None
-    elif outcome == "worker_failure":
-        status, ended = "failed", _now()
     else:
-        status, ended = "completed", _now()
-    res = db.execute(
-        update(Run)
-        .where(Run.run_id == run_id, Run.worker_token == token_hash,
-               Run.status.in_(("queued", "running")))
-        .values(status=status, outcome=outcome, result=result,
-                ended_at=ended, worker_token=None))
+        remote = cancel_remote_operations(db, run)
+        if remote["ok"]:
+            if outcome == "worker_failure":
+                status, ended = "failed", _now()
+            else:
+                status, ended = "completed", _now()
+        else:
+            status, ended = "cancel-unknown", None
+            result = {**result, "containment": remote}
+    values = dict(status=status, outcome=outcome, result=result,
+                  ended_at=ended, worker_token=None)
+    stmt = (update(Run)
+            .where(Run.run_id == run_id, Run.worker_token == token_hash,
+                   Run.status.in_(("queued", "running"))))
+    if status in ("completed", "failed"):
+        # guarded: refuse finalization while ANY operation is unresolved
+        stmt = stmt.where(~_unresolved_ops_exists())
+    res = db.execute(stmt.values(**values))
     db.commit()
     if res.rowcount == 0:
         db.refresh(run)
         if run.worker_token is None:
             raise PermissionError("worker credential already consumed")
+        if run.status in ("queued", "running"):
+            # LOST THE CONTAINMENT GUARD (audit T-04): a registration landed
+            # between the containment pass and the transition. Consume the
+            # credential, refuse the terminal state, leave the obligation
+            # visible as 'cancel-unknown' for stop/recovery to retry.
+            db.execute(update(Run).where(Run.run_id == run_id,
+                                         Run.status.in_(("queued", "running")))
+                       .values(status="cancel-unknown", worker_token=None,
+                               error="run finalization REFUSED: unresolved remote "
+                                     "operations exist — cessation UNCONFIRMED"))
+            db.commit()
+            db.refresh(run)
+            return run
         raise RunStateError(f"run already {run.status}")
     db.refresh(run)
     return run

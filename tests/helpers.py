@@ -92,3 +92,53 @@ def make_runner_token(session_id: str, scenario_id: str = "test") -> str:
                   worker_token=hashlib.sha256(tok.encode()).hexdigest()))
         s.commit()
     return tok
+
+
+def cgroup_containment_root() -> str:
+    """Resolve AND probe a delegated cgroup v2 directory for the runner
+    supervisor's authoritative containment (audit T-04). The supervisor
+    REFUSES to start work without it (unsupported execution mode), so tests
+    that need real containment SKIP with an explicit reason when the host
+    does not delegate one; the refusal itself is tested separately.
+
+    The probe is not just mkdir: a child process must actually be movable
+    into a fresh child cgroup — that is the containment guarantee."""
+    import os
+    import subprocess
+    import sys
+    import uuid as _u
+
+    import pytest
+    root = os.environ.get("RUNNER_CGROUP_ROOT")
+    if not root:
+        try:
+            with open("/proc/self/cgroup") as f:
+                path = next(l.split("::", 1)[1].strip()
+                            for l in f if l.startswith("0::"))
+            root = "/sys/fs/cgroup" + path
+        except (OSError, StopIteration):
+            pytest.skip("no cgroup v2 unified self-path — containment untestable here")
+    if not os.path.isdir(root) or not os.access(root, os.W_OK):
+        pytest.skip(f"no writable delegated cgroup v2 root at {root!r} — the "
+                    "supervisor refuses uncontained starts by design")
+    probe = os.path.join(root, f"srprobe-{_u.uuid4().hex[:8]}")
+    try:
+        os.mkdir(probe)
+        proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        try:
+            with open(os.path.join(probe, "cgroup.procs"), "w") as f:
+                f.write(str(proc.pid))
+            with open(f"/proc/{proc.pid}/cgroup") as f:
+                if "srprobe-" not in f.read():
+                    pytest.skip(f"cgroup {root!r} does not accept process moves")
+        except OSError:
+            pytest.skip(f"cgroup {root!r} rejects process moves")
+        finally:
+            proc.kill()
+            proc.wait()
+    finally:
+        try:
+            os.rmdir(probe)
+        except OSError:
+            pass
+    return root

@@ -31,6 +31,13 @@ CANCELLATION / STOP SEMANTICS (audit R03/N05):
     SSH disconnect alone is never treated as remote cancellation.
   * Output is captured with a BOUNDED streaming reader (never unbounded
     buffering followed by truncation).
+  * ORDINARY COMPLETION IS GATED ON CONTAINMENT (audit T-04): before a
+    remote command's exit is reported as finished, the runner queries the
+    supervisor's authoritative (cgroup-backed) containment status. Surviving
+    descendants are contained via the control channel and the containment is
+    CONFIRMED; an unconfirmed or unreachable verdict is reported as
+    cancel_state='unknown' — the loop halts and the API refuses to finalize
+    the run. The SSH leader's exit code alone never marks work complete.
 
 `LocalDevRunner` exists solely for developer machines (SR_ENV=dev, explicit
 `runner_transport=local-dev`) and refuses to run anything in production mode —
@@ -220,6 +227,7 @@ class RunResult:
     error: str | None = None
     op_id: str | None = None
     cancel_state: str | None = None   # confirmed | unknown | failed (N05)
+    note: str | None = None           # truthful completion detail (audit T-04)
 
 
 def _bounded_reader(proc: subprocess.Popen, max_bytes: int,
@@ -234,7 +242,14 @@ def _bounded_reader(proc: subprocess.Popen, max_bytes: int,
     small write from a long-silent child). The deadline is checked on every
     loop iteration, so a one-byte-then-silence child is cut off at the
     deadline, and the PARTIAL output captured so far is RETURNED, never
-    discarded. Returns (bytes, timed_out)."""
+    discarded. Returns (bytes, timed_out).
+
+    AUDIT T-04: a SUPERVISED start connection ends when the job LEADER exits,
+    but a backgrounded survivor inherits the pipe's write end — waiting for
+    EOF would block until the survivor exits and fold ordinary completion
+    into a timeout. Once the start process has exited, one more quiet select
+    window is the end of the stream; the survivor is then handled by the
+    containment check, not by waiting on it."""
     import os as _os
     import select
     import time
@@ -250,6 +265,8 @@ def _bounded_reader(proc: subprocess.Popen, max_bytes: int,
             wait = 0.5
         ready, _, _ = select.select([fd], [], [], wait)
         if not ready:
+            if proc.poll() is not None:
+                break     # leader gone; stream held open only by survivors
             continue
         try:
             chunk = _os.read(fd, 65536)
@@ -315,6 +332,16 @@ class SshRunner(Runner):
     def _supervisor_bin(self) -> str:
         return getattr(self.s, "runner_supervisor_bin", "") or "runner-supervisor"
 
+    @staticmethod
+    def _verdict(out: str) -> str:
+        """The supervisor answers with exactly ONE token on stdout; take the
+        LAST non-empty line so stray noise on the merged channel can never
+        turn a clean 'gone' into 'unknown' (audit T-04)."""
+        for line in reversed((out or "").splitlines()):
+            if line.strip():
+                return line.strip()
+        return ""
+
     def _control(self, verb: str, op_id: str, timeout: int = 15) -> tuple[int, str]:
         proc = subprocess.Popen(self._base_cmd() +
                                 [f"{shlex.quote(self._supervisor_bin())} {verb} "
@@ -337,10 +364,23 @@ class SshRunner(Runner):
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             code, out = self._control("status", op_id, timeout=5)
-            if code == 0 and out.strip() in ("gone", "not-found"):
+            if code == 0 and self._verdict(out) in ("gone", "not-found"):
                 return True
             time.sleep(0.5)
         return False
+
+    def containment_status(self, op_id: str) -> str | None:
+        """AUTHORITATIVE containment verdict for an operation (audit T-04):
+        'running' (work survives), 'gone'/'not-found' (confirmed finished),
+        or None — the supervisor is unreachable and the state is UNKNOWN.
+        Unknown is never folded into 'gone'."""
+        code, out = self._control("status", op_id, timeout=15)
+        if code != 0:
+            return None
+        verdict = self._verdict(out)
+        if verdict in ("running", "gone", "not-found"):
+            return verdict
+        return None   # unparseable answer is unknown, not gone
 
     def run(self, command: str, timeout: int | None = None,
             op_id: str | None = None) -> RunResult:
@@ -421,6 +461,27 @@ class SshRunner(Runner):
                              error=None if confirmed else
                              ("ssh transport lost and remote cessation UNCONFIRMED "
                               "— report partial stop"))
+        # ORDINARY COMPLETION (audit T-04): a successful shell can exit while
+        # a redirected background child KEEPS RUNNING — the leader's exit
+        # code says nothing about the operation's containment. Ask the
+        # supervisor (authoritative, cgroup-backed) before calling this
+        # operation finished; unknown is treated as unknown.
+        verdict = self.containment_status(op_id)
+        if verdict == "running":
+            confirmed = self.cancel_remote(op_id, timeout_s=10)
+            if confirmed:
+                return RunResult(exit_code=code, output=out, op_id=op_id,
+                                 note="command exited with surviving remote descendants "
+                                      "— contained and confirmed gone via supervisor")
+            return RunResult(exit_code=code, output=out, op_id=op_id,
+                             cancel_state="unknown",
+                             error="command exited with SURVIVING REMOTE DESCENDANTS "
+                                   "and containment is UNCONFIRMED — report partial stop")
+        if verdict is None:
+            return RunResult(exit_code=code, output=out, op_id=op_id,
+                             cancel_state="unknown",
+                             error="command exited but supervisor containment status is "
+                                   "UNREACHABLE — remote cessation UNKNOWN, not gone")
         return RunResult(exit_code=code, output=out, op_id=op_id)
 
     def health(self) -> tuple[bool, str]:

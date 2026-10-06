@@ -75,6 +75,12 @@ class Settings(BaseSettings):
     runner_supervisor_bin: str = "runner-supervisor"
     runner_command_timeout_s: int = 120
     runner_max_output_bytes: int = 8000
+    # --- telemetry enrollment evidence bounds (audit T-05) --------------
+    # How long provisioning waits for the HOST-ORIGINATED authenticated
+    # callback (delivery) and for the capture probe's audit event (capture).
+    # A timeout is a visible enrollment failure, never an assumed pass.
+    enroll_confirm_timeout_s: int = 30
+    enroll_capture_timeout_s: int = 30
 
     # --- Verifier management exec (trusted backend only, F01/F10) --------------
     verifier_ssh_user: str = "root"

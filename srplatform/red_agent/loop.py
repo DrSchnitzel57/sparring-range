@@ -96,10 +96,13 @@ class RedAgentLoop:
         if fn is not None:
             fn(op_uuid, self._op_kind())
 
-    def _complete_operation(self, op_uuid: str, state: str) -> None:
+    def _complete_operation(self, op_uuid: str, state: str, detail: str | None = None) -> None:
         fn = getattr(self.transport, "complete_operation", None)
         if fn is not None:
-            fn(op_uuid, state)
+            try:
+                fn(op_uuid, state, detail=detail)
+            except TypeError:      # transport double without the detail kwarg
+                fn(op_uuid, state)
 
     # ------------------------------------------------------------------ helpers
     def _log(self, actor, action_type, payload, phase=None, mitre=None, raw_ref=None, host=None,
@@ -279,7 +282,9 @@ class RedAgentLoop:
                       raw_output_hash=hashlib.sha256(out.encode()).hexdigest()[:16])
             self._complete_operation(op_uuid,
                                      "cancel-unknown" if cancel_state == "unknown"
-                                     else "completed")
+                                     else "completed",
+                                     detail=(getattr(res, "note", None)
+                                             or getattr(res, "error", None)))
 
             # audit T01: an UNCONFIRMED remote cancellation halts the loop —
             # further commands against a range with unknown live work are

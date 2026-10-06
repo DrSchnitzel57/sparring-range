@@ -67,7 +67,14 @@ environment (docker not installed) — recorded as BLOCKED, not passed.
      `SR_BASTION_TOKEN` on the bastion LXC.
    - Per range host: `{"scope":"telemetry","host":"web01"}` (host-bound;
      bind `session_id` too for strict per-session correlation).
-   - Runner tokens are created per run by the API; nothing to provision.
+   - Runner tokens are created per run by the API; nothing to provision there.
+  ON THE RUNNER HOST, however, install `infra/runner/runner_supervise.sh`
+  (e.g. as `/usr/local/bin/runner-supervisor`, matching
+  `RUNNER_SUPERVISOR_BIN`) and give the runner user two writable
+  directories: `RUNNER_SUPERVISOR_STATE` (job bookkeeping) and
+  `RUNNER_CGROUP_ROOT` — an owned directory on the cgroup2 filesystem
+  (`mkdir /sys/fs/cgroup/srrunner && chown <runner-user> ...`). Without a
+  usable cgroup root the supervisor REFUSES all work (exit 4) — see §6.
 5. Member bastion logins: append `"<username> ssh-ed25519 AAAA..."` lines to
    `BASTION_AUTHORIZED_KEYS_FILE`. The bastion requires the member KEY *and*
    a live per-session token as the SSH username.
@@ -161,11 +168,27 @@ environment (docker not installed) — recorded as BLOCKED, not passed.
   shipper PARSES — documented), `/usr/local/bin/sparring-shipper`, and the
   systemd unit (`tail -F -n 0 /var/log/audit/audit.log | sparring-shipper`).
 - Shipper config `/etc/sparring-range/shipper.env`: `SR_API_URL`,
-  `SR_TELEMETRY_TOKEN` (host-bound), `SR_HOST`, `SR_SPOOL_DIR`. Offline
-  records buffer in the bounded spool (drops oldest, counts `spool_dropped`
-  gap events) and retry with backoff. Identity/session comes from the
-  CAPABILITY, never the payload; duplicate `boot_id:source_id` dedups at the
-  boundary.
+  `SR_TELEMETRY_TOKEN` (host-bound), `SR_HOST`, `SR_ENROLL_NONCE`,
+  `SR_SPOOL_DIR`. Offline records buffer in the bounded spool (drops oldest,
+  counts `spool_dropped` gap events) and retry with backoff. Identity/session
+  comes from the CAPABILITY, never the payload; duplicate `boot_id:source_id`
+  dedups at the boundary.
+- ENROLLMENT IS EVIDENCE, NOT A SERVICE STATE (audit T-05): the golden image
+  ships NO live token. At deploy time the control plane writes the env file
+  (capability + a FRESH enrollment nonce) over the pinned management channel,
+  enables+restarts the unit, and the phase advances ONLY on distinct
+  host-originated evidence: `service_running` (systemd active) →
+  `delivery_confirmed` (the installed shipper POSTs `/enroll/confirm`,
+  authenticated by its capability and bound to the nonce — proving the API
+  address, token and delivery path actually work) → `confirmed` (a harmless
+  capture probe `/bin/true SR-CAPTURE-<nonce>` executed on the host is
+  OBSERVED as an audit event through the installed service — proving command
+  capture works under the unit's real identity). `systemctl is-active` alone
+  is startup status, never confirmation: a shipper with a wrong API address,
+  a rejected token, or an unreadable audit input stays visibly stuck
+  (`confirm_failed` with the failing stage) and BLOCKS readiness. Timeouts
+  `ENROLL_CONFIRM_TIMEOUT_S` / `ENROLL_CAPTURE_TIMEOUT_S` bound the waits; a
+  timeout is a visible failure, never an assumed pass.
 - Windows/Sysmon: WEC collector → convert to `detection` events; fixture at
   `telemetry/fixtures/sysmon-detection-sample.json`; mapping documented in
   `infra/images/WINDOWS_CHECKLIST` (see WINDOWS-CHECKLIST.md).
@@ -180,20 +203,36 @@ environment (docker not installed) — recorded as BLOCKED, not passed.
   run-scoped capability token (sha256 stored). Stop = killpg; a worker that
   dies uncleanly is failed by the watchdog; API restart reconciles
   (`reconcile_on_startup` fails gone workers, kills live ones when latched).
-- AUTHORITATIVE STOP / CANCEL-UNKNOWN (audit T01/T02): a run row only becomes
-  `cancelled` when BOTH the local process group and every registered REMOTE
-  operation are confirmed gone. A failed/unconfirmable remote cancel moves
-  the run to `cancel-unknown` (DB-enforced, one per session): the lease and
-  operation inventory are RETAINED, new runs/launches are refused, and every
-  stop attempt + API restart retries the remote cancellation. Only an
+- AUTHORITATIVE STOP / CANCEL-UNKNOWN (audit T01/T02/T-04): a run row only
+  becomes `cancelled` when BOTH the local process group and every registered
+  REMOTE operation are confirmed gone. A failed/unconfirmable remote cancel
+  moves the run to `cancel-unknown` (DB-enforced, one per session): the lease
+  and operation inventory are RETAINED, new runs/launches are refused, and
+  every stop attempt + API restart retries the remote cancellation. Only an
   operator killswitch release (with evidence) clears the state. The runner
-  side is `infra/runner/runner_supervise.sh`: it tracks the command's whole
-  descendant tree by `SR_OP_ID` environment identity (immune to PID reuse),
-  refuses delayed starts after a cancel via tombstones, and exits 144 when
-  cessation cannot be confirmed — the worker maps that to `cancel_unconfirmed`
-  (exit 4), never to a clean stop. SSH transport loss mid-command (client
-  exit 255) is treated the same way: cancel the remote operation, do not
-  report the run from output/exit-code alone.
+  side is `infra/runner/runner_supervise.sh`, whose containment is
+  CGROUP v2-BASED (audit T-04): point `RUNNER_CGROUP_ROOT` at a directory
+  the runner user owns on a cgroup2 fs (e.g. a chowned subtree, or the
+  delegated user slice — auto-detected when writable). Each operation runs
+  in its own child cgroup, so liveness is "the cgroup still has members" —
+  a descendant that CLEARS its environment cannot escape it (the old
+  `SR_OP_ID` environ scan is kept only as a secondary signal). WITHOUT a
+  usable cgroup root `start` REFUSES (exit 4, unsupported execution mode):
+  the supervisor never runs uncontained work. The pidfile records
+  `<pid>:<starttime>` and no process-group signal is sent unless that
+  identity still matches (recycled PIDs are never signalled); start and
+  cancel serialize on a per-operation flock (a cancel can no longer
+  acknowledge "gone" between a start's tombstone check and its spawn), and
+  tombstones refuse delayed starts. ORDINARY COMPLETION IS GATED ON THE
+  SAME AUTHORITY: before a command's exit is reported as finished the
+  runner queries containment — surviving descendants are contained and
+  CONFIRMED gone (recorded on the operation row), and an unreachable or
+  unconfirmed verdict is `cancel-unknown`, never a silent completion. Run
+  finalization and stop refuse terminal states while any operation is
+  unresolved (guarded single-statement transitions; command registration is
+  refused on stopping/cancel-unknown runs). SSH transport loss mid-command
+  (client exit 255) is treated the same way: cancel the remote operation,
+  do not report the run from output/exit-code alone.
 - Model outages are recorded events (`model_unavailable`), never silent
   successes; the gateway is bounded priority (hints > red > AAR) with
   visible overflow 503s.
