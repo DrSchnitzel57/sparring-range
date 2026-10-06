@@ -251,7 +251,11 @@ class Spooler:
       oversized record of an empty spool (visible drop, never silent);
     * gap/drop counters are PERSISTED and reloaded on restart;
     * readers are tolerant: a torn trailing line from an interrupted write is
-      skipped and counted as a visible gap, never a crash.
+      QUARANTINED to `malformed.ndjson` and counted ONCE (never re-counted on
+      every read, never joined onto by the next append — audit T08);
+    * the sequence counter updates atomically (tmp+rename+fsync) and an
+      invalid/lost counter RECOVERS from the largest ID still in the spool —
+      an outstanding ID is never reused after a crash (audit T08).
     """
 
     def __init__(self, spool_dir: str, max_bytes: int = 64 * 1024 * 1024):
@@ -259,6 +263,7 @@ class Spooler:
         self.gap_path = os.path.join(spool_dir, "gaps")
         self.lock_path = os.path.join(spool_dir, "spool.lock")
         self.seq_path = os.path.join(spool_dir, "seq")
+        self.quarantine_path = os.path.join(spool_dir, "malformed.ndjson")
         self.max_bytes = max_bytes
         os.makedirs(spool_dir, exist_ok=True)
         self.dropped = self._load_dropped()
@@ -306,11 +311,12 @@ class Spooler:
             return 0
 
     def _read_lines(self) -> list[str]:
-        """Tolerant read: malformed/trailing torn lines are skipped and
-        counted as a visible gap (interrupted-write recovery)."""
+        """Tolerant read: malformed fragments are SKIPPED (never a crash).
+        Counting/quarantine happens exactly once in `_repair()` — repeated
+        reads must not re-count the same physical loss (audit T08)."""
         if not os.path.exists(self.path):
             return []
-        out, bad = [], 0
+        out = []
         with open(self.path) as f:
             for l in f:
                 if not l.strip():
@@ -319,10 +325,39 @@ class Spooler:
                     json.loads(l)
                     out.append(l if l.endswith("\n") else l + "\n")
                 except json.JSONDecodeError:
-                    bad += 1
-        if bad:
-            self._gap("dropped-malformed", bad)
+                    pass
         return out
+
+    def _repair(self) -> None:
+        """REPAIR BEFORE ANY APPEND (audit T08): a torn/malformed fragment —
+        e.g. the tail of an interrupted write — is QUARANTINED to a side file
+        and counted ONCE, and the spool is rewritten to valid records only.
+        Without this, the next append would be JOINED onto the torn tail and
+        silently lost from delivery."""
+        if not os.path.exists(self.path):
+            return
+        with open(self.path) as f:
+            data = f.read()
+        if not data:
+            return
+        good, bad = [], []
+        for l in data.splitlines(keepends=True):
+            if not l.strip():
+                continue
+            try:
+                json.loads(l)
+                good.append(l if l.endswith("\n") else l + "\n")
+            except json.JSONDecodeError:
+                bad.append(l)
+        if not bad:
+            return
+        with open(self.quarantine_path, "a") as q:
+            for l in bad:
+                q.write(l if l.endswith("\n") else l + "\n")
+            q.flush()
+            os.fsync(q.fileno())
+        self._gap("quarantined-malformed", len(bad))
+        self._atomic_write_lines(good)
 
     def _atomic_write_lines(self, lines: list[str]) -> None:
         tmp = self.path + ".tmp"
@@ -332,16 +367,54 @@ class Spooler:
             os.fsync(f.fileno())
         os.replace(tmp, self.path)
 
-    def _next_seq(self) -> int:
-        try:
-            cur = int(open(self.seq_path).read().strip() or "0")
-        except (OSError, ValueError):
-            cur = 0
-        n = cur + 1
-        with open(self.seq_path, "w") as f:
-            f.write(str(n))
+    def _max_seq_in_file(self) -> int:
+        m = 0
+        for l in self._read_lines():
+            try:
+                m = max(m, int(json.loads(l).get("_seq", 0)))
+            except (ValueError, TypeError):
+                continue
+        return m
+
+    def _write_seq(self, n: int) -> None:
+        """DURABLE counter update: tmp + rename + fsync (file AND directory).
+        A crash can leave the counter at n or at n-1 — never EMPTY/invalid,
+        which is what allowed ID reuse after an interrupted in-place rewrite
+        (audit T08)."""
+        tmp = self.seq_path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(str(n) + "\n")
             f.flush()
             os.fsync(f.fileno())
+        os.replace(tmp, self.seq_path)
+        try:
+            dfd = os.open(os.path.dirname(self.seq_path) or ".", os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+
+    def _next_seq(self) -> int:
+        try:
+            raw = open(self.seq_path).read().strip()
+        except FileNotFoundError:
+            raw = "0"          # a genuinely fresh spool
+        if raw == "":
+            # EMPTY counter: the crash window of an interrupted in-place
+            # update (truncate-then-write) — NOT a fresh spool. Recovering
+            # from zero here is exactly how IDs got reused (audit T08).
+            cur = self._max_seq_in_file()
+        else:
+            try:
+                cur = int(raw)
+                if cur < 0:
+                    raise ValueError("negative counter")
+            except ValueError:
+                cur = self._max_seq_in_file()
+        n = cur + 1
+        self._write_seq(n)
         return n
 
     # ---- queue operations --------------------------------------------------------
@@ -350,6 +423,7 @@ class Spooler:
         record id, or None when the record itself exceeds the spool — a
         VISIBLE drop, including as the very first record)."""
         with self._lock():
+            self._repair()
             seq = self._next_seq()
             payload = json.dumps({**event, "_seq": seq}) + "\n"
             size = len(payload.encode())
@@ -373,6 +447,7 @@ class Spooler:
 
     def pending(self, n: int = 200) -> list[tuple[int, dict]]:
         with self._lock():
+            self._repair()
             out = []
             for l in self._read_lines()[:n]:
                 rec = json.loads(l)
@@ -383,6 +458,7 @@ class Spooler:
         """Acknowledge BY STABLE ID: records created while the delivered
         batch was in flight are NOT in `ids` and survive."""
         with self._lock():
+            self._repair()
             lines = self._read_lines()
             keep = [l for l in lines if json.loads(l).get("_seq", 0) not in ids]
             if len(keep) != len(lines):
