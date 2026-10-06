@@ -435,6 +435,16 @@ class Supervisor:
         if not runner_ok:
             reasons.append(f"runner unavailable: {why}")
         dp_available = getattr(self.datapath, "mechanism", None) != "noop" or self.settings.sr_env == "production"
+        if getattr(self.datapath, "mechanism", None) == "nft":
+            # LIVE TOPOLOGY BEFORE AUTHORIZING A RUN (audit T03): the recorded
+            # evidence identity contains the CONFIGURED port list — config
+            # string equality is not live coverage. Re-discover the current
+            # bridge inventory through the same mechanism nft uses and refuse
+            # if it no longer matches.
+            from srplatform.safety.firewall import validate_port_coverage
+            cov_ok, cov_why = validate_port_coverage(self.settings)
+            if not cov_ok:
+                reasons.append(f"live bridge topology: {cov_why}")
         for kind, label in (("baseline_check", "baseline verification"),
                             ("datapath_proof", "operator datapath proof"),
                             ("killswitch_test", "killswitch stop/isolation test")):

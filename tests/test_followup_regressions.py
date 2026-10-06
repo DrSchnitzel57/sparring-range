@@ -417,8 +417,12 @@ def test_r05_baseline_render_is_destination_constrained_and_port_aware(monkeypat
         # audit N06: reply directions are EXPLICIT (replies to control paths
         # arrive on the range bridge, destination-scoped) — no blanket
         # established accept, and no mistaken `ip protocol ip`
-        assert 'ct state established,related ip daddr 10.0.0.0/24 iifname "vmbr1" accept' in base
-        assert 'ct state established,related ip daddr 10.9.8.7 iifname "vmbr1" accept' in base
+        # audit N06 + T03: reply directions are EXPLICIT and PORT-SCOPED —
+        # established traffic only for the management SSH port and the API
+        # ingest port, never destination-wide (a pre-established range->
+        # management connection to an arbitrary port must not survive).
+        assert 'ct state established,related ip daddr 10.0.0.0/24 tcp sport 22 iifname "vmbr1" accept' in base
+        assert 'ct state established,related ip daddr 10.9.8.7 tcp dport 9999 iifname "vmbr1" accept' in base
         assert "ip protocol ip" not in base, "ip protocol is the UPPER-LAYER field, not 'is IPv4'"
     finally:
         get_settings.cache_clear()
@@ -469,7 +473,7 @@ def test_r05_controller_applies_atomically_and_verifies_both_families(monkeypatc
         if args[:2] == ["-nn", "list"] or args[:3] == ["-nn", "-j", "list"]:
             name = args[-1]
             if name not in state["tables"]:
-                return 1, "nope"
+                return 1, "Error: Could not process rule: No such file or directory"
             if "-j" in args:
                 fam = name.split()[0]
                 # REAL nft JSON: flat entries — table, then chain with hook
@@ -502,8 +506,10 @@ def test_r05_controller_applies_atomically_and_verifies_both_families(monkeypatc
     removal = calls["stdin"][-1]
     assert "delete table inet sr_emergency" in removal
     assert "delete table bridge sr_emergency_l2" in removal
-    checked = [a[-1] for a in calls["run"] if a[:2] == ["-nn", "list"]]
+    checked = [a[-1] for a in calls["run"] if a[:3] == ["-nn", "-j", "list"]]
     assert f"inet {dp.EMERGENCY_TABLE}" in checked and f"bridge {dp.EMERGENCY_TABLE}_l2" in checked
+    # removal verification must have RE-INSPECTED after the delete transaction
+    assert len([a for a in calls["run"] if a[:3] == ["-nn", "-j", "list"]]) >= 4
 
 
 def test_r06_apply_refused_without_port_coverage(monkeypatch):
@@ -561,7 +567,7 @@ def test_r06_table_presence_combinations(monkeypatch):
             if args[:2] == ["-nn", "list"] or args[:3] == ["-nn", "-j", "list"]:
                 name = args[-1]
                 if name not in state["tables"]:
-                    return 1, "nope"
+                    return 1, "Error: Could not process rule: No such file or directory"
                 if "-j" in args:
                     fam = name.split()[0]
                     doc = {"nftables": [
@@ -602,7 +608,7 @@ def test_r06_release_refuses_and_retains_when_baseline_unverified(monkeypatch):
     monkeypatch.setattr(firewall, "validate_port_coverage", lambda s: (True, "ok"))
     stdin_calls = []
     nft._run_nft_stdin = lambda rs: (stdin_calls.append(rs) or (0, ""))
-    nft.table_exists = lambda t: True
+    nft.inspect_table = lambda t: ("present", None, "faked")
     nft.baseline_status = lambda: {"ok": False, "detail": "baseline broken", "mechanism": "nft"}
     res = nft.remove_emergency()
     assert res["ok"] is False

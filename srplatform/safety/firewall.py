@@ -79,33 +79,37 @@ def bridge_ports(s: Settings) -> list[str]:
 
 
 def discover_bridge_ports(s: Settings) -> list[str] | None:
-    """DISCOVERED bridge ports from /sys. The controller executes through
-    `nft_command_prefix` (e.g. `sudo -n` or a test namespace wrapper), so
-    when a direct read fails the inventory is read THROUGH that same
-    prefix — coverage is always verified in the namespace where the rules
-    will actually live. None = cannot determine (not 'empty')."""
+    """DISCOVERED bridge ports read THROUGH THE SAME EXECUTION MECHANISM as
+    nft (audit T03): the controller applies rules via `nft_command_prefix`
+    (e.g. `sudo -n`, `ip netns exec …`), so the inventory is read through
+    that prefix WHENEVER IT IS CONFIGURED — a same-named bridge in the
+    local /sys must never be mistaken for the target namespace/host. Only
+    with NO prefix configured (controller runs in the datapath namespace
+    itself) is a direct /sys read the same-host read. None = cannot
+    determine (not 'empty')."""
     import re
     import shlex
     import subprocess
     from pathlib import Path
     br = s.range_bridge
+    prefix = shlex.split(s.nft_command_prefix) if s.nft_command_prefix else []
+    if prefix:
+        # authoritative read: the namespace/host where the rules will live
+        if not re.fullmatch(r"[A-Za-z0-9_.+-]+", br):
+            return None
+        d = f"/sys/class/net/{br}/brif"
+        try:
+            r = subprocess.run(prefix + ["ls", d], capture_output=True,
+                               text=True, timeout=10)
+            if r.returncode != 0:
+                return None
+            return sorted(x for x in r.stdout.split() if x)
+        except (OSError, subprocess.SubprocessError):
+            return None
     d = Path("/sys/class/net") / br / "brif"
     try:
         return sorted(p.name for p in d.iterdir())
     except OSError:
-        pass
-    if not re.fullmatch(r"[A-Za-z0-9_.+-]+", br):
-        return None
-    prefix = shlex.split(s.nft_command_prefix) if s.nft_command_prefix else []
-    if not prefix:
-        return None
-    try:
-        r = subprocess.run(prefix + ["ls", str(d)], capture_output=True,
-                           text=True, timeout=10)
-        if r.returncode != 0:
-            return None
-        return sorted(x for x in r.stdout.split() if x)
-    except (OSError, subprocess.SubprocessError):
         return None
 
 
@@ -163,17 +167,21 @@ table inet {BASELINE_TABLE} {{
     iifname != "{bridge}" return
 
     # established/related ONLY for control-plane return traffic — each reply
-    # direction is EXPLICIT (audit N06 item 4). The chain only filters
-    # packets ARRIVING on the range bridge (first rule returns otherwise),
-    # so the replies that need accepting are the range->control-plane ones:
+    # direction is EXPLICIT and PORT/DESTINATION-SCOPED (audit N06 item 4 +
+    # T03). The chain only filters packets ARRIVING on the range bridge
+    # (first rule returns otherwise), so the replies that need accepting are
+    # the range->control-plane ones:
     #   * replies to management SSH (mgmt -> range:22): the reply is
-    #     range -> mgmt and arrives on the range bridge;
-    #   * continuations toward the API ingest endpoint (range -> ctrl:port).
+    #     range -> mgmt WITH SOURCE PORT 22 — a pre-existing range-originated
+    #     connection to any OTHER management port must NOT survive the deny
+    #     (T03: destination-wide established accepts were a policy hole);
+    #   * continuations toward the API ingest endpoint (range -> ctrl:port):
+    #     scoped to the ingest destination port, not the whole host.
     # Replies FROM the control plane arrive on other interfaces and return
     # untouched. A blanket established accept would let pre-existing
     # range-originated tunnels survive the deny (audit R05).
-    ct state established,related ip daddr {mgmt} iifname "{bridge}" accept
-    ct state established,related ip daddr {ctrl} iifname "{bridge}" accept
+    ct state established,related ip daddr {mgmt} tcp sport 22 iifname "{bridge}" accept
+    ct state established,related ip daddr {ctrl} tcp dport {api_port} iifname "{bridge}" accept
 
     # IPv4 intra-range operation is allowed (scenario hosts must talk) —
     # DESTINATION-CONSTRAINED: range -> range only, not range -> anything.

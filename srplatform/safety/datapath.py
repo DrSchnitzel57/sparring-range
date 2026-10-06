@@ -135,9 +135,30 @@ class NftDatapath:
             return 124, "nft timed out"
 
     # --- table inspection ------------------------------------------------------
+    # TRI-STATE (audit T03): "the table is absent" and "I could not look" are
+    # different facts. Only a POSITIVE nft ENOENT answer is absence; a
+    # permission/transport/parse failure is UNKNOWN and can never substantiate
+    # a successful apply, removal, or baseline verification.
+    _ABSENT_MARKERS = ("no such file or directory", "doesn't exist",
+                       "cannot parse table", "no such table")
+
+    def inspect_table(self, famtable: str) -> tuple[str, dict | None, str]:
+        """(status, table_json, detail) with status in
+        present | absent | unknown."""
+        code, out = self._run_nft(["-nn", "-j", "list", "table", famtable])
+        if code == 0:
+            tbl = self._json_table(famtable)
+            if tbl is None:
+                return "unknown", None, f"nft answered but the table JSON was unparseable: {out[:200]}"
+            return "present", tbl, "table listed"
+        low = out.lower()
+        if any(m in low for m in self._ABSENT_MARKERS):
+            return "absent", None, out.strip()[:200]
+        return "unknown", None, f"inspection failed (exit {code}): {out.strip()[:200]}"
+
     def table_exists(self, table: str) -> bool:
-        code, out = self._run_nft(["-nn", "list", "table", table])
-        return code == 0
+        status, _, _ = self.inspect_table(table)
+        return status == "present"
 
     def list_table(self, table: str) -> str | None:
         code, out = self._run_nft(["-nn", "list", "table", table])
@@ -195,7 +216,10 @@ class NftDatapath:
     def _expected_baseline_statements(self) -> list[str]:
         """Normalized expected rule sequence in the SAME canonical token form
         `_normalize_rule` produces from nft JSON — verification and
-        application can never drift apart."""
+        application can never drift apart. This is the COMPLETE effective
+        policy: verification checks EXACT membership and order (audit T03),
+        so an extra permissive rule anywhere — including a conditional early
+        accept such as `meta nfproto ipv4 accept` — fails validation."""
         from srplatform.safety.firewall import _ctrl_addr, _api_port
         s = self.s
         ctrl = _ctrl_addr(s)
@@ -204,8 +228,13 @@ class NftDatapath:
         br = s.range_bridge
         return [
             f"meta.iifname!={br} return",
-            f"ct.state==established,related ip.daddr=={mgmt} meta.iifname=={br} accept",
-            f"ct.state==established,related ip.daddr=={ctrl} meta.iifname=={br} accept",
+            # established allowances are PORT/DESTINATION-SCOPED (audit T03):
+            # management replies carry source port 22; API continuations
+            # carry the ingest destination port.
+            f"ct.state==established,related ip.daddr=={mgmt} tcp.sport==22 "
+            f"meta.iifname=={br} accept",
+            f"ct.state==established,related ip.daddr=={ctrl} tcp.dport=={api_port} "
+            f"meta.iifname=={br} accept",
             "ip.saddr==@range_hosts ip.daddr==@range_hosts accept",
             f"ip.protocol==tcp ip.daddr=={ctrl} tcp.dport=={api_port} ct.state==new accept",
             f"ip.protocol==tcp ip.saddr=={mgmt} ip.daddr==@range_hosts "
@@ -282,11 +311,17 @@ class NftDatapath:
 
     def baseline_status(self) -> dict:
         from srplatform.safety.firewall import validate_port_coverage
-        tbl = self._json_table(f"inet {BASELINE_TABLE}")
-        if tbl is None:
+        status, tbl, why = self.inspect_table(f"inet {BASELINE_TABLE}")
+        if status == "absent":
             return {"ok": False,
                     "detail": f"inet table {BASELINE_TABLE} ABSENT — range egress deny NOT active",
                     "mechanism": "nft"}
+        if status == "unknown":
+            # T03: an inspection error is NOT absence and can never be treated
+            # as verification either — it is reported as UNKNOWN.
+            return {"ok": False, "unknown": True,
+                    "detail": f"{BASELINE_TABLE} inspection UNAVAILABLE (not 'absent', "
+                              f"not verified): {why}", "mechanism": "nft"}
         if tbl.get("family") != "inet":
             return {"ok": False, "detail": f"{BASELINE_TABLE} family is "
                       f"{tbl.get('family')!r}, expected 'inet' — wrong scope", "mechanism": "nft"}
@@ -307,41 +342,35 @@ class NftDatapath:
         if not rng or rng.get("type") != "ipv4_addr" or "interval" not in (rng.get("flags") or []):
             return {"ok": False, "detail": "set range_hosts missing or malformed "
                       "(expected ipv4_addr with interval flag)", "mechanism": "nft"}
-        expected_elems = set()
+        actual_elems = set()
         for e in (rng.get("elem") or []):
             if isinstance(e, dict) and "prefix" in e:
-                expected_elems.add(f"{e['prefix'].get('addr')}/{e['prefix'].get('len')}")
+                actual_elems.add(f"{e['prefix'].get('addr')}/{e['prefix'].get('len')}")
             else:
-                expected_elems.add(str(e))
-        if str(self.s.range_cidr) not in {str(e) for e in expected_elems}:
-            return {"ok": False, "detail": f"set range_hosts does not contain "
-                      f"{self.s.range_cidr} — modified sets fail validation", "mechanism": "nft"}
+                actual_elems.add(str(e))
+        # EXACT SET MEMBERSHIP (audit T03): the configured range CIDR must be
+        # the ONLY element. Containment of one required element let an added
+        # 0.0.0.0/1 turn the intra-range accept into an external allowance.
+        if actual_elems != {str(self.s.range_cidr)}:
+            return {"ok": False, "detail": f"set range_hosts is not exactly "
+                      f"{{{self.s.range_cidr}}}: found {sorted(actual_elems)} — "
+                      "expanded sets fail validation", "mechanism": "nft"}
 
         actual = [self._normalize_rule(r) for r in fwd.get("rule", [])]
         expected = self._expected_baseline_statements()
-        # ORDER-SENSITIVE subsequence check: every expected rule must appear,
-        # in order; an EARLIER unconditional accept/return that is not part of
-        # the expected sequence invalidates the guarantee.
-        it = iter(actual)
-        pos = 0
-        for want in expected:
-            for j in range(pos, len(actual)):
-                if _rules_equivalent(actual[j], want):
-                    pos = j + 1
-                    break
-            else:
-                return {"ok": False, "detail": f"baseline rule missing or out of order: "
-                          f"{want!r} — effective rules: {actual}", "mechanism": "nft"}
-        # any rule BEFORE the first terminal drop that is an unconditional
-        # accept/return (no matches) is an escape hatch
-        for idx, rule in enumerate(actual):
-            if rule in ("accept", "return") and idx < len(actual):
-                # the expected sequence has no unconditional accept/return
-                return {"ok": False, "detail": f"unconditional '{rule}' at position {idx} "
-                          "precedes the terminal drops — baseline escape", "mechanism": "nft"}
+        # EXACT EFFECTIVE-POLICY EQUIVALENCE (audit T03): same rules, same
+        # order, NOTHING ELSE. The old subsequence check accepted an inserted
+        # `meta nfproto ipv4 accept` (or any other permissive rule) before
+        # the expected sequence — an inserted rule now fails by construction.
+        if len(actual) != len(expected) or not all(
+                _rules_equivalent(a, e) for a, e in zip(actual, expected)):
+            return {"ok": False, "detail": "effective policy is NOT exactly the expected "
+                      f"baseline (extra, missing, reordered or modified rules): "
+                      f"actual={actual} expected={expected}", "mechanism": "nft"}
         cov_ok, cov_why = validate_port_coverage(self.s)
-        out = {"ok": True, "detail": f"inet table {BASELINE_TABLE} structurally verified "
-                 f"(hook, scope, ordering, sets, terminal drops)", "mechanism": "nft"}
+        out = {"ok": True, "detail": f"inet table {BASELINE_TABLE} verified as the EXACT "
+                 f"expected policy (hook, scope, sets, rules, order, terminal drops)",
+               "mechanism": "nft"}
         if not cov_ok:
             out["coverage_warning"] = cov_why
         return out
@@ -359,8 +388,18 @@ class NftDatapath:
                               "would survive the killswitch. Provision RANGE_BRIDGE_PORTS "
                               "from the live bridge inventory and retry.",
                     "mechanism": "nft", "coverage": cov_why}
-        have_inet = self.table_exists(f"inet {EMERGENCY_TABLE}")
-        have_bridge = self.table_exists(f"bridge {EMERGENCY_TABLE}_l2")
+        have_inet_s, _, inet_why = self.inspect_table(f"inet {EMERGENCY_TABLE}")
+        have_bridge_s, _, bridge_why = self.inspect_table(f"bridge {EMERGENCY_TABLE}_l2")
+        if "unknown" in (have_inet_s, have_bridge_s):
+            # T03: without knowing which emergency tables exist, the atomic
+            # replace cannot be rendered truthfully — refuse, change nothing.
+            return {"ok": False,
+                    "detail": "emergency apply REFUSED: existing table inspection "
+                              f"UNAVAILABLE (inet: {inet_why}; bridge: {bridge_why}) — "
+                              "cannot render an atomic replacement over unknown state",
+                    "mechanism": "nft"}
+        have_inet = have_inet_s == "present"
+        have_bridge = have_bridge_s == "present"
         ruleset = self.render_emergency(drop_inet=have_inet, drop_bridge=have_bridge)
         code, out = self._run_nft_stdin(ruleset)
         if code != 0:
@@ -368,10 +407,10 @@ class NftDatapath:
                     "mechanism": "nft"}
         # verify BOTH families are actually hooked after the transaction
         for fam, table in (("inet", EMERGENCY_TABLE), ("bridge", f"{EMERGENCY_TABLE}_l2")):
-            tbl = self._json_table(f"{fam} {table}")
-            if tbl is None:
-                return {"ok": False, "detail": f"{fam} {table} missing after apply",
-                        "mechanism": "nft"}
+            status, tbl, why = self.inspect_table(f"{fam} {table}")
+            if status != "present":
+                return {"ok": False, "detail": f"{fam} {table} not positively present after "
+                          f"apply ({status}: {why})", "mechanism": "nft"}
             hooked = any(h.get("hook") == "forward" and h.get("family") == fam
                          for c in (tbl.get("chains") or []) for h in (c.get("hooks") or []))
             if not hooked:
@@ -390,8 +429,19 @@ class NftDatapath:
                     "detail": "release REFUSED: baseline egress-deny is NOT verified "
                               f"({base['detail']}) — emergency protection RETAINED",
                     "mechanism": "nft"}
-        have_inet = self.table_exists(f"inet {EMERGENCY_TABLE}")
-        have_bridge = self.table_exists(f"bridge {EMERGENCY_TABLE}_l2")
+        have_inet_s, _, inet_why = self.inspect_table(f"inet {EMERGENCY_TABLE}")
+        have_bridge_s, _, bridge_why = self.inspect_table(f"bridge {EMERGENCY_TABLE}_l2")
+        if "unknown" in (have_inet_s, have_bridge_s):
+            # T03: UNKNOWN inspection cannot substantiate successful removal
+            # — refusing keeps whatever protection exists rather than
+            # reporting a release it cannot see.
+            return {"ok": False,
+                    "detail": "release REFUSED: emergency table inspection UNAVAILABLE "
+                              f"(inet: {inet_why}; bridge: {bridge_why}) — unknown "
+                              "inspection cannot substantiate removal; protection retained",
+                    "mechanism": "nft"}
+        have_inet = have_inet_s == "present"
+        have_bridge = have_bridge_s == "present"
         if not have_inet and not have_bridge:
             return {"ok": True, "detail": "no emergency tables present (idempotent release); "
                                           "baseline deny verified", "mechanism": "nft"}
@@ -401,10 +451,15 @@ class NftDatapath:
             return {"ok": False, "detail": f"emergency remove failed (protection retained): {out}",
                     "mechanism": "nft"}
         for fam_table in (f"inet {EMERGENCY_TABLE}", f"bridge {EMERGENCY_TABLE}_l2"):
-            if self.table_exists(fam_table):
+            status, _, why = self.inspect_table(fam_table)
+            if status == "present":
                 return {"ok": False,
                         "detail": f"{fam_table} STILL INSTALLED after removal — not released",
                         "mechanism": "nft"}
+            if status == "unknown":
+                return {"ok": False,
+                        "detail": f"{fam_table} removal UNCONFIRMED (inspection unavailable: "
+                                  f"{why}) — cannot claim release", "mechanism": "nft"}
         # 2. post-removal baseline re-verification; on failure REINSTATE emergency
         base = self.baseline_status()
         if not base["ok"]:
