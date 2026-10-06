@@ -37,6 +37,26 @@ def set_verifier_exec(fn: VerifierExec | None) -> None:
     _exec_override = fn
 
 
+def management_exec(addr: str, command: str) -> tuple[int, str]:
+    """Run COMMAND on the owned host at ADDR through the management channel
+    (test override or pinned-key SSH). Public so deployment can PROVISION
+    through the same authenticated path the verifier reads through."""
+    return (_exec_override or _ssh_exec)(addr, command)
+
+
+def management_channel_configured() -> tuple[bool, str]:
+    """Is the management exec channel actually available (override injected,
+    or key + EXISTING pinned known-hosts file)?"""
+    if _exec_override is not None:
+        return True, "management exec channel (injected)"
+    s = get_settings()
+    if (s.verifier_ssh_key_path and s.verifier_ssh_known_hosts
+            and os.path.exists(s.verifier_ssh_known_hosts)):
+        return True, "pinned-key SSH management channel"
+    return False, ("management exec channel not configured "
+                   "(missing verifier key and/or existing pinned known-hosts file)")
+
+
 def _ssh_exec(host: str, command: str) -> tuple[int, str]:
     s = get_settings()
     if not s.verifier_ssh_key_path:
@@ -115,41 +135,73 @@ def _deployment_identity(db: Session, session_id) -> dict:
 
 def readiness_checks(db: Session, session_id) -> dict:
     """Service-readiness gate for the provisioning contract (audit N10 item
-    4): every service declared by the session's snapshot topology must be
-    PRESENT (service_present against the owned active inventory) before the
-    session reaches `ready`. When the management exec channel is not
-    configured (dev mode), enforcement is skipped but VISIBLE — it never
-    silently passes as 'ready without readiness'."""
+    4, T05, T06): every service declared by the session's snapshot topology
+    must be PRESENT (service_present against the owned active inventory) AND
+    every created clone must have CONFIRMED telemetry enrollment (token
+    issuance alone is not enrollment). The dev-mode relaxation is only
+    available in dev mode and stays VISIBLE (`enforced=False`); production
+    missing key/pins/unavailable checks BLOCK readiness."""
     from srplatform.scenario_engine.loader import SUPPORTED_SERVICES
     spec = scenario_spec(db, session_id)
     hosts = (spec.get("topology") or {}).get("hosts", [])
     declared = [(h["name"], svc) for h in hosts for svc in h.get("services", [])]
-    if not declared:
-        return {"enforced": True, "ok": True, "checks": [],
-                "reason": "no services declared"}
-    hmap = host_map_for(db, session_id)
-    exec_fn = _exec_override or _ssh_exec
-    if _exec_override is None:
-        s = get_settings()
-        if (not s.verifier_ssh_key_path or not s.verifier_ssh_known_hosts
-                or not os.path.exists(s.verifier_ssh_known_hosts)):
+    s = get_settings()
+    chan_ok, chan_why = management_channel_configured()
+
+    # TELEMETRY ENROLLMENT (audit T05): every created clone must be confirmed.
+    enroll_items = []
+    dep = active_deployment(db, session_id)
+    if dep is not None:
+        for r in (dep.resources or []):
+            if r.get("state") != "created":
+                continue
+            phase = (r.get("telemetry_enroll") or {}).get("phase")
+            enroll_items.append({"host": r.get("host"), "phase": phase,
+                                 "ok": phase == "confirmed"})
+    from srplatform.scenario_engine import orchestrator
+    enroll_enforced = orchestrator.enrollment_channel_available()
+
+    if not chan_ok and not enroll_enforced:
+        if s.sr_env == "dev":
+            # T06: the relaxation EXPLICITLY requires dev mode and is visible.
             return {"enforced": False, "ok": True, "checks": [],
-                    "reason": "management exec channel not configured — dev-mode "
-                              "relaxation, visible in this response (production "
-                              "refuses `ready` without readiness)"}
-    v = registry.get("service_present")
-    ctx = Context(exec=_resolve(exec_fn, hmap), hosts=hmap)
+                    "enrollments": enroll_items,
+                    "reason": f"dev-mode relaxation ({chan_why}) — service readiness "
+                              "and telemetry enrollment are NOT verified in this "
+                              "response; production refuses `ready` here"}
+        return {"enforced": True, "ok": False, "checks": [],
+                "enrollments": enroll_items,
+                "reason": f"production refuses `ready` without a working management "
+                          f"exec channel ({chan_why}) — service readiness cannot be "
+                          "verified (unknown is not ok)"}
     items, ok = [], True
-    for host, svc in declared:
-        unit = SUPPORTED_SERVICES.get(svc, svc)
-        outcome = v.evaluate(ctx, host=host, service=unit)
-        if outcome.status != "passed":
+    reasons = []
+    if declared:
+        if not chan_ok:
             ok = False
-        items.append({"host": host, "service": svc, "unit": unit,
-                      "status": outcome.status, "evidence": outcome.evidence,
-                      "error": outcome.error})
-    return {"enforced": True, "ok": ok, "checks": items,
-            "reason": None if ok else "declared services not ready on the owned inventory"}
+            reasons.append(f"services declared but {chan_why}")
+        else:
+            hmap = host_map_for(db, session_id)
+            exec_fn = _exec_override or _ssh_exec
+            v = registry.get("service_present")
+            ctx = Context(exec=_resolve(exec_fn, hmap), hosts=hmap)
+            for host, svc in declared:
+                unit = SUPPORTED_SERVICES.get(svc, svc)
+                outcome = v.evaluate(ctx, host=host, service=unit)
+                if outcome.status != "passed":
+                    ok = False
+                items.append({"host": host, "service": svc, "unit": unit,
+                              "status": outcome.status, "evidence": outcome.evidence,
+                              "error": outcome.error})
+    if enroll_enforced and not all(e["ok"] for e in enroll_items):
+        ok = False
+    if not ok:
+        if declared and any(i["status"] != "passed" for i in items):
+            reasons.append("declared services not ready on the owned inventory")
+        if enroll_enforced and not all(e["ok"] for e in enroll_items):
+            reasons.append("telemetry enrollment not confirmed on every created clone")
+    return {"enforced": True, "ok": ok, "checks": items, "enrollments": enroll_items,
+            "reason": "; ".join(reasons) or None}
 
 
 def check_objective(db: Session, session_id, objective_id: str) -> dict:

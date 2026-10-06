@@ -156,6 +156,128 @@ def _token_ref(token: str) -> str:
     return f"...{token[-6:]}"
 
 
+# ------------------------------------------------- telemetry enrollment (T05) --
+# Token ISSUANCE is not enrollment. Each clone must be PROVISIONED with its
+# session-bound capability through the management channel and the running
+# service CONFIRMED, with the phase persisted per resource so an interrupted
+# or lost-response provisioning resumes safely instead of re-issuing blindly.
+#
+# Phases: (none) -> pending_token -> provisioned -> confirmed
+#         failure states: provision_failed / confirm_failed / unconfigured
+_enrollment_exec = None  # fn(addr, command) -> (code, out); test/operator hook
+
+
+def set_enrollment_exec(fn):
+    """Test/operator hook: replace the enrollment provisioning channel."""
+    global _enrollment_exec
+    _enrollment_exec = fn
+
+
+def enrollment_channel_available() -> bool:
+    """Enrollment is ENFORCED when a provisioning channel exists: the
+    explicit hook, or the real pinned-key SSH management channel (key +
+    EXISTING known-hosts file). A verifier-READ override does not count —
+    reading host state is not the same capability as writing it."""
+    if _enrollment_exec is not None:
+        return True
+    import os
+    s = get_settings()
+    return bool(s.verifier_ssh_key_path and s.verifier_ssh_known_hosts
+                and os.path.exists(s.verifier_ssh_known_hosts))
+
+
+def _enrollment_channel():
+    if _enrollment_exec is not None:
+        return _enrollment_exec
+    if enrollment_channel_available():
+        from srplatform import verification_service
+        return verification_service.management_exec
+    return None
+
+
+def _recover_telemetry_token(db: Session, session_id, host: str) -> str | None:
+    """Recover the issued plaintext after a lost deployment response: the
+    ServiceToken row IS the durable record (plaintext primary key), so a
+    retry resumes enrollment for the SAME capability instead of issuing a
+    second one."""
+    return db.execute(select(ServiceToken.token)
+                      .where(ServiceToken.session_id == session_id,
+                             ServiceToken.host == host,
+                             ServiceToken.scope == "telemetry",
+                             ServiceToken.revoked_at.is_(None))
+                      .order_by(ServiceToken.created_at.desc())).scalars().first()
+
+
+def _provision_command(host: str, token: str, s) -> str:
+    """The per-clone provisioning command the golden image's installer
+    contract expects: write the REAL env file (no placeholders), restrict it
+    to the service identity, and enable+restart the enrolled service."""
+    import shlex
+    env = (f"SR_API_URL={s.api_base_url}\n"
+           f"SR_TELEMETRY_TOKEN={token}\n"
+           f"SR_HOST={host}\n"
+           f"SR_SPOOL_DIR=/var/lib/sparring-range/shipper\n")
+    return ("install -d -m 0750 /etc/sparring-range && "
+            f"printf '%s' {shlex.quote(env)} > /etc/sparring-range/shipper.env && "
+            "chown root:srshipper /etc/sparring-range/shipper.env && "
+            "chmod 0640 /etc/sparring-range/shipper.env && "
+            "systemctl enable --now sparring-shipper && "
+            "systemctl restart sparring-shipper")
+
+
+def _enroll_host_telemetry(db: Session, dep: Deployment, res: dict, resources: list,
+                           session_id, host_name: str, ip: str | None, s,
+                           out: dict) -> str:
+    """Drive ONE host's enrollment as far as the channel allows, committing
+    the phase after every step (crash/lost-response resumes, never repeats
+    token issuance). Returns the resulting phase."""
+    enroll = dict(res.get("telemetry_enroll") or {})
+    if enroll.get("phase") == "confirmed":
+        return "confirmed"
+    tok = _recover_telemetry_token(db, session_id, host_name)
+    if tok is None:
+        tok = _enroll_telemetry(db, session_id, host_name)
+        res["telemetry_token_ref"] = _token_ref(tok)
+        dep.resources = resources
+        flag_modified(dep, "resources")
+        db.commit()
+    enroll = {"phase": "pending_token", "token_ref": _token_ref(tok)}
+    out[host_name] = tok  # plaintext returned to the deployment response
+    chan = _enrollment_channel()
+    if chan is None or not ip:
+        enroll["phase"] = "unconfigured"
+        enroll["note"] = ("provisioning channel not configured — dev-mode "
+                          "relaxation, visible in readiness")
+        res["telemetry_enroll"] = enroll
+        dep.resources = resources
+        flag_modified(dep, "resources")
+        db.commit()
+        return "unconfigured"
+    code, tail = chan(ip, _provision_command(host_name, tok, s))
+    if code != 0:
+        enroll.update(phase="provision_failed", error=str(tail)[:200])
+        res["telemetry_enroll"] = enroll
+        dep.resources = resources
+        flag_modified(dep, "resources")
+        db.commit()
+        return "provision_failed"
+    enroll.update(phase="provisioned", provisioned_at=_now().isoformat())
+    res["telemetry_enroll"] = enroll
+    dep.resources = resources
+    flag_modified(dep, "resources")
+    db.commit()
+    code, tail = chan(ip, "systemctl is-active --quiet sparring-shipper")
+    if code == 0:
+        enroll.update(phase="confirmed", confirmed_at=_now().isoformat())
+    else:
+        enroll.update(phase="confirm_failed", error=str(tail)[:200])
+    res["telemetry_enroll"] = enroll
+    dep.resources = resources
+    flag_modified(dep, "resources")
+    db.commit()
+    return enroll["phase"]
+
+
 # ------------------------------------------------------------------- lease ---
 def _residual_resources(db: Session, session_id) -> list[dict]:
     """Owned resources that still exist (or whose fate is uncertain) for a
@@ -246,14 +368,33 @@ def deploy(db: Session, session_id, scenario_id: str, proxmox, resume: bool = Tr
         starts, so a crash between side effects still leaves the VM owned.
     """
     s = get_settings()
-    spec = load_scenario(scenario_id)
+    # IMMUTABLE SNAPSHOT (audit T04): deployment provisions what the SESSION
+    # captured at creation — the same specification the worker executes and
+    # the verifier grades. Editing the source YAML after session creation
+    # must not change deployed topology independently of the graded spec.
+    if session_id is not None:
+        from srplatform import verification_service
+        spec = verification_service.scenario_spec(db, session_id)
+    else:
+        spec = load_scenario(scenario_id)
     node = s.proxmox_node
 
     dep = _active_deployment(db, session_id, scenario_id) if resume else None
     if dep is not None and dep.status == "ready":
+        # Idempotent return — but enrollment may have been interrupted
+        # (lost response / crashed provisioning): RESUME it, never silently
+        # return a "ready" deployment whose clones are unenrolled.
+        resources = [dict(r) for r in (dep.resources or [])]
+        enrollments = {}
+        for r in resources:
+            if r.get("state") == "created" and \
+                    (r.get("telemetry_enroll") or {}).get("phase") != "confirmed":
+                _enroll_host_telemetry(db, dep, r, resources, session_id,
+                                       r.get("host"), r.get("ip"), s, enrollments)
         return {"scenario_id": scenario_id, "action": "deploy", "idempotent": True,
                 "deployment_id": str(dep.deployment_id),
-                "hosts": [r for r in (dep.resources or []) if r.get("state") == "created"]}
+                "hosts": [r for r in resources if r.get("state") == "created"],
+                "telemetry_enrollments": enrollments}
     if dep is None:
         dep = Deployment(session_id=session_id, scenario_id=scenario_id, status="preparing",
                          resources=[])
@@ -272,14 +413,11 @@ def deploy(db: Session, session_id, scenario_id: str, proxmox, resume: bool = Tr
             name = _vm_name(scenario_id, host["name"], session_id)
             res = by_host.get(host["name"])
             if res and res.get("state") == "created":
-                if not res.get("telemetry_token_ref"):
-                    # host completed before enrollment existed (resume path)
-                    tok = _enroll_telemetry(db, session_id, host["name"])
-                    res["telemetry_token_ref"] = _token_ref(tok)
-                    enrollments[host["name"]] = tok
-                    dep.resources = resources
-                    flag_modified(dep, "resources")
-                continue  # already owned & completed — resume skips it
+                if (res.get("telemetry_enroll") or {}).get("phase") != "confirmed":
+                    # resume path: finish interrupted enrollment (T05)
+                    _enroll_host_telemetry(db, dep, res, resources, session_id,
+                                           host["name"], res.get("ip"), s, enrollments)
+                continue  # already owned & completed — resume skips the clone
             if res and res.get("vmid"):
                 vmid = int(res["vmid"])          # reuse the pending intent's VMID
             else:
@@ -352,9 +490,8 @@ def deploy(db: Session, session_id, scenario_id: str, proxmox, resume: bool = Tr
                     proxmox.start_and_wait(node, vmid)
                     res.update({"state": "created", "ip": host["ip"], "node": node,
                                 "name": name})
-                    tok = _enroll_telemetry(db, session_id, host["name"])
-                    res["telemetry_token_ref"] = _token_ref(tok)
-                    enrollments[host["name"]] = tok
+                    _enroll_host_telemetry(db, dep, res, resources, session_id,
+                                           host["name"], host["ip"], s, enrollments)
                     created = [r for r in resources if r.get("state") == "created"]
                     dep.resources = resources
                     flag_modified(dep, "resources")
@@ -381,9 +518,8 @@ def deploy(db: Session, session_id, scenario_id: str, proxmox, resume: bool = Tr
                                    f"net0={net0!r} does not use bridge {s.range_bridge}")
             proxmox.start_and_wait(node, vmid)
             res.update({"state": "created", "ip": host["ip"], "node": node, "name": name})
-            tok = _enroll_telemetry(db, session_id, host["name"])
-            res["telemetry_token_ref"] = _token_ref(tok)
-            enrollments[host["name"]] = tok
+            _enroll_host_telemetry(db, dep, res, resources, session_id,
+                                   host["name"], host["ip"], s, enrollments)
             created = [r for r in resources if r.get("state") == "created"]
             dep.resources = resources
             flag_modified(dep, "resources")

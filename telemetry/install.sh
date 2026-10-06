@@ -65,7 +65,9 @@ systemctl daemon-reload
 systemctl enable auditd sparring-shipper
 echo "[install] telemetry pipeline installed. Restart auditd + shipper at next boot (golden image) or now:"
 echo "  systemctl restart auditd sparring-shipper"
-echo "[install] ENROLLMENT (audit N09): golden images must NOT ship live tokens."
-echo "  Per clone, provision /etc/sparring-range/shipper.env with the deploy"
-echo "  response's telemetry enrollment (SR_API_URL, SR_HOST, session-bound"
-echo "  SR_TELEMETRY_TOKEN) — tokens are revoked on session end/reset/teardown."
+echo "[install] ENROLLMENT (audit N09/T05): golden images must NOT ship live tokens."
+echo "  The CONTROL PLANE provisions /etc/sparring-range/shipper.env per clone"
+echo "  at deploy time over the pinned management channel (SR_API_URL, SR_HOST,"
+echo "  session-bound SR_TELEMETRY_TOKEN), enables+restarts the service and"
+echo "  confirms it before the session reaches ready. Tokens are revoked on"
+echo "  session end/reset/teardown. The placeholders above are intentional."

@@ -356,41 +356,57 @@ def launch_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
         except orchestrator.ForeignResourceError as e:
             raise HTTPException(409, {"error": "foreign_resource", "detail": str(e)[:500]})
 
-        # SERVICE READINESS GATE (audit N10 item 4): the session reaches
-        # `ready` only after the declared per-host services are verified
-        # present on the owned inventory (when the management channel is
-        # configured). Failure is explicit — machines stay deployed for a
-        # documented retry, the session does NOT pretend to be ready.
+        # SERVICE READINESS + ENROLLMENT GATE (audit N10 item 4, T05, T06):
+        # the session reaches `ready` only after declared services verify on
+        # the owned inventory AND every clone's telemetry enrollment is
+        # confirmed (when the provisioning channel is available). Failure is
+        # explicit — machines stay deployed for a documented retry, the
+        # session does NOT pretend to be ready.
         from srplatform import verification_service
-        readiness = verification_service.readiness_checks(db, sess.session_id)
-        if readiness["enforced"] and not readiness["ok"]:
-            db.add(Event(session_id=sess.session_id, ts=_now(), actor="system",
-                         action_type="readiness_failed", payload=readiness))
-            raise HTTPException(409, {"error": "readiness_failed",
-                                      "reason": readiness["reason"],
-                                      "checks": readiness["checks"]})
-
-        # member-specific host connection capabilities (F08)
-        s = get_settings()
-        instructions = []
-        for r in result["hosts"]:
-            tok = f"tok-{r['host']}-{uuid.uuid4().hex[:6]}"
-            db.add(LoginToken(token=tok, session_id=sess.session_id, user_id=p.user_id,
-                              target_host=r["ip"], target_port=22,
-                              expires_at=_now() + timedelta(hours=s.web_token_ttl_hours)))
-            instructions.append({"host": r["host"], "ip": r["ip"], "login_token": tok,
-                                 "ssh": f"ssh {s.bastion_address} -p {s.bastion_listen_port} -l {tok}"})
-        sess.status = "ready"
-        db.add(Event(session_id=sess.session_id, ts=_now(), actor="system",
-                     action_type="session_ready",
-                     payload={"hosts": [i["host"] for i in instructions]}))
-        db.flush()
+        instructions, readiness = _finalize_ready(db, sess, p, result,
+                                                  verification_service)
         _ok = True
         return {"session_id": str(sess.session_id), "status": sess.status,
                 "deployment": result, "connections": instructions,
                 "readiness": readiness}
     finally:
         _release_claim_safely(db, sess.session_id, _ok, _claim_owner)
+
+
+def _finalize_ready(db, sess, p, result, verification_service):
+    """Shared READY workflow (audit T06): readiness gate, per-host member
+    connection capabilities, status transition, evidence. Used by BOTH
+    /launch and /reset so a reset can never skip the launch checks."""
+    readiness = verification_service.readiness_checks(db, sess.session_id)
+    if readiness["enforced"] and not readiness["ok"]:
+        # the request transaction is discarded on the raise — persist the
+        # failure evidence through a SEPARATE session (audit T06: assert DB
+        # state, not just the route status)
+        from srplatform.db.session import db as db_ctx
+        with db_ctx() as s2:
+            s2.add(Event(session_id=sess.session_id, ts=_now(), actor="system",
+                         action_type="readiness_failed", payload=readiness))
+            s2.commit()
+        raise HTTPException(409, {"error": "readiness_failed",
+                                  "reason": readiness["reason"],
+                                  "checks": readiness["checks"],
+                                  "enrollments": readiness.get("enrollments", [])})
+    # member-specific host connection capabilities (F08)
+    s = get_settings()
+    instructions = []
+    for r in result["hosts"]:
+        tok = f"tok-{r['host']}-{uuid.uuid4().hex[:6]}"
+        db.add(LoginToken(token=tok, session_id=sess.session_id, user_id=p.user_id,
+                          target_host=r["ip"], target_port=22,
+                          expires_at=_now() + timedelta(hours=s.web_token_ttl_hours)))
+        instructions.append({"host": r["host"], "ip": r["ip"], "login_token": tok,
+                             "ssh": f"ssh {s.bastion_address} -p {s.bastion_listen_port} -l {tok}"})
+    sess.status = "ready"
+    db.add(Event(session_id=sess.session_id, ts=_now(), actor="system",
+                 action_type="session_ready",
+                 payload={"hosts": [i["host"] for i in instructions]}))
+    db.flush()
+    return instructions, readiness
 
 
 @app.post("/sessions/{session_id}/end")
@@ -581,12 +597,35 @@ def reset_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
         try:
             # orchestrator.reset ACQUIRES/VERIFIES the global lease first (R07)
             out = orchestrator.reset(db, sess.session_id, sess.scenario_id, get_proxmox())
-            _ok = True
-            return out
         except orchestrator.LeaseConflict as e:
             raise HTTPException(409, {"error": "range_busy", "holder_session": e.holder_session_id})
         except RuntimeError as e:
             raise HTTPException(409, str(e))
+        # T06: reset runs the SAME readiness + credential workflow as launch.
+        # Success => fresh `ready` state with NEW connection capabilities;
+        # failure => session is explicitly `preparing` (redeployed but not
+        # ready), never left claiming the pre-reset state.
+        from srplatform import verification_service
+        try:
+            instructions, readiness = _finalize_ready(db, sess, p, out,
+                                                      verification_service)
+        except HTTPException as e:
+            # persisted through a SEPARATE session — the request transaction
+            # is discarded by the raise (audit T06: clear new session state)
+            from srplatform.db.session import db as db_ctx
+            with db_ctx() as s2:
+                sess2 = s2.get(SessionModel, sess.session_id)
+                sess2.status = "preparing"
+                s2.add(Event(session_id=sess.session_id, ts=_now(), actor="system",
+                             action_type="session_reset_incomplete",
+                             payload={"detail": e.detail if isinstance(e.detail, (dict, str))
+                                      else str(e.detail)}))
+                s2.commit()
+            raise
+        _ok = True
+        out.update({"status": sess.status, "connections": instructions,
+                    "readiness": readiness})
+        return out
     finally:
         _release_claim_safely(db, sess.session_id, _ok, _claim_owner)
 
