@@ -321,6 +321,26 @@ confined-profile regression), `db` gate PASS (113, real Docker),
 `containment` gate PASS (mount-inclusive probe + 21). Packet and browser
 remain CI-only gates.
 
+**Third CI run (run 37841594922 at `2bc926a`) — packet GREEN; two causes
+left (2026-10-08):**
+1. `containment` + `db` died in the workflow probe itself: `unshare:
+   failed to execute sh: Permission denied` (exit 126). The confined
+   profile had NO execute grant: under `abi <abi/4.0>` (policy v6) the
+   file `m` bit is mmap-exec, not execute — exec requires an `x` rule
+   with a transition mode. Added `/** rix,` (exec, inherit profile), so
+   unshare can exec sh/bash/mount/the command and every child stays in
+   the profile (capability/mount remain available inside the namespace).
+   The harness regression now pins the exec grant too.
+2. `browser`: login worked (CORS fix confirmed); replay failed "player
+   never mounted" — asciinema-player 3.17 is the Solid rewrite: it mounts
+   as `.ap-player` with the text mirror in `<pre class="ap-term-text">`;
+   the legacy `.asciinema-player` class no longer exists, so the test's
+   selector could never match. Verified against the installed package:
+   `create(src, elem, opts)` API matches the page, unknown opts are
+   filtered (not rejected), the vt WASM is base64-inlined (no external
+   asset). Test selectors updated to the real DOM.
+Fast default after fixes: **114 passed**.
+
 **Milestone 01 acceptance status:** all locally executable gates pass.
 Packet and browser gates fail closed here for missing prerequisites
 by design; per the plan they are accepted only when the required CI jobs pass

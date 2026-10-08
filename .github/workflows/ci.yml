@@ -120,6 +120,14 @@ jobs:
             allow mount,
             allow umount,
 
+            # EXEC grant with profile INHERITANCE: under abi/4.0 (policy
+            # v6) the file 'm' bit is mmap-exec, NOT execute — without an
+            # x rule the confined unshare cannot even exec sh inside the
+            # boundary (EACCES, CI round 3). 'ix' keeps every exec'd child
+            # (bash, mount, the operation command) in this profile, so
+            # capability/mount stay available inside the namespace.
+            /** rix,
+
             include if exists <local/unshare>
           }
           EOF

@@ -349,21 +349,24 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
         eng.dispose()
         pw("goto", f"{WEB_URL}/session/{sid}/replay")
         _body_has(pw, "event timeline")
+        # asciinema-player 3.17 (Solid rewrite) mounts as .ap-player with the
+        # text mirror in <pre class="ap-term-text"> — the legacy
+        # .asciinema-player class no longer exists in the DOM.
         deadline = time.time() + 30
         while time.time() < deadline:
             if pw("--raw", "eval",
-                  "!!document.querySelector('.asciinema-player')").stdout.strip() == "true":
+                  "!!document.querySelector('.ap-player')").stdout.strip() == "true":
                 break
             time.sleep(0.5)
         else:
-            pytest.fail("asciinema-player never mounted on the replay page")
+            pytest.fail("asciinema-player (.ap-player) never mounted on the replay page")
 
         def _eval(expr: str) -> str:
             return pw("--raw", "eval", expr).stdout.strip().strip('"')
 
         # paused at t=0: the 1s frame is NOT rendered yet
         assert "hardening done" not in _eval(
-            "document.querySelector('.asciinema-player').textContent")
+            "document.querySelector('.ap-term-text').textContent")
 
         # the first timeline row shows its offset; it must sit strictly
         # between the two frames for the content assertion to prove position
@@ -379,7 +382,7 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
         deadline = time.time() + 20
         while time.time() < deadline:
             now_v = _eval("document.querySelector('[data-now]').getAttribute('data-now')")
-            text = _eval("document.querySelector('.asciinema-player').textContent")
+            text = _eval("document.querySelector('.ap-term-text').textContent")
             try:
                 moved = abs(float(now_v) - off) <= 2.0
             except ValueError:

@@ -401,6 +401,9 @@ def test_ci_userns_profile_is_confined_and_proves_mounts():
     for grant in ("allow userns,", "allow capability,", "allow mount,",
                   "allow umount,"):
         assert grant in code, f"userns profile must grant {grant}"
+    # abi/4.0 'm' is mmap-exec, not execute: without an x rule with a
+    # transition mode the confined unshare cannot exec ANY child (EACCES).
+    assert " rix," in code, "profile must grant exec with inheritance"
     assert "mount -t cgroup2 cgroup2 /sys/fs/cgroup" in code
     assert "mount -t tmpfs tmpfs /mnt" in code
     for line in lines:
