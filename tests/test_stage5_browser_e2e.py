@@ -143,19 +143,25 @@ def web_app(ports, tmp_path):
         pytest.skip("web/node_modules missing — run `npm ci` in web/ first")
     dist = WEB / os.environ.get("SR_E2E_DIST_DIR", ".next-e2e")
     marker = dist / ".sr-e2e-baked-url"
+    # Next 16 resolves distDir RELATIVE to the project dir and silently
+    # treats an absolute path as relative (an absolute SR_NEXT_DIST_DIR
+    # built into web/home/dev/... and returned rc 0). Hand next a relative
+    # path; Python keeps the absolute one for its own marker checks.
+    dist_rel = os.path.relpath(dist, WEB)
     baked = f"http://localhost:{ports['api']}"
     need_build = ((not (dist / "BUILD_ID").exists())
                   or (not marker.exists()) or marker.read_text() != baked)
     if need_build:
         subprocess.run(["npm", "run", "build"], cwd=WEB, check=True,
                        env={**os.environ, "NEXT_PUBLIC_API_URL": baked,
-                            "SR_NEXT_DIST_DIR": str(dist),
+                            "SR_NEXT_DIST_DIR": dist_rel,
                             "NEXT_TELEMETRY_DISABLED": "1"},
                        capture_output=True, text=True)
+        marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(baked)
     proc = subprocess.Popen([str(node_bin / "next"), "start"], cwd=WEB,
                             env={**os.environ, "PORT": str(ports["web"]),
-                                 "SR_NEXT_DIST_DIR": str(dist),
+                                 "SR_NEXT_DIST_DIR": dist_rel,
                                  "NEXT_TELEMETRY_DISABLED": "1"},
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     import httpx

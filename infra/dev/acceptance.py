@@ -133,8 +133,12 @@ def pytest_run(args: list[str], env: dict | None = None, timeout: int = 3600):
     e = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
     if env:
         e.update(env)
-    r = run([PY, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args],
-            env=e, cwd=REPO, timeout=timeout)
+    # --tb=line: every failure contributes ONE traceback line (file:line:
+    # message). Without it a -q run's tracebacks sit far above the failure
+    # tail this gate prints, and a red CI job shows only test NAMES with no
+    # reason — undiagnosable (learned the hard way on the first CI run).
+    r = run([PY, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+             "--tb=line", *args], env=e, cwd=REPO, timeout=timeout)
     counts = parse_counts(r.stdout)
     print(f"  -> exit {r.returncode}; counts {counts or '{}'}")
     return r, counts
@@ -195,7 +199,7 @@ def check_selection() -> None:
     # The default run must be infrastructure-free: zero prerequisite skips.
     r, counts = pytest_run(["-ra"])
     if r.returncode != 0:
-        fail("fast default passes", f"exit {r.returncode}: {r.stdout[-800:]}")
+        fail("fast default passes", f"exit {r.returncode}: {r.stdout[-4000:]}")
     if counts.get("skipped", 0):
         fail("fast default has no prerequisite skips", f"{counts}")
     ok("fast default passes without integration prerequisite skips",
@@ -247,9 +251,16 @@ IMPORTS = ("srplatform.api.app", "srplatform.bastion.proxy",
 
 
 def _interpreter_for(spec: str) -> str | None:
-    """Resolve an interpreter spec (path or version like 3.12). uv-managed
-    downloads are allowed (fresh run-owned envs); a missing spec is a
-    prerequisite failure the caller reports."""
+    """Resolve an interpreter spec (path or version like 3.12). The CURRENT
+    interpreter counts when it matches the spec: the CI matrix job already
+    runs on the requested version with a fresh run-owned locked install, and
+    GitHub runners have neither `uv` nor a bare `3.12` binary on PATH.
+    uv-managed downloads are allowed otherwise (fresh run-owned envs); a
+    missing spec is a prerequisite failure the caller reports."""
+    cur = f"{sys.version_info.major}.{sys.version_info.minor}"
+    if spec == cur or spec == sys.executable or (
+            spec == f"{cur}.{sys.version_info.micro}"):
+        return sys.executable
     p = shutil.which(spec)
     if p:
         return p
@@ -461,7 +472,7 @@ def check_db() -> None:
         require_selection(counts, "db")
         if r.returncode != 0:
             fail("disposable DB layer (fresh + forward migrations + regressions)",
-                 f"exit {r.returncode}, counts {counts}:\n{r.stdout[-1500:]}")
+                 f"exit {r.returncode}, counts {counts}:\n{r.stdout[-6000:]}")
         ok("disposable DB layer passes in required mode",
            f"{counts.get('passed', 0)} passed, {counts.get('deselected', 0)} "
            f"deselected, {counts.get('skipped', 0)} skipped")
@@ -531,6 +542,21 @@ def check_containment() -> None:
         fail("containment prerequisite", f"no writable delegated cgroup v2 root at {root!r}")
     if not shutil.which("unshare"):
         fail("containment prerequisite", "unshare missing (namespace boundary)")
+    # The supervisor REFUSES every start (exit 4) unless the trusted
+    # user+mount+cgroup+pid boundary can actually be created. Ubuntu 24.04+
+    # (GitHub runners included) restricts unprivileged user namespaces via
+    # AppArmor — probe the exact boundary here so the gate names the real
+    # prerequisite instead of 15 tests failing on "command never started".
+    boundary = ["unshare", "--user", "--map-root-user", "--mount",
+                "--cgroup", "--pid", "--fork", "--mount-proc", "/bin/true"]
+    r = run(boundary, echo=False, timeout=60)
+    if r.returncode != 0:
+        fail("trusted command boundary (unshare userns)",
+             "unshare --user refused — unprivileged user namespaces are "
+             "restricted here (Ubuntu AppArmor?); the supervisor would refuse "
+             "every start. In CI the workflow loads the scoped /usr/bin/unshare "
+             "AppArmor profile; do NOT disable the restriction globally.")
+    ok("trusted command boundary (user+mnt+cgroup+pid namespaces) creatable")
     _migration_probe(root)
     # full wrapper path (review P1): the UNPRIVILEGED phase of
     # infra/dev/run_in_cgroup.sh — create a child cgroup, migrate a real
@@ -549,7 +575,7 @@ def check_containment() -> None:
                            env={"SR_REQUIRE_CONTAINMENT": "1"}, timeout=1800)
     if r.returncode != 0:
         fail("containment regressions in required mode",
-             f"exit {r.returncode}, counts {counts}:\n{r.stdout[-1500:]}")
+             f"exit {r.returncode}, counts {counts}:\n{r.stdout[-6000:]}")
     ok("namespace/recursive-membership/cancellation regressions pass (required mode)",
        f"{counts.get('passed', 0)} passed, {counts.get('skipped', 0)} skipped")
     leaked = {p for p in pathlib.Path(root).glob("sr-*")} - before
@@ -574,7 +600,7 @@ def check_packet() -> None:
                            timeout=1800)
     if r.returncode != 0:
         fail("packet regressions in required mode",
-             f"exit {r.returncode}, counts {counts}:\n{r.stdout[-1500:]}")
+             f"exit {r.returncode}, counts {counts}:\n{r.stdout[-6000:]}")
     ok("real isolated packet tests pass without host-namespace rules",
        f"{counts.get('passed', 0)} passed")
     # no sr test namespaces may survive the layer
@@ -916,7 +942,7 @@ def check_browser() -> None:
                                env=env, timeout=3600)
         if r.returncode != 0:
             fail("isolated real-browser workflow/replay",
-                 f"exit {r.returncode}, counts {counts}:\n{r.stdout[-2000:]}")
+                 f"exit {r.returncode}, counts {counts}:\n{r.stdout[-6000:]}")
         ok("isolated real-browser workflow + replay pass",
            f"{counts.get('passed', 0)} passed, {counts.get('skipped', 0)} skipped")
     finally:

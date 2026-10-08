@@ -8,6 +8,7 @@ loop (capture -> verification -> score -> report -> cleanup) end to end.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import threading
 import time
@@ -16,6 +17,24 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from tests.helpers import tool
+
+
+def _minimal_python_env():
+    """Env for the cross-process red-turn client: no range/DB settings leak
+    in, but the interpreter's own runtime still starts. On hosts whose
+    python needs an explicit loader path (GitHub's hostedtoolcache builds
+    export LD_LIBRARY_PATH for exactly this), dropping it makes the child
+    die before it can post anything — NOT the invariant under test. Do NOT
+    set PYTHONHOME: it overrides the venv's own prefix detection and the
+    child loses its site-packages."""
+    import pathlib
+
+    env = {"PATH": "/usr/bin:/bin",
+           "PYTHONPATH": str(pathlib.Path(__file__).resolve().parents[1])}
+    for var in ("LD_LIBRARY_PATH", "LD_PRELOAD"):
+        if os.environ.get(var):
+            env[var] = os.environ[var]
+    return env
 
 
 def _free_port():
@@ -152,8 +171,7 @@ print("ALL-DONE", flush=True)
 """
         proc = subprocess.Popen([sys.executable, "-c", script],
                                 stdout=subprocess.PIPE, text=True,
-                                env={"PATH": "/usr/bin:/bin",
-                                     "PYTHONPATH": str(__import__("pathlib").Path(__file__).resolve().parents[1])})
+                                env=_minimal_python_env())
         # let red0 occupy the slot and red1..3 queue up
         time.sleep(0.25)
         t0 = time.monotonic()

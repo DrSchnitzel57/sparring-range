@@ -245,6 +245,44 @@ replacement. Round-6 gate results: fast suite **112 passed** on 3.11.17,
 matrix gate PASS on all three; `selection` PASS; `containment` PASS (21
 passed, wrapper probe included).
 
+**First CI run (run 37832124220 at `beae969`) — failures and fixes
+(2026-10-08):** selection/frontend/compose green; five distinct causes
+behind the rest.
+1. `python` matrix (all 3): the gate demanded a `uv` or bare `3.12` binary;
+   GH runners have neither. `_interpreter_for` now accepts the RUNNING
+   interpreter when it matches the spec — the matrix job's venv already IS
+   the fresh run-owned locked install on that version.
+2. `containment` (15 failures) + 2 `db` worker-chain failures: the
+   supervisor's trusted boundary needs `unshare --user`, which Ubuntu
+   24.04+ (GitHub runner images) restricts via AppArmor
+   (`apparmor_restrict_unprivileged_userns`); the supervisor correctly
+   refused every start (exit 4). The workflow now loads Ubuntu's documented
+   SCOPED profile granting `userns` to exactly `/usr/bin/unshare` on the
+   disposable runner (never the global sysctl switch), and the containment
+   gate gained a boundary pre-probe that names this prerequisite instead of
+   failing 15 tests on "command never started".
+3. `browser`: Next 16 resolves `distDir` RELATIVE to the project and
+   silently treats an absolute path as relative (built into
+   `web/home/dev/...`, rc 0), so the baked-URL marker had no directory.
+   The fixture now hands next a relative distDir (verified locally: build +
+   `next start` serve from `.next-e2e`).
+4. `db` hint-jump test: its cross-process client stripped the environment
+   to `PATH=/usr/bin:/bin`, dropping `LD_LIBRARY_PATH`, which GitHub's
+   hostedtoolcache python needs (its own workflow env exports it) — the
+   child died before posting. `_minimal_python_env()` keeps the minimal
+   surface but forwards loader variables.
+5. Harness diagnostics: the first CI run showed failing test NAMES with no
+   reasons (tracebacks above the 1500-char failure tail). Layer runs use
+   `--tb=line` and the failure tail grew to 6000 chars.
+Still open for the next CI run (tracebacks were invisible): the m2 bastion
+and r06 packet failures — both green locally, but neither has ever passed
+in CI, so treat them as unresolved until the one-line tracebacks name the
+cause.
+Round of fixes verified locally: fast default **113 passed** (new
+interpreter-resolution regression), `selection`, `db` (113), `containment`
+(boundary probe + 21), `python` gate in CI-matrix shape (current-interpreter
+match) all PASS.
+
 **Milestone 01 acceptance status:** all locally executable gates pass.
 Packet and browser gates fail closed here for missing prerequisites
 by design; per the plan they are accepted only when the required CI jobs pass

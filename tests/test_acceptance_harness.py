@@ -61,6 +61,19 @@ CLEAN = ('{"metadata":{"vulnerabilities":{"info":0,"low":0,"moderate":0,'
          '"high":0,"critical":0}}}')
 
 
+def test_interpreter_spec_matches_the_running_interpreter(monkeypatch):
+    # CI matrix jobs run the gate ON the requested interpreter; GitHub
+    # runners have neither uv nor a bare `3.12` binary on PATH, so the
+    # running interpreter must count as the spec it names.
+    import sys
+    cur = f"{sys.version_info.major}.{sys.version_info.minor}"
+    assert acc._interpreter_for(cur) == sys.executable
+    assert acc._interpreter_for(f"{cur}.{sys.version_info.micro}") == sys.executable
+    # an unrelated spec with no binary and no uv is a prerequisite failure
+    monkeypatch.setattr(acc.shutil, "which", lambda n: None)
+    assert acc._interpreter_for("9.99") is None
+
+
 def test_audit_evaluation_fails_closed():
     F = acc.Failed
     # error response (registry unreachable) is NEVER zero findings

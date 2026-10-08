@@ -83,6 +83,32 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install -r requirements.lock
           .venv/bin/pip install --no-deps -e .
+      - &userns-boundary
+        name: Permit the supervisor's userns boundary (Ubuntu 24.04 AppArmor)
+        # Ubuntu 24.04+ (GitHub runner images included) restricts
+        # unprivileged user namespaces to binaries with an AppArmor profile
+        # granting `userns`; without it the runner-supervisor's trusted
+        # user+mount+cgroup+pid boundary cannot be created and it refuses
+        # every start (exit 4). Ubuntu's documented mechanism is a SCOPED
+        # profile for exactly one binary (/usr/bin/unshare) on this
+        # disposable runner VM — never the global
+        # kernel.apparmor_restrict_unprivileged_userns=0 switch.
+        run: |
+          set -euo pipefail
+          sudo tee /etc/apparmor.d/usr.bin.unshare > /dev/null <<'EOF'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile unshare /usr/bin/unshare flags=(unconfined) {
+            userns,
+
+            include if exists <local/unshare>
+          }
+          EOF
+          sudo apparmor_parser -r /etc/apparmor.d/usr.bin.unshare
+          # prove the exact boundary the supervisor needs now works
+          unshare --user --map-root-user --mount --cgroup --pid --fork \
+            --mount-proc /bin/true
       - &delegate-cgroup
         name: Delegate a cgroup v2 subtree for runner containment
         run: |
@@ -115,6 +141,7 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install -r requirements.lock
           .venv/bin/pip install --no-deps -e .
+      - *userns-boundary
       - *delegate-cgroup
       - name: Run containment unprivileged INSIDE the delegated subtree
         run: |
