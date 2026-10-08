@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sparring-range"
 version = "0.1.0"
-description = "AI Red-Team Sparring Range — see plan.markdown (Parts 1-7 are the contract)"
+description = "AI Red-Team Sparring Range — see docs/ARCHITECTURE.md and docs/ROADMAP.md"
 requires-python = ">=3.11"
 dependencies = [
     # Part 2 — decided stack. Do not add libraries without justification.

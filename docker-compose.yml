@@ -18,7 +18,7 @@
 # (the old `srplatform.coach.service` import never existed).
 #
 # Runtime services never receive PROXMOX_* or owner-DB credentials; model
-# selection/execution happens in runner-scoped workers (see docs/ARCHITECTURE_NOTES.md).
+# selection/execution happens in runner-scoped workers (see docs/ARCHITECTURE.md).
 services:
   postgres:
     image: postgres:16
