@@ -1,6 +1,7 @@
 # Current findings and validation evidence
 
-Updated: 2026-10-08. Application revision inspected/tested: **`23de4f4`**.
+Updated: 2026-10-08. Application revision inspected/tested: **`23de4f4`**
+(planning baseline); milestone-01 implementation evidence recorded at **`ac5a61b`**.
 Release contract: [ARCHITECTURE.md](ARCHITECTURE.md); ordered work:
 [ROADMAP.md](ROADMAP.md); operator gates: [OPERATOR_RUNBOOK.md](OPERATOR_RUNBOOK.md).
 
@@ -106,12 +107,45 @@ not on PATH. No Docker resources, DB schema, browser service, live range or host
 firewall were created/mutated by these checks. These results supersede assumptions
 about Docker availability, not the outstanding acceptance gates.
 
+## Milestone 01 implementation evidence (2026-10-08)
+
+Executed at clean revision **`ac5a61b`** (branch `happy-chipmunk`) on this
+developer host: Python **3.13.5** (uv-created pip-less `.venv` from
+`requirements.lock`), Node **22.23.3**, npm **10.9.9**, Docker daemon 29.8.2 /
+Compose 5.6.0, cgroup v2 with a writable delegated subtree. No Proxmox, live
+range, host firewall or unrelated-VM access; all fixtures run-owned.
+
+| Gate (exact command) | Result |
+|---|---|
+| `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -ra -p no:cacheprovider` | Exit 0: **97 passed, 0 failed, 0 skipped, 139 deselected**, 4 warnings, 14.4s — infrastructure-free default |
+| `.venv/bin/python infra/dev/acceptance.py selection` | **PASS**: 236 tests = 97 fast + 139 integration (db 113, containment 25, packet 4, browser 1, live 0 until milestone 11); required modes verified to fail for absent prerequisite, skipped required test and empty selection |
+| `.venv/bin/python infra/dev/acceptance.py python` | **PASS**: fresh run-owned venv, locked install without re-resolve, dependency check clean, 4 entrypoint imports on Python 3.13.5 (CI matrix covers 3.11–3.13) |
+| `.venv/bin/python infra/dev/acceptance.py db` | **PASS**: disposable `postgres:16` (unique container/volume, loopback port, synthetic creds) — **113 passed, 0 skipped**, 123 deselected in required mode; fresh chain, populated pre-0010 forward upgrade, grants and append-only regressions; no `srtest_*`/`sr_*` leftovers; container+volume removed |
+| `.venv/bin/python infra/dev/acceptance.py containment` | **PASS**: 21 namespace/recursive-membership/cancellation regressions in required mode, 0 skipped; no run-owned cgroups leaked (4 db∩containment compound tests run inside the db gate) |
+| `.venv/bin/python infra/dev/acceptance.py packet` | **FAIL here (prerequisite)**: missing root + `nft` — this host is not the approved privileged fixture; CI packet job (standard Linux VM, nftables, rules only in disposable netns) is the gate |
+| `.venv/bin/python infra/dev/acceptance.py frontend` | **PASS**: `npm ci`, production `next build` (Next **16.4.0**, Pages Router, React **18.3.1**), `npm audit --omit=dev` → **0 vulnerabilities** (baseline was 3 critical/1 high across Next/PostCSS/Seroval/Solid; all were Next-14 transitive and are gone; no lower-severity findings remain to triage) |
+| `.venv/bin/python infra/dev/acceptance.py compose` | **PASS**: real image build, fresh bootstrap + idempotent rerun (run-owned project, loopback ports, synthetic passwords/keys) — alembic at `0010`, app-role-only API readiness, app-role schema access, bastion running behind the seed-keys gate; only run-owned resources removed |
+| `.venv/bin/python infra/dev/acceptance.py browser` | **FAIL here (prerequisite)**: pinned CLI present but Chromium cannot launch (missing system libraries such as `libglib-2.0.so.0`; no root to install them) — CI browser job (`playwright install --with-deps`) is the gate; E2E now isolated (free/configurable ports, `.next-e2e` dist, run-owned session) and covers replay seek |
+
+Genuine production defects found by the first real DB-layer execution and
+repaired with their regressions kept: SQLAlchemy 2.1 `Row` attribute access in
+token recovery (`.scalars()`), phase-only JSON trusted by the deploy/idempotent
+resume paths (now requires current capability evidence, F3), and migration
+0010's helper rejecting an Engine. The supervisor additionally treats a
+concurrently-removed operation cgroup tree as confirmed cessation (kernel only
+removes empty cgroups). No safety regression was deleted or weakened.
+
+**Milestone 01 acceptance status:** all locally executable gates pass at
+`ac5a61b`. Packet and browser gates fail closed here for missing prerequisites
+by design; per the plan they are accepted only when the required CI jobs pass
+after the operator pushes. Milestone remains until then.
+
 ## Release blockers and missing work
 
 | ID / priority | Current finding and evidence boundary | Milestone |
 |---|---|---|
-| B01 / P1 | Reproduced failing baseline and DB marker leakage; test identity premises need repair, not unsafe rollback | 01 |
-| B02 / P1 | Reproduced frontend advisory scan; supported upgrades and applicability/build tests needed | 01 |
+| B01 / P1 | **Repaired at `ac5a61b` (see milestone-01 evidence):** baseline failures fixed on real host identities; DB marker leakage structurally prevented (fixture-closure derivation). Awaits CI green for milestone close | 01 |
+| B02 / P1 | **Repaired at `ac5a61b`:** Next 16.4.0 + patched transitive deps; `npm audit --omit=dev` reports 0 vulnerabilities; build/replay/browser validated | 01 |
 | B03 / P0 | Inspected API still constructs direct PVE adapter; current safety controller invokes privileged nft machinery. Incompatible with agreed private limited-token/no-runtime-host-root boundary | 02 |
 | B04 / P0 | Namespace/cgroup boundary and kernel kill exist, but nine-failure baseline is not containment acceptance. Missing/unreadable authority, recursive membership, bookkeeping protection, unsupported starts and all signal identities need independent proof | 01–02 |
 | B05 / P0 | Run-row locking, guarded writers and any-run obligations exist. DB races and every writer/caller (spawn, callback, stop, watchdog, startup, emergency) remain unverified here; never rely on helper docstrings saying every writer is covered | 02 |
@@ -119,7 +153,7 @@ about Docker availability, not the outstanding acceptance gates.
 | B07 / P1 | Current image artifacts do not establish usable web/database templates. Service-present checks are not actual transactions; YAML has placeholder integrity/user baselines and seed contracts need completion | 03 |
 | B08 / P1 | Enrollment now carries exact capability/generation evidence and migration 0010 invalidation logic. Fresh/legacy upgrades, stale-token rejection, recovery and concurrent confirms require disposable DB acceptance | 04 |
 | B09 / P1 | **Missing software:** `tests/test_fifth_followup_installed_capture.py` and required installed-systemd/auditd acceptance. Subprocess synthetic stdin cannot prove `srshipper` reads real audit input or captures a real command | 04 |
-| B10 / P1 | **Incomplete CI:** `SR_REQUIRE_CONTAINMENT=1` is supported by helpers but absent from CI. mkdir/chown delegation alone is not proof migration is permitted; required capture/packet/browser prerequisites must not silently skip | 01, 04 |
+| B10 / P1 | **Wired at `ac5a61b`:** required layers run as dedicated CI jobs via `infra/dev/acceptance.py` with `SR_REQUIRE_*` (missing prerequisites/empty selections/skipped required tests fail). Installed-capture fixture still missing (milestone 04). CI execution pending operator push | 01, 04 |
 | B11 / P1 | SSH/recording/spool code exists; real pinned SSH, installed identity, input/API/token negatives, shared durable storage, delivery gaps and transport-loss recovery remain unverified | 04, 11 |
 | B12 / P1 | **Missing release behavior:** configuration snapshots for new controls, explicit timed Begin, ready-idle expiry, server clock, restart interruption and automatic post-evidence cleanup. Existing end keeps owned VMs/reservation pending separate teardown | 05 |
 | B13 / P1 | **Missing release behavior:** continuous independent HTTP/MySQL probes, availability samples/rubric, distinct live component scores, scorer-health detector and outage interruption | 06 |

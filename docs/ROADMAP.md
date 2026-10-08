@@ -23,7 +23,13 @@ is implementation work, not a hardware-only gate. Preserve existing useful fixes
 the product. **Depends on:** the agreed release contract.
 
 Approved implementation plan: [01-reproducible-baseline](../.openchamber/plans/01-reproducible-baseline.md)
-(2026-10-08). Implementation and milestone acceptance remain pending.
+(2026-10-08). **Implemented at `ac5a61b` (2026-10-08):** all locally executable
+gates pass (infrastructure-free default 97/0/0; selection/python/db/containment/
+frontend/compose via `infra/dev/acceptance.py`); packet and browser fail closed
+on this host for missing prerequisites and are accepted only when their required
+CI jobs pass after the operator pushes. Evidence:
+[findings checklist](FINDINGS_CHECKLIST.md). Acceptance stays pending until CI
+is green — not waived.
 
 Investigate the ten fresh failures (including the prose-coupled readiness test),
 namespace/PID semantics and DB marker leakage; do not restore unsafe containment just to make old assertions

@@ -121,10 +121,20 @@ four affected packages. Docker is now available: Compose 5.6.0, daemon 29.8.2.
 No disposable DB admin, browser CLI or nft binary was configured, and no Docker
 fixture or live/privileged gate was started during this planning baseline.
 
+### Superseded by milestone-01 implementation (2026-10-08, `ac5a61b`)
+
+The ten baseline failures and the frontend audit findings above are repaired:
+the no-admin default is now **97 passed, 0 failed, 0 skipped, 139 deselected**,
+and `npm audit --omit=dev` reports 0 vulnerabilities. Layer membership derives
+from the fixture closure; per-gate acceptance runs through
+`python infra/dev/acceptance.py <check>`. Exact results and the pending CI
+gates (packet, browser) are recorded in `docs/FINDINGS_CHECKLIST.md`.
+
 ## Validation commands and safety
 
-- Fast baseline: the pytest command above, or select `not db and not browser and
-  not live`; existing marker leakage is a milestone-01 repair, not a passing gate.
+- Fast baseline: the pytest command above (infrastructure-free since `ac5a61b`:
+  0 failed, 0 prerequisite skips); integration layers are db/containment/packet/
+  browser/live, and `python infra/dev/acceptance.py <check>` runs each real gate.
 - DB tests require `SR_PG_ADMIN_URL` or `SR_PG_ADMIN_CMD` for a disposable cluster;
   fixtures create unique `srtest_*` databases/roles. Never select production.
 - Containment/packet/systemd tests need isolated fixtures and explicit required

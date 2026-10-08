@@ -215,36 +215,47 @@ env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 \
   .venv/bin/python -m pytest -q -ra -p no:cacheprovider
 ```
 
-Known failing result is recorded in the findings checklist. The selector
-`-m "not db and not browser and not live"` still has DB marker leakage; do not
-advertise it as fully infrastructure-free until milestone 01 repairs it.
+This default selection is infrastructure-free (milestone 01): DB/containment/
+packet/browser/live are explicit layers, DB and containment membership derives
+from the fixture closure, and the default run has zero prerequisite skips.
+Per-gate acceptance runs through `python infra/dev/acceptance.py <check>`
+(`selection|python|db|containment|packet|frontend|compose|browser`), which
+executes the real commands and fails on absent prerequisites, empty selections
+or cleanup problems.
 
 ### Disposable database integration
 
-Set `SR_PG_ADMIN_URL` or `SR_PG_ADMIN_CMD` only to an explicitly approved disposable
-cluster. Fixtures create/drop unique `srtest_*` DBs and unique roles; they must
-never target production. Then run:
+`python infra/dev/acceptance.py db` starts its own run-owned `postgres:16`
+container (unique names/storage, loopback port, synthetic credentials, scoped
+cleanup). To point tests at an already-approved disposable cluster instead,
+set `SR_PG_ADMIN_URL` or `SR_PG_ADMIN_CMD`; fixtures create/drop unique
+`srtest_*` DBs and roles derived from that endpoint and must never target
+production. Then run:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -m "db or adapter" -q -ra -p no:cacheprovider
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -m "db and not browser" \
+  -q -ra -p no:cacheprovider
 ```
 
-Check selection: adapter tests can carry other infrastructure requirements.
-Use explicit dedicated commands for migrations/upgrade/concurrency in the agreed
-plan. The absence of DB test failures due to skipped fixtures is not DB acceptance.
+With `SR_REQUIRE_DB=1` a skipped DB test is a failure. The absence of DB test
+failures due to skipped fixtures is not DB acceptance.
 
 ### Containment, installed capture and packet jobs
 
 Containment jobs require correctly delegated cgroup v2, user/mount/cgroup/PID
-namespace support, trusted launcher setup and actual harmless migration/non-escape
-proof. `SR_REQUIRE_CONTAINMENT=1` exists in helpers but is **not yet enabled in CI**.
-Mandatory jobs must fail missing prerequisites; optional developer skips remain.
+namespace support and actual harmless containment proof; run them with
+`python infra/dev/acceptance.py containment` (sets `SR_REQUIRE_CONTAINMENT=1`,
+verifies no run-owned cgroups leak). CI now runs required layers as dedicated
+jobs (`SR_REQUIRE_*` per job) — a missing prerequisite, empty selection or
+skipped required test fails the job; optional developer skips remain.
 
 The required installed-capture fixture/flag/job is **missing**, to be implemented
 in milestone 04. Do not run a nonexistent file and call it a hardware-only gate.
-Packet tests need a privileged disposable isolated Linux fixture with nftables/
-iproute2 and positive controls; never install host firewall rules here or on the
-R740 merely to get green tests. Required jobs must execute, not skip/deselect.
+Packet tests (`python infra/dev/acceptance.py packet`) need root + nftables +
+iproute2 and apply rules ONLY inside disposable network namespaces the tests
+create and remove; never install host firewall rules here or on the R740 merely
+to get green tests. The CI packet job runs on a standard GitHub Linux VM for
+exactly this reason. Required jobs must execute, not skip/deselect.
 
 ### Frontend and browser
 
@@ -253,25 +264,31 @@ From `web/`:
 ```bash
 npm ci
 npm run build
-npm audit --package-lock-only --json
+npm audit --omit=dev --json    # release gate: zero high/critical
 ```
 
-Browser acceptance separately uses a disposable DB, built frontend, Playwright
-CLI/Chromium and isolated free ports. Current E2E is
-`tests/test_stage5_browser_e2e.py`, selected with `-m browser`; it uses controlled
-PVE/model/runner/verifier/datapath boundaries and synthetic capture. It is not real
-installed telemetry or R740 acceptance. Do not stop OpenChamber/other services to
-free ports 3000/8010; use an isolated fixture/configuration.
+Browser acceptance (`python infra/dev/acceptance.py browser`) uses a disposable
+DB fixture, the pinned local Playwright CLI (`@playwright/cli` web
+devDependency), a run-owned named session, FREE-or-configurable ports
+(`SR_E2E_API_PORT`/`SR_E2E_WEB_PORT`) and an isolated `.next-e2e` build — a
+developer's `.next`, ports 3000/8010 and other services are never displaced.
+The E2E (`tests/test_stage5_browser_e2e.py`, `-m browser`) covers the member
+workflow plus replay seek with controlled PVE/model/runner/verifier/datapath
+boundaries and synthetic capture. It is not real installed telemetry or R740
+acceptance.
 
 ### Dev Compose
 
-Existing `docker-compose.yml`, `.env.example`, `infra/dev/seed_bastion_keys.sh`
-and `rangectl bootstrap` provide a dev bootstrap path. Milestone 01 must validate
-`docker compose config`/build and a fresh **disposable** stack with supplied keys,
-role bootstrap/migrations, recording volume, idempotent operator/capability
-bootstrap and readiness. Do not point unaccepted dev defaults at live infrastructure
-or delete an existing volume. Fake pins/dev local runner/datapath relaxations are
-not production safety evidence.
+`python infra/dev/acceptance.py compose` validates the real path: image build,
+fresh bootstrap and an idempotent rerun with a run-owned project name, loopback
+ports, synthetic `SR_DEV_OWNER_PASSWORD`/`SR_DEV_APP_PASSWORD`/bastion token
+and synthetic operator keys, asserting alembic-at-head, app-role-only API
+readiness and bastion startup behind the key-seeding gate, then removing only
+its own resources. `infra/db/bootstrap.sql` takes the app-role password from
+`SR_DEV_APP_PASSWORD` (no committed default dependency). Do not point
+unaccepted dev defaults at live infrastructure or delete an existing volume.
+Fake pins/dev local runner/datapath relaxations are not production safety
+evidence.
 
 ## 9. Actual R740 release gates — all open
 
