@@ -233,6 +233,18 @@ Round-5 gate results: fast default **112 passed, 0 failed, 0 skipped,
 139 deselected**; `db` PASS against real Docker (post-create nonce check on
 the happy path, failure-path + collision probes, 113 passed required mode).
 
+**Round-6 review fix (2026-10-08, post-`cf98a67` review — VERDICT: FIX,
+the item):** the t03 discovery test replaced global `pathlib.Path` with a
+lambda, which crashes Python 3.11 (`Path._flavour` INTERNALERROR, reproduced
+on 3.11.17 before the fix). The direct `/sys` bridge-port read is now a named
+module seam (`_local_bridge_ports` in `srplatform/safety/firewall.py`), and
+the test doubles THAT — same trap semantics (a same-named local bridge must
+never be consulted while an execution prefix is configured), no global class
+replacement. Round-6 gate results: fast suite **112 passed** on 3.11.17,
+3.12.15 and 3.13.5 (fresh locked venvs, mirroring the CI matrix); `python`
+matrix gate PASS on all three; `selection` PASS; `containment` PASS (21
+passed, wrapper probe included).
+
 **Milestone 01 acceptance status:** all locally executable gates pass.
 Packet and browser gates fail closed here for missing prerequisites
 by design; per the plan they are accepted only when the required CI jobs pass

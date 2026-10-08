@@ -78,6 +78,20 @@ def bridge_ports(s: Settings) -> list[str]:
     return [p.strip() for p in (s.range_bridge_ports or "").split(",") if p.strip()]
 
 
+def _local_bridge_ports(br: str) -> list[str] | None:
+    """Direct /sys read of the bridge port directory — used ONLY when no
+    execution prefix is configured (controller runs in the datapath
+    namespace itself). A named seam so tests can place a same-named local
+    bridge WITHOUT replacing global pathlib.Path (which breaks Python 3.11
+    internals)."""
+    from pathlib import Path
+    d = Path("/sys/class/net") / br / "brif"
+    try:
+        return sorted(p.name for p in d.iterdir())
+    except OSError:
+        return None
+
+
 def discover_bridge_ports(s: Settings) -> list[str] | None:
     """DISCOVERED bridge ports read THROUGH THE SAME EXECUTION MECHANISM as
     nft (audit T03): the controller applies rules via `nft_command_prefix`
@@ -90,7 +104,6 @@ def discover_bridge_ports(s: Settings) -> list[str] | None:
     import re
     import shlex
     import subprocess
-    from pathlib import Path
     br = s.range_bridge
     prefix = shlex.split(s.nft_command_prefix) if s.nft_command_prefix else []
     if prefix:
@@ -106,11 +119,7 @@ def discover_bridge_ports(s: Settings) -> list[str] | None:
             return sorted(x for x in r.stdout.split() if x)
         except (OSError, subprocess.SubprocessError):
             return None
-    d = Path("/sys/class/net") / br / "brif"
-    try:
-        return sorted(p.name for p in d.iterdir())
-    except OSError:
-        return None
+    return _local_bridge_ports(br)
 
 
 def validate_port_coverage(s: Settings) -> tuple[bool, str]:

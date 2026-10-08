@@ -224,28 +224,28 @@ def test_t03_absent_is_still_absent(monkeypatch):
 # Discovery happens in the nft namespace, not the local /sys                   #
 # --------------------------------------------------------------------------- #
 
-def test_t03_discovery_uses_prefix_namespace_even_when_local_bridge_exists(monkeypatch, tmp_path):
+def test_t03_discovery_uses_prefix_namespace_even_when_local_bridge_exists(monkeypatch):
     """A same-named bridge in the LOCAL /sys must never be mistaken for the
     target namespace: with a prefix configured, discovery runs THROUGH the
-    prefix and its answer governs."""
-    import pathlib
+    prefix and its answer governs.
+
+    The local read is doubled through the module's named seam — replacing
+    global pathlib.Path (as this test used to) breaks Python 3.11 pathlib
+    internals and crashes the whole suite.
+    """
     from srplatform.safety import firewall
     from srplatform.settings import Settings
 
     calls = []
+    local_reads = []
 
-    class FakeBrifDir:
-        def __init__(self, path):
-            self.path = str(path)
+    def local_trap(br):
+        # LOCAL same-named bridge with DIFFERENT ports — the trap. It must
+        # NEVER be consulted while an execution prefix is configured.
+        local_reads.append(br)
+        return ["LOCALtap9"]
 
-        def iterdir(self):
-            if self.path.endswith("/brif"):
-                # LOCAL same-named bridge with DIFFERENT ports — the trap
-                return [pathlib.PurePosixPath("/sys/class/net/vmbr1/brif/LOCALtap9")]
-            raise OSError("no such")
-
-    real_path = pathlib.Path
-    monkeypatch.setattr(pathlib, "Path", lambda *a: FakeBrifDir(real_path(*a)))
+    monkeypatch.setattr(firewall, "_local_bridge_ports", local_trap)
 
     def fake_run(cmd, *a, **k):
         calls.append(cmd)
@@ -257,7 +257,7 @@ def test_t03_discovery_uses_prefix_namespace_even_when_local_bridge_exists(monke
     ports = firewall.discover_bridge_ports(s)
     assert ports == ["veth7", "veth8"], ports
     assert calls and calls[0][:4] == ["ip", "netns", "exec", "rangehost"], calls
-    assert "LOCALtap9" not in (ports or [])
+    assert not local_reads  # local /sys never consulted through the trap
 
 
 @pytest.mark.db  # uses the client fixture (real DB for the safety-record mirror)
