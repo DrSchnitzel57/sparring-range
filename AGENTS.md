@@ -131,6 +131,7 @@ from the fixture closure; per-gate acceptance runs through
 `docs/FINDINGS_CHECKLIST.md`; the CI-only gates (packet, browser) passed in
 run 37852029894 at `3539667`. Independent review at `27e2624` reopened
 milestone 01 for shared browser-build isolation and the edit to migration 0010;
+subsequent CI at the same commit also exposes intermittent browser command timing.
 see the findings checklist. Green gate results do not waive plan requirements.
 
 ## Validation commands and safety

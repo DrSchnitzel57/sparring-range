@@ -31,7 +31,8 @@ that cannot run on this host — all passed in run 37852029894 at `3539667`
 (ten jobs green). Evidence: [findings checklist](FINDINGS_CHECKLIST.md).
 Independent review at `27e2624` reproduced safe local gates and checked hosted
 logs, but found a shared/reused browser build directory and an edit to migration
-0010 contrary to the approved plan. Fix those gaps and rerun affected gates before
+0010 contrary to the approved plan. CI follow-up also found intermittent browser
+command-observation failure at the same commit (M01-R3). Fix these gaps and rerun affected gates before
 closing milestone 01. Requirements are unchanged; no milestone-02 plan exists.
 
 Investigate the ten fresh failures (including the prose-coupled readiness test),

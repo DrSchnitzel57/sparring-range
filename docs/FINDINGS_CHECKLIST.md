@@ -466,6 +466,29 @@ Green command results remain valid, but do not prove run-owned build isolation o
 waive migration immutability. Close M01-R1/R2 and rerun affected gates before
 marking milestone 01 accepted. Billing protection remains an operator manual check.
 
+**CI follow-up after user reported another failure (2026-10-08):**
+`gh run list --workflow ci --limit 12 --json databaseId,headSha,headBranch,conclusion,status,createdAt,url,displayTitle`
+and `gh run view 37852794770 --log-failed` (both exit 0) confirm
+[happy-chipmunk run 37852794770](https://github.com/DrSchnitzel57/sparring-range/actions/runs/37852794770)
+failed browser E2E at `27e2624`: `tests/test_stage5_browser_e2e.py:296`,
+`assert 'command' in recent`, **1 failed**, 2 warnings, 50.05s.
+`gh run view 37852833914 --json conclusion,jobs,url,headSha` (exit 0) confirms
+[master run 37852833914](https://github.com/DrSchnitzel57/sparring-range/actions/runs/37852833914)
+passed all ten jobs at the SAME commit. These are mixed results, not proof the
+intermittent failure is repaired. They supersede any impression of consistently
+green acceptance; the user's abbreviated email reference was not identified.
+
+- **M01-R3 / P2 — command assertion does not wait for the command.**
+  `tests/test_stage5_browser_e2e.py:293–296` waits for `web01`, already present
+  in connection instructions, then immediately asserts `command` before the
+  two-second dashboard poll is guaranteed to complete. This is consistent with
+  the observed pass/fail at the same revision. Wait with a bounded deadline for
+  the newly ingested command event itself, retaining the UI-rendering assertion;
+  investigate further if it never appears. Rerun affected browser acceptance and
+  check repeat-run stability; do not merely rerun until green or suppress failure.
+  This repair falls within the existing browser-fixture step/criterion, not a
+  new milestone or permission to change application behavior without evidence.
+
 ## Release blockers and missing work
 
 | ID / priority | Current finding and evidence boundary | Milestone |

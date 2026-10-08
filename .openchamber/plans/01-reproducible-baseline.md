@@ -3,8 +3,8 @@
 Approved 2026-10-08. Contract: docs/ARCHITECTURE.md, docs/ROADMAP.md,
 docs/FINDINGS_CHECKLIST.md.
 
-Review `27e2624` (2026-10-08): **FIX/reopened**. Local gates and CI
-37852029894 pass. Fix shared browser builds/edited migration; see findings.
+Review `27e2624`: **FIX/reopened**. Local gates pass; CI mixed at same commit.
+Fix shared builds, edited migration and browser event timing; see findings.
 
 ## Goal and context
 
