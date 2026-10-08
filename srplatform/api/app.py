@@ -42,13 +42,25 @@ app = FastAPI(title="sparring-range API", version="0.2.0")
 # LAN origins are EXPLICIT (F23) — never wildcard, never silently localhost.
 from srplatform.settings import get_settings  # noqa: E402
 
-_s = get_settings()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[o.strip() for o in _s.api_allowed_origins.split(",") if o.strip()],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+class _StartupCORSMiddleware(CORSMiddleware):
+    """Origins are read when the middleware stack is BUILT (app startup),
+    not at module import: a test/dev process sets its own web origin via
+    API_ALLOWED_ORIGINS before serving, and importing this module earlier
+    (e.g. during pytest collection) must not freeze the defaults.
+    Production behaviour is unchanged — settings are read once, at boot."""
+
+    def __init__(self, asgi_app):
+        s = get_settings()
+        super().__init__(
+            asgi_app,
+            allow_origins=[o.strip() for o in s.api_allowed_origins.split(",") if o.strip()],
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+
+app.add_middleware(_StartupCORSMiddleware)
 
 
 def get_db():

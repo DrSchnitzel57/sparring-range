@@ -384,3 +384,26 @@ def test_ci_workflow_is_schema_valid():
                 f"{job_id}: step needs exactly one of uses/run: {step}"
             if "uses" in step:
                 assert isinstance(step["uses"], str) and step["uses"]
+
+
+def test_ci_userns_profile_is_confined_and_proves_mounts():
+    # CI round 2: a flags=(unconfined) profile leaves the userns creator in
+    # the kernel's "unconfined state", so Ubuntu transitions it into the
+    # restrictive unprivileged_userns profile (deny capability) and the
+    # boundary's inner cgroup2/tmpfs mounts fail (exit 96). The workflow
+    # must load a REAL confined profile (upstream bwrap-userns-restrict
+    # pattern) and probe the FULL boundary, mounts included.
+    lines = (REPO / ".github" / "workflows" / "ci.yml").read_text().splitlines()
+    code = "\n".join(l for l in lines if not l.strip().startswith("#"))
+    assert "flags=(unconfined)" not in code, \
+        "flags=(unconfined) strips capability inside the new userns"
+    assert "flags=(attach_disconnected,mediate_deleted)" in code
+    for grant in ("allow userns,", "allow capability,", "allow mount,",
+                  "allow umount,"):
+        assert grant in code, f"userns profile must grant {grant}"
+    assert "mount -t cgroup2 cgroup2 /sys/fs/cgroup" in code
+    assert "mount -t tmpfs tmpfs /mnt" in code
+    for line in lines:
+        if "apparmor_restrict_unprivileged_userns=0" in line:
+            assert line.strip().startswith("#"), \
+                f"global sysctl disable must stay a comment: {line}"

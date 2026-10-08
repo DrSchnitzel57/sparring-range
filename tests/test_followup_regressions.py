@@ -757,8 +757,10 @@ def test_r06_disposable_netns_packet_semantics(tmp_path, monkeypatch):
         inns(ns, "addr", "add", f"{GW_IP}/24", "dev", br)
         inns(ns, "link", "set", br, "up")
         sysctl_ns(ns, "net.ipv4.ip_forward", 1)
+        br_ports = []
         for name, ipaddr in ((RANGE1, R1_IP), (RANGE2, R2_IP)):
             a = f"v{name[3:5]}"
+            br_ports.append(a)
             ip("link", "add", f"x{a}", "type", "veth", "peer", "name", f"y{a}")
             ip("link", "set", f"x{a}", "netns", ns)
             ip("link", "set", f"y{a}", "netns", name)
@@ -777,8 +779,14 @@ def test_r06_disposable_netns_packet_semantics(tmp_path, monkeypatch):
         link_pair(ns, "srv0", SRV, "eth0", a_ip=f"{SRV_GW}/24", b_ip=f"{SRV_IP}/24",
                   via=SRV_GW)
 
+        # Ports DECLARED (production requirement): same-subnet range traffic
+        # is BRIDGED, and the bridge forward hook sees the PORTS, never the
+        # master — an empty declaration would leave the emergency L2 drop
+        # matching nothing, severing intra-range traffic only if the host
+        # happens to have br_netfilter loaded (audit N06: undeclared ports
+        # mean INCOMPLETE coverage, not a pass).
         s = Settings(sr_env="dev", range_bridge=br, range_cidr="10.66.0.0/24",
-                     management_cidr="10.0.0.0/24", range_bridge_ports="",
+                     management_cidr="10.0.0.0/24", range_bridge_ports=",".join(br_ports),
                      api_base_url=f"http://{SRV_IP}:{API_PORT}", datapath_controller="nft",
                      nft_command_prefix=f"ip netns exec {ns} ",
                      safety_state_file=str(tmp_path / "st"))

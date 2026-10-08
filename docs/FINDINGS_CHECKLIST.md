@@ -283,6 +283,44 @@ interpreter-resolution regression), `selection`, `db` (113), `containment`
 (boundary probe + 21), `python` gate in CI-matrix shape (current-interpreter
 match) all PASS.
 
+**Second CI run (run 37835631215 at `7de03cb`) — failures and fixes
+(2026-10-08):** python matrix/selection/frontend/compose green and the m2
+bastion test passed; four jobs red, three distinct causes — the new
+`--tb=line` tails named them.
+1. `containment` (12 failures) + `db` (2, "the remote job never started"):
+   the scoped profile was `flags=(unconfined)` + `userns,`. That permits
+   userns creation (the pre-probe passed), but Ubuntu's kernel treats a
+   profile in the *unconfined state* as an unconfined creator and
+   transitions it into the restrictive `unprivileged_userns` profile,
+   whose `deny capability` then fails the boundary's two inner mounts
+   (cgroup2 remount, tmpfs state mask) — exit 96. The workflow now loads a
+   REAL confined profile (upstream apparmor's `bwrap-userns-restrict`
+   pattern: explicit `allow capability/file/mount/umount/userns/...`;
+   exec'd children inherit it), and both the workflow probe and the
+   containment gate pre-probe exercise the FULL boundary including those
+   mounts. A harness regression pins the profile shape.
+2. `packet` (r06, "emergency must sever intra-range traffic"): R1↔R2
+   traffic is BRIDGED, and the inet forward hook only sees bridged frames
+   when `br_netfilter` is loaded — true on the dev host, false on the
+   runner. The test declared `range_bridge_ports=""`, so the bridge-family
+   emergency drop matched only the master, which the bridge forward hook
+   never shows (the render's own audit-R05 comment says so). The test now
+   declares the real veth ports, exercising the production L2-sever
+   mechanism independent of any host module.
+3. `browser`: the distDir fix worked — built, served and driven by
+   Chromium; login failed with "Failed to fetch": `app.py` snapshotted
+   `get_settings()` at IMPORT for CORS, while the test sets
+   `API_ALLOWED_ORIGINS` after import (and pytest collection imports the
+   app module even earlier), so the run's ephemeral web origin was never
+   allowed. The CORS middleware now resolves origins when the middleware
+   stack is BUILT (app startup) — production behaviour unchanged (read
+   once, at boot); verified: a preflight from the configured origin gets
+   ACAO, any other origin does not.
+Verified locally after the fixes: fast default **114 passed** (new
+confined-profile regression), `db` gate PASS (113, real Docker),
+`containment` gate PASS (mount-inclusive probe + 21). Packet and browser
+remain CI-only gates.
+
 **Milestone 01 acceptance status:** all locally executable gates pass.
 Packet and browser gates fail closed here for missing prerequisites
 by design; per the plan they are accepted only when the required CI jobs pass

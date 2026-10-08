@@ -543,20 +543,29 @@ def check_containment() -> None:
     if not shutil.which("unshare"):
         fail("containment prerequisite", "unshare missing (namespace boundary)")
     # The supervisor REFUSES every start (exit 4) unless the trusted
-    # user+mount+cgroup+pid boundary can actually be created. Ubuntu 24.04+
-    # (GitHub runners included) restricts unprivileged user namespaces via
-    # AppArmor — probe the exact boundary here so the gate names the real
-    # prerequisite instead of 15 tests failing on "command never started".
+    # user+mount+cgroup+pid boundary can actually be created AND the two
+    # mounts it performs inside (cgroup2 remount, tmpfs state mask)
+    # succeed. Ubuntu 24.04+ (GitHub runners included) restricts
+    # unprivileged user namespaces via AppArmor, and a profile that only
+    # grants userns while leaving the process "unconfined" still has
+    # capability stripped inside the new namespace — so probe the FULL
+    # boundary here, mounts included, instead of letting every test fail
+    # on "command never started" / exit 96.
     boundary = ["unshare", "--user", "--map-root-user", "--mount",
-                "--cgroup", "--pid", "--fork", "--mount-proc", "/bin/true"]
+                "--cgroup", "--pid", "--fork", "--mount-proc",
+                "sh", "-c", "mount -t cgroup2 cgroup2 /sys/fs/cgroup "
+                            "&& mount -t tmpfs tmpfs /mnt"]
     r = run(boundary, echo=False, timeout=60)
     if r.returncode != 0:
-        fail("trusted command boundary (unshare userns)",
-             "unshare --user refused — unprivileged user namespaces are "
-             "restricted here (Ubuntu AppArmor?); the supervisor would refuse "
-             "every start. In CI the workflow loads the scoped /usr/bin/unshare "
-             "AppArmor profile; do NOT disable the restriction globally.")
-    ok("trusted command boundary (user+mnt+cgroup+pid namespaces) creatable")
+        fail("trusted command boundary (unshare userns + cgroup2/tmpfs mounts)",
+             "the boundary or its inner mounts were refused — unprivileged "
+             "user namespaces are restricted here (Ubuntu AppArmor?); the "
+             "supervisor would refuse every start. In CI the workflow loads "
+             "the scoped CONFINED /usr/bin/unshare AppArmor profile (a "
+             "flags=(unconfined) profile is NOT enough — capability is "
+             "stripped inside the namespace); do NOT disable the "
+             "restriction globally.")
+    ok("trusted command boundary (user+mnt+cgroup+pid namespaces + mounts) creatable")
     _migration_probe(root)
     # full wrapper path (review P1): the UNPRIVILEGED phase of
     # infra/dev/run_in_cgroup.sh — create a child cgroup, migrate a real

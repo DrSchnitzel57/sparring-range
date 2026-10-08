@@ -93,22 +93,42 @@ jobs:
         # profile for exactly one binary (/usr/bin/unshare) on this
         # disposable runner VM — never the global
         # kernel.apparmor_restrict_unprivileged_userns=0 switch.
+        #
+        # The profile MUST be a real CONFINED profile (upstream apparmor's
+        # bwrap-userns-restrict pattern), NOT flags=(unconfined)+userns:
+        # a flags=(unconfined) profile leaves the process in the kernel's
+        # "unconfined state", and Ubuntu then transitions such userns
+        # creators into the restrictive unprivileged_userns profile, whose
+        # `deny capability` makes the boundary's cgroup2/tmpfs mounts fail
+        # (exit 96). A confined profile keeps its own permissions inside
+        # the namespace, and exec'd children (bash, mount, the command)
+        # inherit it. Grants are the minimum the boundary performs.
         run: |
           set -euo pipefail
           sudo tee /etc/apparmor.d/usr.bin.unshare > /dev/null <<'EOF'
           abi <abi/4.0>,
           include <tunables/global>
 
-          profile unshare /usr/bin/unshare flags=(unconfined) {
-            userns,
+          profile unshare /usr/bin/unshare flags=(attach_disconnected,mediate_deleted) {
+            allow capability,
+            allow file rwlkm /{**,},
+            allow network,
+            allow unix,
+            allow ptrace,
+            allow signal,
+            allow userns,
+            allow mount,
+            allow umount,
 
             include if exists <local/unshare>
           }
           EOF
           sudo apparmor_parser -r /etc/apparmor.d/usr.bin.unshare
-          # prove the exact boundary the supervisor needs now works
+          # prove the FULL boundary the supervisor needs — namespace AND
+          # the two mounts it performs inside (cgroup2 remount, tmpfs mask)
           unshare --user --map-root-user --mount --cgroup --pid --fork \
-            --mount-proc /bin/true
+            --mount-proc sh -c 'mount -t cgroup2 cgroup2 /sys/fs/cgroup \
+            && mount -t tmpfs tmpfs /mnt'
       - &delegate-cgroup
         name: Delegate a cgroup v2 subtree for runner containment
         run: |
