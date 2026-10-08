@@ -140,6 +140,17 @@ class PgFixture:
         if r.returncode != 0:
             raise RuntimeError(
                 f"volume create failed: {(r.stderr or r.stdout).strip()[:300]}")
+        # `docker volume create` SUCCEEDS for an already-existing volume and
+        # keeps its original labels (review P2 round 5): a race that plants a
+        # foreign volume between the absence check and the create would
+        # otherwise get MOUNTED into postgres. Verify our nonce landed
+        # before anything is allowed to touch the volume.
+        nonce = self._owner_nonce("volume", self.volume)
+        if nonce != self.run_id:
+            raise RuntimeError(
+                f"volume {self.volume} does not carry this run's ownership "
+                f"nonce after create (found {nonce!r}) — refusing to mount a "
+                "volume this run did not create")
         if self._inspect_state("container", self.container) == "exists":
             raise RuntimeError(
                 f"container {self.container} already exists — refusing to "
@@ -193,19 +204,25 @@ class PgFixture:
         returned for the caller to treat as fatal.
         """
         problems: list[str] = []
-        for kind, name, claimed in (
-                ("container", self.container, self._owned_container),
-                ("volume", self.volume, self._owned_volume)):
-            if not claimed:
+        for kind, name, attr in (
+                ("container", self.container, "_owned_container"),
+                ("volume", self.volume, "_owned_volume")):
+            if not getattr(self, attr):
                 continue
             try:
                 nonce = self._owner_nonce(kind, name)
             except RuntimeError as e:
-                problems.append(f"{kind} {name}: {e} — NOT removed")
+                # claim RETAINED: identity is unresolved, a later cleanup()
+                # must retry rather than silently report success
+                problems.append(f"{kind} {name}: {e} — NOT removed (retry "
+                                "pending)")
                 continue
             if nonce is None:
-                continue  # gone: never created, or already removed
+                setattr(self, attr, False)  # confirmed absent: resolved
+                continue
             if nonce != self.run_id:
+                # claim RETAINED: a foreign resource under our names is an
+                # unresolved condition, never silently forgotten
                 problems.append(
                     f"{kind} {name} exists WITHOUT this run's ownership label "
                     f"(found {nonce!r}) — left in place, NOT removed")
@@ -218,8 +235,8 @@ class PgFixture:
                     and "not found" not in err):
                 problems.append(f"{kind} {name}: "
                                 f"{(r.stderr or r.stdout).strip()[:200]}")
-        self._owned_container = False
-        self._owned_volume = False
+                continue  # claim RETAINED: removal must be retried
+            setattr(self, attr, False)  # removed (or vanished): resolved
         return problems
 
     # -- access -------------------------------------------------------------

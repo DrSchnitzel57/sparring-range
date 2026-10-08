@@ -215,6 +215,24 @@ Round-4 gate results: fast default **111 passed, 0 failed, 0 skipped,
 dropped-phase probe) PASS; `db` PASS with failure-path + collision probes
 (nonce-verified teardown).
 
+**Round-5 review fixes (2026-10-08, post-`b97cfa9` review — VERDICT: FIX,
+both items):** `docker volume create` succeeds for an already-existing
+volume and keeps its FOREIGN label (re-verified against real Docker here),
+so the fixture now verifies its ownership nonce landed **immediately after
+creation and before the volume is mounted** into postgres — a raced foreign
+volume is refused, never mounted, never removed. `cleanup()` no longer
+clears its tracking flags on failure: identity-inspection errors, failed
+removals, and foreign-nonce resources RETAIN the claim so every subsequent
+`cleanup()` retries and re-reports until the resource is confirmed removed
+or absent (only then is the obligation cleared). Regressions: raced-volume
+(never mounted, never removed, obligation retained), retained-retry for
+foreign containers and unconfirmable identity, and resolution-clears-claim
+transitions.
+
+Round-5 gate results: fast default **112 passed, 0 failed, 0 skipped,
+139 deselected**; `db` PASS against real Docker (post-create nonce check on
+the happy path, failure-path + collision probes, 113 passed required mode).
+
 **Milestone 01 acceptance status:** all locally executable gates pass.
 Packet and browser gates fail closed here for missing prerequisites
 by design; per the plan they are accepted only when the required CI jobs pass

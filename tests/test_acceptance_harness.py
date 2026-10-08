@@ -124,13 +124,15 @@ NO_SUCH_VOLUME = "Error response from daemon: No such volume: xyz"
 
 def _fake_docker(monkeypatch, *, nonce, volume="absent", container="absent",
                  fail_on=None, timeout_on=None, planted=False,
-                 identity_error=False):
+                 volume_planted=False, identity_error=False):
     """Fault-inject pg_fixture's docker calls; returns the call log.
 
     Resources come into existence through THIS fixture's own create calls
     (carrying `nonce`), so cleanup identity checks see reality: our creates
     match, a `planted` run conflict carries someone else's nonce, and
-    `identity_error` makes every nonce lookup fail.
+    `identity_error` makes every nonce lookup fail. `volume_planted`
+    reproduces docker's real idempotence: `volume create` SUCCEEDS for an
+    existing volume but keeps the FOREIGN label.
     """
     calls: list[list[str]] = []
     state = {"volume": volume, "container": container,
@@ -144,7 +146,9 @@ def _fake_docker(monkeypatch, *, nonce, volume="absent", container="absent",
                 raise subprocess.TimeoutExpired(cmd=["docker", *args], timeout=1)
             if fail_on == ["volume", "create"]:
                 return _FakeR(1, "", "injected failure")
-            state["volume"], state["volume_nonce"] = "exists", nonce
+            state["volume"] = "exists"
+            state["volume_nonce"] = ("someone-else" if volume_planted
+                                     else nonce)
             return _FakeR(0)
         if head == ["run", "-d"]:
             if planted:
@@ -250,7 +254,30 @@ def test_pg_fixture_raced_collision_is_never_deleted(monkeypatch):
     with pytest.raises(RuntimeError, match="left in place"):
         fx.start()
     assert ["rm", "-f", fx.container] not in calls  # foreign kept
+    # review P2 round 5: the unresolved foreign resource keeps the cleanup
+    # obligation — a second cleanup must RETRY/RE-REPORT, not silence it
+    problems = fx.cleanup()
+    assert problems and "left in place" in problems[0]
+    assert ["rm", "-f", fx.container] not in calls
+    # ...and once it is genuinely gone, the obligation resolves
+    calls2 = _fake_docker(monkeypatch, nonce="t6")  # everything absent
     assert fx.cleanup() == []
+
+
+def test_pg_fixture_raced_volume_is_never_mounted(monkeypatch):
+    # review P2 round 5: docker volume create SUCCEEDS for an existing
+    # volume and keeps its foreign label. The fixture must verify its nonce
+    # landed BEFORE mounting the volume into postgres — and must never
+    # remove the foreign volume.
+    calls = _fake_docker(monkeypatch, nonce="t9", volume_planted=True)
+    fx = pgf.PgFixture(run_id="t9")
+    with pytest.raises(RuntimeError, match="refusing to mount"):
+        fx.start()
+    assert not any(c[:2] == ["run", "-d"] for c in calls)  # never mounted
+    assert ["volume", "rm", fx.volume] not in calls  # foreign kept
+    problems = fx.cleanup()  # obligation retained
+    assert problems and "left in place" in problems[0]
+    assert ["volume", "rm", fx.volume] not in calls
 
 
 def test_pg_fixture_inspection_error_is_not_absence(monkeypatch):
@@ -267,13 +294,18 @@ def test_pg_fixture_inspection_error_is_not_absence(monkeypatch):
 
 def test_pg_fixture_unconfirmable_identity_is_not_deleted(monkeypatch):
     # cleanup verifies the nonce BEFORE deleting; if that check errors, the
-    # resource is left in place and the problem is surfaced
+    # resource is left in place, the problem is surfaced, and the claim is
+    # RETAINED for retry (review P2 round 5)
     calls = _fake_docker(monkeypatch, nonce="t8", fail_on=["run", "-d"],
                          identity_error=True)
     fx = pgf.PgFixture(run_id="t8")
     with pytest.raises(RuntimeError, match="NOT removed"):
         fx.start()
     assert ["rm", "-f", fx.container] not in calls
+    problems = fx.cleanup()  # retry obligation retained
+    assert problems and "retry pending" in problems[0]
+    _fake_docker(monkeypatch, nonce="t8")  # identity resolvable, gone
+    assert fx.cleanup() == []  # resolved: obligation cleared
 
 
 # ---------------------------------------------------------------- cgroup wrapper
