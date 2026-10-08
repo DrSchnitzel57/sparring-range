@@ -132,6 +132,10 @@ def build_aar(events: list[dict], scenario: dict, scorecard: dict | None,
         if narrative.strip():
             narrative_block = "## Coach narrative (citations validated)\n" + narrative.strip() + "\n"
 
+    # precomputed: a backslash inside an f-string EXPRESSION is a SyntaxError
+    # before Python 3.12 (the supported matrix starts at 3.11)
+    red_block = ("\n" + red_note) if red_note else ""
+
     md = f"""# After-Action Review — {scenario.get('name', scenario.get('id', '?'))}
 {score_line}
 
@@ -149,7 +153,7 @@ def build_aar(events: list[dict], scenario: dict, scorecard: dict | None,
 
 ## Techniques observed in evidence
 {', '.join(f"`{t}`" for t in sorted(observed)) or 'none directly observed'}
-{('\\n' + red_note) if red_note else ''}
+{red_block}
 
 ## NIST CSF coverage of this session's evidence
 {csf_section}

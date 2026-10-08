@@ -73,11 +73,18 @@ class PgFixture:
             if pull.returncode != 0:
                 raise PrerequisiteMissing(
                     f"cannot pull {IMAGE}: {(pull.stderr or pull.stdout).strip()[:200]}")
-        # named volume FIRST so a failed container start still has a tracked,
-        # removable resource (no orphan storage)
-        if _docker(["volume", "create", self.volume], check=True).returncode != 0:
-            raise RuntimeError("volume create failed")
+        # names are unique per run, so cleanup may always attempt removal —
+        # ownership is claimed BEFORE each create/start so a PARTIAL startup
+        # (volume made, container created but failed to start, died during
+        # readiness) can never strand a resource (review P2)
         self._owned_volume = True
+        r = _docker(["volume", "create", self.volume])
+        if r.returncode != 0:
+            problems = self.cleanup()
+            raise RuntimeError(f"volume create failed: "
+                               f"{(r.stderr or r.stdout).strip()[:300]}"
+                               + (f"; cleanup problems: {problems}" if problems else ""))
+        self._owned_container = True
         r = _docker([
             "run", "-d", "--name", self.container,
             "--label", f"sr-range-run={self.run_id}",
@@ -88,15 +95,20 @@ class PgFixture:
             IMAGE,
         ])
         if r.returncode != 0:
-            self.cleanup()
-            raise RuntimeError(f"postgres container start failed: "
-                               f"{(r.stderr or r.stdout).strip()[:400]}")
-        self._owned_container = True
+            # docker may have CREATED the container before failing (e.g. an
+            # occupied port) — cleanup removes whatever exists under our
+            # unique names and SURFACES any residue
+            problems = self.cleanup()
+            raise RuntimeError(
+                f"postgres container start failed: "
+                f"{(r.stderr or r.stdout).strip()[:400]}"
+                + (f"; cleanup problems: {problems}" if problems else ""))
         try:
             self._wait_ready(timeout=90)
-        except Exception:
-            self.cleanup()
-            raise
+        except Exception as e:
+            problems = self.cleanup()
+            raise RuntimeError(f"{e}"
+                               + (f"; cleanup problems: {problems}" if problems else ""))
         return self
 
     def _wait_ready(self, timeout: float) -> None:
@@ -122,21 +134,22 @@ class PgFixture:
               file=sys.stderr)
 
     def cleanup(self) -> list[str]:
-        """Remove ONLY the resources this fixture created. Returns the list
-        of failures (empty = clean); callers must treat non-empty as fatal."""
+        """Remove exactly the resources THIS fixture names (unique per run).
+        Always attempts both removals and tolerates 'not found' (idempotent);
+        returns every other failure — callers must treat non-empty as fatal."""
         problems: list[str] = []
-        if self._owned_container:
-            r = _docker(["rm", "-f", self.container], timeout=60)
-            if r.returncode != 0 and "No such container" not in (r.stderr or ""):
-                problems.append(f"container {self.container}: "
-                                f"{(r.stderr or r.stdout).strip()[:200]}")
-            self._owned_container = False
-        if self._owned_volume:
-            r = _docker(["volume", "rm", self.volume], timeout=60)
-            if r.returncode != 0 and "not found" not in (r.stderr or ""):
-                problems.append(f"volume {self.volume}: "
-                                f"{(r.stderr or r.stdout).strip()[:200]}")
-            self._owned_volume = False
+        r = _docker(["rm", "-f", self.container], timeout=60)
+        err = (r.stderr or "").lower()
+        if r.returncode != 0 and "no such container" not in err:
+            problems.append(f"container {self.container}: "
+                            f"{(r.stderr or r.stdout).strip()[:200]}")
+        self._owned_container = False
+        r = _docker(["volume", "rm", self.volume], timeout=60)
+        err = (r.stderr or "").lower()
+        if r.returncode != 0 and "not found" not in err and "no such volume" not in err:
+            problems.append(f"volume {self.volume}: "
+                            f"{(r.stderr or r.stdout).strip()[:200]}")
+        self._owned_volume = False
         return problems
 
     # -- access -------------------------------------------------------------

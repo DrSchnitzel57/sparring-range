@@ -79,7 +79,8 @@ export default function Replay() {
         <div ref={rootRef} style={{ minHeight: 100 }} />
         {!epoch && <p className="bad">recording has no epoch header — timeline alignment disabled</p>}
       </div>
-      <div className="panel" data-seek-at={seekAt === null ? "" : String(seekAt)}>
+      <div className="panel" data-seek-at={seekAt === null ? "" : String(seekAt)}
+           data-now={String(now)}>
         <h3>event timeline</h3>
         {data.timeline.map((e) => {
           const off = offsetOf(e.ts);

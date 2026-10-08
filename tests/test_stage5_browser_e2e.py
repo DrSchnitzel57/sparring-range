@@ -317,17 +317,22 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
 
         # ---- replay: player mounts and a timeline click REALLY seeks ---------
         # a synthetic bastion recording (cast under RECORDINGS_DIR + row),
-        # exactly what the bastion would have registered
+        # exactly what the bastion would have registered. The epoch is 300s
+        # in the past and the frames sit at 1s and 3600s, so every session
+        # event offset lands inside the recording and the two frames bracket
+        # the seek target: after a real seek the FIRST frame's text must be
+        # rendered and the SECOND's must not — a no-op seek cannot produce
+        # that state.
         import time as _t
         rec_dir = tmp_path / "rec"
         rec_dir.mkdir(exist_ok=True)
         cast = rec_dir / "e2e.cast"
-        epoch = int(_t.time()) - 30
+        epoch = int(_t.time()) - 300
         cast.write_text(
             json.dumps({"version": 2, "width": 80, "height": 24,
                         "timestamp": epoch, "title": "e2e"}) + "\n"
-            + json.dumps([1.0, "o", "blue@web01:~$ hardening done\r\n"]) + "\n"
-            + json.dumps([5.0, "o", "flag captured\r\n"]) + "\n")
+            + json.dumps([1.0, "o", "hardening done\r\n"]) + "\n"
+            + json.dumps([3600.0, "o", "flag captured\r\n"]) + "\n")
         eng = create_engine(test_db_url_owner)
         with eng.begin() as conn:
             conn.execute(text(
@@ -346,18 +351,39 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
             time.sleep(0.5)
         else:
             pytest.fail("asciinema-player never mounted on the replay page")
-        # clicking a timeline event seeks the player (observable data-seek-at)
-        pw("click", 'div[title^="#"] >> nth=0')
-        deadline = time.time() + 15
+
+        def _eval(expr: str) -> str:
+            return pw("--raw", "eval", expr).stdout.strip().strip('"')
+
+        # paused at t=0: the 1s frame is NOT rendered yet
+        assert "hardening done" not in _eval(
+            "document.querySelector('.asciinema-player').textContent")
+
+        # the first timeline row shows its offset; it must sit strictly
+        # between the two frames for the content assertion to prove position
+        row = 'div[title^="#"] >> nth=0'
+        off = float(_eval(
+            "document.querySelector('div[title^=\"#\"]').innerText").split("s")[0])
+        assert 1.5 < off < 3590, f"event offset {off}s outside the frame bracket"
+
+        pw("click", row)
+        # the player's OWN reported position (polled into data-now) must move
+        # to the seek target, and the rendered frame content must change to
+        # match that position — never just a click-side bookkeeping value
+        deadline = time.time() + 20
         while time.time() < deadline:
-            v = pw("--raw", "eval",
-                   "document.querySelector('[data-seek-at]').getAttribute('data-seek-at')"
-                   " || ''").stdout.strip().strip('"')
-            if v and v != "null":
+            now_v = _eval("document.querySelector('[data-now]').getAttribute('data-now')")
+            text = _eval("document.querySelector('.asciinema-player').textContent")
+            try:
+                moved = abs(float(now_v) - off) <= 2.0
+            except ValueError:
+                moved = False
+            if moved and "hardening done" in text and "flag captured" not in text:
                 break
             time.sleep(0.5)
         else:
-            pytest.fail("timeline click never produced a seek")
+            pytest.fail(f"timeline click never produced a real seek: "
+                        f"data-now={now_v}, target={off}, rendered={text[:200]!r}")
 
         # ---- progress page reflects the scored session ------------------------
         pw("click", 'a[href="/progress"]')

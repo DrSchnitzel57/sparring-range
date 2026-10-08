@@ -135,8 +135,38 @@ resume paths (now requires current capability evidence, F3), and migration
 concurrently-removed operation cgroup tree as confirmed cessation (kernel only
 removes empty cgroups). No safety regression was deleted or weakened.
 
-**Milestone 01 acceptance status:** all locally executable gates pass at
-`ac5a61b`. Packet and browser gates fail closed here for missing prerequisites
+**Review fixes (2026-10-08, post-`ac5a61b` review — VERDICT: FIX, all 8 items):**
+Python 3.11 rejected a backslash inside an f-string expression in
+`srplatform/coach/aar.py` — rewritten compatibly; the full 3.11/3.12/3.13
+matrix now passes `acceptance.py python`. The CI db job now also delegates a
+cgroup v2 subtree (the layer includes four DB+containment worker-chain tests),
+and delegation is proven by a migration positive control both in the CI step
+and inside `acceptance.py containment` (a real process is migrated in and
+observed there — ownership alone is not permission). The compose override now
+uses `!override` to REPLACE base port mappings (verified via `compose config`),
+and the gate holds the default ports 5432/8000/2222 for its whole run. The PG
+fixture claims ownership before each create/start, surfaces cleanup failures,
+is idempotent, and `acceptance.py db` now runs a failure-path probe (occupied
+port → fails and strands nothing). The frontend audit gate fails closed on
+error responses/unparsable/missing metadata, and the skip gate read the wrong
+count key (`skip` vs pytest's `skipped`) — both fixed with harness unit
+regressions (`tests/test_acceptance_harness.py`, 4 tests). Replay coverage now
+proves a REAL seek: the player's own polled position (`data-now`) must reach
+the clicked event's offset and the rendered frame content must change to match
+(bracketing frames at 1s/3600s). Compose verification now checks the exact
+alembic head, DB-backed `/readyz`, the API's app-role-only credential env, and
+authenticated account operations with idempotent rerun behavior (bootstrap
+closed 403, duplicate member 409, login survives rerun).
+
+Post-fix gate results at this revision: fast default **101 passed, 0 failed,
+0 skipped, 139 deselected**; `selection` PASS (240 total); `python` PASS on
+3.11.17/3.12.15/3.13.5; `db` PASS (failure-path probe + **113 passed,
+0 skipped**); `containment` PASS (migration probe + 21 passed); `frontend`
+PASS; `compose` PASS with default ports held (exact-head migrations,
+credential split, `/readyz`, account ops, idempotent rerun, clean teardown).
+
+**Milestone 01 acceptance status:** all locally executable gates pass.
+Packet and browser gates fail closed here for missing prerequisites
 by design; per the plan they are accepted only when the required CI jobs pass
 after the operator pushes. Milestone remains until then.
 

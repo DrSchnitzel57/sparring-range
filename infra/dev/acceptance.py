@@ -26,6 +26,7 @@ import os
 import pathlib
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -44,6 +45,27 @@ COUNT_RE = re.compile(r"(\d+) (passed|failed|errors?|skipped|deselected)")
 
 class Failed(Exception):
     pass
+
+
+def audit_vulnerabilities(stdout: str, returncode: int) -> dict:
+    """Strictly evaluate `npm audit --json` output. FAILS on an error
+    response (registry unreachable, bad lockfile...), unparsable output, or
+    missing vulnerability metadata — an audit that never ran must never read
+    as zero findings (review P2: fail-open)."""
+    try:
+        data = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        raise Failed(f"production audit produced unparsable JSON "
+                     f"(exit {returncode}): {stdout[:300]!r}")
+    if not isinstance(data, dict) or "error" in data:
+        err = data.get("error") if isinstance(data, dict) else data
+        raise Failed(f"production audit errored (exit {returncode}): "
+                     f"{str(err)[:300]}")
+    meta = data.get("metadata")
+    if not isinstance(meta, dict) or not isinstance(meta.get("vulnerabilities"), dict):
+        raise Failed(f"production audit JSON lacks metadata.vulnerabilities "
+                     f"(exit {returncode}) — refusing to treat it as clean")
+    return meta["vulnerabilities"]
 
 
 def env_summary(extra: dict | None = None) -> str:
@@ -73,6 +95,14 @@ def parse_counts(out: str) -> dict:
     for value, label in COUNT_RE.findall(out):
         counts["error" if label == "errors" else label] = int(value)
     return counts
+
+
+def require_selection(counts: dict, layer: str) -> None:
+    """A required layer that selects NOTHING is never acceptance."""
+    if counts.get("passed", 0) + counts.get("failed", 0) + \
+            counts.get("skipped", 0) == 0:
+        fail(f"required layer {layer} selects tests",
+             f"empty selection ({counts}) — a required layer must execute")
 
 
 def pytest_run(args: list[str], env: dict | None = None, timeout: int = 3600):
@@ -142,7 +172,7 @@ def check_selection() -> None:
     r, counts = pytest_run(["-ra"])
     if r.returncode != 0:
         fail("fast default passes", f"exit {r.returncode}: {r.stdout[-800:]}")
-    if counts.get("skip", 0):
+    if counts.get("skipped", 0):
         fail("fast default has no prerequisite skips", f"{counts}")
     ok("fast default passes without integration prerequisite skips",
        f"{counts.get('passed', 0)} passed, 0 skipped, "
@@ -177,7 +207,7 @@ def check_selection() -> None:
     r, counts = pytest_run(["-m", "packet and not packet"],
                            env={"SR_REQUIRE_PACKET": "1"}, timeout=120)
     selected = counts.get("passed", 0) + counts.get("failed", 0) + \
-        counts.get("skip", 0)
+        counts.get("skipped", 0)
     if selected != 0:
         fail("empty-selection detection", "expected zero selected tests")
     ok("required mode fails for an empty selection",
@@ -280,17 +310,55 @@ def _pg_fixture():
     return pg_fixture.PgFixture(port=int(port) if port else None).start()
 
 
+def _fixture_failure_probe() -> None:
+    """Failure-path regression (review P2): a start that fails partway (here:
+    an occupied port) must surface the error AND strand nothing — the run's
+    unique container/volume names must be gone afterwards."""
+    import pg_fixture
+    blocker = socket.socket()
+    blocker.bind(("127.0.0.1", 0))
+    port = blocker.getsockname()[1]
+    fx = pg_fixture.PgFixture(port=port)
+    try:
+        try:
+            fx.start()
+            started_ok = True
+        except RuntimeError:
+            started_ok = False
+        if started_ok:
+            fail("DB fixture fails on an occupied port", "start() succeeded")
+        problems = fx.cleanup()
+        if problems:
+            fail("DB fixture partial-startup cleanup", "; ".join(problems))
+        if _docker_probe(["inspect", fx.container]) == 0:
+            fail("DB fixture partial-startup cleanup",
+                 f"container {fx.container} survived the failed start")
+        if _docker_probe(["volume", "inspect", fx.volume]) == 0:
+            fail("DB fixture partial-startup cleanup",
+                 f"volume {fx.volume} survived the failed start")
+        ok("DB fixture failure path: occupied port fails and strands nothing")
+    finally:
+        fx.cleanup()
+        blocker.close()
+
+
+def _docker_probe(args: list[str]) -> int:
+    return subprocess.run(["docker", *args], capture_output=True).returncode
+
+
 def check_db() -> None:
+    _fixture_failure_probe()
     fx = _pg_fixture()
     try:
         env = {"SR_PG_ADMIN_URL": fx.admin_url(), "SR_REQUIRE_DB": "1"}
         r, counts = pytest_run(["-m", "db and not browser"], env=env, timeout=3600)
+        require_selection(counts, "db")
         if r.returncode != 0:
             fail("disposable DB layer (fresh + forward migrations + regressions)",
                  f"exit {r.returncode}, counts {counts}:\n{r.stdout[-1500:]}")
         ok("disposable DB layer passes in required mode",
            f"{counts.get('passed', 0)} passed, {counts.get('deselected', 0)} "
-           f"deselected, {counts.get('skip', 0)} skipped")
+           f"deselected, {counts.get('skipped', 0)} skipped")
         leftovers = fx.leftover_test_databases()
         if leftovers:
             fail("owned DB resources cleaned", f"leftovers: {leftovers}")
@@ -315,12 +383,49 @@ def _cgroup_root() -> str:
     return "/sys/fs/cgroup" + path
 
 
+def _migration_probe(root: str) -> None:
+    """Positive control (review P2/B10): prove the delegated subtree grants
+    REAL process-migration permission — ownership of a created directory is
+    not proof the kernel permits moving processes into it."""
+    op = f"probe{uuid.uuid4().hex[:8]}"
+    d = pathlib.Path(root) / f"sr-{op}"
+    d.mkdir()
+    p = subprocess.Popen(["sleep", "30"])
+    try:
+        try:
+            (d / "cgroup.procs").write_text(str(p.pid))
+        except OSError as e:
+            fail("delegated cgroup permits process migration",
+                 f"writing a pid into cgroup.procs failed: {e} — directory "
+                 "ownership alone is not migration permission; delegate the "
+                 "subtree properly (controllers enabled, writable domain)")
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if p.pid in [int(x) for x in (d / "cgroup.procs").read_text().split()]:
+                break
+            time.sleep(0.1)
+        else:
+            fail("delegated cgroup permits process migration",
+                 f"pid {p.pid} never appeared in {d}/cgroup.procs")
+        ok("delegated cgroup subtree permits real process migration (positive control)")
+    finally:
+        p.kill()
+        p.wait()
+        for _ in range(50):  # cgroup rmdir only succeeds once fully empty
+            try:
+                d.rmdir()
+                break
+            except OSError:
+                time.sleep(0.1)
+
+
 def check_containment() -> None:
     root = _cgroup_root()
     if not os.path.isdir(root) or not os.access(root, os.W_OK):
         fail("containment prerequisite", f"no writable delegated cgroup v2 root at {root!r}")
     if not shutil.which("unshare"):
         fail("containment prerequisite", "unshare missing (namespace boundary)")
+    _migration_probe(root)
     before = {p for p in pathlib.Path(root).glob("sr-*")}
     r, counts = pytest_run(["-m", "containment and not db"],
                            env={"SR_REQUIRE_CONTAINMENT": "1"}, timeout=1800)
@@ -328,7 +433,7 @@ def check_containment() -> None:
         fail("containment regressions in required mode",
              f"exit {r.returncode}, counts {counts}:\n{r.stdout[-1500:]}")
     ok("namespace/recursive-membership/cancellation regressions pass (required mode)",
-       f"{counts.get('passed', 0)} passed, {counts.get('skip', 0)} skipped")
+       f"{counts.get('passed', 0)} passed, {counts.get('skipped', 0)} skipped")
     leaked = {p for p in pathlib.Path(root).glob("sr-*")} - before
     if leaked:
         fail("containment fixture cleanup", f"leftover operation cgroups: {leaked}")
@@ -381,9 +486,10 @@ def check_frontend() -> None:
         fail("production build", (r.stderr or r.stdout)[-800:])
     ok("production build (next build)")
     r = run(["npm", "audit", "--omit=dev", "--json"], cwd=web, timeout=300)
-    data = json.loads(r.stdout)
-    vulns = data.get("metadata", {}).get("vulnerabilities", {})
+    vulns = audit_vulnerabilities(r.stdout, r.returncode)
     high, critical = vulns.get("high", 0), vulns.get("critical", 0)
+    if not all(isinstance(v, int) for v in vulns.values()):
+        fail("production audit metadata", f"non-integer severity counts: {vulns}")
     if high or critical:
         fail("production audit zero high/critical",
              f"high={high} critical={critical} — run `npm audit --omit=dev`")
@@ -413,23 +519,57 @@ def check_compose() -> None:
         "SR_ENV": "dev",
         "SR_COMPOSE_PROJECT": project,
     }
-    # run-specific LOOPBACK ports so parallel/occupied hosts never collide
-    override = pathlib.Path(tempfile.mkdtemp(prefix="sr-acc-compose-")) / "override.yml"
+    # Occupy the BASE compose ports (5432/8000/2222) for the whole run: the
+    # stack must come up entirely on run-specific ports while the defaults are
+    # taken, proving the override REPLACES (not appends to) the mappings.
+    held = []
+    for port in (5432, 8000, 2222):
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+            held.append(s)
+        except OSError:
+            print(f"  note: default port {port} already occupied by another "
+                  "process — isolation is still exercised, just not by us")
+    # run-specific LOOPBACK ports so parallel/occupied hosts never collide;
+    # !override REPLACES the base port list (plain lists merge/append)
+    override_dir = tempfile.mkdtemp(prefix="sr-acc-compose-")
+    override = pathlib.Path(override_dir) / "override.yml"
     api_port, pg_port, bastion_port = (_free() for _ in range(3))
     override.write_text(
         "services:\n"
         "  postgres:\n"
-        f"    ports: ['127.0.0.1:{pg_port}:5432']\n"
+        "    ports: !override\n"
+        f"      - '127.0.0.1:{pg_port}:5432'\n"
         "  api:\n"
-        f"    ports: ['127.0.0.1:{api_port}:8000']\n"
+        "    ports: !override\n"
+        f"      - '127.0.0.1:{api_port}:8000'\n"
         "  bastion:\n"
-        f"    ports: ['127.0.0.1:{bastion_port}:2222']\n")
+        "    ports: !override\n"
+        f"      - '127.0.0.1:{bastion_port}:2222'\n")
     keys_dir = _synthetic_operator_keys(tempfile.mkdtemp(prefix="sr-acc-keys-"))
     run_env["SR_DEPLOY_KEYS_DIR"] = str(keys_dir)
 
     def compose(*args, timeout=1800):
         return run([*_compose_base(project, run_env), *args],
                    env=run_env, cwd=REPO, timeout=timeout)
+
+    # the merged config must publish ONLY the run's ports
+    r = compose("-f", "docker-compose.yml", "-f", str(override), "config")
+    for base_mapping in ("5432:5432", "8000:8000", "2222:2222"):
+        if f"127.0.0.1:{base_mapping}" in r.stdout:
+            fail("compose port override replaces base mappings",
+                 f"merged config still publishes 127.0.0.1:{base_mapping}")
+    ok("compose config publishes only run-owned loopback ports",
+       f"api {api_port}, pg {pg_port}, bastion {bastion_port}")
+
+    # exact expected migration head, from this checkout's migration tree
+    r = run([PY, "-m", "alembic", "heads"], cwd=REPO, timeout=120)
+    m = re.search(r"(\S+) \(head\)", r.stdout)
+    if r.returncode != 0 or not m:
+        fail("resolve alembic head", (r.stdout + r.stderr)[-300:])
+    head = m.group(1)
 
     cleanup_problems: list[str] = []
     try:
@@ -448,8 +588,7 @@ def check_compose() -> None:
                      (r.stderr or r.stdout)[-800:])
             ok(f"compose bootstrap attempt {attempt} "
                f"({'fresh' if attempt == 1 else 'idempotent rerun'})")
-            _verify_compose_stack(compose, api_port)
-
+            _verify_compose_stack(compose, api_port, head, attempt, run_env)
         r = compose("ps", "--format", "json")
         states = {}
         for line in r.stdout.splitlines():
@@ -465,6 +604,8 @@ def check_compose() -> None:
             fail("bastion started after key seeding", str(states))
         ok("bastion running after seed-bastion-keys success gate", str(states))
     finally:
+        for s in held:
+            s.close()
         r = compose("down", "-v", "--remove-orphans", timeout=300)
         if r.returncode != 0:
             cleanup_problems.append(f"compose down: {(r.stderr or r.stdout)[-200:]}")
@@ -475,7 +616,7 @@ def check_compose() -> None:
             rr = run(["docker", "volume", "rm", vol], echo=False)
             if rr.returncode != 0:
                 cleanup_problems.append(f"volume {vol}")
-        shutil.rmtree(override.parent, ignore_errors=True)
+        shutil.rmtree(override_dir, ignore_errors=True)
         shutil.rmtree(keys_dir, ignore_errors=True)
     if cleanup_problems:
         fail("compose cleanup (only run-owned resources)", "; ".join(cleanup_problems))
@@ -511,39 +652,106 @@ def _synthetic_operator_keys(dirpath: str) -> pathlib.Path:
     return d
 
 
-def _verify_compose_stack(compose, api_port: int) -> None:
+def _http_json(method: str, url: str, body: dict | None = None,
+               headers: dict | None = None, timeout: int = 10) -> tuple[int, dict]:
+    import urllib.error
     import urllib.request
-    # migrations applied: alembic version at head, via the OWNER container
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Content-Type": "application/json",
+                                          **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        raw = e.read() or b"{}"
+        try:
+            return e.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return e.code, {"raw": raw.decode(errors="replace")[:200]}
+
+
+def _verify_compose_stack(compose, api_port: int, head: str, attempt: int,
+                          run_env: dict) -> None:
+    # 1. migrations applied at bootstrap: EXACT expected head, via the OWNER
     r = compose("exec", "-T", "postgres", "psql", "-U", "sr_owner",
                 "-d", "sparring_range", "-tAc",
                 "SELECT version_num FROM alembic_version", timeout=60)
-    if r.returncode != 0 or not r.stdout.strip():
-        fail("compose migrations", (r.stderr or r.stdout)[-300:])
-    ok("migrations applied at bootstrap", f"alembic version {r.stdout.strip()}")
-    # app-role API access: the API (app role ONLY) answers readiness
-    deadline = time.time() + 60
+    got = r.stdout.strip()
+    if r.returncode != 0 or got != head:
+        fail("compose migrations at exact head",
+             f"want {head!r}, got {got!r} (rc {r.returncode}) "
+             f"{(r.stderr or '')[-200:]}")
+    ok(f"migrations applied at bootstrap (attempt {attempt})",
+       f"alembic version == head {head}")
+
+    # 2. the API runtime must hold app-role credentials ONLY (audit R12)
+    r = compose("exec", "-T", "api", "env", timeout=60)
+    env_lines = dict(l.split("=", 1) for l in r.stdout.splitlines() if "=" in l)
+    app_pw = run_env["SR_DEV_APP_PASSWORD"]
+    if "POSTGRES_URL_OWNER" in env_lines:
+        fail("compose credential split", "API env contains POSTGRES_URL_OWNER")
+    api_db_url = env_lines.get("POSTGRES_URL", "")
+    if ("sr_app:" not in api_db_url or app_pw not in api_db_url
+            or "sr_owner" in api_db_url):
+        fail("compose credential split",
+             f"API POSTGRES_URL is not the interpolated app role: {api_db_url[:80]}")
+    ok("API runtime holds app-role credentials only (no owner URL)")
+
+    # 3. DB-backed readiness: /readyz actually queries the DB and the schema
+    api = f"http://127.0.0.1:{api_port}"
+    deadline = time.time() + 90
     last = None
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{api_port}/healthz",
-                                        timeout=3) as resp:
-                if resp.status == 200:
-                    break
-            last = f"status {resp.status}"
+            code, body = _http_json("GET", f"{api}/readyz")
+            last = (code, body)
+            if code == 200 and body.get("ready"):
+                break
         except Exception as e:  # noqa: BLE001
             last = str(e)
         time.sleep(2)
     else:
-        fail("app-role API readiness", last or "never answered")
-    ok("API (app-role credentials only) answers readiness")
-    # the app role is real and can read the migrated schema (append-only
-    # protections are exercised by the db layer; here: wiring works)
+        fail("app-role API readiness (/readyz)", str(last))
+    code, body = last
+    if body.get("migration_version") != head or body.get("issues"):
+        fail("/readyz reports the migrated schema at head",
+             f"{code} {json.dumps(body)[:400]}")
+    ok(f"/readyz ready with DB + schema at head (attempt {attempt})",
+       f"migration_version={body.get('migration_version')}")
+
+    # 4. authenticated app-role account operations + idempotent behavior.
+    #    Every write below goes through the API's sr_app connection.
+    op_pw = "acc-operator-pw-9"
+    code, _ = _http_json("POST", f"{api}/auth/bootstrap",
+                         {"username": "drew", "password": op_pw})
+    if attempt == 1:
+        if code != 201:
+            fail("operator bootstrap through app-role API", f"{code}")
+    elif code != 403:
+        fail("bootstrap stays closed once provisioned (idempotent rerun)",
+             f"expected 403, got {code}")
+    code, body = _http_json("POST", f"{api}/auth/login",
+                            {"username": "drew", "password": op_pw})
+    if code != 200 or "token" not in body:
+        fail("operator login through app-role API", f"{code} {str(body)[:200]}")
+    op = {"Authorization": f"Bearer {body['token']}"}
+    code, _ = _http_json("POST", f"{api}/users",
+                         {"username": "acc-member", "password": "acc-member-pw-9",
+                          "role": "member"}, op)
+    if attempt == 1 and code != 201:
+        fail("member account creation through app-role API", f"{code}")
+    if attempt == 2 and code != 409:
+        fail("account creation is idempotent-visible (409 on rerun)", f"{code}")
+    # the write is really in the DB, readable via the app role
     r = compose("exec", "-T", "postgres", "psql", "-U", "sr_app",
-                "-d", "sparring_range", "-tAc", "SELECT 1 FROM events LIMIT 1",
+                "-d", "sparring_range", "-tAc",
+                "SELECT count(*) FROM users WHERE username = 'acc-member'",
                 timeout=60)
-    if r.returncode != 0:
-        fail("app-role DB access", (r.stderr or r.stdout)[-300:])
-    ok("app role can query the migrated schema")
+    if r.returncode != 0 or r.stdout.strip() != "1":
+        fail("app-role account write visible in DB",
+             f"rc {r.returncode} out {r.stdout.strip()!r}")
+    ok(f"authenticated app-role account ops + idempotence (attempt {attempt})")
 
 
 # -------------------------------------------------------------------------- #
@@ -561,7 +769,7 @@ def check_browser() -> None:
             fail("isolated real-browser workflow/replay",
                  f"exit {r.returncode}, counts {counts}:\n{r.stdout[-2000:]}")
         ok("isolated real-browser workflow + replay pass",
-           f"{counts.get('passed', 0)} passed, {counts.get('skip', 0)} skipped")
+           f"{counts.get('passed', 0)} passed, {counts.get('skipped', 0)} skipped")
     finally:
         problems = fx.cleanup()
         if problems:

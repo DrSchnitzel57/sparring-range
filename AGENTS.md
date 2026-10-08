@@ -124,7 +124,7 @@ fixture or live/privileged gate was started during this planning baseline.
 ### Superseded by milestone-01 implementation (2026-10-08, `ac5a61b`)
 
 The ten baseline failures and the frontend audit findings above are repaired:
-the no-admin default is now **97 passed, 0 failed, 0 skipped, 139 deselected**,
+the no-admin default is now **101 passed, 0 failed, 0 skipped, 139 deselected**,
 and `npm audit --omit=dev` reports 0 vulnerabilities. Layer membership derives
 from the fixture closure; per-gate acceptance runs through
 `python infra/dev/acceptance.py <check>`. Exact results and the pending CI

@@ -16,6 +16,46 @@ permissions:
 env:
   PYTHONDONTWRITEBYTECODE: "1"
 
+# The db layer includes tests combining DB + containment prerequisites (the
+# worker-chain regressions). BOTH jobs below therefore delegate a cgroup v2
+# subtree, and the delegation is PROVEN with a migration positive control —
+# ownership of a created directory alone is not permission (audit B10).
+# The acceptance gate re-probes migration before running anything.
+defaults:
+  run:
+    shell: bash
+
+# YAML anchor: delegate cgroup v2 AND prove migration permission with a real
+# move (a process is migrated in and observed there before the job proceeds).
+# If the kernel refuses the move, the step fails — no silently-unrun boundary.
+# (Top-level x-* keys are permitted metadata carriers for workflow anchors.)
+x-delegate-cgroup: &delegate-cgroup
+  name: Delegate a cgroup v2 subtree (migration positive control)
+  run: |
+    set -euo pipefail
+    test "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs || {
+      echo "no cgroup v2 on this runner"; exit 1; }
+    sudo mkdir -p /sys/fs/cgroup/srrunner
+    sudo chown "$(id -u):$(id -g)" /sys/fs/cgroup/srrunner
+    # enable controllers for children so the delegated subtree is usable
+    if [ -w /sys/fs/cgroup/cgroup.subtree_control ]; then
+      for c in $(cat /sys/fs/cgroup/cgroup.controllers); do
+        echo "+$c" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null 2>&1 || true
+      done
+    fi
+    # POSITIVE CONTROL: actually migrate a process into the subtree
+    mkdir -p /sys/fs/cgroup/srrunner/sr-delegate-probe
+    sleep 20 & pid=$!
+    echo "$pid" | tee /sys/fs/cgroup/srrunner/sr-delegate-probe/cgroup.procs
+    deadline=$((SECONDS+10))
+    until grep -q sr-delegate-probe "/proc/$pid/cgroup"; do
+      [ "$SECONDS" -lt "$deadline" ] || { echo "migration into the delegated subtree never took effect"; kill "$pid" 2>/dev/null || true; exit 1; }
+      sleep 0.2
+    done
+    kill "$pid" 2>/dev/null || true
+    rmdir /sys/fs/cgroup/srrunner/sr-delegate-probe
+    echo "RUNNER_CGROUP_ROOT=/sys/fs/cgroup/srrunner" >> "$GITHUB_ENV"
+
 jobs:
   selection:
     # classification invariants: every test is fast-default or a required
@@ -59,7 +99,9 @@ jobs:
 
   db:
     # disposable postgres:16 fixture (run-owned container/volume): fresh
-    # migrations, populated forward 0010 upgrade, grants, regressions
+    # migrations, populated forward 0010 upgrade, grants, regressions. The
+    # layer includes worker-chain tests that ALSO need the containment
+    # boundary, so this job provides BOTH prerequisites.
     timeout-minutes: 40
     runs-on: ubuntu-latest
     steps:
@@ -70,6 +112,7 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install -r requirements.lock
           .venv/bin/pip install --no-deps -e .
+      - *delegate-cgroup
       - run: .venv/bin/python infra/dev/acceptance.py db
 
   containment:
@@ -85,12 +128,7 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install -r requirements.lock
           .venv/bin/pip install --no-deps -e .
-      - name: Delegate a cgroup v2 subtree for runner containment
-        run: |
-          test "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs
-          sudo mkdir -p /sys/fs/cgroup/srrunner
-          sudo chown "$USER" /sys/fs/cgroup/srrunner
-          echo "RUNNER_CGROUP_ROOT=/sys/fs/cgroup/srrunner" >> "$GITHUB_ENV"
+      - *delegate-cgroup
       - run: .venv/bin/python infra/dev/acceptance.py containment
 
   packet:
