@@ -7,8 +7,9 @@ Release contract: [ARCHITECTURE.md](ARCHITECTURE.md); ordered work:
 
 **Not release-ready.** This replaces accumulated remediation checkmarks. Existing
 repairs and regression tests are valuable, but historical green totals and reports
-are not fresh acceptance. Milestone 01 has verified green CI but is reopened by
-independent review below. No live attacks are authorized; later milestones remain
+are not fresh acceptance. Milestone 01 is accepted after independent review
+reopened it and a repair round closed the findings (see below). No live attacks
+are authorized; later milestones remain
 unaccepted. Documentation changes do not repair the application.
 
 ## Evidence labels
@@ -510,8 +511,10 @@ green acceptance; the user's abbreviated email reference was not identified.
   verified `command` appears on the session page ONLY as an event
   `action_type` cell (no static text can satisfy the wait early).
 
-Pending before re-acceptance: CI browser-e2e pass at the repair revision plus
-one repeat-run stability check; db/selection/fast already rerun above.
+Re-accepted 2026-10-08: CI run 37855269245 at `62939f7` passed all ten jobs on
+the initial attempt and again on the repeat-run stability check (attempt 2,
+browser-e2e included); db/selection/fast gates rerun locally at the repair
+revision (113 / PASS / 128 passed).
 
 ## Release blockers and missing work
 

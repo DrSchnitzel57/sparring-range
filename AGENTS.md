@@ -130,9 +130,11 @@ from the fixture closure; per-gate acceptance runs through
 `python infra/dev/acceptance.py <check>`. Exact results are recorded in
 `docs/FINDINGS_CHECKLIST.md`; the CI-only gates (packet, browser) passed in
 run 37852029894 at `3539667`. Independent review at `27e2624` reopened
-milestone 01 for shared browser-build isolation and the edit to migration 0010;
-subsequent CI at the same commit also exposes intermittent browser command timing.
-see the findings checklist. Green gate results do not waive plan requirements.
+milestone 01 for shared browser-build isolation, the edit to migration 0010,
+and an intermittent browser command wait; all three were repaired at
+`62939f7` (run-owned fresh builds + fast isolation regressions, byte-exact
+migration restore, bounded event wait) and CI run 37855269245 passed all ten
+jobs on two attempts. Green gate results do not waive plan requirements.
 
 ## Validation commands and safety
 

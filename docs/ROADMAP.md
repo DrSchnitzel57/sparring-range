@@ -5,7 +5,8 @@ Design: [ARCHITECTURE.md](ARCHITECTURE.md). Baseline/open evidence:
 [OPERATOR_RUNBOOK.md](OPERATOR_RUNBOOK.md).
 
 These are **new release milestones**, not retroactive completion of the old
-M0–M7 plan. Milestone 01 has green CI but is reopened by independent review below.
+M0–M7 plan. Milestone 01 is accepted (reopened by independent review, then
+closed by the repair round recorded in the findings).
 Architecture and ordered scope are agreed; write the full implementation plan for **one milestone at a
 time**, inspect the then-current code, and obtain agreement before implementing.
 Plans go in `.openchamber/plans/NN-short-name.md`; do not write them all now.
@@ -17,7 +18,7 @@ is implementation work, not a hardware-only gate. Preserve existing useful fixes
 
 ## 01 — Reproducible baseline and release dependency hygiene
 
-- [ ] Accept milestone 01 (reopened by independent review, 2026-10-08).
+- [x] Accept milestone 01 (re-accepted after the independent review's repair round, 2026-10-08).
 
 **Goal:** trustworthy tests/CI and a reproducible developer stack before expanding
 the product. **Depends on:** the agreed release contract.
@@ -32,8 +33,14 @@ that cannot run on this host — all passed in run 37852029894 at `3539667`
 Independent review at `27e2624` reproduced safe local gates and checked hosted
 logs, but found a shared/reused browser build directory and an edit to migration
 0010 contrary to the approved plan. CI follow-up also found intermittent browser
-command-observation failure at the same commit (M01-R3). Fix these gaps and rerun affected gates before
-closing milestone 01. Requirements are unchanged; no milestone-02 plan exists.
+command-observation failure at the same commit (M01-R3).
+**Re-accepted (2026-10-08, `62939f7`):** M01-R1/R2/R3 repaired (fresh run-owned
+build dirs with override rejection + cleanup and 14 new fast isolation
+regressions; migration 0010 restored byte-exact with the test passing a
+transaction-bound Connection; bounded wait for the ingested command event).
+CI run 37855269245 passed all ten jobs on the initial attempt and again on a
+repeat-run stability check (attempt 2), browser-e2e included. Requirements
+were unchanged by the review; no milestone-02 plan exists.
 
 Investigate the ten fresh failures (including the prose-coupled readiness test),
 namespace/PID semantics and DB marker leakage; do not restore unsafe containment just to make old assertions

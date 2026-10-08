@@ -3,10 +3,10 @@
 Approved 2026-10-08. Contract: docs/ARCHITECTURE.md, docs/ROADMAP.md,
 docs/FINDINGS_CHECKLIST.md.
 
-Review `27e2624`: **FIX/reopened**. Local gates pass; CI mixed at same commit.
-R1/R2/R3 repaired (run-owned fresh builds, migration 0010 restored byte-exact,
-bounded wait for the ingested command event); re-acceptance awaits a CI browser
-pass at the repair revision plus one repeat-run stability check; see findings.
+Review `27e2624`: FIX/reopened → **CLOSED (2026-10-08, `62939f7`)**: R1/R2/R3
+repaired (run-owned fresh builds + fast isolation regressions, migration 0010
+restored byte-exact, bounded command-event wait); CI run 37855269245 passed all
+ten jobs on the initial attempt and the repeat-run stability check.
 
 ## Goal and context
 
