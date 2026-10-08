@@ -631,14 +631,13 @@ def test_r05_baseline_verification_checks_rules_not_just_table():
     assert res["ok"] is False, "an EMPTY baseline table must NOT verify"
 
 
-@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0
-                    or not __import__("shutil").which("nft")
-                    or not __import__("shutil").which("ip"),
-                    reason="needs root + nft + iproute2")
+@pytest.mark.packet
 def test_r05_real_nft_apply_remove_roundtrip(tmp_path):
     """Real nftables round-trip INSIDE A DISPOSABLE NETWORK NAMESPACE with a
     disposable bridge — never the developer's real range namespace (audit
     N06: privileged tests only in disposable test namespaces)."""
+    from tests.helpers import require_packet_prereq
+    require_packet_prereq()
     import subprocess as sp
     import uuid
     from srplatform.safety import datapath as dp
@@ -695,10 +694,7 @@ def test_r05_real_nft_apply_remove_roundtrip(tmp_path):
         ip("netns", "del", ns, check=False)
 
 
-@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0
-                    or not __import__("shutil").which("nft")
-                    or not __import__("shutil").which("ip"),
-                    reason="needs root + nft + iproute2")
+@pytest.mark.packet
 def test_r06_disposable_netns_packet_semantics(tmp_path, monkeypatch):
     """Audit N06 packet evidence in DISPOSABLE namespaces: with the rendered
     baseline applied, intra-range IPv4 is allowed, range WAN egress and IPv6
@@ -706,6 +702,8 @@ def test_r06_disposable_netns_packet_semantics(tmp_path, monkeypatch):
     replies (the reply-direction rule the review found missing), range->API
     ingest works while other control-plane ports are dropped, and the
     emergency drop severs intra-range traffic."""
+    from tests.helpers import require_packet_prereq
+    require_packet_prereq()
     import subprocess as sp
     import uuid
     from srplatform.safety import datapath as dp

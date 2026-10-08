@@ -32,17 +32,26 @@ def test_m0_rendered_rulesets_are_default_deny_and_parse():
     assert 'iifname "vmbr1" drop' in em and 'oifname "vmbr1" drop' in em
     assert "table bridge" in em            # no same-bridge L2 escape
 
+
+@pytest.mark.packet
+def test_m0_rendered_rulesets_pass_the_real_nft_parser():
+    """Machine-checkable parsing with the REAL nft ruleset parser (milestone
+    01 layer split: this needs the nft binary, so it is part of the required
+    packet layer instead of skipping in the infrastructure-free default)."""
+    from tests.helpers import require_packet_prereq
+    require_packet_prereq()
+    from srplatform.safety.firewall import (render_baseline_ruleset,
+                                             render_emergency_ruleset)
+
     nft = shutil.which("nft")
-    if not nft:
-        pytest.skip("nft not on this host — CI covers ruleset validation")
-    import tempfile
-    from pathlib import Path
-    for rs in (base, em):
-        with tempfile.NamedTemporaryFile("w", suffix=".nft") as f:
+    for rs in (render_baseline_ruleset(), render_emergency_ruleset()):
+        with open(f"/tmp/sr-m0-check-{abs(hash(rs)) % 9999}.nft", "w") as f:
             f.write(rs)
-            f.flush()
-            r = subprocess.run([nft, "-c", "-f", f.name], capture_output=True, text=True)
-            assert r.returncode == 0, f"nft -c rejected ruleset:\n{r.stderr}"
+            name = f.name
+        r = subprocess.run([nft, "-c", "-f", name], capture_output=True, text=True)
+        import os
+        os.unlink(name)
+        assert r.returncode == 0, f"nft -c rejected ruleset:\n{r.stderr}"
 
 
 # --- criterion 2 ---------------------------------------------------------------

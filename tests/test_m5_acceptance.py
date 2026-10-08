@@ -18,7 +18,7 @@ from srplatform.coach.aar import build_aar, validate_narrative
 from srplatform.coach.timeline import compress_timeline
 from srplatform.model_gateway import get_model_gateway
 
-pytestmark = pytest.mark.db
+# db layer membership derives from the fixture closure (milestone 01)
 
 
 def ev(eid, ts, actor, kind, host=None, payload=None, **kw):

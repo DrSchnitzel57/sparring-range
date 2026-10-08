@@ -398,7 +398,6 @@ def test_deploy_enrolls_session_bound_telemetry(client, users):
     assert not [e for e in evs2 if e["actor"] == "telemetry"]
 
 
-@pytest.mark.db
 def test_repo_and_templates_hold_no_live_tokens():
     """Live enrollment tokens exist only in the DB and the one-time deploy
     response — never in repo files or the golden-image env template."""

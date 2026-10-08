@@ -326,6 +326,7 @@ def test_f1_bookkeeping_is_not_command_writable(local_supervisor, tmp_path):
         "the command rewrote/erased the supervisor's trusted bookkeeping (F1)"
 
 
+@pytest.mark.containment  # probes cgroup_containment_root() directly (no fixture)
 def test_f1_unsupported_boundary_refuses_before_any_side_effect(tmp_path):
     """An unsupported isolation setup refuses the harmless command BEFORE
     executing it: with no unshare available, start exits 4 and the command
@@ -1018,6 +1019,9 @@ def test_f8_required_containment_fails_instead_of_skipping(tmp_path):
     t.write_text(helper.format(repo=str(REPO)))
     base_env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
                 "RUNNER_CGROUP_ROOT": str(tmp_path / "definitely-not-a-cgroup")}
+    # the probe itself must control the flag — never inherit it from a
+    # required-mode outer run, or the "optional host SKIPs" half breaks
+    base_env.pop("SR_REQUIRE_CONTAINMENT", None)
 
     r = subprocess.run([PY, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(t)],
                        capture_output=True, text=True, env=base_env, timeout=120)

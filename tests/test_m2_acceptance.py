@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from srplatform.bastion.proxy import BastionProxy
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.db]
+pytestmark = pytest.mark.asyncio  # db-marked tests derive automatically (milestone 01)
 
 
 class _AllowAll(asyncssh.SSHServer):

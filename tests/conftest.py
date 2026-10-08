@@ -40,6 +40,56 @@ PY = sys.executable  # never assume .venv/bin/python (audit F22)
 DB_NAME_PREFIX = "srtest_"
 FORBIDDEN_DB_NAMES = {"postgres", "template0", "template1", "sparring_range", "sparring_range_test"}
 
+# --------------------------------------------------------------------------- #
+# Layer classification (milestone 01): a test can never leak a prerequisite.   #
+# --------------------------------------------------------------------------- #
+# Integration-layer markers are DERIVED from the fixture closure: any test
+# whose fixture graph touches the disposable DB (`migrated_db` is the single
+# DB chokepoint) is `db`; any test using the real-supervisor containment
+# fixture is `containment`. Explicit markers remain valid and additive. This
+# closes the baseline's unmarked-DB-dependency leak (r04) structurally.
+_DB_FIXTURE = "migrated_db"
+_CONTAINMENT_FIXTURES = {"local_supervisor"}
+
+# Required-mode environment flags: with the flag set to 1, a test of that
+# layer that SKIPS is converted to a FAILURE — a skipped required test is
+# never acceptance (audit F8). Prerequisite absence itself fails inside the
+# layer helpers with the exact missing prerequisite.
+REQUIRED_LAYER_ENV = {
+    "db": "SR_REQUIRE_DB",
+    "containment": "SR_REQUIRE_CONTAINMENT",
+    "packet": "SR_REQUIRE_PACKET",
+    "browser": "SR_REQUIRE_BROWSER",
+    "live": "SR_REQUIRE_LIVE",
+}
+
+
+def pytest_collection_modifyitems(config, items):
+    for item in items:
+        names = set(getattr(item, "fixturenames", ()))
+        if _DB_FIXTURE in names:
+            item.add_marker(pytest.mark.db)
+        if _CONTAINMENT_FIXTURES & names:
+            item.add_marker(pytest.mark.containment)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    if not report.skipped:
+        return
+    for layer, env in REQUIRED_LAYER_ENV.items():
+        if os.environ.get(env) == "1" and item.get_closest_marker(layer):
+            reason = getattr(report, "longrepr", "")
+            if isinstance(reason, tuple) and len(reason) == 3:
+                reason = reason[2]
+            report.outcome = "failed"
+            report.longrepr = (
+                f"required layer {layer!r} ({env}=1) test was SKIPPED — a skip "
+                f"is never acceptance: {reason}")
+            break
+
 
 def _safe_db_name(name: str) -> str:
     assert re.fullmatch(rf"{DB_NAME_PREFIX}[a-z0-9_]+", name), f"refusing to touch {name!r}"

@@ -12,7 +12,7 @@ from srplatform import verification_service
 from verifiers.base import Context
 from verifiers import registry
 
-pytestmark = pytest.mark.db
+# db layer membership derives from the fixture closure (milestone 01)
 
 
 # --- criterion 1: YAML-only scenario, end to end through the API --------------

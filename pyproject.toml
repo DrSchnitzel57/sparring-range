@@ -40,14 +40,23 @@ include = ["rangectl*", "infra*", "srplatform*", "verifiers*", "telemetry*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-# Test layers (audit F22): unit tests must run with NO infrastructure;
-# `db` needs an explicit disposable Postgres admin (see tests/conftest.py);
-# `adapter` exercises production adapters against simulated transports;
-# `browser` is the E2E layer; `live` is the operator's hardware gate (opt-in).
+# Test layers (audit F22/F8, milestone 01): the DEFAULT selection is
+# infrastructure-free — plain `pytest` must never skip for a missing
+# integration prerequisite. Integration layers are explicit markers, and a
+# required job (SR_REQUIRE_<LAYER>=1) FAILS for an absent prerequisite, an
+# empty selection, or a skipped required test — never silently skips.
+#   db          real disposable PostgreSQL (SR_PG_ADMIN_URL/SR_PG_ADMIN_CMD)
+#   containment real cgroup v2 delegation + namespace boundary (runner supervisor)
+#   packet      real nft/netns packet semantics, disposable namespaces only
+#   adapter     production-adapter contract tests against simulated transports
+#   browser     end-to-end browser tests (opt-in; also needs db)
+#   live        operator live-infrastructure acceptance gate (never automatic)
 markers = [
     "db: requires a real (disposable) PostgreSQL — explicit admin via SR_PG_ADMIN_URL/SR_PG_ADMIN_CMD",
+    "containment: requires a delegated cgroup v2 root and working unshare namespaces",
+    "packet: requires root + nft + iproute2 (rules only inside disposable netns)",
     "adapter: production-adapter contract tests against simulated transports",
     "browser: end-to-end browser tests (opt-in)",
     "live: operator live-infrastructure acceptance gate (never automatic)",
 ]
-addopts = "-m 'not browser and not live'"
+addopts = "-m 'not db and not containment and not packet and not browser and not live'"

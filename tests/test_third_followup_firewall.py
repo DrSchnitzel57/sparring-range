@@ -293,9 +293,7 @@ def test_t03_start_gate_requires_live_topology_match(client, users, env_dirs, mo
 # PACKET TEST: established allowances are port-scoped in the real datapath     #
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0
-                    or not shutil.which("nft") or not shutil.which("ip"),
-                    reason="needs root + nft + iproute2")
+@pytest.mark.packet
 def test_t03_netns_established_flows_are_port_scoped(tmp_path, monkeypatch):
     """Disposable namespaces: with the rendered baseline applied,
     (a) an ALREADY-ESTABLISHED range->management:8080 connection (created
@@ -303,6 +301,8 @@ def test_t03_netns_established_flows_are_port_scoped(tmp_path, monkeypatch):
     established accept let it survive;
     (b) the intended flows still work: management->range:22 with replies,
     and range->API:8000 ingest."""
+    from tests.helpers import require_packet_prereq
+    require_packet_prereq()
     import subprocess as sp
 
     uid = uuid.uuid4().hex[:6]
