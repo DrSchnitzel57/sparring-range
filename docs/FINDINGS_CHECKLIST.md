@@ -516,6 +516,22 @@ the initial attempt and again on the repeat-run stability check (attempt 2,
 browser-e2e included); db/selection/fast gates rerun locally at the repair
 revision (113 / PASS / 128 passed).
 
+- **M01-R4 / P2 — intermittent db-layer auth-handoff failure (OPEN).**
+  Docs-only commit `9a12374` turned CI `db` red:
+  `test_stage5_acceptance.py::test_hint_jumps_queued_red_turns_across_processes`
+  line 144 `KeyError: 'session_id'` — the POST /sessions response carried no
+  session_id, i.e. an error body the test discarded. Same signature as the
+  earlier compose "member creation — 401" one-off: the request immediately
+  after a successful login intermittently fails, and neither failure
+  captured the response. Repairs at this revision: the stage-5 handoff calls
+  now go through `_api_json` (status+body in the failure message), and every
+  uvicorn readiness loop that silently proceeded on `server.started == False`
+  now asserts (a failed port bind names itself instead of poisoning
+  downstream requests). Local fast (128) and db gate (113) PASS. Unclassified
+  until the next occurrence names the branch (401 vs 5xx vs wrong-server);
+  milestone 01 acceptance rests on the twice-green `62939f7` runs, and this
+  finding stays open until classified.
+
 ## Release blockers and missing work
 
 | ID / priority | Current finding and evidence boundary | Milestone |

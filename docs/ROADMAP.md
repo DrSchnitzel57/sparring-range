@@ -40,7 +40,10 @@ regressions; migration 0010 restored byte-exact with the test passing a
 transaction-bound Connection; bounded wait for the ingested command event).
 CI run 37855269245 passed all ten jobs on the initial attempt and again on a
 repeat-run stability check (attempt 2), browser-e2e included. Requirements
-were unchanged by the review; no milestone-02 plan exists.
+were unchanged by the review; no milestone-02 plan exists. **Open finding
+M01-R4:** a docs-only push then exposed an intermittent db-layer failure
+(discarded error body on the login→session handoff); instrumented at this
+revision, tracked in the findings until classified.
 
 Investigate the ten fresh failures (including the prose-coupled readiness test),
 namespace/PID semantics and DB marker leakage; do not restore unsafe containment just to make old assertions

@@ -1252,6 +1252,8 @@ def test_r01_real_worker_end_to_end_over_http(migrated_db, test_db_url_owner, tm
     deadline = time.time() + 15
     while not server.started and time.time() < deadline:
         time.sleep(0.05)
+    assert server.started, ("uvicorn never started within 15s (port bind or "
+                            "startup failure) — requests below would be noise")
     base = f"http://127.0.0.1:{port}"
     monkeypatch.setenv("API_BASE_URL", base)
     get_settings.cache_clear()
@@ -1360,6 +1362,8 @@ def test_r02_bastion_token_login_binds_owner_key(migrated_db, test_db_url_owner,
     deadline = time.time() + 15
     while not server.started and time.time() < deadline:
         time.sleep(0.05)
+    assert server.started, ("uvicorn never started within 15s (port bind or "
+                            "startup failure) — requests below would be noise")
     base = f"http://127.0.0.1:{port}"
     monkeypatch.setenv("API_BASE_URL", base)
     get_settings.cache_clear()

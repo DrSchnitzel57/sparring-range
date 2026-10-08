@@ -87,6 +87,19 @@ class SlowFakeModel:
 # Stage 5 item 1 — ONE shared scheduler across processes                        #
 # --------------------------------------------------------------------------- #
 
+def _api_json(method: str, url: str, *, body=None, headers=None,
+              expect: tuple = (200, 201)):
+    """HTTP call with a SELF-EXPLANATORY failure (M01-R3 lesson): a bare
+    .json()["key"] on an error response raises a contentless KeyError and
+    leaves CI unclassifiable — the status + body name the branch (auth vs
+    5xx vs validation) the moment it happens."""
+    import httpx
+    r = httpx.request(method, url, json=body, headers=headers, timeout=30)
+    if r.status_code not in expect:
+        raise AssertionError(f"{method} {url} -> {r.status_code} {r.text[:400]}")
+    return r.json()
+
+
 @pytest.mark.db
 def test_hint_jumps_queued_red_turns_across_processes(migrated_db, test_db_url_owner,
                                                       tmp_path, monkeypatch):
@@ -129,20 +142,23 @@ def test_hint_jumps_queued_red_turns_across_processes(migrated_db, test_db_url_o
     deadline = time.time() + 15
     while not server.started and time.time() < deadline:
         time.sleep(0.05)
+    assert server.started, ("uvicorn never started within 15s (port bind or "
+                            "startup failure) — requests below would be noise")
     base = f"http://127.0.0.1:{port}"
     monkeypatch.setenv("API_BASE_URL", base)
     st.get_settings.cache_clear()
     set_model_gateway(None)
 
     try:
-        httpx.post(f"{base}/auth/bootstrap",
-                   json={"username": "drew", "password": "operator-testpw-9"})
-        tok = httpx.post(f"{base}/auth/login",
-                         json={"username": "drew", "password": "operator-testpw-9"}
-                         ).json()["token"]
+        _api_json("POST", f"{base}/auth/bootstrap",
+                  body={"username": "drew", "password": "operator-testpw-9"},
+                  expect=(201, 403))
+        tok = _api_json("POST", f"{base}/auth/login",
+                        body={"username": "drew", "password": "operator-testpw-9"})["token"]
         H = {"Authorization": f"Bearer {tok}"}
-        sid = httpx.post(f"{base}/sessions", json={"scenario_id": "quick-win-01"},
-                         headers=H).json()["session_id"]
+        sid = _api_json("POST", f"{base}/sessions",
+                        body={"scenario_id": "quick-win-01"}, headers=H,
+                        expect=(201,))["session_id"]
         assert httpx.post(f"{base}/sessions/{sid}/launch", headers=H).status_code == 200
         runner_token = _mint_runner_token(sid)
 
