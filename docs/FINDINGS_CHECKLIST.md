@@ -489,6 +489,30 @@ green acceptance; the user's abbreviated email reference was not identified.
   This repair falls within the existing browser-fixture step/criterion, not a
   new milestone or permission to change application behavior without evidence.
 
+### M01-R1/R2/R3 repair round (2026-10-08)
+
+- **R2 repaired:** migration `0010_fifth_followup_enrollment.py` restored
+  byte-identical to `da13e72` (`git diff da13e72 -- <path>` empty); the helper
+  test now passes the transaction-bound Connection (`s.connection()`) at both
+  call sites instead of the Engine. `db` gate PASS (113 passed, 0 skipped,
+  owned cleanup). No applied migration is edited.
+- **R1 repaired:** the `web_app` fixture builds into a FRESH unique directory
+  per call under `web/.e2e-builds/` (marker reuse removed), rejects unsafe
+  `SR_E2E_DIST_DIR` targets (absolute, `..`, `.next`, `.next-e2e`,
+  `node_modules`, project dirs), and removes the run dir on success AND on
+  build/serve failure. 14 new fast isolation regressions
+  (`tests/test_browser_fixture_isolation.py`): per-call uniqueness, override
+  rejection, fresh relative build + teardown cleanup, concurrent-run
+  isolation, failure cleanup — mocked npm/next/httpx against a temp WEB, so
+  they run in the fast default (now **128 passed**, selection gate PASS).
+- **R3 repaired:** the dashboard assertion waits with a bounded deadline for
+  the ingested event itself (`_body_has(pw, "command", timeout=20)`);
+  verified `command` appears on the session page ONLY as an event
+  `action_type` cell (no static text can satisfy the wait early).
+
+Pending before re-acceptance: CI browser-e2e pass at the repair revision plus
+one repeat-run stability check; db/selection/fast already rerun above.
+
 ## Release blockers and missing work
 
 | ID / priority | Current finding and evidence boundary | Milestone |

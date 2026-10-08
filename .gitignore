@@ -10,6 +10,7 @@ recordings/
 web/node_modules/
 web/.next/
 web/.next-e2e/
+web/.e2e-builds/
 web/npm-install.log
 .playwright-cli/
 /Claude outputs

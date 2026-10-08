@@ -79,15 +79,7 @@ WHERE jsonb_typeof(d.resources) = 'array'
 def downgrade_stale_confirmed(bind) -> None:
     """Invalidate phase-only confirmations and bind un-bound enrollment
     capabilities to their deployment generation. Exposed for the upgrade and
-    for the acceptance test that exercises it directly. Accepts the Alembic
-    Connection OR an Engine (opens its own transaction — SQLAlchemy 2.x
-    Engines have no .execute; the upgrade path is unchanged)."""
-    from sqlalchemy.engine import Engine
-    if isinstance(bind, Engine):
-        with bind.begin() as conn:
-            conn.execute(_BIND_SQL)
-            conn.execute(_DOWNGRADE_SQL)
-        return
+    for the acceptance test that exercises it directly."""
     bind.execute(_BIND_SQL)
     bind.execute(_DOWNGRADE_SQL)
 

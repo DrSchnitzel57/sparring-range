@@ -975,7 +975,10 @@ def test_f3_migration_downgrades_phase_only_and_binds_evidence(client, users):
         s.commit()
         # token WITHOUT evidence (pre-0009 shape), unbound deployment
         tok, _ = _issue_for(sid, "web01", None)
-        m0010.downgrade_stale_confirmed(s.bind)
+        # transaction-bound Connection (the historical calling convention):
+        # the migration helper takes the Alembic-style Connection, never an
+        # Engine — an applied migration must not be edited for test comfort.
+        m0010.downgrade_stale_confirmed(s.connection())
         s.expire_all()
         res = s.get(Deployment, legacy.deployment_id).resources
         assert res[0]["telemetry_enroll"]["phase"] != "confirmed", \
@@ -996,7 +999,7 @@ def test_f3_migration_downgrades_phase_only_and_binds_evidence(client, users):
         from sqlalchemy.orm.attributes import flag_modified
         flag_modified(s.get(Deployment, legacy.deployment_id), "resources")
         s.commit()
-        m0010.downgrade_stale_confirmed(s.bind)
+        m0010.downgrade_stale_confirmed(s.connection())
         s.expire_all()
         res = s.get(Deployment, legacy.deployment_id).resources
         assert res[0]["telemetry_enroll"]["phase"] == "confirmed", \

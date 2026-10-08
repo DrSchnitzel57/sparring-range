@@ -7,8 +7,9 @@ model endpoint (fast fake OpenAI), the runner (local-dev transport), the
 verifier exec (controlled host state) and the datapath (fake).
 
 Isolation (milestone 01): ports are configurable and default to FREE
-ephemeral ports; the web build goes to its OWN dist dir (`.next-e2e`,
-baked with the chosen API URL) so a developer's `.next` is never touched;
+ephemeral ports; each run builds into a FRESH unique dist dir under
+web/.e2e-builds/ (baked with its own API URL) and removes it afterwards —
+nothing is shared between runs and a developer's `.next` is never touched;
 the Playwright CLI is the PINNED local one (web/node_modules, devDependency)
 and runs in a run-owned named session (`sr-e2e-<runid>`), never a shared or
 the user's session. Nothing outside this run's own ports/dir/session is
@@ -134,53 +135,75 @@ def _body_has(pw, text: str, timeout=40) -> str:
     pytest.fail(f"page never showed {text!r}; last body text:\n{last[:1500]}")
 
 
+def _run_dist_dir(base: str | None = None):
+    """Fresh RUN-OWNED build directory (M01-R1).
+
+    Next resolves distDir relative to the project dir, so the build must
+    live under web/ — but every fixture call gets its OWN unique leaf under
+    a build-only base, so two concurrent runs can never share or overwrite
+    a build (each bakes a DIFFERENT API URL), and nothing is reused: a
+    stale marker must never serve another run's baked URL. SR_E2E_DIST_DIR
+    may relocate the base but may not target a shared/developer directory.
+    """
+    base = os.environ.get("SR_E2E_DIST_DIR", ".e2e-builds") if base is None else base
+    p = Path(base)
+    if not base or p.is_absolute() or ".." in p.parts:
+        pytest.fail(f"SR_E2E_DIST_DIR must be a relative path inside web/, got {base!r}")
+    if p.parts[0] in {".next", ".next-e2e", "node_modules", ".git",
+                      "pages", "lib", "styles", "public"}:
+        pytest.fail(f"SR_E2E_DIST_DIR must not target {p.parts[0]!r} — the run "
+                    "appends its own leaf under a build-only base")
+    d = WEB / p / f"e2e-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    d.mkdir(parents=True, exist_ok=False)
+    return d
+
+
 @pytest.fixture()
 def web_app(ports, tmp_path):
-    """Serve the REAL Next.js app from an ISOLATED dist dir baked for THIS
-    run's API port; a developer's `.next` build is never read or replaced."""
+    """Serve the REAL Next.js app from a FRESH RUN-OWNED dist dir baked for
+    THIS run's API port (M01-R1): unique per call, always built fresh, and
+    removed on teardown — success or failure. A developer's `.next` build
+    is never read, replaced, or targeted."""
     node_bin = WEB / "node_modules" / ".bin"
     if not (node_bin / "next").exists():
         pytest.skip("web/node_modules missing — run `npm ci` in web/ first")
-    dist = WEB / os.environ.get("SR_E2E_DIST_DIR", ".next-e2e")
-    marker = dist / ".sr-e2e-baked-url"
-    # Next 16 resolves distDir RELATIVE to the project dir and silently
-    # treats an absolute path as relative (an absolute SR_NEXT_DIST_DIR
-    # built into web/home/dev/... and returned rc 0). Hand next a relative
-    # path; Python keeps the absolute one for its own marker checks.
+    dist = _run_dist_dir()
+    # next resolves distDir RELATIVE to the project dir and silently treats
+    # an absolute path as relative — hand next the relative path only.
     dist_rel = os.path.relpath(dist, WEB)
     baked = f"http://localhost:{ports['api']}"
-    need_build = ((not (dist / "BUILD_ID").exists())
-                  or (not marker.exists()) or marker.read_text() != baked)
-    if need_build:
+    proc = None
+    try:
         subprocess.run(["npm", "run", "build"], cwd=WEB, check=True,
                        env={**os.environ, "NEXT_PUBLIC_API_URL": baked,
                             "SR_NEXT_DIST_DIR": dist_rel,
                             "NEXT_TELEMETRY_DISABLED": "1"},
                        capture_output=True, text=True)
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(baked)
-    proc = subprocess.Popen([str(node_bin / "next"), "start"], cwd=WEB,
-                            env={**os.environ, "PORT": str(ports["web"]),
-                                 "SR_NEXT_DIST_DIR": dist_rel,
-                                 "NEXT_TELEMETRY_DISABLED": "1"},
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    import httpx
-    deadline = time.time() + 40
-    while time.time() < deadline:
-        try:
-            if httpx.get(f"http://127.0.0.1:{ports['web']}", timeout=2).status_code == 200:
-                break
-        except Exception:
-            time.sleep(0.5)
-    else:
-        proc.terminate()
-        pytest.fail("next start never answered on the web port")
-    yield proc
-    proc.terminate()
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+        proc = subprocess.Popen([str(node_bin / "next"), "start"], cwd=WEB,
+                                env={**os.environ, "PORT": str(ports["web"]),
+                                     "SR_NEXT_DIST_DIR": dist_rel,
+                                     "NEXT_TELEMETRY_DISABLED": "1"},
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        import httpx
+        deadline = time.time() + 40
+        while time.time() < deadline:
+            try:
+                if httpx.get(f"http://127.0.0.1:{ports['web']}", timeout=2).status_code == 200:
+                    break
+            except Exception:
+                time.sleep(0.5)
+        else:
+            pytest.fail("next start never answered on the web port")
+        yield proc
+    finally:
+        # cleanup runs on success AND on build/serve/test failure
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        shutil.rmtree(dist, ignore_errors=True)
 
 
 def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
@@ -290,10 +313,11 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
              "comm": "bash", "exe": "/usr/bin/bash", "source_id": "71", "boot_id": "b1"}]},
             headers={"Authorization": f"Bearer {tok}"})
         assert r.status_code == 201 and r.json()["accepted"] == 1
-        # the live dashboard (2s poll) shows the captured command event
-        _body_has(pw, "web01", timeout=20)
-        recent = pw("--raw", "eval", "document.body.innerText").stdout
-        assert "command" in recent
+        # the live dashboard (2s poll) shows the captured command event.
+        # Wait for the INGESTED EVENT ITSELF (M01-R1/R3): "web01" is already
+        # on the page from the connection instructions, so waiting on it
+        # proved nothing and the immediate assert raced the first poll.
+        _body_has(pw, "command", timeout=20)
 
         # ---- start red: REAL worker subprocess through the UI button ---------
         pw("click", 'button:has-text("start red")')

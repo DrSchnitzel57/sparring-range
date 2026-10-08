@@ -4,7 +4,9 @@ Approved 2026-10-08. Contract: docs/ARCHITECTURE.md, docs/ROADMAP.md,
 docs/FINDINGS_CHECKLIST.md.
 
 Review `27e2624`: **FIX/reopened**. Local gates pass; CI mixed at same commit.
-Fix shared builds, edited migration and browser event timing; see findings.
+R1/R2/R3 repaired (run-owned fresh builds, migration 0010 restored byte-exact,
+bounded wait for the ingested command event); re-acceptance awaits a CI browser
+pass at the repair revision plus one repeat-run stability check; see findings.
 
 ## Goal and context
 
