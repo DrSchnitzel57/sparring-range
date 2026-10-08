@@ -122,15 +122,22 @@ async def test_m2_bastion_records_cast_and_events_with_session_id(range_env):
 
     await asyncio.sleep(0.2)
 
-    # (1) cast: asciinema v2, both directions, opaque filename (no token in path)
+    # (1) cast: asciinema v2, both directions, opaque filename (no token in
+    # path). The exec-channel sessions record their OWN output-only casts, so
+    # the interactive cast must be FOUND — glob order is filesystem luck and
+    # picking casts[0] made this assertion flake.
     casts = list(Path(ctx.proxy.recordings_dir).glob("*.cast"))
     assert casts, "no .cast recording written"
-    assert "tok-" not in casts[0].name
-    lines = casts[0].read_text().splitlines()
-    header = json.loads(lines[0])
-    assert header["version"] == 2 and "timestamp" in header  # epoch anchor (F17)
-    events = [json.loads(l) for l in lines[1:]]
-    assert any(e[1] == "o" for e in events) and any(e[1] == "i" for e in events)
+    parsed = []
+    for c in casts:
+        assert "tok-" not in c.name
+        lines = c.read_text().splitlines()
+        header = json.loads(lines[0])
+        assert header["version"] == 2 and "timestamp" in header  # epoch anchor (F17)
+        parsed.append([json.loads(l) for l in lines[1:]])
+    assert any(any(e[1] == "o" for e in ev) and any(e[1] == "i" for e in ev)
+               for ev in parsed), \
+        "no single cast recorded both directions (interactive session)"
 
     # (2) events carry the CORRECT session id and server-assigned bastion actor
     logged = ctx.client.get("/events", params={"session_id": ctx.session_id,

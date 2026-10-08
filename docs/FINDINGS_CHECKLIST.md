@@ -370,6 +370,43 @@ Verified locally after the fixes: fast default **114 passed**, `db` gate
 PASS (113), `containment` gate PASS (bind-based probe + 21), web build
 OK.
 
+**Fifth CI run (run 37845728116 at `271e6f6`) — replay never loaded
+(2026-10-08):** only `browser-e2e` red: "asciinema-player never loaded
+the recording (duration stayed empty)", no player error. Instrumented
+the page (unhandled-rejection trap, lifecycle-event trace
+`data-player-events`, both surfaced as attributes + in the test's
+failure message) and root-caused the rest against the REAL library
+driver in Node: asciinema-player 3.17 made loading LAZY — `INIT_REQUESTED`
+in COLD does nothing unless `preload` (or an npt poster) is set, so a
+paused player never fetches the cast and `getDuration()` stays undefined.
+The original single-click failure matches too: a seek issued before the
+driver exists is queued behind the startup promise and silently
+swallowed. Fix: `preload: true` in the page's create options (verified
+in `CORE_OPTS`; Node repro: duration 3600 arrives post-init, seek lands,
+metadata+seeked fire). With preload the duration wait also proves the
+WASM vt came up (the driver only exists after terminalReady).
+
+**Sixth CI run (run 37850316805 at `6841ace`) — browser-e2e GREEN;
+two flakes (2026-10-08):** selection, python 3.11/3.12/3.13, frontend,
+packet, containment and — for the first time — **`browser-e2e` all
+passed**: the preload fix is confirmed in the runner's Chromium. Two
+previously-green jobs turned red on a frontend-only diff:
+1. `db`: m2 bastion "no input frames" — the two `conn.run` exec sessions
+   each write their OWN output-only cast, and the test read `casts[0]`
+   from `glob()`: filesystem order decided which cast was checked. Now
+   every cast must have an opaque name + v2 header and the BOTH-
+   directions assertion searches for the interactive cast (exec casts
+   can never carry `i` frames, so this is equivalent, not weaker).
+   Verified: `db` gate PASS locally (113).
+2. `compose`: "member account creation through app-role API — 401"
+   immediately after a successful login. No code path deletes or revokes
+   WebToken rows between requests, FastAPI ≥0.106 commits dependency
+   teardown before the response is sent, and the gate passes locally
+   (both attempts, full stack). Unreproducible; the check discarded the
+   response body, which would name the branch ("authentication required"
+   vs "token expired or revoked" vs "bad token"). Bootstrap/users/login
+   failures now include the body so a recurrence is classifiable.
+
 **Milestone 01 acceptance status:** all locally executable gates pass.
 Packet and browser gates fail closed here for missing prerequisites
 by design; per the plan they are accepted only when the required CI jobs pass

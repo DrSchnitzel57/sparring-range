@@ -883,26 +883,31 @@ def _verify_compose_stack(compose, api_port: int, head: str, attempt: int,
     # 4. authenticated app-role account operations + idempotent behavior.
     #    Every write below goes through the API's sr_app connection.
     op_pw = "acc-operator-pw-9"
-    code, _ = _http_json("POST", f"{api}/auth/bootstrap",
-                         {"username": "drew", "password": op_pw})
+    code, body = _http_json("POST", f"{api}/auth/bootstrap",
+                            {"username": "drew", "password": op_pw})
     if attempt == 1:
         if code != 201:
-            fail("operator bootstrap through app-role API", f"{code}")
+            fail("operator bootstrap through app-role API", f"{code} {str(body)[:200]}")
     elif code != 403:
         fail("bootstrap stays closed once provisioned (idempotent rerun)",
-             f"expected 403, got {code}")
+             f"expected 403, got {code} {str(body)[:200]}")
     code, body = _http_json("POST", f"{api}/auth/login",
                             {"username": "drew", "password": op_pw})
     if code != 200 or "token" not in body:
         fail("operator login through app-role API", f"{code} {str(body)[:200]}")
     op = {"Authorization": f"Bearer {body['token']}"}
-    code, _ = _http_json("POST", f"{api}/users",
-                         {"username": "acc-member", "password": "acc-member-pw-9",
-                          "role": "member"}, op)
+    code, body = _http_json("POST", f"{api}/users",
+                            {"username": "acc-member", "password": "acc-member-pw-9",
+                             "role": "member"}, op)
     if attempt == 1 and code != 201:
-        fail("member account creation through app-role API", f"{code}")
+        # the body names the REASON ("authentication required" vs "token
+        # expired or revoked" vs "bad token") — without it a 401 is
+        # unclassifiable after the fact
+        fail("member account creation through app-role API",
+             f"{code} {str(body)[:200]}")
     if attempt == 2 and code != 409:
-        fail("account creation is idempotent-visible (409 on rerun)", f"{code}")
+        fail("account creation is idempotent-visible (409 on rerun)",
+             f"{code} {str(body)[:200]}")
     # the write is really in the DB, readable via the app role
     r = compose("exec", "-T", "postgres", "psql", "-U", "sr_app",
                 "-d", "sparring_range", "-tAc",
