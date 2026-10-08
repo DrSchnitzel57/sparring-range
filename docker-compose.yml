@@ -40,7 +40,8 @@ services:
     environment:
       PGPASSWORD: ${SR_DEV_OWNER_PASSWORD:-devowner}
     command: >
-      psql -h postgres -U sr_owner -d sparring_range -v ON_ERROR_STOP=1 -f /bootstrap.sql
+      psql -h postgres -U sr_owner -d sparring_range -v ON_ERROR_STOP=1
+      -v app_pw=${SR_DEV_APP_PASSWORD:-devapp} -f /bootstrap.sql
     volumes:
       - ./infra/db/bootstrap.sql:/bootstrap.sql:ro
     restart: "no"

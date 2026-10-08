@@ -434,7 +434,7 @@ def check_compose() -> None:
     cleanup_problems: list[str] = []
     try:
         r = compose("-f", "docker-compose.yml", "-f", str(override),
-                    "build", "--pull", "never", timeout=3600)
+                    "build", timeout=3600)
         if r.returncode != 0:
             fail("compose build", (r.stderr or r.stdout)[-800:])
         ok("compose build (real images from infra/dev/Dockerfile)")
