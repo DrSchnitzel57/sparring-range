@@ -1,275 +1,308 @@
-# Operator Runbook
+# Operator runbook and live acceptance gates
 
-Everything here reflects the code as shipped. Steps marked **[LIVE GATE]**
-require Drew's R740/model/range VMs and remain unaccepted until executed —
-the harness cannot honestly close them.
+Status: **planning runbook, not an accepted production installation guide**.
+Updated 2026-10-08; current application baseline `23de4f4` is failing.
+See [ARCHITECTURE.md](ARCHITECTURE.md), [ROADMAP.md](ROADMAP.md), and
+[FINDINGS_CHECKLIST.md](FINDINGS_CHECKLIST.md). Old instructions requiring runtime
+host-root/nft execution or claiming final acceptance are superseded.
 
-## 0. Fresh-stack bootstrap (dev compose: empty deployment → running stack)
+The operator owns Proxmox/network setup and approves disposable live fixtures.
+Agents prepare artifacts and execute authorized safe automated tests, not mutate
+your R740 or unrelated workloads. No model-driven attacks until actual isolation
+and emergency-stop gates pass. Windows/AD gates belong to the later milestone.
 
-One documented, idempotent path: compose seed step + `rangectl bootstrap`.
+## 1. Discovery before production configuration
 
-1. `cp .env.example .env` (compose dev passwords have documented defaults;
-   `SR_ENV=production` refuses placeholders).
-2. Operator-supplied key material in `./deploy/bastion/` (override the dir
-   with `SR_DEPLOY_KEYS_DIR`). **Secret material — never commit it** (this
-   directory is not in `.gitignore`; keep it outside the repo or ignore it
-   yourself):
-   - `authorized_keys` — one `"<username> <algo> <base64>"` line per member
-     (exactly the format `BASTION_AUTHORIZED_KEYS_FILE` is read in
-     `srplatform/bastion/proxy.py`).
-   - `target_known_hosts` — pinned range-host keys
-     (`ssh-keyscan -p 22 <range-host> > deploy/bastion/target_known_hosts`).
-   - **[DEV-ONLY substitution]** with no range hosts yet, generate a
-     placeholder pin:
-     `ssh-keygen -q -t ed25519 -N '' -f /tmp/devtarget && printf 'target01 %s\n' "$(cat /tmp/devtarget.pub)" > deploy/bastion/target_known_hosts`
-     — DEV ONLY: production refuses TOFU, so placeholder pins must never ship;
-     re-key against real host keys before any member session.
-3. `docker compose up -d` — postgres → bootstrap-roles → migrate →
-   **seed-bastion-keys** (copies both files into the `bastion-keys` volume at
-   `/etc/sparring-range/{authorized_keys,target_known_hosts}` and creates the
-   recordings dir; exits 1 with a runbook pointer if a file is missing or
-   empty) → api → bastion.
-4. `rangectl bootstrap --telemetry-host web01 [--telemetry-host ...]`
-   (password via `--password`, `$BOOTSTRAP_OPERATOR_PASSWORD`, or prompt):
-   creates the operator via `POST /auth/bootstrap`, mints the bastion +
-   per-host telemetry capabilities via `POST /admin/service_tokens` (printed
-   ONCE, recorded 0600 in `~/.rangectl/bootstrap.json`), validates the key
-   material and ensures the recordings dir. **Re-running is a no-op**: a
-   closed bootstrap and already-minted capabilities are reported, never
-   re-minted (the state file is the mint ledger — deleting it re-mints).
-5. Wire the minted bastion capability: set `SR_DEV_BASTION_TOKEN` in `.env`,
-   then `docker compose up -d bastion` (recreate). Until then the bastion
-   serves member-key auth but cannot resolve session tokens.
-6. `rangectl login && rangectl readyz` — readyz reports migration version,
-   runner config, `recordings_writable` and safety state.
+Record these non-secret inputs when their milestone is planned:
 
-**Verification status (honest):** the seed script, the bootstrap path and the
-volume/env wiring are covered by `tests/test_stage5_bootstrap.py` and the
-compose YAML tests in `tests/test_followup_regressions.py`. `docker compose
-config` and a fresh-volume boot could NOT be executed in the authoring
-environment (docker not installed) — recorded as BLOCKED, not passed.
+- Installed Proxmox version/node, VMID allocations, approved templates, range
+  bridge/VLAN and actual routed/bridged paths; management/model/NAS destinations.
+- VM disk storage, free capacity, supported full/linked-clone mode, measured
+  clone/reset performance and budget for simultaneous lab disks/recordings.
+  Approximately 100 GB free on the boot disk is not an accepted VM/evidence store.
+  Add SSD storage if needed; do not cut release features silently.
+- CPU/RAM/disk/network budgets protecting other R740 workloads and inference.
+- Control-plane VM/bastion placement, private web IP/port, ingest/probe/control
+  flow allowlist, PVE CA and trusted guest SSH host-key acquisition method.
+- Qwen endpoint URL/API model alias, llama.cpp build, quantization/context limits,
+  authentication and measured structured-response/latency compatibility. Existing
+  inference LXC stays outside the range and is not an attack host.
+- Protected persistent storage and backup destination (NAS can be chosen),
+  credential storage/rotation, and disposable restore/test environments.
 
-## 1. One-time setup (control plane host)
+Do not put real values containing credentials in the repository or recordings.
+Unresolved version/storage/ACL inputs block deployment, not authorize guesses.
 
-1. `.env` from `.env.example` (all variables documented there). `SR_ENV=production`
-   refuses to start with placeholder secrets.
-2. Postgres 16+: create roles/db per §Database below, then
-   `rangectl db migrate` (runs Alembic as `POSTGRES_URL_OWNER` — the ONE
-   sanctioned non-HTTP operation; app role has no DDL and cannot
-   UPDATE/DELETE/TRUNCATE `events` — trigger + grants).
-3. Bootstrap the operator (works only while NO account has a password):
-   `rangectl bootstrap` (idempotent full path — see §0) or raw
-   `curl -X POST $API/auth/bootstrap -d '{"username":"drew","password":"<10+ chars>"}'`
-   Later accounts: `POST /users` (operator token) — members get real
-   passwords; username knowledge is never authentication.
-4. Mint long-lived capabilities (shown ONCE, store in your secret store):
-   - Bastion: `POST /admin/service_tokens {"scope":"bastion"}` → set as
-     `SR_BASTION_TOKEN` on the bastion LXC.
-   - Per range host: `{"scope":"telemetry","host":"web01"}` (host-bound;
-     bind `session_id` too for strict per-session correlation).
-   - Runner tokens are created per run by the API; nothing to provision there.
-  ON THE RUNNER HOST, however, install `infra/runner/runner_supervise.sh`
-  (e.g. as `/usr/local/bin/runner-supervisor`, matching
-  `RUNNER_SUPERVISOR_BIN`) and give the runner user two writable
-  directories: `RUNNER_SUPERVISOR_STATE` (job bookkeeping) and
-  `RUNNER_CGROUP_ROOT` — an owned directory on the cgroup2 filesystem
-  (`mkdir /sys/fs/cgroup/srrunner && chown <runner-user> ...`). Without a
-  usable cgroup root the supervisor REFUSES all work (exit 4) — see §6.
-5. Member bastion logins: append `"<username> ssh-ed25519 AAAA..."` lines to
-   `BASTION_AUTHORIZED_KEYS_FILE`. The bastion requires the member KEY *and*
-   a live per-session token as the SSH username.
+## 2. Identity, secrets and trust
 
-## 2. Network datapath (F01/F02 — run on the Proxmox host)
+The operator creates/disables member accounts and provisions member SSH **public**
+keys. Never request or upload member private keys. Current bastion key format is
+one `<username> <algorithm> <base64-public-key>` entry per authorized key; a live
+session token binds the SSH login to its owning member. Production onboarding/
+disable/rotation steps will be accepted in milestone 10, not assumed from format.
 
-- Baseline default-deny + emergency rulesets are rendered from
-  `srplatform/safety/firewall.py` for YOUR bridge/VLAN (validated with
-  `nft -c -f` in CI/tests). Install baseline persistently:
-  `python -m srplatform.safety.firewall baseline > /etc/nftables.d/sr-baseline.nft && nft -f ...`
-- Standalone killswitch (works even if the platform is down):
-  `infra/firewall/killswitch.sh` (installs emergency drop),
-  `infra/firewall/killswitch.sh --release` (removes ONLY the emergency set,
-  baseline deny stays).
-- Platform safety latch: `POST /safety/killswitch` (engage) stops all run
-  workers by process GROUP and applies the emergency ruleset; each layer is
-  reported independently — partial engagement says so loudly. Release via
-  `/safety/killswitch-release`; release INVALIDATES fresh-evidence records.
-- **[LIVE GATE] Full egress proof** from a booted range VM (not from a
-  network namespace on the control plane):
-  `ping -c1 1.1.1.1` must FAIL; `getent hosts example.com` must FAIL;
-  `ip -6 route` must show NO default route. Record the attestation:
-  `POST /safety/datapath-proof {"probes": {...}, "vm_hostname": "web01-..."}`.
-- Freshness: `/run` is refused (423) unless (a) not latched, (b) runner
-  configured (ssh + pinned known_hosts), and in production (c) a FRESH
-  `baseline-check` + operator `datapath-proof` exist that match the current
-  config identity (`/safety/status` shows `config_identity` — any bridge/CIDR
-  change invalidates both).
-- LIVE TOPOLOGY + EFFECTIVE POLICY (audit T03): with the nft controller the
-  start gate ALSO re-discovers the bridge's port inventory THROUGH the
-  configured `NFT_COMMAND_PREFIX` namespace (never the local `/sys`) and
-  refuses if it no longer matches the recorded evidence — a port attached
-  after the proof denies new runs. `baseline-check` compares the EFFECTIVE
-  policy (exact ordered rule list + exact `range_hosts` set membership via
-  `nft -j`), so an inserted accept, a reordered rule or a widened CIDR all
-  fail; an inspection that can neither confirm presence nor absence
-  (unpermitted/transport error) is `unknown` — never ABSENT, and never ok.
+Keep secret files outside Git/image contexts; `.gitignore` alone does not protect
+Docker layers or every generated filename. The old `deploy/bastion/` suggestion
+is not an assurance that arbitrary files there are ignored. Keep PVE tokens solely
+in the private deployment boundary, owner-DB credentials solely in explicit
+offline migration/admin tooling, verifier keys in trusted services, and NAS
+credentials solely in protected backup tooling. No such secret enters workers,
+model prompts, member/browser responses, telemetry, normal logs or casts.
 
-## 3. Deployment / golden images
+Pin guest SSH identities through a trusted provisioning channel. An unauthenticated
+`ssh-keyscan` alone is not verification; fake development pins/TOFU never satisfy
+production readiness. Validate PVE HTTPS with its CA. LAN access still requires
+password authentication, ownership checks and scoped/revocable producer tokens.
 
-1. **[LIVE GATE]** Build golden images: `infra/images/provision-linux-golden.sh`
-  (telemetry pipeline via `telemetry/install.sh` — auditd rules, ENRICHED
-  format, shipper + systemd unit). Scenario host `services` are a VERSIONED
-  PREBUILT-TEMPLATE REQUIREMENT (audit N10): the golden template must provide
-  the mapped units (`http`→nginx, `mysql`→mysql, `ssh`→sshd — see
-  `SUPPORTED_SERVICES`), and `launch` VERIFIES readiness on the owned
-  inventory before a session reaches `ready` (unknown/failed readiness keeps
-  the session out of `ready` with explicit reasons; dev mode without a
-  management channel reports the relaxation in the launch response).
-  Unsupported service names are rejected at scenario validation, never
-  silently ignored. Or
-  `infra/images/golden-linux.pkr.hcl` (hashicorp packer plugin; transfers the
-  files properly — run `packer validate` against your PVE). Convert to
-  template (`qm template <vmid>`); record VMIDs in `.env`
-  (`TEMPLATE_VMID_*`). Windows + Sysmon: `infra/images/WINDOWS-CHECKLIST.md`.
-2. Deploy is session-scoped: `POST /sessions {"scenario_id"}` then
-  `POST /sessions/{id}/launch` (CLI `launch`, browser "launch" — identical
-  backend path). Sequence: lease acquire (single active range; conflicts
-  return 409 `range_busy` with holder) → linked clone → set
-  ipconfig/net0(`bridge=RANGE_BRIDGE,tag=RANGE_VLAN`)+ownership tag → **NIC
-  read-back validation** → start with UPID task waiting. Every created VM is
-  recorded to the deployment row BEFORE the next side effect; failures
-  persist `deploy_failed` + partial ownership (commits survive rollback).
-3. `reset` = destroy owned + fresh clones (idempotent). `teardown` removes
-  EXACTLY the resources recorded for that session — never a name-prefix
-  sweep. `end` keeps VMs (documented decision) but stops runs, takes the
-  final trusted score, revokes session capabilities, and releases the lease.
-4. **[LIVE GATE]** Real PVE clone/reset/teardown with concurrent-launch
-  conflict on your cluster.
+Production member access will be same-origin `https://<private-ip>:<port>` using
+a self-signed certificate with the chosen IP SAN. Distribute/verify its fingerprint
+out of band and document client trust installation; do not normalize ignoring all
+certificate errors. Do not expose the public API, broker, DB or model to the WAN.
 
-## 4. Bastion & recordings (F16)
+## 3. Network setup and restricted automation
 
-- Run: `python -m srplatform.bastion.proxy` on the bastion LXC
-  (`SR_BASTION_TOKEN` + `API_BASE_URL` set). Users connect with their member
-  key + launch-issued token (`tok-<host>-xxxxxx` shown by CLI/web).
-- Recordings: exclusive-create files named by UUID (NEVER by token); the
-  bastion registers each via `POST /sessions/{id}/recordings` and clients
-  only ever see opaque `recording_id`s. Cast header carries the recording
-  `timestamp` epoch — the web replay anchors its timeline there.
-- **Shared-storage contract**: the API host must see the same
-  `RECORDINGS_DIR` path (NFS export from the bastion mounted at the same
-  path, or run both on one host). Missing file → explicit 404 message, not a
-  broken player.
-- Terminal resize frames are recorded; byte cap (`RECORDING_MAX_BYTES`)
-  truncates visibly (`truncated` flag in the session_end event).
+Install static default-deny isolation using operator-owned Proxmox administration
+tools. Attacker and targets are full VMs with no host filesystem, NAS, GPU or device
+mounts/passthrough. The running platform must not SSH to Proxmox as root or execute
+host-shell/firewall commands. The existing nft adapter/renderers are legacy code
+to preserve/test while redesigning the boundary, not the accepted deployment path.
 
-## 5. Telemetry (F09)
+Deny range access to WAN (including DNS, IPv4/IPv6 and arbitrary TCP/UDP), Proxmox
+management, model LXC, NAS, control administration and unrelated workloads.
+Allow only exact necessary bastion replies, scoped telemetry ingestion, trusted
+probe and guest-management flows. Telemetry ingestion is a narrow endpoint, not
+general API administration. Test bridged and routed traffic, established flows,
+and new clone NIC placement. No update proxy exception is enabled during matches;
+image provisioning occurs outside the active attack environment.
 
-- Golden hosts run `telemetry/install.sh`: auditd rules
-  (`telemetry/auditd.rules`), `log_format = ENRICHED` (the format the
-  shipper PARSES — documented), `/usr/local/bin/sparring-shipper`, and the
-  systemd unit (`tail -F -n 0 /var/log/audit/audit.log | sparring-shipper`).
-- Shipper config `/etc/sparring-range/shipper.env`: `SR_API_URL`,
-  `SR_TELEMETRY_TOKEN` (host-bound), `SR_HOST`, `SR_ENROLL_NONCE`,
-  `SR_SPOOL_DIR`. Offline records buffer in the bounded spool (drops oldest,
-  counts `spool_dropped` gap events) and retry with backoff. Identity/session
-  comes from the CAPABILITY, never the payload; duplicate `boot_id:source_id`
-  dedups at the boundary.
-- ENROLLMENT IS EVIDENCE, NOT A SERVICE STATE (audit T-05): the golden image
-  ships NO live token. At deploy time the control plane writes the env file
-  (capability + a FRESH enrollment nonce) over the pinned management channel,
-  enables+restarts the unit, and the phase advances ONLY on distinct
-  host-originated evidence: `service_running` (systemd active) →
-  `delivery_confirmed` (the installed shipper POSTs `/enroll/confirm`,
-  authenticated by its capability and bound to the nonce — proving the API
-  address, token and delivery path actually work) → `confirmed` (a harmless
-  capture probe `/bin/true SR-CAPTURE-<nonce>` executed on the host is
-  OBSERVED as an audit event through the installed service — proving command
-  capture works under the unit's real identity). `systemctl is-active` alone
-  is startup status, never confirmation: a shipper with a wrong API address,
-  a rejected token, or an unreadable audit input stays visibly stuck
-  (`confirm_failed` with the failing stage) and BLOCKS readiness. Timeouts
-  `ENROLL_CONFIRM_TIMEOUT_S` / `ENROLL_CAPTURE_TIMEOUT_S` bound the waits; a
-  timeout is a visible failure, never an assumed pass.
-- Windows/Sysmon: WEC collector → convert to `detection` events; fixture at
-  `telemetry/fixtures/sysmon-detection-sample.json`; mapping documented in
-  `infra/images/WINDOWS_CHECKLIST` (see WINDOWS-CHECKLIST.md).
-- **[LIVE GATE]** A command on a real range VM lands in the right session's
-  log with the right host and source time (both Linux and Windows paths).
+Provision a dedicated non-root automation identity and restricted PVE token for
+approved lab resources only. Validate **effective** ACLs, including denials against
+unrelated VMs/LXCs, host administration, forbidden config/mount/storage operations
+and privilege changes. An assigned resource pool does not prove isolation. The
+broker also validates typed requests, exact ownership/generation, approved
+templates/storage/network/resource budgets. If safe ACLs cannot support required
+operations on your PVE version, block deployment and revise the design explicitly;
+never widen permissions to make a test green.
 
-## 6. Red runs (F01/F13/F18)
+## 4. Images, access and installed capture
 
-- Runner: `RUNNER_TRANSPORT=ssh` to a fixed Kali target with
-  `RUNNER_SSH_KNOWN_HOSTS` pinned; the API spawns a per-run WORKER
-  subprocess (`srplatform.red_agent.worker`) in its own process group with a
-  run-scoped capability token (sha256 stored). Stop = killpg; a worker that
-  dies uncleanly is failed by the watchdog; API restart reconciles
-  (`reconcile_on_startup` fails gone workers, kills live ones when latched).
-- AUTHORITATIVE STOP / CANCEL-UNKNOWN (audit T01/T02/T-04): a run row only
-  becomes `cancelled` when BOTH the local process group and every registered
-  REMOTE operation are confirmed gone. A failed/unconfirmable remote cancel
-  moves the run to `cancel-unknown` (DB-enforced, one per session): the lease
-  and operation inventory are RETAINED, new runs/launches are refused, and
-  every stop attempt + API restart retries the remote cancellation. Only an
-  operator killswitch release (with evidence) clears the state. The runner
-  side is `infra/runner/runner_supervise.sh`, whose containment is
-  CGROUP v2-BASED (audit T-04): point `RUNNER_CGROUP_ROOT` at a directory
-  the runner user owns on a cgroup2 fs (e.g. a chowned subtree, or the
-  delegated user slice — auto-detected when writable). Each operation runs
-  in its own child cgroup, so liveness is "the cgroup still has members" —
-  a descendant that CLEARS its environment cannot escape it (the old
-  `SR_OP_ID` environ scan is kept only as a secondary signal). WITHOUT a
-  usable cgroup root `start` REFUSES (exit 4, unsupported execution mode):
-  the supervisor never runs uncontained work. The pidfile records
-  `<pid>:<starttime>` and no process-group signal is sent unless that
-  identity still matches (recycled PIDs are never signalled); start and
-  cancel serialize on a per-operation flock (a cancel can no longer
-  acknowledge "gone" between a start's tombstone check and its spawn), and
-  tombstones refuse delayed starts. ORDINARY COMPLETION IS GATED ON THE
-  SAME AUTHORITY: before a command's exit is reported as finished the
-  runner queries containment — surviving descendants are contained and
-  CONFIRMED gone (recorded on the operation row), and an unreachable or
-  unconfirmed verdict is `cancel-unknown`, never a silent completion. Run
-  finalization and stop refuse terminal states while any operation is
-  unresolved (guarded single-statement transitions; command registration is
-  refused on stopping/cancel-unknown runs). SSH transport loss mid-command
-  (client exit 255) is treated the same way: cancel the remote operation,
-  do not report the run from output/exit-code alone.
-- Model outages are recorded events (`model_unavailable`), never silent
-  successes; the gateway is bounded priority (hints > red > AAR) with
-  visible overflow 503s.
-- Verifier truth: only backend-executed verifier events confirm objectives;
-  agent `DONE` requires ALL objectives verifier-confirmed; intents are
-  logged BEFORE execution and never blindly replayed after a crash.
-- **[LIVE GATE]** Full red run against real Kali + real scenario hosts with
-  your model endpoint.
+Milestone 03 must deliver reproducible Linux web and web+MySQL templates with
+synthetic seeded business data, usable services, declared vulnerabilities/limited
+footholds, defender guest administration, trusted verification channels and stable
+baselines. Existing scripts/YAML are not proof those guests exist. Image versions,
+template IDs, service/data baselines and host keys are part of accepted inventory.
 
-## 7. Web
+Install the trusted operation supervisor **inside the disposable attacker VM**,
+not on Proxmox. It requires correctly delegated cgroup v2/kernel facilities and
+supported namespace protection; a top-level mkdir/chown example is insufficient.
+Milestone 02 must specify/prove launcher identities, migration permissions,
+bookkeeping protection and safe cancellation. Missing prerequisites refuse work
+before command execution. Development `local-dev` is never a production fallback.
 
-- `web/` (Next 14): `npm ci && npm run build && npm start`;
-  `NEXT_PUBLIC_API_URL` must point at the API. Bearer tokens; 401 → login.
-  Replay uses vendored asciinema-player (npm) fed via blob URL.
-- Login page expects username+password. Library filters use scenario
-  metadata; live dashboard polls `/live` (cursor-tailed); report page GETs
-  the PERSISTED AAR (generation is explicit); progress reads
-  `v_score_items` (trusted snapshots only).
-- Checked-in browser E2E (opt-in): `pytest -m browser`
-  (`tests/test_stage5_browser_e2e.py`) drives the REAL app against the REAL
-  API + worker with controlled doubles (PVE/model/runner/verifier/datapath);
-  needs `playwright-cli`, `web/node_modules`, and ports 8010/3000 free — it
-  SKIPS honestly otherwise. **[LIVE GATE]** the same workflow against the
-  deployed stack (real PVE hosts, real bastion recording playback).
+Linux capture requires the actual installed `sparring-shipper` systemd unit as
+`srshipper`, its declared input/group/sandbox permissions and writable bounded
+spool. The deployment provisions a session/host/generation-scoped capability plus
+fresh nonce, never a live token baked into an image. Readiness separately proves:
 
-## 8. Upgrades / migrations
+1. Provisioning and service startup.
+2. Authenticated delivery from the exact current capability/nonce/generation.
+3. A harmless marker command executed on the guest, captured by real auditd, and
+   observed through that installed service at the authenticated API/DB boundary.
 
-- Apply migrations via `rangectl db migrate` before restarting the API.
-  If migration list changes `v_score_items` or safety tables, re-run
-  `POST /safety/baseline-check` afterwards (config identity changes
-  invalidate old evidence by design).
+`systemctl is-active`, fabricated audit stdin or controller-posted callbacks cannot
+substitute for capture. With the unit still active, wrong API/path, invalid token
+and unreadable audit input must each block readiness visibly and recover after
+repair. Migration 0010/current enrollment code exists, but safe legacy-ready/run
+upgrade and exact binding remain unverified here. No installing/reconfiguring
+auditd or user accounts on this review host; use an explicitly disposable fixture.
 
-## 9. Known gaps (honesty list)
+Recording bastion and API need an accepted durable same-path storage or transfer
+contract; dev Compose uses a shared volume. Replay exposes opaque IDs, never
+filesystem paths/tokens. Missing files, truncation and capture/delivery gaps are
+visible. Record only synthetic lab activity, never real admin operations.
 
-- Single-active-range lease (v1 assumption). Windows automation is
-  checklist-driven. `POSTGRES` cluster default collation must be UTF8-safe
-  (tests create with explicit ENCODING).
-- All **[LIVE GATE]** items above.
-- `docker compose config` + fresh-volume boot of §0: **BLOCKED** in the
-  authoring environment (no docker); validated by YAML-parsing tests only.
+## 5. Production startup and match behavior — target, not shipped
+
+Milestone 10 will supply executable managed guest-service packaging, same-origin
+HTTPS and exact startup/upgrade/recovery commands. Production is not simply dev
+Compose pointed at your real infrastructure. Preserve PostgreSQL 16+ UTF8,
+separate owner/app roles, forward Alembic migrations, app-role denial of event
+UPDATE/DELETE/TRUNCATE and DB trigger enforcement. Current explicit migration
+entrypoint is `rangectl db migrate`; inspect/configure it before authorized use.
+
+Accepted startup order must establish storage/DB, role bootstrap and migrations,
+private deployment boundary, API readiness/reconciliation, bastion and frontend,
+then dependent jobs. HTTP liveness alone is insufficient. No owner DB URL in
+runtime services; no attacks automatically resumed after API restart.
+
+The agreed member flow is: login → approved preset/options → Start practice →
+provisioning/readiness → per-host SSH instructions → connect → **Begin competition**
+→ defend/watch scores/injects → final evidence/report inputs → automatic cleanup
+→ reusable range and retained history. Current code does **not** implement all of
+this. Current end leaves resources/reservation until separate teardown; do not
+tell members the new automatic cleanup exists yet.
+
+- Options: guided/competition; 30/60/120 minutes; low/normal/high intensity;
+  injects on/off; explicit network-entry/assumed-breach starts.
+- Ready/unstarted expiry: 15 minutes. Running server clock continues on browser
+  closure. API restart interrupts/reconciles; it never silently restarts attacks.
+- Service checks: every 10s, 5s timeout. Dashboard refresh: 2s. Attack dispatch
+  ceilings: 60/30/15s, no overlaps; not guaranteed achieved attack throughput.
+- Model timeout: 60s; at most three attempts with 5/15s delays; exhausted recovery
+  interrupts. No hidden scripted attacker or foothold fallback.
+- Confirmed scorer-infrastructure outage interrupts and preserves partial results;
+  actual target failure counts as downtime when scoring infrastructure is healthy.
+- Unknown stop/ownership/cleanup retains durable obligations and lease. New users
+  see a blocked/recovery state, not an available environment with residual guests.
+
+Effective operator settings are snapshotted per session. Endpoint testing may
+require agreeing revised defaults; do not silently alter an in-progress match.
+
+## 6. Emergency stop, recovery and release
+
+**Accepted design still to implement/prove:** persist latch first, fence further
+dispatch, attempt worker/operation cessation, and independently hard-stop all
+positively owned lab VMs (attacker and targets) through restricted PVE authority.
+Confirm PVE tasks plus authoritative status; API timeout/worker death is not
+confirmation. Do not wait for model report generation. Results may be partial.
+Static isolation remains installed throughout, including while the API is down.
+
+If the platform/broker is unavailable, the operator uses trusted Proxmox UI/API
+to stop only the exact identified owned lab guests. If ownership is uncertain,
+inspect the approved reservation/creation ledger and actual identities before
+mutating anything—no name-prefix sweep. Do not reset disks or change unrelated VMs.
+
+Retain the lease and unresolved operation/resource inventory until verified
+cessation and cleanup. Do not edit evidence, mark obligations done by hand, delete
+a corrupt latch, or release merely because the attacker worker disappeared.
+Record interruption and reconciliation outcomes without secrets. Safe retry is
+idempotent; old callbacks/late starts cannot revive the match.
+
+Release is an explicit operator action after genuine resolution, with fresh
+isolation/stop evidence bound to current configuration/generation. It never
+restores WAN access or resumes interrupted attacks. Milestones 02/10 will define
+the actual API/admin procedure; legacy nft commands are not prescribed here.
+
+## 7. Evidence storage, backup and purge
+
+Reports, score evidence, immutable specs/settings and SSH recordings remain until
+explicit operator purge. No automatic eviction. Show usage and block new starts
+when evidence cannot be stored safely; an active storage failure is surfaced and
+handled conservatively, not silently ignored. Finalization must preserve required
+inputs before normal VM cleanup; report model work may finish afterward.
+
+Back up PostgreSQL, casts and reference/template/rubric manifests consistently to
+operator-selected protected storage. Keep NAS credentials/mounts out of the range.
+Test restores in a disposable isolated stack: identity/history, component scores,
+recording references/replay and immutable report versions must survive. Restored
+operational state must be reconciled, not restart attacks or mutate old VMIDs.
+
+Milestone 10 specifies backup scheduling/consistency, recovery objectives and an
+offline scoped archive/purge procedure with confirmation and export/backup first.
+Runtime app roles do not gain event-delete/truncate privileges. Missing/removed
+recordings are shown honestly. Do not improvise recursive evidence deletion or
+volume resets as a recovery action. Indefinite retention requires capacity
+monitoring and an operator decision when storage fills.
+
+## 8. Safe validation commands and prerequisites
+
+### Current optional developer baseline
+
+From the repository root (no DB admin selected):
+
+```bash
+env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 \
+  .venv/bin/python -m pytest -q -ra -p no:cacheprovider
+```
+
+Known failing result is recorded in the findings checklist. The selector
+`-m "not db and not browser and not live"` still has DB marker leakage; do not
+advertise it as fully infrastructure-free until milestone 01 repairs it.
+
+### Disposable database integration
+
+Set `SR_PG_ADMIN_URL` or `SR_PG_ADMIN_CMD` only to an explicitly approved disposable
+cluster. Fixtures create/drop unique `srtest_*` DBs and unique roles; they must
+never target production. Then run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -m "db or adapter" -q -ra -p no:cacheprovider
+```
+
+Check selection: adapter tests can carry other infrastructure requirements.
+Use explicit dedicated commands for migrations/upgrade/concurrency in the agreed
+plan. The absence of DB test failures due to skipped fixtures is not DB acceptance.
+
+### Containment, installed capture and packet jobs
+
+Containment jobs require correctly delegated cgroup v2, user/mount/cgroup/PID
+namespace support, trusted launcher setup and actual harmless migration/non-escape
+proof. `SR_REQUIRE_CONTAINMENT=1` exists in helpers but is **not yet enabled in CI**.
+Mandatory jobs must fail missing prerequisites; optional developer skips remain.
+
+The required installed-capture fixture/flag/job is **missing**, to be implemented
+in milestone 04. Do not run a nonexistent file and call it a hardware-only gate.
+Packet tests need a privileged disposable isolated Linux fixture with nftables/
+iproute2 and positive controls; never install host firewall rules here or on the
+R740 merely to get green tests. Required jobs must execute, not skip/deselect.
+
+### Frontend and browser
+
+From `web/`:
+
+```bash
+npm ci
+npm run build
+npm audit --package-lock-only --json
+```
+
+Browser acceptance separately uses a disposable DB, built frontend, Playwright
+CLI/Chromium and isolated free ports. Current E2E is
+`tests/test_stage5_browser_e2e.py`, selected with `-m browser`; it uses controlled
+PVE/model/runner/verifier/datapath boundaries and synthetic capture. It is not real
+installed telemetry or R740 acceptance. Do not stop OpenChamber/other services to
+free ports 3000/8010; use an isolated fixture/configuration.
+
+### Dev Compose
+
+Existing `docker-compose.yml`, `.env.example`, `infra/dev/seed-bastion-keys.sh`
+and `rangectl bootstrap` provide a dev bootstrap path. Milestone 01 must validate
+`docker compose config`/build and a fresh **disposable** stack with supplied keys,
+role bootstrap/migrations, recording volume, idempotent operator/capability
+bootstrap and readiness. Do not point unaccepted dev defaults at live infrastructure
+or delete an existing volume. Fake pins/dev local runner/datapath relaxations are
+not production safety evidence.
+
+## 9. Actual R740 release gates — all open
+
+Each gate needs operator approval, exact evidence revision/environment/commands,
+non-secret outcomes and positive controls. Early discovery is useful; attack gates
+do not become optional because development tests pass.
+
+- [ ] Effective limited PVE ACLs allow only approved operations/resources and deny
+  unrelated VM/LXC, host-administration and privilege-expansion access.
+- [ ] Real booted lab VM cannot reach WAN/DNS/IPv6, management, inference, NAS or
+  unrelated workloads; authorized bastion/probe/ingest flows work. Cover bridge,
+  routing and established flows; management stays usable.
+- [ ] Emergency stop stops all owned attacker/target VM traffic and work, including
+  background/transport-loss/control-outage cases; latch/release/new-start rules are
+  honest and manual PVE stop works independently of the application.
+- [ ] Supported template clone/read-back/start/reset/teardown and concurrent launch
+  conflict work; failures/unknowns retain ownership/lease; unrelated VMs unaffected.
+- [ ] Pinned member SSH, interactive/exec/resize/reconnect casts and durable API
+  replay work; revoked/foreign keys/tokens fail.
+- [ ] Installed Linux auditd/systemd capture under `srshipper` binds current
+  session/host/generation, plus active-service API/token/input negatives recover.
+- [ ] Qwen endpoint works through bounded shared gateway: valid tool output,
+  measured prompt/context/latency, guided hint priority, paced attacks, retry then
+  interruption, honest objective verification and no secret/tool authority.
+- [ ] Production HTTPS/IP trust, services/role grants/migrations, boot/restart
+  interruption, capacity/quota handling and consistent disposable backup restore.
+- [ ] Real service break/restore affects separate scores; technical inject timing/
+  verification and written advisory feedback work, including partial results.
+- [ ] Both presets/start conditions and guided/competition policies work; operator
+  and another member complete unaided browser+SSH sessions, view replay/history
+  across sessions, and accept the usefulness/truthfulness of the AAR.
+
+Windows licensing/templates, Sysmon/WEC installed capture, Windows verification
+and access are later milestone-12 gates, not marked complete by Linux acceptance.

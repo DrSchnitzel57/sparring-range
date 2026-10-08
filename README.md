@@ -1,87 +1,94 @@
 # sparring-range
 
-AI Red-Team Sparring Range — built to `plan.markdown` (Parts 1–7 are the contract).
+A Linux-first, browser-led CCDC defense practice range: disposable lab VMs,
+AI attacks, service scoring, timed injects, SSH replay and after-action feedback.
 
-The one-line mental model: this repo is the *factory* (code, config, scripts); the
-R740 + range VLAN + GPU box are the *kitchen*. Nothing here runs until it's pointed
-at real infrastructure via `.env` (see `.env.example`).
+**Status: incomplete and not accepted for live model-driven practice.** Existing
+backend, CLI, frontend and safety/evidence repairs are foundations—not proof that
+the agreed competition workflow or deployment is finished.
 
-## Layout
+## Current project contract
 
-Per plan Part 3, with **one deviation**: the plan's `platform/` directory is named
-**`srplatform/`** here, because `platform` is a Python stdlib module that SQLAlchemy,
-the OpenAI SDK, and proxmoxer all import — a top-level importable package named
-`platform` shadows the stdlib and breaks the stack whenever the repo root is on
-`sys.path`. Contents are identical to the plan's intent.
+- [Agent workflow and safety rules](AGENTS.md)
+- [Release architecture and decisions](docs/ARCHITECTURE.md)
+- [Ordered milestones](docs/ROADMAP.md)
+- [Current findings and exact validation evidence](docs/FINDINGS_CHECKLIST.md)
+- [Operator prerequisites and live gates](docs/OPERATOR_RUNBOOK.md)
 
-```
-rangectl/          Typer CLI — the human's main interface; pure API client
-                   (only sanctioned exception: `db migrate` runs Alembic as owner)
-infra/             proxmoxer wrapper, cloud-init, firewall egress-deny + killswitch,
-                   golden-image scripts, dev Dockerfile, db bootstrap roles
-srplatform/        the platform (plan's `platform/`): api, db (models+alembic),
-                   bastion, red_agent, coach, scenario_engine
-verifiers/         deterministic checks — the ONLY thing allowed to declare red success
-scenarios/         YAML scenario specs (the product's contract)
-telemetry/         auditd rules + Sysmon config + the ~100-line tail-and-POST shipper
-web/               M7 Next.js app — thin client of the same FastAPI service
-tests/             one test per acceptance criterion (gates between milestones)
-```
+The original master plan and accumulated audit/handoff/completion documents are
+superseded. Their useful requirements/findings are consolidated above; detailed
+historical records remain in Git. No implementation milestone is accepted yet.
+Full implementation plans will be agreed **one milestone at a time** in
+`.openchamber/plans/`; none has been created by this release-design pass.
 
-## Hard constraints (Part 1) — where they live in code
+## Agreed first release
 
-1. **Range VLAN has no WAN egress** → `infra/firewall/range-egress-deny.nft.conf.tmpl` (default-DENY). Datapath proof is Drew's (`rangectl safety verify`).
-2. **Killswitch stops the red agent AND drops the datapath, tested first** → `srplatform/safety.py` + `infra/firewall/killswitch.sh`; `tests/test_m0_acceptance.py`.
-3. **No self-reported success** → `verifiers/` only; grades/objectives derive from verifier-result events.
-4. **Event log is append-only** → Alembic migration `0001` (RAISE trigger + role revocations); test attempts an UPDATE and expects failure.
-5. **Secrets never enter the repo** → `.env` (gitignored); only `.env.example` committed.
-6. **Home-LAN trust boundary** → no internet-facing exposure, simple LAN auth.
+LAN-only HTTPS at a private IP/port; operator-managed accounts and SSH public keys;
+one active environment. Users select web or web+database, guided or competition,
+30/60/120 minutes, attack intensity, injects on/off, and explicit network-entry or
+assumed-breach starts. Deployment/readiness produces SSH instructions; **Begin
+competition** starts the server clock, attacks, service scoring and injects.
 
-## Design rules honored
+Display service-availability, technical-inject and security-state scores
+separately. Written reports receive advisory AI feedback, never verified points.
+Preserve evidence/reports/replay inputs before automatic VM cleanup; keep history
+until explicit operator purge. These are target behaviors, not claims about the
+current UI. Windows/AD follows the first Linux release.
 
-- **API is the only front door** — CLI and web are both HTTP clients; nothing else
-  touches Postgres.
-- **New capability = new scenario YAML field + a verifier**, not new machinery.
-- **The log is the product** — AAR, timeline, scorecard, /hint, replay are all
-  queries over `events`.
+Attacker and targets are full VMs, not LXCs. The existing inference LXC on the
+same R740 serves the operator's Qwen 3.8 Flash Next endpoint outside the attack
+network. AI commands never receive Proxmox/host-root, DB-owner, verifier or NAS
+authority. A private deterministic deployment service with restricted PVE access
+and permanent operator-configured isolation is planned; current privileged nft
+wiring is **not** the accepted production design.
 
-## Milestones — all built, one commit per milestone
+## Repository layout
 
-| Milestone | Automated acceptance (tests/) | Drew's live-infra gate (Part 0.4) |
-|---|---|---|
-| M0 skeleton+safety | ✅ append-only UPDATE raises (real PG), killswitch kills+datapath-drops, default-deny ruleset | prove ping/DNS die from a real range VM |
-| M1 templates+deploy | ✅ linked clones, cloud-init IP pin, reset=destroy+reclone, teardown no orphans | golden images (esp. Win DC/Win10+Sysmon) |
-| M2 bastion+event bus | ✅ real asyncssh round-trip: `.cast` v2 both directions + auditd ingest tied to live session | bastion LXC at the boundary |
-| M3 red harness | ✅ verifier-gated objectives, phase-tagged steps, anti-self-report gate, kill/resume from agent_state | model endpoint `curl` proof (Part 6.1) + prompt tuning |
-| M4 scenarios+verifiers | ✅ validator (unknown verifier/points/host rejected), pure-YAML scenario runs+scores, YAML-only objective addition | author 1–2 more scenarios |
-| M5 coach | ✅ AAR cites event timestamps/ids; hint context-aware; hint jumps the queue ahead of batches | judge AAR usefulness |
-| M6 practice loop | ✅ CLI-over-real-HTTP end-to-end: scenarios→deploy→run→hint→status→report→teardown | run it unaided, list rough edges |
-| M7 web gym | ✅ login/library/live/AAR/replay/progress endpoints (progress = SQL VIEW over the log); Next.js app builds; browser-checked login→library→progress | member accounts, LXC deploy, judge AAR before polishing |
+| Path | Purpose |
+|---|---|
+| `srplatform/` | FastAPI, DB/migrations, scenario engine, bastion, supervised worker, coach and safety |
+| `rangectl/` | HTTP CLI client; explicit offline DB migration/admin exceptions |
+| `infra/` | Existing PVE adapter, image/cloud-init, runner and dev deployment artifacts |
+| `scenarios/` | Validated YAML snapshots; usable release presets still need completion |
+| `verifiers/` | Trusted deterministic state checks, not model self-reported success |
+| `telemetry/` | Linux audit shipper/spool/unit and later Windows artifacts |
+| `web/` | Next.js Pages Router client of the same API |
+| `tests/`, `audit/` | Regression/integration tests and preserved historical probes |
+| `.openchamber/plans/` | Agreed milestone plans only |
 
-`rangectl` story (Part 0.5) — every command implemented:
-`db migrate` · `safety verify/killswitch` · `deploy` · `run` · `status` · `hint` · `score` · `report` · `reset` · `teardown` · `scenarios` · `sessions`
+The Python package is `srplatform`, not `platform`, to avoid shadowing the Python
+standard library. Preserve the existing stack; do not rewrite around a new framework.
 
-## Deviations & environment notes (honest list)
+## Safe development baseline
 
-1. **`platform/` → `srplatform/`** (above).
-2. **Driver: psycopg2**, not psycopg3 — psycopg3 returns bytes for text on
-   SQL_ASCII databases (this box's cluster default) and SQLAlchemy's dialect
-   chokes. Drew's production DB must be **UTF8** (see `infra/db/bootstrap.sql`
-   comment; the test fixture enforces `ENCODING 'UTF8' TEMPLATE template0`).
-3. The local asyncssh build required `public_key_auth_supported() -> True` and
-   `line_editor=False` on the bastion server (transparent pipe — no double echo).
-4. Killswitch is provably effective in-process/API-level in tests; **the
-   "from inside a range VM" proof is Drew's** — that is by design (Part 0.4)
-   and `rangectl safety verify` prints the exact commands to run.
-5. Web app is dev-only-cors (localhost origins), LAN trust — matches
-   constraint #6; do not expose to the internet.
-
-## Dev loop
+Python 3.11–3.13 are current CI targets; locked requirements are in
+`requirements.lock`. On a new developer environment:
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
-cp .env.example .env        # fill in your infra
-.venv/bin/pytest            # 23 tests — one per acceptance criterion
-docker compose up           # dev postgres+api+agents (real deploy = LXCs)
-cd web && npm install && npm run build && npm start   # the gym front door
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.lock
+.venv/bin/pip install --no-deps -e .
 ```
+
+Do not replace an existing environment or use live credentials implicitly. Current
+optional baseline without DB administration:
+
+```bash
+env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 \
+  .venv/bin/python -m pytest -q -ra -p no:cacheprovider
+```
+
+At application revision `23de4f4`, Python 3.13.5: **exit 1, 9 failed, 107 passed,
+115 skipped, 1 deselected, 4 warnings**. Eight process-test failures need
+namespace/identity investigation; one unmarked test requires unavailable DB.
+Do not weaken containment to satisfy old premises. DB tests need explicitly
+approved disposable PostgreSQL administration; skipped tests are not acceptance.
+
+From `web/`, frontend commands are `npm ci` and `npm run build`; browser acceptance
+is separate. Fresh lockfile audit: **3 critical / 1 high**, four affected packages;
+applicability/patch validation remains open. Do not displace OpenChamber or another
+service to free browser-test ports.
+
+Read the runbook before Compose, migration, privileged packet/systemd or live
+testing. No production quick-start is claimed yet; deployment, containment,
+installed capture, browser workflow and R740 safety still need the ordered gates.

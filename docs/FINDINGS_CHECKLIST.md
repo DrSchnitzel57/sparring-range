@@ -1,137 +1,197 @@
-# Findings checklist F01–F23 (remediation tracker)
+# Current findings and validation evidence
 
-Baseline audit: `IMPLEMENTATION_AUDIT.md` @ `a5b19ab`. Handoff: `LOCAL_AGENT_HANDOFF.md`.
-Legend: ☑ = code + automated evidence in-repo; ☑+E = live evidence on Drew's
-hardware (operator gate — cannot be closed by the harness, see
-docs/OPERATOR_RUNBOOK.md §LIVE GATEs). No finding below is marked done by
-claiming live acceptance.
+Updated: 2026-10-08. Application revision inspected/tested: **`23de4f4`**.
+Release contract: [ARCHITECTURE.md](ARCHITECTURE.md); ordered work:
+[ROADMAP.md](ROADMAP.md); operator gates: [OPERATOR_RUNBOOK.md](OPERATOR_RUNBOOK.md).
 
-> **Follow-up review round (docs/FOLLOWUP_REVIEW.md, R01–R12):** the review at
-> `bd93f0d` reopened several rows below as broken in production paths. All
-> twelve R-findings have since been remediated with production-boundary
-> regression tests (`tests/test_followup_regressions.py`); see the R-table at
-> the bottom of this file for the mapping and evidence. Rows whose R-fix needs
-> live hardware stay behind the live gates.
+**Not release-ready.** This replaces accumulated remediation checkmarks. Existing
+repairs and regression tests are valuable, but historical green totals and reports
+are not fresh acceptance. No release milestone has been accepted, no live attacks
+are authorized, and documentation changes do not repair the application.
 
-> **Second follow-up review round (docs/SECOND_FOLLOWUP_REVIEW.md, N01–N11):**
-> the review at `18377c6` showed several ☑ marks above were OVERCLAIMS — the
-> fixes existed but had fail-open paths (N01/N02/N03/N07), missing
-> implementation dressed as a "live gate" (N05 remote cancellation, N09
-> installed unit, N11 provisioning), or in-process-only proofs where the
-> contract was cross-process (N08 spool race, F18 scheduler). The ☑ marks
-> above reflect the state AFTER the N-remediation; what each row actually
-> required is in the N-table at the bottom of this file. Historical review
-> findings stand as written — they were real.
+## Evidence labels
 
-| ID | Priority | Fix (code) | Automated evidence | Status |
-|----|----------|-----------|--------------------|--------|
-| F01 | P0 | `red_agent/runner.py` ssh-only runner (pinned known_hosts, no local fallback in prod), `red_agent/worker.py`, `api/runs.py` process-group supervision + watchdog + startup reconciliation | m3 `test_m3_run_endpoint_supervises_worker_lifecycle` (dup-guard, killpg, durable state); `start_gate` refuses unconfigured runner | ☑ |
-| F02 | P0 | `safety/` package: persisted latch (file+DB), records with config-identity+freshness, run registry, independent datapath layer; arbitrary-PID endpoint removed | m0 killswitch/partial-engage/release-evidence-invalidation tests; m3 `test_m3_run_endpoint_guards` (423 + reasons) | ☑ |
-| F03 | P0 | `safety/firewall.py` rendered rulesets (v4+v6+bridge L2, range-scoped, idempotent); `infra/firewall/killswitch.sh` standalone | m0 `nft -c` parse + default-deny structure assertions (also run in CI; `nft -c` green on this host) | ☑ (packet-drop live gate remains) |
-| F04 | P0 | `api/auth.py` real credentials (scrypt, documented deviation), per-principal token issuance/revocation, producer-scoped ingest, server-assigned actors, service capabilities (bastion/telemetry/runner) | m7 login lifecycle (expiry semantics via revocation), m2 bastion/telemetry capability tests, m3 `FORBIDDEN_KINDS` path used throughout | ☑ |
-| F05 | P1 | `infra/proxmox_client.py` correct verbs/URLs, UPID task polling, TLS policy; `FakePVEHttp` simulates the HTTP boundary (async tasks, failures) | m1 tests drive the REAL client over the fake incl. task-failure injection (`fail_task_fragments`) | ☑ |
-| F06 | P1 | single-active `range_lease`, deployment ownership rows, NIC read-back validation, teardown of owned resources only | m1 launch/lease-conflict/reset/teardown/prefix-orphan + failed-deploy ownership tests | ☑ |
-| F07 | P1 | compose without red-agent/coach services, migrate job, credential split, `.dockerignore`, locked deps | `docker compose config` cannot run here (no docker) — files reviewed & CI lint only | ◐ (needs operator `docker compose config` + build) |
-| F08 | P1 | `/sessions/{id}/launch` shared CLI/browser workflow issuing per-host connection capabilities; revocation at end | m1 launch + `test_m1_end_releases_lease_revokes_tokens_and_scores`; m2 bastion consumes launch token; browser flow smoke | ☑ |
-| F09 | P1 | `telemetry/shipper.py` raw audit-line parse (multi-record events), bounded spool + backoff + gap note, capability identity; install script + systemd unit; Sysmon config + fixture | m2 `test_m2_shipper_groups_raw_auditd_lines`, dedup + host-identity tests | ☑ (live VM gate remains) |
-| F10 | P1 | verifier typed args (pydantic), polarity (`expect`), three-valued status, baseline-aware cron, flag provenance, shlex quoting | m4 polarity/unknown/provenance/quoting tests | ☑ |
-| F11 | P1 | backend `POST /sessions/{id}/score` + trusted finalize on end; CLI/web score over HTTP only | m4 score endpoint (scored/partial), m1 end-score, m6 CLI score prints backend card | ☑ |
-| F12 | P1 | coach timeline correlation (same-host, windowed), explicit wins, telemetry gaps, UNSCORED ≠ F, citation validation, failure-weighted study | m5 correlation/gap/miss/win tests, `test_aar_unscored_never_becomes_an_f`, narrative citation test | ☑ |
-| F13 | P1 | lifecycle states preparing→ready→running→stopping→complete/failed, `/run` validation + duplicate guard, lease lifecycle | m1/m3 endpoint tests incl. 409-before-launch, 409 busy, watchdog-failed worker | ☑ |
-| F14 | P1 | event-id cursor pagination server-side (no head window), prior-summary carry-forward, intent-before-exec, no blind replay | m7 `test_m7_cursor_pagination_deterministic`, m3 restart/compression tests | ☑ |
-| F15 | P1 | DONE requires ALL objectives verifier-confirmed (3-strike stop), strict schema + single retry, scenario phases | m3 `test_m3_done_claim_without_verifier_truth_is_refused`, partial-progress test | ☑ |
-| F16 | P1 | opaque recording ids, UUID cast names (exclusive create), path containment at registration AND read, exec-channel recording | m2 recording-name opacity + registration; m7 containment + symlink rejection | ☑ |
-| F17 | P2 | asciinema-player (vendored via npm) fed by blob URL, header-epoch alignment, multi-recording selector, seek from timeline | m7 replay shape/epoch test; browser check (see final report) | ☑ |
-| F18 | P2 | `model_gateway.py` single bounded priority queue shared by hints/red/AAR; outage = visible outcome | m5 `test_hint_jumps_the_queue_ahead_of_batch_work`, AAR persistence/version tests | ☑ |
-| F19 | P2 | typed pydantic scenario schema, strict loader (ids/paths/points/polarity/verifier args), session YAML snapshot | m4 loader rejection matrix + snapshot semantics (session YAML embedded in session_start) | ☑ |
-| F20 | P2 | per-domain progress from `v_score_items` trusted snapshots, dedup per session, trend, partial visibility | m7 `test_m7_progress_is_per_domain_from_snapshots_over_multiple_sessions` (incl. view fix payload path) | ☑ |
-| F21 | P2 | golden provisioning installs auditd rules + shipper + systemd unit + env contract; packer fixed (hashicorp plugin, file provisioner); Windows checklist + Sysmon config/fixture | `telemetry/install.sh` reviewed; packer file valid HCL (no packer binary here to `validate` — operator run) | ◐ (live image build gate) |
-| F22 | P2 | test layering: markers (db/adapter/browser/live), disposable unique DB + roles, explicit admin (`SR_PG_ADMIN_URL`/`_CMD`), `sys.executable`, singleton reset, per-test truncate | conftest + whole suite green on clean run; no implicit cluster mutation paths remain | ☑ |
-| F23 | P2 | `SR_ENV=production` validation rejects placeholders/TOFU/local runner; docs honest about every deviation | settings validator unit-covered? partially (validator exists); docs/ARCHITECTURE_NOTES + OPERATOR_RUNBOOK rewritten | ☑ (validator test small) |
+- **Reproduced:** executed here at the stated revision/environment.
+- **Inspected:** current source/artifacts support the observation; not a passing
+  production integration test.
+- **Missing software:** a required mechanism or acceptance fixture is absent.
+- **Unverified:** required boundary has not been independently executed here.
+- **Historical:** prior revision evidence/claims, recoverable from Git; not current
+  acceptance. Reproduction assertions proving a bug are not acceptance passes.
 
-## Remaining operator (live-evidence) gates — cannot be auto-closed
-1. nft packet-level egress proof from a booted range VM (ping/DNS/IPv6).
-2. Real Proxmox: linked clone/reset/teardown on R740 + concurrent-launch lease conflict.
-3. Real Kali runner over SSH (pinned host keys) + full red run vs live hosts.
-4. Real model endpoint through the gateway under load (hints vs AAR).
-5. Telemetry from real Linux VM (auditd) AND Windows VM (Sysmon→WEC→ingest).
-6. `docker compose config`/build + full-stack boot; golden-image builds (packer/manual); Windows template + Sysmon checklist items.
-7. Browser E2E against the DEPLOYED stack (a checked-in E2E against the real
-   API with controlled doubles now exists: `pytest -m browser`,
-   `tests/test_stage5_browser_e2e.py` — it does not replace this gate).
+## Fresh planning baseline
 
-## Follow-up review remediation (R01–R12, docs/FOLLOWUP_REVIEW.md)
+Checkout was clean on `master`, equal to `origin/master`, before documentation
+work. Linux, existing `.venv`, Python **3.13.5**, Node **22.23.3**, npm **10.9.9**.
+No disposable PostgreSQL admin configured; no user-approved live PVE/templates,
+installed systemd/auditd fixture, packet or deployed-browser acceptance performed.
 
-Evidence: `tests/test_followup_regressions.py` unless noted. Full suite green
-against a real disposable PostgreSQL 16; nft rulesets validated with the real
-`nft` parser and a privileged apply/remove round-trip.
+Executed in the repository root:
 
-| R | Reopened because… | Fix | Evidence | Status |
-|---|-------------------|-----|----------|--------|
-| R01 | worker bearer token never resolved by API auth (only the completion callback worked) | `auth.py` resolves the run credential (sha256) as session-bound `runner` capability; revoked when the run is inactive; `start_run` commits the credential BEFORE spawn; callback one-shot; terminal state final; tests use the real credential format | `test_r01_run_credential_authenticates_and_dies_with_the_run`, `test_r01_completion_callback_is_one_shot_and_terminal_final`, `test_r01_real_worker_end_to_end_over_http` (REAL worker subprocess → REAL uvicorn API → local runner → trusted verifier) | ☑ |
-| R02 | `/tokens/{token}` returned no username → token logins could never authorize the owner's key | API resolves the owner's username server-side; bastion binds the login to that member's provisioned key (production keys file, no override); asyncssh key-rendering fixed for the pinned version | `test_r02_bastion_token_login_binds_owner_key` (production resolver + keys file + live API; foreign member's key rejected) | ☑ |
-| R03 | stopping the worker left command groups alive; killswitch only REPORTED recovered groups; PGID reuse unguarded | runner supervises command handles; worker SIGTERM kills the command group; killswitch PASSES recovered groups to the kill; startup RE-REGISTERS surviving groups; leader start-time identity guard (`runs.pgid_pstart`, migration 0006); worker-termination exceptions cannot block the datapath half | `test_r03_worker_sigterm_kills_the_command_group`, `test_r03_killswitch_kills_recovered_groups_and_reconcile_reregisters`, `test_r03_terminate_group_refuses_reused_pgid_identity` | ☑ (remote-runner cancel-ack protocol remains a live gate) |
-| R04 | latch read missing/corrupt state as not-latched; release did not invalidate evidence; proofs accepted reachable-egress observations | conservative latch reconciliation (file OR DB mirror; both unreadable → fail closed; persistence errors exposed); engage/release invalidate prior evidence; datapath-proof schema rejects REACHABLE observations; baseline endpoint cannot override a failed live check | `test_r04_release_invalidates_previously_valid_evidence`, `test_r04_corrupt_local_latch_cannot_forget_engaged_db_mirror`, `test_r04_probe_schema_distinguishes_isolation_from_reachability`, `test_r04_attestation_endpoints_fail_closed`; m0 release test made unconditional | ☑ |
-| R05 | bridge-family rules matched the master not ports; release left the L2 table; apply was delete-then-load; baseline verified table existence only | port-set topology render (`RANGE_BRIDGE_PORTS`); destination-constrained intra-range rule; source-scoped established accept; ingest port from settings; ONE atomic `nft -f` transaction for apply and for removal of BOTH families; baseline checks REQUIRED rules | `test_r05_*` (render/atomicity/verification) + real `nft -c` parse + privileged apply/remove round-trip in CI | ☑ (packet-level bridge tests remain a live gate) |
-| R06 | clone posted invented `newvmid`; the fake agreed with the mistake | documented `newid`; fake rejects unknown parameters and 404s config of missing VMs | `test_r06_clone_posts_documented_newid_and_fake_rejects_unknowns` | ☑ (real PVE version confirmation remains a live gate) |
-| R07 | end released the lease while VMs ran; stop failures ignored; teardown freed the lease after failed destroys; reset skipped the lease | end keeps the reservation while owned machines exist; stop failure → 409, session NOT finalized; lease takeover blocked by residual resources; teardown completes only when all destroys succeeded; reset acquires/verifies the lease; red_verified_complete reconstructed from trusted verifier events | `test_r07_teardown_failure_retains_lease_until_destroy_succeeds`, `test_r07_reset_requires_the_lease`, updated m1 end/lease test | ☑ |
-| R08 | VMs cloned before being recorded could orphan; launches not idempotent; teardown trusted stale rows | durable PENDING intent committed before the clone; resume reconciles existing VMs instead of re-cloning; launch idempotent (same deployment, no extra VMs); ownership read-back (tag OR recorded name) before every delete; foreign VMIDs disowned, never deleted | `test_r08_crash_after_clone_leaves_vm_owned_and_resumable`, `test_r08_launch_is_idempotent`, `test_r08_teardown_never_deletes_foreign_vmid` | ☑ |
-| R09 | `build_scorecard` dropped `expect` → absent-checks scored with default polarity | polarity forwarded to the verifier | `test_r09_absent_polarity_flips_with_host_state` (clean earns, compromised scores 0) | ☑ |
-| R10 | a timeout during execution killed the sole gateway thread, permanently stalling the queue | correct Future state machine (`set_running_or_notify_cancel`), lost-result tolerated, loop survives any task failure | `test_r10_timeout_during_execution_keeps_worker_and_queue_alive`, `test_r10_task_exception_does_not_kill_worker` | ☑ (cross-process shared-GPU scheduling remains a documented live gate) |
-| R11 | SYSCALL-first events lost attribution; trailing groups dropped at EOF; delivery only ran when new input arrived; backoff dead on the real outage path; spool trim not byte-aware/atomic | event-id assembly tolerant of record order + EOE + EOF flush; background `DeliveryLoop` (idle recovery, backoff on the false path, final flush at shutdown); byte-bounded atomic spool trim | `test_r11_syscall_first_event_keeps_attribution_fields`, `test_r11_trailing_group_flushed_on_eof_and_eoe`, `test_r11_delivery_backoff_on_false_and_idle_flush`, `test_r11_spool_byte_bounds_and_atomic_trim` | ☑ (host enrollment binding remains a live gate) |
-| R12 | compose API loaded the whole `.env` (owner URL); worker inherited all API env; bastion wiring absent; golden script never called the installer | explicit API env allowlist (also for spawned workers via `runs._worker_env`); compose: no env_file, shared recordings volume on BOTH services, bastion token/keys/known-hosts wired; golden script calls `telemetry/install.sh`; runbook claim corrected | `test_r12_compose_splits_credentials_and_wires_bastion`, `test_r12_golden_image_calls_the_real_installer` | ☑ (`docker compose config`/fresh-volume boot remains a live gate) |
+```bash
+env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 \
+  .venv/bin/python -m pytest -q -ra -p no:cacheprovider
+```
 
-## Second follow-up review remediation (N01–N11, docs/SECOND_FOLLOWUP_REVIEW.md)
+Exit **1**: **9 failed, 107 passed, 115 skipped, 1 deselected, 4 warnings**,
+**61.13s**. Default pytest selection excludes browser/live. DB cases mostly skip;
+an unmarked case leaks a DB requirement. This is not DB, real SSH, installed
+capture, privileged packet, browser or R740 acceptance.
 
-Baseline reviewed `18377c6`; fixed in staged commits (Stage 1–5) with the
-review's own probes re-run at every stage (`audit/second-review-results-after-stage*.json`;
-pre-fix evidence preserved in `audit/second-review-results-before-fix.json`).
-Legend: ☑ = implemented AND automatically verified in-repo; ☑+E = additionally
-needs live hardware for full acceptance (the automated part is still green).
+| Failing test | Interpretation to investigate, not assumed vulnerability |
+|---|---|
+| `tests/test_fifth_followup_acceptance.py::test_f1_same_uid_escape_to_parent_cgroup_is_impossible` | Namespace-local child PID / changed leader-exit behavior; retain no-escape invariant |
+| `tests/test_fifth_followup_acceptance.py::test_f1_nested_membership_is_running_not_gone` | Nested-survivor premise must match protected namespaces and actual host identities |
+| `tests/test_fifth_followup_acceptance.py::test_f1_unreadable_membership_is_unknown_not_gone` | Current leader exit can remove the survivor; establish real live-authority failure before asserting unknown |
+| `tests/test_fourth_followup_containment.py::test_t04_cleared_env_descendant_is_visible_and_contained` | Observe host identities and valid survivor conditions under new PID namespace |
+| `tests/test_fourth_followup_containment.py::test_t04_normal_zero_exit_with_survivor_is_contained_not_blind` | Namespace PID 1 exit may terminate children; verify cessation, not an obsolete note alone |
+| `tests/test_fourth_followup_containment.py::test_t04_failed_normal_exit_is_also_gated_on_containment` | Same issue for nonzero completion; preserve truthful exit and cessation |
+| `tests/test_fourth_followup_containment.py::test_t04_unreachable_supervisor_at_completion_is_unknown` | Ensure test actually reaches an unresolved control boundary |
+| `tests/test_third_followup_lifecycle.py::test_t01_descendant_survives_leader_exit_status_still_sees_it` | Legacy survivor expectation needs safe current-mechanism fixture |
+| `tests/test_followup_regressions.py::test_r04_release_invalidates_previously_valid_evidence` | Unmarked DB dependence; PostgreSQL unavailable, not proof invalidation itself is broken |
 
-| N | Reopened because… | Fix (production code) | Automated evidence | Status |
-|---|-------------------|----------------------|--------------------|--------|
-| N01 | Proxmox read failures were treated as "VM absent" → deletion authorized by outages | typed lookup outcomes at the adapter (`PveUnavailable`/`PveForbidden`/… propagate; only contract-conform absence is absence); destroy returns confirmed outcomes only — uncertain reads retain resource+lease and report `complete=false`; ownership validated before set-config/start/stop/delete with creation identity for the clone-before-tag window; fake produces the distinct responses | `tests/test_stage1_safety.py`: `config_read_timeout_retains_resource_and_lease`, `status_read_failure_during_teardown_retains_everything`, `confirmed_absent_is_idempotent_without_delete`, `pending_vmid_now_foreign_receives_zero_mutation`; probe `ownership_on_read_timeout`/`destroy_on_status_timeout` now raise | ☑ (real PVE version confirmation ☑+E) |
-| N02 | request-row "locks" did not survive `commit()`; launches/runs raced | DB-backed operation claims + DB-enforced active-run uniqueness (migration 0007), atomic transitions, crash recovery; start/engage and run/run serialized | `operation_claim_serializes_across_commits`, `concurrent_launch_cannot_double_deploy`, `concurrent_run_spawns_exactly_one_worker`, `start_racing_engage_never_escapes_supervision` (barrier-synchronized, assert external call counts + final DB state) | ☑ |
-| N03 | lifecycle endpoints could release/change the range under an active worker | one lifecycle policy across launch/deploy/reset/teardown/run/end; teardown stops+confirms the worker before release (or refuses); terminal-session deploy only via documented reset; partial-failure bookkeeping survives rollback | `teardown_then_run_is_refused`, `teardown_stops_active_worker_before_release`, `legacy_deploy_enforces_scenario_and_terminal_state` | ☑ |
-| N04 | production worker demanded the whole controller config (and loaded its `.env`) | split controller/worker validation; worker starts on capability+model+runner only; controller `.env` auto-load disabled for the worker; resolved settings serialized explicitly | `tests/test_stage3_telemetry.py`: `worker_role_validates_only_its_own_capability`, `worker_never_loads_controller_dotenv` (sentinel secrets in CWD never read), `worker_env_serializes_resolved_settings`; probes `production_worker_validation`/`production_controller_still_gated` | ☑ |
-| N05 | remote cancellation was MISSING implementation labeled a live gate | runner operation identities + status/cancel/ack path, restart reconciliation, spawn/register race closed, bounded STREAMING output capture; runner-side supervisor script (pidfile + process group); unconfirmed cessation is reported NOT-cancelled and stays tracked | `tests/test_stage2_safety.py`: `runner_cancel_reaches_descendants`, `runner_cancel_before_attach_kills_on_attach`, `cancel_active_reports_unconfirmed_truthfully`, `worker_crash_does_not_abandon_command_group`, `runner_output_bound_is_enforced_streaming`; probe `cancel_unconfirmed_never_silent` | ☑ (real SSH transport-loss on the R740 runner ☑+E) |
-| N06 | `nft -c` parse + substring checks did not establish effective isolation; bridge coverage stale | JSON-STRUCTURAL verification (family/table/hook/priority/policy/set contents/ordered rules; unhooked chains and early accepts rejected); apply refuses full success without current bridge-port coverage; per-family atomic transactions by table presence; release verifies baseline deny BEFORE dropping emergency, reinstalls on failure; destination-scoped reply rules (no `ip protocol ip` misuse) | `r06_apply_refused_without_port_coverage`, `r06_table_presence_combinations`, `r06_release_refuses_and_retains_when_baseline_unverified`, `r06_disposable_netns_packet_semantics` (real packets in disposable netns), `r05_real_nft_apply_remove_roundtrip`; probes `unhooked_baseline_accepted`/`missing_bridge_ports_apply`/`reply_rules_destination_scoped` | ☑ (packet truth on the R740 bridge ☑+E) |
-| N07 | missing/corrupt state read as not-latched; stale DB could forget newer file events | fail-closed reconciliation (missing file + unreadable DB = LATCHED; no evidence anywhere = latched until documented `initialize_state()`); timestamp merge (stale DB cannot outrank newer file); persistence failures retained and deny starts; engage/release invalidate ALL prior evidence; config identity binds bridge ports + API endpoint | `missing_file_with_unreadable_db_fails_closed`, `no_evidence_anywhere_fails_closed_until_initialized`, `corrupt_file_with_reachable_db_uses_db`, `stale_db_cannot_outrank_newer_file_records`, `record_persistence_failure_denies_start`, `release_reuses_no_old_proofs`, `killswitch_test_record_required_for_start`, `config_identity_binds_topology_and_api` | ☑ |
-| N08 | background delivery could silently lose records (ack-by-position, in-flight appends, first oversized record) | durable spool with stable record identities; synchronized append/trim/ack incl. in-flight batches; byte limits incl. the FIRST oversized record (visible drop counter); torn/malformed write recovery | `spool_first_oversized_record_is_visible_drop`, `spool_ack_by_identity_survives_inflight_append`, `spool_trim_oldest_byte_aware_and_persisted`, `spool_recovers_from_torn_and_malformed_data`, `delivery_outage_then_idle_delivery_and_shutdown`; probes `oversize_first_spool_record`/`append_during_delivery_remove` | ☑ |
-| N09 | audit assembly closed events wrongly; the installed unit could not run; enrollment was static | event-identity grouping (no close on SYSCALL/foreign id alone; EOE + live-stream flush; repeated EXECVE concatenated visibly; quoting preserved); installed artifact exercised end-to-end (interpreter + writable state + real delivery); per-deployment session+host-bound telemetry enrollment, revoked per lifecycle; no live tokens in repo/templates | `grouping_interleaved_events_preserve_all_fields`, `grouping_does_not_close_on_syscall_or_new_id_alone`, `grouping_repeated_execve_concatenates_visibly`, `quoted_hex_like_argument_stays_literal`, `live_stream_final_event_deliverable_while_input_open`, `installed_shipper_artifact_end_to_end`, `unit_and_installer_agree_on_service_identity`, `deploy_enrolls_session_bound_telemetry`, `repo_and_templates_hold_no_live_tokens` | ☑ (real auditd/Sysmon streams ☑+E) |
-| N10 | verifiers could SSH to another session's reused addresses; unpinned keys | host resolution restricted to active positively-owned resources of the correct deployment generation (missing/stale → unknown, NO DNS/SSH attempt); pinned SSH host keys with visible failure; deployment identity recorded in evidence; historical reports use recorded snapshots | `missing_inventory_yields_unknown_without_dns_or_ssh`, `end_then_score_refuses_ssh_at_reused_addresses`, `removed_or_pending_resources_filtered_from_host_map`, `verifier_evidence_records_deployment_identity`, `ssh_exec_refuses_unpinned_channels` | ☑ |
-| N11 | objectives were re-read from mutable YAML; provisioning claimed services it never configured | one immutable validated session snapshot drives deployment/objectives/verification/reporting (worker resolves it over its session API, never live YAML); versioned prebuilt-template readiness contract — unknown service names rejected, readiness actually checked | `worker_resolves_objectives_from_snapshot_not_live_yaml`, `worker_transport_scenario_spec_over_http`, `unknown_service_names_are_rejected_not_ignored`, `ready_requires_service_readiness_when_channel_configured`, `objective_pass_requires_true_host_state_and_reports_it` | ☑ (real golden-template builds ☑+E) |
+Do not weaken containment to satisfy the eight old process assumptions. Fix tests
+to independently observe real process identities and safety outcomes; if genuine
+production defects emerge, repair them with negative-path regressions. Baseline
+failure investigation belongs in milestone 01; full authority acceptance in 02.
 
-## Stage 5 acceptance gaps (original-plan M5/M7 items)
+Executed from `web/`:
 
-| Item | Fix | Evidence | Status |
-|------|-----|----------|--------|
-| One model scheduler across processes | worker red turns schedule through the API's ONE gateway via `/internal/model/complete` (run capability = authorization); the worker holds NO model credential; coach liveness probe deliberately outside the scheduler | `test_hint_jumps_queued_red_turns_across_processes` (separate process, interactive hint provably overtakes queued red turns), `test_worker_env_has_no_model_credential`, `test_model_endpoint_requires_runner_capability` | ☑ (shared-GPU capacity on real hardware ☑+E) |
-| Honest coach labels | same-host activity is UNATTRIBUTED (attacker telemetry cannot earn defender credit); remediation is a CLAIM until verified; detection events render explicitly | `test_attacker_telemetry_cannot_earn_defender_credit`, `test_defender_attributed_response_does_correlate`, `test_remediation_is_labeled_a_claim`, `test_detection_events_are_rendered` | ☑ |
-| Fresh-stack bootstrap | compose `seed-bastion-keys` one-shot populates the key volume + recordings dir (loud failure on missing material); `rangectl bootstrap` idempotently provisions operator + capabilities; runbook §0 documents the whole path incl. DEV-ONLY substitutions | `tests/test_stage5_bootstrap.py` (real CLI core + real seed script + bastion key resolution + mint-once DB count), `test_stage5_compose_seeds_bastion_key_volume` | ☑ (`docker compose config` + fresh-volume boot: BLOCKED here — no docker — operator gate) |
-| Browser E2E workflow | checked-in `pytest -m browser`: REAL Next.js app + REAL uvicorn API + REAL worker; login → launch → connection instructions → captured command (session-bound telemetry) → start red → end (confirm dialog) → explicit AAR with trusted scorecard → progress | `tests/test_stage5_browser_e2e.py` (green twice consecutively; controlled doubles only for PVE/model/runner/verifier/datapath) | ☑ (E2E against the deployed R740 stack ☑+E) |
-| Full safe practice loop | capture → deterministic verification → score → report → cleanup with revocation and historical-score checks | `test_full_practice_loop_capture_verify_score_report_cleanup` + the browser E2E above | ☑ (real PVE/R740/GPU/Windows ☑+E) |
+```bash
+npm audit --package-lock-only --json
+```
 
-## Third follow-up review remediation (T01–T08, docs/THIRD_FOLLOWUP_REVIEW.md)
+Exit **1**: **4 affected packages, 3 critical / 1 high**: Next, PostCSS, Seroval,
+Solid. No upgrade performed. Pages Router/Linux deployment applicability must be
+triaged advisory-by-advisory; package severity alone is not exploitability proof.
+Patch applicable issues and validate build/replay/browser behavior in milestone 01;
+do not use blind major-version `audit fix --force`.
 
-Baseline reviewed `0b0d726`; fixed in four staged commits (`77c7971`,
-`5c4caf6`, `f5c5ffd`, `370d23c`). Labels are deliberately separated:
-**impl** = production code implements it; **auto** = automatically verified
-by a production-boundary regression in this environment; **HW** = the
-residual claim needs hardware unreachable here (never counted as done).
+No fresh `npm ci`/build, Docker boot, Packer build, DB migration/concurrency,
+privileged packet, installed capture or browser result is claimed by this planning
+pass. Exact baseline is also recorded in `AGENTS.md`.
 
-| T | Finding | Fix (production code) | Automated evidence | impl | auto | HW |
-|---|---------|----------------------|--------------------|------|------|----|
-| T01 | remote child survives leader exit; stop reported success without remote confirmation | supervisor descendant tracking by `SR_OP_ID` + tombstones; 255→cancel; exit 144; `cancel_remote_operations` retries incl. `cancel-unknown` | `tests/test_third_followup_lifecycle.py` (7 T01 tests: real script + real descendants + production recovery) | ☑ | ☑ | real-SSH loss on R740 runner |
-| T02 | lifecycle races; false `cancelled` | conditional transitions + `cancel-unknown` (migration 0008), owner-fenced claims, run participates in claims | 6 T02 tests incl. barrier-synchronized run-vs-teardown | ☑ | ☑ | — |
-| T03 | substring baseline check accepted policy-weakening edits | EXACT effective-policy + set-membership verification; tri-state inspection; port-scoped established rules; prefix-namespace discovery; live topology in start gate | `tests/test_third_followup_firewall.py` (probe's nft JSON fixtures rejected; REAL-packet netns test: pre-established range→mgmt:8080 flow dies, intended flows live) | ☑ | ☑ | packet truth on R740 bridge |
-| T04 | deploy ignored the session snapshot | `deploy()` resolves `scenario_spec` (session bytes) | T04 test: YAML edited post-creation; real launch+reset clone calls still snapshot-shaped | ☑ | ☑ | — |
-| T05 | tokens issued, never installed | durable enrollment phases provisioned+confirmed through the management channel; token recovery; readiness gate; installer text | 4 T05 tests (captured provisioning, real ingest round trip, resume-with-same-token, 409+DB on unconfirmed) | ☑ | ☑ | real auditd/Sysmon streams on VMs |
-| T06 | production skipped readiness; reset skipped launch workflow | relaxation requires dev mode; production missing key/pins-file enforced; shared `_finalize_ready` for launch+reset; durable failure state | 3 T06 tests (route status + DB state; reset credential rotation + revoked old) | ☑ | ☑ | — |
-| T07 | buffered reads blocked past deadline | select + `os.read` byte-oriented bounded reader | 3 T07 tests (sparse/silent/multibyte, partial retained) | ☑ | ☑ | Windows pipes (documented) |
-| T08 | spool crash recovery reused IDs, lost post-tail events | atomic durable counter + recovery from outstanding max; quarantine-once tail repair | `tests/test_third_followup_spool.py` (7 crash-injection tests on the real Spooler) | ☑ | ☑ | — |
+### Documentation-only validation
 
-Completion evidence: `docs/THIRD_FOLLOWUP_COMPLETION_REPORT.md` (commands,
-environment, commits, outcomes) and the dated addendum in
-`docs/SECOND_FOLLOWUP_COMPLETION_REPORT.md`.
+At `23de4f4` with this pass's documentation changes, independently executed:
+
+| Command / check | Result |
+|---|---|
+| `git diff --check` | Exit 0; no whitespace errors |
+| `python3` inline Markdown validator (required documents, relative links, fences, milestone ordering and absence of detailed plans) | Exit 0; 7 Markdown files, 24 relative links, balanced fences, milestones 01–11 in order, no detailed plans |
+| `python3` inline Git provenance/scope check using `git cat-file -e 23de4f4:<path>` for every deleted file | Exit 0; all 15 removed documents recoverable; changed/untracked files are documentation and the plans-directory marker only |
+
+These checks validate the documentation consolidation, **not** any application
+milestone. The application suite was not rerun after documentation-only edits;
+its executed baseline above remains failing and explicitly revision-bound.
+
+## Release blockers and missing work
+
+| ID / priority | Current finding and evidence boundary | Milestone |
+|---|---|---|
+| B01 / P1 | Reproduced failing baseline and DB marker leakage; test identity premises need repair, not unsafe rollback | 01 |
+| B02 / P1 | Reproduced frontend advisory scan; supported upgrades and applicability/build tests needed | 01 |
+| B03 / P0 | Inspected API still constructs direct PVE adapter; current safety controller invokes privileged nft machinery. Incompatible with agreed private limited-token/no-runtime-host-root boundary | 02 |
+| B04 / P0 | Namespace/cgroup boundary and kernel kill exist, but nine-failure baseline is not containment acceptance. Missing/unreadable authority, recursive membership, bookkeeping protection, unsupported starts and all signal identities need independent proof | 01–02 |
+| B05 / P0 | Run-row locking, guarded writers and any-run obligations exist. DB races and every writer/caller (spawn, callback, stop, watchdog, startup, emergency) remain unverified here; never rely on helper docstrings saying every writer is covered | 02 |
+| B06 / P0 | Exact effective PVE permissions, static bridged/routed isolation, resource budgets and independent owned-VM emergency stop are not accepted. No attacks before real gates; no permission widening to pass | 02, 11 |
+| B07 / P1 | Current image artifacts do not establish usable web/database templates. Service-present checks are not actual transactions; YAML has placeholder integrity/user baselines and seed contracts need completion | 03 |
+| B08 / P1 | Enrollment now carries exact capability/generation evidence and migration 0010 invalidation logic. Fresh/legacy upgrades, stale-token rejection, recovery and concurrent confirms require disposable DB acceptance | 04 |
+| B09 / P1 | **Missing software:** `tests/test_fifth_followup_installed_capture.py` and required installed-systemd/auditd acceptance. Subprocess synthetic stdin cannot prove `srshipper` reads real audit input or captures a real command | 04 |
+| B10 / P1 | **Incomplete CI:** `SR_REQUIRE_CONTAINMENT=1` is supported by helpers but absent from CI. mkdir/chown delegation alone is not proof migration is permitted; required capture/packet/browser prerequisites must not silently skip | 01, 04 |
+| B11 / P1 | SSH/recording/spool code exists; real pinned SSH, installed identity, input/API/token negatives, shared durable storage, delivery gaps and transport-loss recovery remain unverified | 04, 11 |
+| B12 / P1 | **Missing release behavior:** configuration snapshots for new controls, explicit timed Begin, ready-idle expiry, server clock, restart interruption and automatic post-evidence cleanup. Existing end keeps owned VMs/reservation pending separate teardown | 05 |
+| B13 / P1 | **Missing release behavior:** continuous independent HTTP/MySQL probes, availability samples/rubric, distinct live component scores, scorer-health detector and outage interruption | 06 |
+| B14 / P1 | **Missing release behavior:** timed inject catalogue/deadlines/submissions, deterministic task results and separate written feedback | 07–08 |
+| B15 / P1 | Inspected red loop terminates at step budget/objective completion; sustained pacing, both explicit start modes and bounded retry-then-interrupt policy still needed | 08 |
+| B16 / P1 | Shared API model gateway exists; actual Qwen alias/context/structured responses, capacity, outage recovery and coaching usefulness remain unverified. No embeddings needed | 08, 11 |
+| B17 / P1 | Inspected live UI exposes red phase/objective progress. Competition spoiler policy must be enforced across all API/CLI/event/report/replay reads, not just hidden controls | 09 |
+| B18 / P1 | Browser pages exist but not agreed session builder/service scoreboard/inject flow/recovery states. Same-origin LAN HTTPS/IP-SAN trust and visiting-client localhost assumptions need work | 09–10 |
+| B19 / P1 | Production packaging, owner/runtime credential separation, storage-pressure readiness, indefinite evidence/explicit offline purge and consistent DB+recording backup/restore are not accepted | 10 |
+| B20 / P1 | Real R740 clone/storage/ACL/isolation/stop, installed telemetry, model, restart/restore and unaided operator/member usefulness gates have not run | 11 |
+
+Windows/Sysmon/WEC remains unfinished later work (milestone 12), not a disguised
+first-release blocker or claimed implemented pipeline. More storage can be added;
+capacity must be discovered, not used to silently remove agreed scope.
+
+## Historical finding coverage retained
+
+The removed reports were at older revisions. The table preserves every finding
+family and its requirement/test anchor without reusing its checkmarks. All rows
+are **retest/preserve**, not newly accepted. Paths below are current code/test
+anchors; detailed historical repros/results remain in Git and `audit/`.
+
+| Historical IDs | Requirement to preserve / test anchor | Release work |
+|---|---|---|
+| F01, R01, N04 | Remote-only production execution; actual worker auth, minimal resolved env, no controller dotenv/secrets; `tests/test_stage3_telemetry.py`, `tests/test_followup_regressions.py` | 01–02 |
+| F02, R03, N05, T01 | Durable operation IDs; local+remote acknowledged cessation, transport loss/crash/restart; `tests/test_stage2_safety.py`, `tests/test_third_followup_lifecycle.py` | 02 |
+| F03, R05, N06, T03 | Actual range-scoped bridge/routed/IPv6/established denial, atomic safety, effective topology/policy, management preservation; firewall/netns regressions | 02, 11 |
+| R04, N07 | Fail-closed latch/file+DB merge, persistence errors, no stale proof reuse; config identity/freshness/killswitch proof; safety regressions | 02 |
+| F04 | Password auth, ownership, producer scopes, actor assignment, revocation; no forged verifier/score events | 02, 04, 09 |
+| F05, R06, N01 | Correct PVE verbs/`newid`/UPID waiting, TLS; typed absence vs outage; no mutation without ownership; `tests/test_stage1_safety.py` | 02–03 |
+| F06, R07–R08, N02–N03, T02 | Single reservation, intent-before-side-effect, idempotency, generation/ownership, fenced lifecycle/concurrency, uncertain cleanup retains lease | 02–05 |
+| F07, R12 | Actual fresh Compose bootstrap, build secret exclusions, no runtime owner URL, real seed/volume wiring; `tests/test_stage5_bootstrap.py` | 01, 10 |
+| F08, R02 | Real token→owner key binding, owned inventory and live SSH instructions, access revocation | 04, 09 |
+| F09, R11, N08–N09, T05, T08 | Real audit assembly/source time/boot IDs, bounded synchronized crash-safe spool, installed identity/delivery/capture, automatic enrollment; telemetry/spool tests | 04 |
+| F10, R09, N10 | Typed/quoted baseline-aware checks, expected polarity, unknown on errors, flag provenance, current owned pinned inventory, historical scores not live SSH to reused IPs | 03, 06 |
+| F11 | API-only trusted scoring and finalize, immutable score snapshots; no CLI-submitted facts | 06 |
+| F12, F18, R10 | Supported coach labels/citations, unscored ≠ failure, prioritized study; one actual cross-process scheduler, timeout/queue recovery | 08 |
+| F13 | Ready/run/end outcomes distinguished from attacker achievement; production-role grants, idempotence, failure reporting | 05 |
+| F14 | Ingest/event-ID cursor pagination, prior-summary carry-forward, logged action intent, no blind replay | 05, 08 |
+| F15 | Strict nested tool schema, all objective truth independently verified, scenario phase/inventory; no model DONE awarded points | 08 |
+| F16–F17 | Opaque UUID exclusive recordings, read/register path and symlink bounds, exec+resize capture; replay epoch/seek/multiple casts | 04, 09 |
+| F19, N11, T04 | One strict immutable scenario snapshot drives deploy/reset/worker/score; versioned usable templates, no live YAML divergence | 03, 05 |
+| F20 | Chronological per-domain/component history from trusted score snapshots, zero/unknown handling and actual browser workflow | 09 |
+| F21 | Supported reproducible Linux image build, real seeded services/key installation; Windows deferred explicitly | 03, 12 |
+| F22–F23, T07 | Safe explicit unique disposable DB fixtures, markers/CI/locks/readiness/packaging; bounded nonblocking byte reads and honest layers | 01, 02, 10 |
+| Fifth F1 / P0 | Protected non-escapable bookkeeping/recursive authority, no failed reads treated empty; PID-namespace test premises must be repaired | 01–02 |
+| Fifth F2 / P0 | Lock before fresh inventory after commits; registration vs every terminal writer; corrupt terminal row cannot hide obligations | 02 |
+| Fifth F3–F4 / P1 | Legacy phase-only ready/run invalidated; exact capability+nonce+session+host+generation; idempotent concurrent confirmation | 04 |
+| Fifth F5 / P1 | Kernel/stable-identity scoped signals; environment marker diagnostic only, scan-to-signal races/unrelated processes protected | 02 |
+| Fifth F6 / P1 | Real installed systemd/auditd capture under `srshipper`; active-service bad API/token/unreadable-input negatives | 04 |
+| Fifth F7 / P2 | Local-dev background children/operation rows resolved truthfully; runner health rejects unknown; never enable local-dev in production | 01–02 |
+| Fifth F8 / P1 | Executable delegation and required containment/capture CI flags; missing prerequisites fail mandatory jobs | 01, 04 |
+
+The fourth review's two blockers were authoritative completion/cessation and real
+delivery/capture enrollment. The fifth review showed its completion report did not
+prove them. The new namespace/migration repairs in `23de4f4` must be evaluated on
+their merits; neither the prior failures nor report claims are blindly carried
+forward as current defects/successes.
+
+## Historical provenance and documentation consolidation
+
+Recover removed tracked documents at the pre-cleanup application revision, e.g.:
+
+```bash
+git show 23de4f4:docs/plans/fifth-followup.md
+git show 23de4f4:IMPLEMENTATION_AUDIT.md
+```
+
+| Historical source (removed from current tree) | Evidence revision / retained meaning |
+|---|---|
+| `plan.markdown` | Original M0–M7 contract; safety/API/evidence/replay/usefulness retained, new explicit release decisions supersede old GPU/LXC/grade assumptions |
+| `IMPLEMENTATION_AUDIT.md`, `LOCAL_AGENT_HANDOFF.md` | `a5b19ab`, F01–F23 |
+| `docs/FOLLOWUP_REVIEW.md`, `docs/FOLLOWUP_REMEDIATION.md` | `bd93f0d`, R01–R12 and subsequently corrected completion claims |
+| `docs/SECOND_FOLLOWUP_{REVIEW,HANDOFF,COMPLETION_REPORT}.md` | `18377c6`, N01–N11; later addendum acknowledges incomplete original claims |
+| `docs/THIRD_FOLLOWUP_{REVIEW,HANDOFF,COMPLETION_REPORT}.md` | `0b0d726`, T01–T08; later repairs/test anchors retained |
+| `docs/FOURTH_FOLLOWUP_{REVIEW,COMPLETION_REPORT}.md` | `213246e` / `2357730`, two blockers and seven focused repair requirements |
+| `docs/plans/fifth-followup.md` | Review at `2357730`, committed in `7c29c45`; F1–F8, production probes and stronger acceptance boundaries |
+| `docs/ARCHITECTURE_NOTES.md` and old checklist/runbook/README | Consolidated into current architecture/roadmap/evidence/runbook; no old “all built” claim remains authoritative |
+
+Prior fifth-review totals (including 206 passes with PostgreSQL 16) belong to
+`2357730` and its environment, **not** this revision. Do not copy them as today's
+result. Historical probe files/results in `audit/` are preserved, not deleted or
+promoted to acceptance. Source/test comments and package metadata still naming
+old docs are legacy references to reconcile in milestone 01 without changing
+regression intentions; they cannot override `AGENTS.md` or the release design.
+
+## Recording new acceptance evidence
+
+For every gate record: date, evidence Git revision and dirty status, exact command
+and non-secret environment, runtime/fixture versions, exit code and all
+pass/fail/skip/deselect totals, boundary actually exercised, prerequisite blockers,
+and observable live outcomes where applicable. Never record plaintext credentials,
+real admin terminal casts or mutable generated files as proof in Git.
+
+Only close a blocker after independently executing its agreed milestone criteria.
+No implementation milestone is closed by this documentation pass.
