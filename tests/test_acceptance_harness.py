@@ -118,45 +118,94 @@ class _FakeR:
         self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
 
 
-def _fake_docker(monkeypatch, *, volume_exists=False, container_exists=False,
-                 fail_on=None, timeout_on=None):
-    """Fault-inject pg_fixture's docker calls; returns the call log."""
+NO_SUCH_CONTAINER = "Error response from daemon: No such container: xyz"
+NO_SUCH_VOLUME = "Error response from daemon: No such volume: xyz"
+
+
+def _fake_docker(monkeypatch, *, nonce, volume="absent", container="absent",
+                 fail_on=None, timeout_on=None, planted=False,
+                 identity_error=False):
+    """Fault-inject pg_fixture's docker calls; returns the call log.
+
+    Resources come into existence through THIS fixture's own create calls
+    (carrying `nonce`), so cleanup identity checks see reality: our creates
+    match, a `planted` run conflict carries someone else's nonce, and
+    `identity_error` makes every nonce lookup fail.
+    """
     calls: list[list[str]] = []
+    state = {"volume": volume, "container": container,
+             "volume_nonce": None, "container_nonce": None}
 
     def fake(args, timeout=120, check=False):
         calls.append(list(args))
-        if timeout_on and args[:2] == list(timeout_on):
-            raise subprocess.TimeoutExpired(cmd=["docker", *args], timeout=1)
-        if fail_on and args[:2] == list(fail_on):
-            return _FakeR(1, "", "injected failure")
-        if args[:2] == ["volume", "inspect"]:
-            return _FakeR(0 if volume_exists else 1)
+        head = args[:2]
+        if head == ["volume", "create"]:
+            if timeout_on == ["volume", "create"]:
+                raise subprocess.TimeoutExpired(cmd=["docker", *args], timeout=1)
+            if fail_on == ["volume", "create"]:
+                return _FakeR(1, "", "injected failure")
+            state["volume"], state["volume_nonce"] = "exists", nonce
+            return _FakeR(0)
+        if head == ["run", "-d"]:
+            if planted:
+                # raced collision: a FOREIGN container takes the name
+                state["container"] = "exists"
+                state["container_nonce"] = "someone-else"
+                return _FakeR(1, "", "Conflict. The container name is already in use")
+            state["container"], state["container_nonce"] = "exists", nonce
+            if timeout_on == ["run", "-d"]:
+                raise subprocess.TimeoutExpired(cmd=["docker", *args], timeout=1)
+            if fail_on == ["run", "-d"]:
+                return _FakeR(1, "", "injected failure")
+            return _FakeR(0)
+        if identity_error and "-f" in args[:3]:
+            return _FakeR(1, "", "Error response from daemon: cannot connect")
+        if head == ["volume", "inspect"]:
+            if len(args) > 3 and args[2] == "-f":  # identity check
+                if state["volume"] != "exists":
+                    return _FakeR(1, "", NO_SUCH_VOLUME)
+                return _FakeR(0, state["volume_nonce"] or "")
+            return _state_r(state, "volume")
         if args[0] == "inspect":
-            return _FakeR(0 if container_exists else 1)
+            if len(args) > 3 and args[1] == "-f":  # identity check
+                if state["container"] != "exists":
+                    return _FakeR(1, "", NO_SUCH_CONTAINER)
+                return _FakeR(0, state["container_nonce"] or "")
+            return _state_r(state, "container")
+        if args[0] in ("version", "image"):
+            return _FakeR(0)
         return _FakeR(0)
 
     monkeypatch.setattr(pgf, "_docker", fake)
     return calls
 
 
+def _state_r(state, kind):
+    v = state[kind]
+    if v == "exists":
+        return _FakeR(0)
+    if v == "absent":
+        return _FakeR(1, "", NO_SUCH_VOLUME if kind == "volume"
+                      else NO_SUCH_CONTAINER)
+    return _FakeR(1, "", "Error response from daemon: cannot connect to the "
+                         "docker daemon")  # error, NOT absence
+
+
 def test_pg_fixture_timeout_cleans_up_every_partial_state(monkeypatch):
-    # review P2 round 3: a TimeoutExpired (not just a nonzero exit) during
-    # startup must still run cleanup for everything already claimed
-    for timeout_on in (["volume", "create"], ["run", "-d"]):
-        calls = _fake_docker(monkeypatch, timeout_on=timeout_on)
-        fx = pgf.PgFixture(run_id="t1")
-        with pytest.raises(RuntimeError):
-            fx.start()
-        if timeout_on == ["volume", "create"]:
-            assert ["volume", "rm", fx.volume] in calls
-            assert ["rm", "-f", fx.container] not in calls  # never claimed
-        else:
-            assert ["rm", "-f", fx.container] in calls
-            assert ["volume", "rm", fx.volume] in calls
+    # a TimeoutExpired (not just a nonzero exit) during startup must still
+    # clean up everything already claimed — when it exists under OUR nonce
+    calls = _fake_docker(monkeypatch, nonce="t1",
+                         timeout_on=["volume", "create"])
+    fx = pgf.PgFixture(run_id="t1")
+    with pytest.raises(RuntimeError):
+        fx.start()
+    # volume create timed out and the volume does not exist: nothing to rm
+    assert not any(c[:2] == ["volume", "rm"] for c in calls)
+    assert not any(c[0] == "rm" for c in calls)
 
-
-def test_pg_fixture_nonzero_exit_cleans_up(monkeypatch):
-    calls = _fake_docker(monkeypatch, fail_on=["run", "-d"])
+    # timeout during `run` AFTER the container was created (nonce matches)
+    calls = _fake_docker(monkeypatch, nonce="t2",
+                         timeout_on=["run", "-d"])
     fx = pgf.PgFixture(run_id="t2")
     with pytest.raises(RuntimeError):
         fx.start()
@@ -164,23 +213,91 @@ def test_pg_fixture_nonzero_exit_cleans_up(monkeypatch):
     assert ["volume", "rm", fx.volume] in calls
 
 
-def test_pg_fixture_refuses_foreign_names_and_never_removes_them(monkeypatch):
-    # review P2 round 3: a name collision is NOT ownership — refuse, and
-    # cleanup must never rm the foreign resource
-    calls = _fake_docker(monkeypatch, volume_exists=True)
+def test_pg_fixture_nonzero_exit_cleans_up(monkeypatch):
+    calls = _fake_docker(monkeypatch, nonce="t3", fail_on=["run", "-d"])
     fx = pgf.PgFixture(run_id="t3")
+    with pytest.raises(RuntimeError):
+        fx.start()
+    assert ["rm", "-f", fx.container] in calls
+    assert ["volume", "rm", fx.volume] in calls
+
+
+def test_pg_fixture_refuses_foreign_names_and_never_removes_them(monkeypatch):
+    # a name collision is NOT ownership — refuse, and cleanup must never
+    # rm the foreign resource
+    calls = _fake_docker(monkeypatch, nonce="t4", volume="exists")
+    fx = pgf.PgFixture(run_id="t4")
     with pytest.raises(RuntimeError, match="already exists"):
         fx.start()
     assert not any(c[0] == "rm" or c[:2] == ["volume", "rm"] for c in calls)
     assert fx.cleanup() == []  # nothing claimed, nothing touched
 
-    calls = _fake_docker(monkeypatch, container_exists=True)
-    fx = pgf.PgFixture(run_id="t4")
+    calls = _fake_docker(monkeypatch, nonce="t5", container="exists")
+    fx = pgf.PgFixture(run_id="t5")
     with pytest.raises(RuntimeError, match="already exists"):
         fx.start()
-    assert ["volume", "rm", fx.volume] in calls  # OUR volume, created first
+    assert ["volume", "rm", fx.volume] in calls  # OUR volume, our nonce
     assert ["rm", "-f", fx.container] not in calls  # foreign container kept
     fx.cleanup()
+
+
+def test_pg_fixture_raced_collision_is_never_deleted(monkeypatch):
+    # review P2 round 4: inspection says absent, then `docker run` fails
+    # because someone planted a container with our name in the race window.
+    # Cleanup must NOT delete it — identity (nonce) is verified first.
+    calls = _fake_docker(monkeypatch, nonce="t6", planted=True)
+    fx = pgf.PgFixture(run_id="t6")
+    with pytest.raises(RuntimeError, match="left in place"):
+        fx.start()
+    assert ["rm", "-f", fx.container] not in calls  # foreign kept
+    assert fx.cleanup() == []
+
+
+def test_pg_fixture_inspection_error_is_not_absence(monkeypatch):
+    # review P2 round 4: a failed inspection (daemon error) must NOT be
+    # treated as a free name — ownership is never claimed, nothing removed
+    calls = _fake_docker(monkeypatch, nonce="t7", volume="error")
+    fx = pgf.PgFixture(run_id="t7")
+    with pytest.raises(RuntimeError, match="cannot verify"):
+        fx.start()
+    assert not any(c[:2] == ["volume", "create"] for c in calls)
+    assert not any(c[0] == "rm" or c[:2] == ["volume", "rm"] for c in calls)
+    assert fx.cleanup() == []
+
+
+def test_pg_fixture_unconfirmable_identity_is_not_deleted(monkeypatch):
+    # cleanup verifies the nonce BEFORE deleting; if that check errors, the
+    # resource is left in place and the problem is surfaced
+    calls = _fake_docker(monkeypatch, nonce="t8", fail_on=["run", "-d"],
+                         identity_error=True)
+    fx = pgf.PgFixture(run_id="t8")
+    with pytest.raises(RuntimeError, match="NOT removed"):
+        fx.start()
+    assert ["rm", "-f", fx.container] not in calls
+
+
+# ---------------------------------------------------------------- cgroup wrapper
+WRAPPER = REPO / "infra" / "dev" / "run_in_cgroup.sh"
+
+
+def test_cgroup_wrapper_refuses_non_root_and_bad_usage():
+    # the privileged phase must never run unprivileged
+    r = subprocess.run(["bash", str(WRAPPER), "/tmp", "someuser", "true"],
+                       capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "sudo" in (r.stderr + r.stdout)
+    r = subprocess.run(["bash", str(WRAPPER)], capture_output=True, text=True)
+    assert r.returncode != 0  # missing arguments
+
+
+def test_cgroup_wrapper_dropped_probe_needs_real_cgroup(tmp_path):
+    # the unprivileged probe must FAIL (not silently pass) when the target
+    # is not a cgroup — a missing cgroup.procs is a hard error
+    r = subprocess.run(["bash", str(WRAPPER), "--dropped", str(tmp_path),
+                        "true"], capture_output=True, text=True)
+    assert r.returncode != 0
+    # and it must leave nothing behind
+    assert not list(tmp_path.iterdir())
 
 
 # ---------------------------------------------------------------- workflow

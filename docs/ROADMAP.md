@@ -24,7 +24,7 @@ the product. **Depends on:** the agreed release contract.
 
 Approved implementation plan: [01-reproducible-baseline](../.openchamber/plans/01-reproducible-baseline.md)
 (2026-10-08). **Implemented (2026-10-08, incl. review fixes):** all locally
-executable gates pass (infrastructure-free default 106/0/0; selection/python
+executable gates pass (infrastructure-free default 111/0/0; selection/python
 3.11–3.13/db/containment/frontend/compose via `infra/dev/acceptance.py`);
 packet and browser fail closed on this host for missing prerequisites and are
 accepted only when their required CI jobs pass after the operator pushes.

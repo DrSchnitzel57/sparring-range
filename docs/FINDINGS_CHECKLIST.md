@@ -192,6 +192,29 @@ Round-3 gate results: fast default **106 passed, 0 failed, 0 skipped,
 `db` PASS with failure-path + collision probes; `compose` PASS with bastion
 capability verified on both attempts.
 
+**Round-4 review fixes (2026-10-08, post-`8ba0764` review — VERDICT: FIX,
+all 3 items):** CI delegation now chowns the subtree's **control files**
+(`cgroup.procs`), not just the directory — the kernel requires the delegatee
+to write `cgroup.procs` for any migration — and `run_in_cgroup.sh` is
+self-verifying end to end: after dropping privileges it runs an
+**unprivileged migration probe** (create child cgroup, migrate a real
+process in, observe, kill+wait, rmdir with retry) and fails before the gate
+if any permission in the chain is wrong; the containment gate now runs that
+same dropped-phase probe against the real subtree (full wrapper path, not
+just `bash -n`), plus fast failure-path tests. The PG fixture distinguishes
+inspection **errors** from absence (a daemon error is never a free name),
+creates every resource with a run-unique `sr-range-run` **ownership nonce**,
+and re-verifies that nonce before any deletion — a raced collision is left
+in place and surfaced, never deleted; covered by fault-injected race/error
+tests. The collision probe now tracks exactly which resources it created,
+verifies its own nonce before removing them, and fails acceptance when its
+teardown does not complete.
+
+Round-4 gate results: fast default **111 passed, 0 failed, 0 skipped,
+139 deselected** (250 total); `selection`, `containment` (incl. wrapper
+dropped-phase probe) PASS; `db` PASS with failure-path + collision probes
+(nonce-verified teardown).
+
 **Milestone 01 acceptance status:** all locally executable gates pass.
 Packet and browser gates fail closed here for missing prerequisites
 by design; per the plan they are accepted only when the required CI jobs pass

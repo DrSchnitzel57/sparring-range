@@ -91,6 +91,11 @@ jobs:
             echo "no cgroup v2 on this runner"; exit 1; }
           sudo mkdir -p /sys/fs/cgroup/srrunner
           sudo chown "$(id -u):$(id -g)" /sys/fs/cgroup/srrunner
+          # the control FILES keep root ownership unless chowned too: the
+          # kernel requires the delegatee to WRITE cgroup.procs for any
+          # migration into or out of this cgroup (audit B10, review P1)
+          sudo chown "$(id -u):$(id -g)" /sys/fs/cgroup/srrunner/cgroup.procs
+          test -w /sys/fs/cgroup/srrunner/cgroup.procs
       - name: Run the DB layer unprivileged INSIDE the delegated subtree
         run: |
           sudo env "PATH=$PATH" "HOME=$HOME" \

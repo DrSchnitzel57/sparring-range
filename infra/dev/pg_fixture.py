@@ -63,6 +63,43 @@ class PgFixture:
         self._owned_container = False
         self._owned_volume = False
 
+    # -- identity ------------------------------------------------------------
+    def _inspect_state(self, kind: str, name: str) -> str:
+        """'exists' or 'absent'. A failed inspection is treated as absence
+        ONLY when docker reports the resource does not exist — daemon errors
+        are raised, never silently read as a free name (review P2)."""
+        args = (["inspect", name] if kind == "container"
+                else ["volume", "inspect", name])
+        r = _docker(args)
+        if r.returncode == 0:
+            return "exists"
+        err = (r.stderr or "").lower()
+        if "no such" in err or "not found" in err:
+            return "absent"
+        raise RuntimeError(
+            f"cannot verify whether {kind} {name} is free: rc {r.returncode}: "
+            f"{(r.stderr or r.stdout).strip()[:200]}")
+
+    def _owner_nonce(self, kind: str, name: str) -> str | None:
+        """The sr-range-run label of an existing resource ('' when it has
+        none), or None when it does not exist. Raises on inspection error —
+        ownership must be CONFIRMED before any deletion, never assumed."""
+        if kind == "container":
+            args = ["inspect", "-f",
+                    '{{ index .Config.Labels "sr-range-run" }}', name]
+        else:
+            args = ["volume", "inspect", "-f",
+                    '{{ index .Labels "sr-range-run" }}', name]
+        r = _docker(args)
+        if r.returncode == 0:
+            return r.stdout.strip()
+        err = (r.stderr or "").lower()
+        if "no such" in err or "not found" in err:
+            return None
+        raise RuntimeError(
+            f"cannot confirm ownership of {kind} {name}: rc {r.returncode}: "
+            f"{(r.stderr or r.stdout).strip()[:200]}")
+
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> "PgFixture":
         if _docker(["version"]).returncode != 0:
@@ -87,20 +124,23 @@ class PgFixture:
 
     def _start_inner(self) -> None:
         # REFUSE pre-existing resources (review P2): a name collision means
-        # the resource is NOT ours, and cleanup must never remove it. Once a
-        # name is verified free, anything that exists under it afterwards was
-        # created by this fixture — ownership is therefore claimed BEFORE
-        # issuing each create/start, so timeouts mid-create still clean up.
-        if _docker(["volume", "inspect", self.volume]).returncode == 0:
+        # the resource is NOT ours, and cleanup must never remove it. Names
+        # are claimed only after the name is VERIFIED free (errors abort);
+        # every resource is created with a run-unique ownership label, and
+        # cleanup re-verifies that label before deleting — so a race that
+        # plants a foreign resource between check and create can still never
+        # be deleted by us.
+        if self._inspect_state("volume", self.volume) == "exists":
             raise RuntimeError(
                 f"volume {self.volume} already exists — refusing to adopt a "
                 "resource this run did not create")
         self._owned_volume = True
-        r = _docker(["volume", "create", self.volume])
+        r = _docker(["volume", "create", "--label",
+                     f"sr-range-run={self.run_id}", self.volume])
         if r.returncode != 0:
             raise RuntimeError(
                 f"volume create failed: {(r.stderr or r.stdout).strip()[:300]}")
-        if _docker(["inspect", self.container]).returncode == 0:
+        if self._inspect_state("container", self.container) == "exists":
             raise RuntimeError(
                 f"container {self.container} already exists — refusing to "
                 "adopt a resource this run did not create")
@@ -116,8 +156,8 @@ class PgFixture:
         ])
         if r.returncode != 0:
             # docker may have CREATED the container before failing (e.g. an
-            # occupied port) — cleanup removes whatever exists under our
-            # unique names and SURFACES any residue
+            # occupied port) — cleanup removes whatever carries OUR ownership
+            # label and SURFACES anything else it must not touch
             raise RuntimeError(
                 f"postgres container start failed: "
                 f"{(r.stderr or r.stdout).strip()[:400]}")
@@ -146,27 +186,40 @@ class PgFixture:
               file=sys.stderr)
 
     def cleanup(self) -> list[str]:
-        """Remove ONLY resources this fixture claimed (name verified free
-        before its create/start was issued). Idempotent: 'not found' is
-        tolerated; every other failure is returned for the caller to treat
-        as fatal. A refused collision leaves the foreign resource untouched.
+        """Remove ONLY resources carrying this run's ownership label, and
+        only after that label is CONFIRMED. Absence is success (idempotent);
+        a foreign resource under our names is left in place and reported;
+        an unconfirmable identity is never deleted. Every other failure is
+        returned for the caller to treat as fatal.
         """
         problems: list[str] = []
-        if self._owned_container:
-            r = _docker(["rm", "-f", self.container], timeout=60)
+        for kind, name, claimed in (
+                ("container", self.container, self._owned_container),
+                ("volume", self.volume, self._owned_volume)):
+            if not claimed:
+                continue
+            try:
+                nonce = self._owner_nonce(kind, name)
+            except RuntimeError as e:
+                problems.append(f"{kind} {name}: {e} — NOT removed")
+                continue
+            if nonce is None:
+                continue  # gone: never created, or already removed
+            if nonce != self.run_id:
+                problems.append(
+                    f"{kind} {name} exists WITHOUT this run's ownership label "
+                    f"(found {nonce!r}) — left in place, NOT removed")
+                continue
+            rm = (["rm", "-f", name] if kind == "container"
+                  else ["volume", "rm", name])
+            r = _docker(rm, timeout=60)
             err = (r.stderr or "").lower()
-            if r.returncode != 0 and "no such container" not in err:
-                problems.append(f"container {self.container}: "
+            if (r.returncode != 0 and "no such" not in err
+                    and "not found" not in err):
+                problems.append(f"{kind} {name}: "
                                 f"{(r.stderr or r.stdout).strip()[:200]}")
-            self._owned_container = False
-        if self._owned_volume:
-            r = _docker(["volume", "rm", self.volume], timeout=60)
-            err = (r.stderr or "").lower()
-            if (r.returncode != 0 and "not found" not in err
-                    and "no such volume" not in err):
-                problems.append(f"volume {self.volume}: "
-                                f"{(r.stderr or r.stdout).strip()[:200]}")
-            self._owned_volume = False
+        self._owned_container = False
+        self._owned_volume = False
         return problems
 
     # -- access -------------------------------------------------------------

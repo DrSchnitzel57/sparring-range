@@ -337,19 +337,31 @@ def _pg_fixture():
 def _fixture_collision_probe() -> None:
     """Foreign-resource regression (review P2): a pre-existing container or
     volume under the fixture's names must be REFUSED, never adopted and
-    never removed by cleanup."""
+    never removed by the fixture. The probe itself tracks exactly which
+    resources it created, verifies its OWN ownership nonce before deleting
+    them, and fails acceptance when its teardown does not complete."""
     import pg_fixture
     fx = pg_fixture.PgFixture(run_id="col" + uuid.uuid4().hex[:5])
-    pre = []
+    marker = f"sr-acc-foreign={fx.run_id}"
+    # (kind, create args, removal args) for resources THIS probe creates
+    plan = [
+        ("volume",
+         ["volume", "create", "--label", marker, fx.volume],
+         ["volume", "rm", fx.volume]),
+        ("container",
+         ["create", "--label", marker, "--name", fx.container,
+          pg_fixture.IMAGE, "true"],
+         ["rm", "-f", fx.container]),
+    ]
+    created: list[tuple[str, list[str]]] = []
     try:
-        for args in (["volume", "create", fx.volume],
-                     ["create", "--name", fx.container, pg_fixture.IMAGE,
-                      "true"]):
-            r = subprocess.run(["docker", *args], capture_output=True, text=True)
+        for kind, mk, rm in plan:
+            r = subprocess.run(["docker", *mk], capture_output=True, text=True)
             if r.returncode != 0:
                 fail("fixture collision probe setup",
-                     f"docker {args[0]}: {(r.stderr or r.stdout).strip()[:200]}")
-            pre.append(args)
+                     f"docker {kind} create: "
+                     f"{(r.stderr or r.stdout).strip()[:200]}")
+            created.append((kind, rm))
         try:
             fx.start()
             started_ok = True
@@ -369,10 +381,36 @@ def _fixture_collision_probe() -> None:
         ok("DB fixture refuses pre-existing names and never removes "
            "resources it did not create")
     finally:
-        subprocess.run(["docker", "rm", "-f", fx.container],
-                       capture_output=True)
-        subprocess.run(["docker", "volume", "rm", fx.volume],
-                       capture_output=True)
+        leftovers = []
+        for kind, rm in created:
+            name = rm[-1]
+            # verify the probe's OWN nonce before deleting: never remove a
+            # resource this probe did not (still) own
+            fmt = ('{{ index .Config.Labels "sr-acc-foreign" }}'
+                   if kind == "container"
+                   else '{{ index .Labels "sr-acc-foreign" }}')
+            probe_args = (["inspect", "-f", fmt, name] if kind == "container"
+                          else ["volume", "inspect", "-f", fmt, name])
+            r = subprocess.run(["docker", *probe_args],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                if "no such" not in (r.stderr or "").lower():
+                    leftovers.append(f"{kind} {name}: identity check failed: "
+                                     f"{(r.stderr or r.stdout).strip()[:150]}")
+                continue  # already gone
+            if r.stdout.strip() != fx.run_id:
+                leftovers.append(f"{kind} {name}: nonce {r.stdout.strip()!r} "
+                                 "is not this probe's — left in place")
+                continue
+            r = subprocess.run(["docker", *rm], capture_output=True, text=True)
+            err = (r.stderr or "").lower()
+            if (r.returncode != 0 and "no such" not in err
+                    and "not found" not in err):
+                leftovers.append(f"{kind} {name}: "
+                                 f"{(r.stderr or r.stdout).strip()[:150]}")
+        if leftovers:
+            fail("collision probe teardown (only probe-owned resources)",
+                 "; ".join(leftovers))
 
 
 def _fixture_failure_probe() -> None:
@@ -403,8 +441,10 @@ def _fixture_failure_probe() -> None:
                  f"volume {fx.volume} survived the failed start")
         ok("DB fixture failure path: occupied port fails and strands nothing")
     finally:
-        fx.cleanup()
+        problems = fx.cleanup()
         blocker.close()
+        if problems:
+            fail("DB fixture failure-probe teardown", "; ".join(problems))
 
 
 def _docker_probe(args: list[str]) -> int:
@@ -492,6 +532,18 @@ def check_containment() -> None:
     if not shutil.which("unshare"):
         fail("containment prerequisite", "unshare missing (namespace boundary)")
     _migration_probe(root)
+    # full wrapper path (review P1): the UNPRIVILEGED phase of
+    # infra/dev/run_in_cgroup.sh — create a child cgroup, migrate a real
+    # process into it as the delegatee, verify, kill+wait, rmdir. In CI the
+    # wrapper itself is the entry point, so this is the same code path that
+    # guards every required containment run.
+    wrapper = REPO / "infra" / "dev" / "run_in_cgroup.sh"
+    r = subprocess.run([str(wrapper), "--dropped", root, "true"],
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        fail("run_in_cgroup.sh unprivileged migration probe",
+             f"exit {r.returncode}: {(r.stderr or r.stdout).strip()[-300:]}")
+    ok("run_in_cgroup.sh dropped-phase migration probe passes in the subtree")
     before = {p for p in pathlib.Path(root).glob("sr-*")}
     r, counts = pytest_run(["-m", "containment and not db"],
                            env={"SR_REQUIRE_CONTAINMENT": "1"}, timeout=1800)
