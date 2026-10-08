@@ -341,6 +341,35 @@ left (2026-10-08):**
    asset). Test selectors updated to the real DOM.
 Fast default after fixes: **114 passed**.
 
+**Fourth CI run (run 37843120582 at `4ace51e`) — exec fixed; boundary
+mount + replay seek fixed (2026-10-08):** the confined profile now loads
+and execs (the round-3 EACCES is gone). Two causes remained.
+1. `containment` + `db` (probe exit 32): `mount: /sys/fs/cgroup: cgroup2
+   already mounted on /sys/fs/cgroup` — the mount(2) SYSCALL returned
+   EBUSY. On 6.8-era kernels (Ubuntu 24.04) the kernfs superblock layer
+   refuses to create/reuse a cgroup2 superblock from a non-init user
+   namespace ("reusing existing filesystem in another namespace not
+   allowed"); the per-userns kernfs rework that permits it landed later
+   (works on this dev host's 7.0 kernel, which is why the boundary always
+   passed locally). The supervisor's boundary therefore re-roots
+   /sys/fs/cgroup by **BINDING the operation's own cgroup directory**
+   (the standard container mechanism — no superblock creation, works on
+   every kernel; verified locally that the bind hides the hierarchy above
+   and keeps the op subtree writable). The workflow's full-boundary probe
+   moved into the delegated-cgroup step (it needs a real bindable cgroup
+   dir) and the containment gate's pre-probe binds a run-owned probe
+   child under the delegated root.
+2. `browser`: the player mounted (selectors fixed) but the timeline click
+   never moved `data-now`. Root cause: the 3.17 driver SILENTLY DROPS a
+   seek issued while still loading, and the page swallowed load errors.
+   The page now surfaces player errors (`data-player-error`) and the
+   loaded duration (`data-duration`); the test waits for load, fails
+   loudly on player errors, and REISSUES the seek click until the
+   player's own reported position moves.
+Verified locally after the fixes: fast default **114 passed**, `db` gate
+PASS (113), `containment` gate PASS (bind-based probe + 21), web build
+OK.
+
 **Milestone 01 acceptance status:** all locally executable gates pass.
 Packet and browser gates fail closed here for missing prerequisites
 by design; per the plan they are accepted only when the required CI jobs pass

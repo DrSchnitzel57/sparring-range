@@ -9,6 +9,7 @@ export default function Replay() {
   const router = useRouter();
   const [data, setData] = useState(null);
   const [err, setErr] = useState(null);
+  const [playerErr, setPlayerErr] = useState(null);
   const [sel, setSel] = useState(0);
   const [now, setNow] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -39,13 +40,16 @@ export default function Replay() {
       if (cancelled || !rootRef.current) return;
       const A = mod.default ?? mod;
       playerRef.current = A.create(url, rootRef.current, { autoPlay: false, loop: false, terminalName: "xterm-256color" });
-      playerRef.current.addEventListener?.("played", () => {});
+      // a failed load/decode must be VISIBLE: a silent COLD player looks
+      // exactly like a never-mounted one from the outside
+      playerRef.current.addEventListener?.("error", (e) =>
+        setPlayerErr(String(e?.message ?? e)));
       const t = setInterval(() => {
         if (playerRef.current?.getCurrentTime) setNow(playerRef.current.getCurrentTime());
         if (playerRef.current?.getDuration) setDuration(playerRef.current.getDuration());
       }, 250);
       playerRef.current._timer = t;
-    });
+    }).catch((e) => { if (!cancelled) setPlayerErr(String(e?.message ?? e)); });
     return () => {
       cancelled = true;
       if (playerRef.current) {
@@ -80,7 +84,9 @@ export default function Replay() {
         {!epoch && <p className="bad">recording has no epoch header — timeline alignment disabled</p>}
       </div>
       <div className="panel" data-seek-at={seekAt === null ? "" : String(seekAt)}
-           data-now={String(now)}>
+           data-now={String(now)}
+           data-duration={duration === undefined || duration === null ? "" : String(duration)}
+           data-player-error={playerErr || ""}>
         <h3>event timeline</h3>
         {data.timeline.map((e) => {
           const off = offsetOf(e.ts);

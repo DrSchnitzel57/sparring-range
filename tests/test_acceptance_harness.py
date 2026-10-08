@@ -404,7 +404,11 @@ def test_ci_userns_profile_is_confined_and_proves_mounts():
     # abi/4.0 'm' is mmap-exec, not execute: without an x rule with a
     # transition mode the confined unshare cannot exec ANY child (EACCES).
     assert " rix," in code, "profile must grant exec with inheritance"
-    assert "mount -t cgroup2 cgroup2 /sys/fs/cgroup" in code
+    # the boundary re-roots /sys/fs/cgroup by BINDING the operation's own
+    # cgroup dir — a fresh cgroup2 superblock mount is refused EBUSY from
+    # a non-init userns on 6.8-era kernels (Ubuntu 24.04).
+    assert "mount --bind /sys/fs/cgroup/srrunner/.sr-probe" in code
+    assert "mount -t cgroup2 cgroup2 /sys/fs/cgroup" not in code
     assert "mount -t tmpfs tmpfs /mnt" in code
     for line in lines:
         if "apparmor_restrict_unprivileged_userns=0" in line:

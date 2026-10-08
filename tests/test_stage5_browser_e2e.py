@@ -364,6 +364,25 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
         def _eval(expr: str) -> str:
             return pw("--raw", "eval", expr).stdout.strip().strip('"')
 
+        # the driver DROPS a seek issued while still loading (silent no-op),
+        # so first wait until the recording is actually loaded (duration
+        # known) — and fail loudly on a surfaced player error instead of
+        # mistaking a dead player for a seek problem
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            dur = _eval("document.querySelector('[data-duration]').getAttribute('data-duration')")
+            perr = _eval("document.querySelector('[data-player-error]').getAttribute('data-player-error')")
+            if perr:
+                pytest.fail(f"asciinema-player failed to load the recording: {perr}")
+            try:
+                if float(dur) > 0:
+                    break
+            except ValueError:
+                pass
+            time.sleep(0.5)
+        else:
+            pytest.fail("asciinema-player never loaded the recording (duration stayed empty)")
+
         # paused at t=0: the 1s frame is NOT rendered yet
         assert "hardening done" not in _eval(
             "document.querySelector('.ap-term-text').textContent")
@@ -375,12 +394,16 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
             "document.querySelector('div[title^=\"#\"]').innerText").split("s")[0])
         assert 1.5 < off < 3590, f"event offset {off}s outside the frame bracket"
 
-        pw("click", row)
         # the player's OWN reported position (polled into data-now) must move
         # to the seek target, and the rendered frame content must change to
-        # match that position — never just a click-side bookkeeping value
-        deadline = time.time() + 20
+        # match that position — never just a click-side bookkeeping value.
+        # A seek issued while the driver is mid-load is silently dropped, so
+        # the click is REISSUED until the position actually moves.
+        deadline = time.time() + 25
+        now_v = text = ""
         while time.time() < deadline:
+            pw("click", row)
+            time.sleep(1.0)
             now_v = _eval("document.querySelector('[data-now]').getAttribute('data-now')")
             text = _eval("document.querySelector('.ap-term-text').textContent")
             try:
@@ -389,7 +412,6 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
                 moved = False
             if moved and "hardening done" in text and "flag captured" not in text:
                 break
-            time.sleep(0.5)
         else:
             pytest.fail(f"timeline click never produced a real seek: "
                         f"data-now={now_v}, target={off}, rendered={text[:200]!r}")

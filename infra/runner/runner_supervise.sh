@@ -277,19 +277,23 @@ case "$cmd" in
     # The group leader moves ITSELF into the containment cgroup and records
     # its own pid + start time BEFORE exec — closing the spawn/register
     # window for cancel (which needs the lock and sees the pidfile). It then
-    # execs the TRUSTED LAUNCHER: fresh user/mount/cgroup/pid namespaces, a
-    # namespace-rooted cgroup mount (the real hierarchy above the operation
-    # becomes unreachable), a fresh /proc (other processes invisible), and the
-    # supervisor's bookkeeping masked by tmpfs. Registration into the
-    # boundary is acknowledged (pidfile recorded) before the lock is released.
+    # execs the TRUSTED LAUNCHER: fresh user/mount/cgroup/pid namespaces,
+    # /sys/fs/cgroup re-rooted onto the operation's own cgroup directory
+    # (BIND — the real hierarchy above the operation becomes unreachable;
+    # a fresh cgroup2 SUPERBLOCK mount is NOT used because kernels before
+    # the 6.13-era kernfs userns rework refuse it from a non-init user
+    # namespace with EBUSY, e.g. Ubuntu 24.04), a fresh /proc (other
+    # processes invisible), and the supervisor's bookkeeping masked by
+    # tmpfs. Registration into the boundary is acknowledged (pidfile
+    # recorded) before the lock is released.
     SR_OP_ID="$op" SR_PIDFILE="$STATE_DIR/$op.pid" SR_CG_PROCS="$CG_OP/cgroup.procs" \
-      SR_STATE_DIR="$STATE_DIR" \
+      SR_CG_DIR="$CG_OP" SR_STATE_DIR="$STATE_DIR" \
       setsid -w bash -c '
         echo $$ > "$SR_CG_PROCS" 2>/dev/null || exit 97
         st=$(awk "{print \$22}" "/proc/$$/stat" 2>/dev/null) || st=0
         echo "$$:$st" > "$SR_PIDFILE"
         exec '"$BOUNDARY_CMD"' bash -c "
-          mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null || exit 96
+          mount --bind \"\$SR_CG_DIR\" /sys/fs/cgroup 2>/dev/null || exit 96
           mount -t tmpfs tmpfs \"\$SR_STATE_DIR\" 2>/dev/null || exit 96
           exec \"\$@\"" _ "$@"' _ "$@" &
     job=$!
@@ -308,7 +312,7 @@ case "$cmd" in
     if [ "$rc" = 97 ] || [ "$rc" = 96 ]; then
       rm -f "$STATE_DIR/$op.pid"; cg_cleanup "$op"
       if [ "$rc" = 96 ]; then
-        echo "refused: command boundary setup failed (cgroup remount / state mask)" >&2
+        echo "refused: command boundary setup failed (cgroup re-root / state mask)" >&2
       else
         echo "refused: job could not enter its containment cgroup" >&2
       fi

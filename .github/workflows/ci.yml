@@ -99,10 +99,10 @@ jobs:
         # a flags=(unconfined) profile leaves the process in the kernel's
         # "unconfined state", and Ubuntu then transitions such userns
         # creators into the restrictive unprivileged_userns profile, whose
-        # `deny capability` makes the boundary's cgroup2/tmpfs mounts fail
-        # (exit 96). A confined profile keeps its own permissions inside
-        # the namespace, and exec'd children (bash, mount, the command)
-        # inherit it. Grants are the minimum the boundary performs.
+        # `deny capability` makes the boundary's inner bind/tmpfs mounts
+        # fail (exit 96). A confined profile keeps its own permissions
+        # inside the namespace, and exec'd children (bash, mount, the
+        # command) inherit it. Grants are the minimum the boundary performs.
         run: |
           set -euo pipefail
           sudo tee /etc/apparmor.d/usr.bin.unshare > /dev/null <<'EOF'
@@ -132,11 +132,13 @@ jobs:
           }
           EOF
           sudo apparmor_parser -r /etc/apparmor.d/usr.bin.unshare
-          # prove the FULL boundary the supervisor needs — namespace AND
-          # the two mounts it performs inside (cgroup2 remount, tmpfs mask)
+          # profile sanity: the boundary namespaces can be created and a
+          # child exec'd inside them. The FULL boundary probe (including
+          # the supervisor's two inner mounts against a real cgroup dir)
+          # runs in the delegated-cgroup step below, once a bindable
+          # operation cgroup exists.
           unshare --user --map-root-user --mount --cgroup --pid --fork \
-            --mount-proc sh -c 'mount -t cgroup2 cgroup2 /sys/fs/cgroup \
-            && mount -t tmpfs tmpfs /mnt'
+            --mount-proc /bin/true
       - &delegate-cgroup
         name: Delegate a cgroup v2 subtree for runner containment
         run: |
@@ -150,6 +152,19 @@ jobs:
           # migration into or out of this cgroup (audit B10, review P1)
           sudo chown "$(id -u):$(id -g)" /sys/fs/cgroup/srrunner/cgroup.procs
           test -w /sys/fs/cgroup/srrunner/cgroup.procs
+          # FULL boundary probe, exactly the supervisor's sequence: inside
+          # user+mount+cgroup+pid namespaces, BIND the operation's own
+          # cgroup directory onto /sys/fs/cgroup (a fresh cgroup2 superblock
+          # mount is refused EBUSY from a non-init userns on 6.8-era kernels
+          # — Ubuntu 24.04 — by the kernfs superblock userns check) and
+          # tmpfs-mask a directory. Run-owned probe cgroup, removed after.
+          mkdir /sys/fs/cgroup/srrunner/.sr-probe
+          trap 'rmdir /sys/fs/cgroup/srrunner/.sr-probe 2>/dev/null || true' EXIT
+          unshare --user --map-root-user --mount --cgroup --pid --fork \
+            --mount-proc sh -c 'mount --bind /sys/fs/cgroup/srrunner/.sr-probe \
+            /sys/fs/cgroup && mount -t tmpfs tmpfs /mnt'
+          rmdir /sys/fs/cgroup/srrunner/.sr-probe
+          trap - EXIT
       - name: Run the DB layer unprivileged INSIDE the delegated subtree
         run: |
           sudo env "PATH=$PATH" "HOME=$HOME" \
