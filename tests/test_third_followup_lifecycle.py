@@ -85,39 +85,80 @@ def _pids_carrying(op: str) -> list[int]:
 # --------------------------------------------------------------------------- #
 
 def test_t01_descendant_survives_leader_exit_status_still_sees_it(local_supervisor):
-    """The review's core reproduction: a background descendant outliving the
-    leader must NOT make status report 'gone' (leader-PID-only containment
-    was the bug)."""
+    """The review's core reproduction was: a background descendant outliving
+    the leader while leader-PID-only containment reported 'gone'. Under the
+    namespace boundary the kernel clears the WHOLE PID namespace when its
+    init exits, so a descendant CANNOT outlive the leader — the regression
+    is that this is actually true (host-identity verified, containment tree
+    empty) and that status then confirms cessation truthfully. The
+    anti-blind-'gone' half is preserved in the same test: while a
+    descendant IS alive, status must report running and cancel must kill
+    the observed host identity."""
+    from tests.helpers import (alive as _alive, cgroup_tree_members,
+                               find_tree_member, wait_value)
     _, state, script = local_supervisor
+    from tests.helpers import cgroup_containment_root
+    cg = cgroup_containment_root()
     op = f"desc{uuid.uuid4().hex[:8]}"
-    # start a job whose leader exits immediately, leaving a live descendant
-    subprocess.Popen(
+    started = pathlib.Path(state).parent / "started.marker"
+    # start a job whose leader exits immediately, backgrounding a descendant
+    conn = subprocess.Popen(
         ["/bin/sh", "-c",
-         f"{script} start {op} -- bash -c 'sleep 30 & echo started; exit 0'"],
+         f"{script} start {op} -- bash -c 'sleep 30 & touch {started}; exit 0'"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         env={**os.environ, "RUNNER_SUPERVISOR_STATE": str(state)})
     try:
+        conn.wait(timeout=30)
+        assert started.exists(), "descendant never started"
         deadline = time.time() + 10
-        while not _pids_carrying(op) and time.time() < deadline:
+        while ((_pids_carrying(op) or cgroup_tree_members(cg, op))
+               and time.time() < deadline):
             time.sleep(0.1)
-        assert _pids_carrying(op), "descendant never started"
-        # leader is gone at this point (it exited after backgrounding)
+        assert not _pids_carrying(op), \
+            "work survived the leader exit (marker-carrying identity)"
+        assert not cgroup_tree_members(cg, op), \
+            "a HOST process survived the leader exit — cessation is a lie"
         st = _sup(script, op, f"status {op}", state)
-        assert st.returncode == 0 and st.stdout.strip() == "running", \
-            f"descendant survived but status said {st.stdout!r}"
-        # cancel must remove the DESCENDANT and only then confirm
-        c = _sup(script, op, f"cancel {op}", state)
-        assert c.returncode == 0 and c.stdout.strip() == "gone", c.stdout + c.stderr
-        deadline = time.time() + 5
-        while _pids_carrying(op) and time.time() < deadline:
-            time.sleep(0.1)
-        assert not _pids_carrying(op), "cancel confirmed while the descendant lived"
+        # 'gone' or 'not-found': the start connection's confirmed-gone
+        # cleanup may already have removed the records — both are truthful
+        # cessation confirmations (the runner folds both into 'confirmed').
+        assert st.returncode == 0 and st.stdout.strip() in ("gone", "not-found"), \
+            f"confirmed-empty tree did not report cessation: {st.stdout!r}"
+
+        # the anti-blind-'gone' half: while a descendant IS alive
+        op2 = f"alive{uuid.uuid4().hex[:8]}"
+        conn2 = subprocess.Popen(
+            ["/bin/sh", "-c",
+             f"{script} start {op2} -- bash -c 'sleep 30 & wait'"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env={**os.environ, "RUNNER_SUPERVISOR_STATE": str(state)})
+        try:
+            child = wait_value(lambda: find_tree_member(cg, op2, ("sleep", "30")))
+            assert child, "descendant never started"
+            st = _sup(script, op2, f"status {op2}", state)
+            assert st.returncode == 0 and st.stdout.strip() == "running", \
+                f"live descendant invisible to status: {st.stdout!r}"
+            c = _sup(script, op2, f"cancel {op2}", state)
+            assert c.returncode == 0 and c.stdout.strip() == "gone", \
+                c.stdout + c.stderr
+            assert wait_value(lambda: None if _alive(child) else True, 5), \
+                "cancel confirmed while the descendant lived"
+        finally:
+            for pid in cgroup_tree_members(cg, op2):
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+            if conn2.poll() is None:
+                conn2.kill()
     finally:
-        for pid in _pids_carrying(op):
+        for pid in cgroup_tree_members(cg, op):
             try:
                 os.kill(pid, 9)
             except OSError:
                 pass
+        if conn.poll() is None:
+            conn.kill()
 
 
 def test_t01_cancel_before_start_tombstone_blocks_late_start(local_supervisor):

@@ -6,6 +6,99 @@ from __future__ import annotations
 import json
 
 
+# --------------------------------------------------------------------------- #
+# Containment observation: REAL HOST identities across the PID namespace       #
+# --------------------------------------------------------------------------- #
+# Commands execute inside a user+mount+cgroup+pid namespace (audit F1/F5): the
+# pids THEY print are namespace-local and meaningless on the host. A test that
+# asserts on process identity must observe the host view of the delegated
+# cgroup tree — the kernel's own bookkeeping — never a number the command
+# chose to write.
+
+def cgroup_tree_members(cg_root: str, op: str) -> list[int]:
+    """RECURSIVE host-PID membership of the operation's containment tree
+    (nested cgroups included; the host sees the real hierarchy even though
+    the command's own cgroup namespace cannot)."""
+    import os
+    out: list[int] = []
+    base = os.path.join(cg_root, f"sr-{op}")
+    for dirpath, _dirs, files in os.walk(base):
+        if "cgroup.procs" not in files:
+            continue
+        try:
+            with open(os.path.join(dirpath, "cgroup.procs")) as f:
+                out.extend(int(x) for x in f.read().split())
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def find_tree_member(cg_root: str, op: str, argv: tuple) -> int | None:
+    """Host PID of the containment-tree member whose /proc cmdline is exactly
+    argv — identity by observed executable, never by a number the command
+    itself reported."""
+    import os
+    for pid in cgroup_tree_members(cg_root, op):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = tuple(a.decode("utf-8", "replace")
+                            for a in f.read().split(b"\0") if a)
+        except OSError:
+            continue
+        if cmd == tuple(argv):
+            return pid
+    return None
+
+
+def wait_value(fn, timeout: float = 10.0):
+    """Poll fn() until it returns a truthy value; return that value (or None).
+    Use with find_tree_member so a move into a nested cgroup is observed."""
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        value = fn()
+        if value:
+            return value
+        time.sleep(0.05)
+    return None
+
+
+def alive(pid: int) -> bool:
+    """Host-identity liveness probe (kill-0): PermissionError means alive."""
+    import os
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def require_packet_prereq() -> None:
+    """Gate for the privileged PACKET layer (real nft + netns packet flows,
+    disposable namespaces only). Ordinary hosts SKIP with the exact missing
+    prerequisites; required jobs (SR_REQUIRE_PACKET=1) FAIL instead — a
+    missing prerequisite is never a green job (audit F8)."""
+    import os
+    import shutil
+
+    import pytest
+    missing = []
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        missing.append("root")
+    if not shutil.which("nft"):
+        missing.append("nft")
+    if not shutil.which("ip"):
+        missing.append("iproute2")
+    if not missing:
+        return
+    reason = f"packet layer needs {' + '.join(missing)}"
+    if os.environ.get("SR_REQUIRE_PACKET") == "1":
+        pytest.fail(f"SR_REQUIRE_PACKET=1 — {reason}", pytrace=False)
+    pytest.skip(reason)
+
+
 def tool(thought: str, command: str) -> str:
     return json.dumps({"thought": thought, "propose_phase": None, "tool": "shell",
                        "args": {"command": command}})

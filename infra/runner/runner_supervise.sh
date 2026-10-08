@@ -157,7 +157,13 @@ op_liveness() {
     fi
     return
   fi
-  ev=$(cat "$cg/cgroup.events" 2>/dev/null) || { echo unknown; return; }
+  ev=$(cat "$cg/cgroup.events" 2>/dev/null) || {
+    # A failed read is UNKNOWN — never gone — UNLESS the tree was removed
+    # concurrently (the start connection's confirmed-gone cleanup races this
+    # read). The kernel only permits rmdir of an EMPTY cgroup, so a tree
+    # that no longer exists is confirmed cessation, not a failed authority.
+    [ -d "$cg" ] || { echo gone; return; }
+    echo unknown; return; }
   case "$ev" in
     *"populated 1"*) echo running ;;
     *"populated 0"*) echo gone ;;

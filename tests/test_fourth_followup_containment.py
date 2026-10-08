@@ -20,6 +20,9 @@ import uuid
 
 import pytest
 
+from tests.helpers import (alive as _alive, cgroup_tree_members as _tree_members,
+                           find_tree_member as _find_member, wait_value as _wait_value)
+
 REPO = pathlib.Path(__file__).resolve().parents[1]
 SUPERVISOR = REPO / "infra" / "runner" / "runner_supervise.sh"
 
@@ -85,7 +88,7 @@ def _start(script, args, state_dir, **extra_env):
 
 
 def _reap(cg: str, op: str):
-    for pid in _cgroup_members(cg, op):
+    for pid in _tree_members(cg, op):
         try:
             os.kill(pid, 9)
         except OSError:
@@ -97,35 +100,35 @@ def _reap(cg: str, op: str):
 # --------------------------------------------------------------------------- #
 
 def test_t04_cleared_env_descendant_is_visible_and_contained(local_supervisor):
-    """THE core T-04 reproduction: a background child that CLEARS its
-    environment is invisible to the marker scan, yet the cgroup-backed
-    supervisor must still see it after the leader exits zero — and cancel
-    must remove it before confirming. (Marker-only tracking reported 'gone'
-    here; the review's blocker.)"""
+    """THE core T-04 reproduction under the namespace boundary: a background
+    descendant that CLEARS its environment is invisible to the marker scan,
+    yet the cgroup-backed supervisor must see it (by HOST identity) while
+    the operation runs, status must say running, and cancel must remove it
+    before confirming. (Marker-only tracking reported 'gone' here; the
+    review's blocker.) A descendant can no longer OUTLIVE the leader — the
+    kernel clears the whole PID namespace at leader exit — which the
+    zero/nonzero-exit completion regressions below assert directly."""
     _, state, script, cg = local_supervisor
     op = f"clrenv{uuid.uuid4().hex[:8]}"
-    _start(script, f"start {op} -- bash -c 'env -i sleep 30 & echo started; exit 0'",
-           state)
+    conn = _start(script, f"start {op} -- bash -c 'env -i sleep 30 & wait'", state)
     try:
-        deadline = time.time() + 10
-        while not _cgroup_members(cg, op) and time.time() < deadline:
-            time.sleep(0.05)
-        assert _cgroup_members(cg, op), \
-            "cleared-environment descendant never appeared in the cgroup"
+        child = _wait_value(lambda: _find_member(cg, op, ("sleep", "30")))
+        assert child, "cleared-environment descendant never appeared in the cgroup"
         # the marker scan alone would be blind here — prove the difference:
-        assert not _pids_carrying(op), \
+        assert child not in _pids_carrying(op), \
             "test premise broken: env -i child still carries SR_OP_ID"
         st = _sup(script, f"status {op}", state)
         assert st.returncode == 0 and st.stdout.strip() == "running", \
             f"survivor invisible to status: {st.stdout!r}"
         c = _sup(script, f"cancel {op}", state)
         assert c.returncode == 0 and c.stdout.strip() == "gone", c.stdout + c.stderr
-        deadline = time.time() + 5
-        while _cgroup_members(cg, op) and time.time() < deadline:
-            time.sleep(0.05)
-        assert not _cgroup_members(cg, op), "cancel confirmed while the child lived"
+        assert _wait_value(lambda: None if _alive(child) else True, 5), \
+            "cancel confirmed while the child lived"
+        assert not _tree_members(cg, op), "members survived an acknowledged cancel"
     finally:
         _reap(cg, op)
+        if conn.poll() is None:
+            conn.kill()
 
 
 def test_t04_start_refused_without_authoritative_containment(tmp_path):
@@ -231,39 +234,91 @@ def test_t04_pgid_signal_requires_process_identity(local_supervisor):
 # SshRunner completion path: exit code never outranks containment              #
 # --------------------------------------------------------------------------- #
 
-def test_t04_normal_zero_exit_with_survivor_is_contained_not_blind(local_supervisor):
-    """Leader exits 0 with a redirected background child: the runner must
-    consult the supervisor, CONTAIN the survivor, and only then report the
-    command finished — with the containment recorded as a note."""
+def test_t04_normal_zero_exit_with_survivor_is_contained_not_blind(local_supervisor,
+                                                                    monkeypatch):
+    """Leader exits 0 leaving a redirected background child. Under the
+    namespace boundary the kernel removes EVERY descendant when the
+    namespace's init exits — a survivor cannot form. The completion path
+    must still CONSULT the authoritative supervisor before calling the
+    operation finished, and the clean verdict must be backed by an empty
+    containment tree observed with real host identities — never a blind
+    success."""
     runner, state, script, cg = local_supervisor
     op = f"done0{uuid.uuid4().hex[:8]}"
+    consulted: list[str] = []
+    real_status = runner.containment_status
+
+    def spy(op_id):
+        consulted.append(op_id)
+        return real_status(op_id)
+
+    monkeypatch.setattr(runner, "containment_status", spy)
     res = runner.run("sleep 30 & echo hi; exit 0", timeout=15, op_id=op)
     try:
         assert res.exit_code == 0 and res.error is None, res
         assert res.cancel_state is None, res
-        assert res.note and "surviving" in res.note.lower(), \
-            f"completion did not record survivor containment: {res}"
-        deadline = time.time() + 5
-        while _cgroup_members(cg, op) and time.time() < deadline:
-            time.sleep(0.05)
-        assert not _cgroup_members(cg, op), "runner reported completion with live work"
+        assert consulted == [op], "completion did not consult the containment authority"
+        assert res.note is None, f"confirmed cessation must not claim survivors: {res}"
+        assert not _tree_members(cg, op), \
+            "runner reported completion while work survived the leader exit"
     finally:
         _reap(cg, op)
 
 
-def test_t04_failed_normal_exit_is_also_gated_on_containment(local_supervisor):
+def test_t04_completion_note_records_survivor_containment(local_supervisor,
+                                                          monkeypatch):
+    """If the supervisor ever DOES report surviving work at completion, the
+    runner must contain it and RECORD the containment in the result note —
+    never report a blind success. (Under the namespace boundary survivors
+    cannot form, so this pins the completion-path logic itself with a
+    controlled authoritative verdict.)"""
+    runner, state, script, cg = local_supervisor
+    monkeypatch.setattr(runner, "containment_status", lambda op_id: "running")
+    monkeypatch.setattr(runner, "cancel_remote", lambda op_id, timeout_s=10: True)
+    res = runner.run("true", timeout=15, op_id=f"note{uuid.uuid4().hex[:8]}")
+    assert res.exit_code == 0, res
+    assert res.note and "surviving" in res.note.lower(), \
+        f"completion did not record survivor containment: {res}"
+
+
+def test_t04_failed_normal_exit_is_also_gated_on_containment(local_supervisor,
+                                                             monkeypatch):
     """'Cover failed normal exits as well as zero exits': a NONZERO leader
-    exit with a survivor is still a containment question, not a free pass."""
+    exit goes through the same containment gate — the exit code never
+    outranks the authoritative cessation verdict."""
     runner, state, script, cg = local_supervisor
     op = f"done7{uuid.uuid4().hex[:8]}"
+    consulted: list[str] = []
+    real_status = runner.containment_status
+
+    def spy(op_id):
+        consulted.append(op_id)
+        return real_status(op_id)
+
+    monkeypatch.setattr(runner, "containment_status", spy)
     res = runner.run("sleep 30 & exit 7", timeout=15, op_id=op)
     try:
         assert res.exit_code == 7, res
-        assert res.note and "surviving" in res.note.lower(), \
-            f"nonzero exit skipped the containment check: {res}"
-        assert not _cgroup_members(cg, op)
+        assert consulted == [op], "nonzero exit skipped the containment gate"
+        assert not _tree_members(cg, op), \
+            "work survived a nonzero leader exit"
     finally:
         _reap(cg, op)
+
+
+def test_t04_unconfirmed_survivor_containment_is_unknown(local_supervisor,
+                                                         monkeypatch):
+    """A survivor the supervisor cannot confirm gone yields
+    cancel_state='unknown' with a SURVIVING error — the nonzero-exit
+    completion path never folds an unresolved containment into a plain
+    failure exit."""
+    runner, state, script, cg = local_supervisor
+    monkeypatch.setattr(runner, "containment_status", lambda op_id: "running")
+    monkeypatch.setattr(runner, "cancel_remote", lambda op_id, timeout_s=10: False)
+    res = runner.run("exit 7", timeout=15, op_id=f"unconf{uuid.uuid4().hex[:8]}")
+    assert res.exit_code == 7, res
+    assert res.cancel_state == "unknown", res
+    assert "SURVIVING" in (res.error or "").upper(), res
 
 
 def test_t04_unreachable_supervisor_at_completion_is_unknown(local_supervisor,
@@ -271,7 +326,9 @@ def test_t04_unreachable_supervisor_at_completion_is_unknown(local_supervisor,
     """When containment CANNOT be observed (control channel dead at the
     completion check), the result is cancel_state='unknown' with an
     UNREACHABLE error — never a silent completion. The loop halts and the
-    API refuses finalization on that verdict."""
+    API refuses finalization on that verdict. (The unknown comes from the
+    dead control channel itself; no survivor needs to exist for the state
+    to be unknown.)"""
     runner, state, script, cg = local_supervisor
     op = f"unreach{uuid.uuid4().hex[:8]}"
     real_control = runner._control
@@ -282,13 +339,13 @@ def test_t04_unreachable_supervisor_at_completion_is_unknown(local_supervisor,
     try:
         monkeypatch.setattr(runner, "_control", dead)
         # start still goes through the real channel (Popen, not _control):
-        # the leader exits 0 leaving a live child, and the containment check
-        # that follows finds the supervisor unreachable.
-        res = runner.run("sleep 30 & echo bg; exit 0", timeout=15, op_id=op)
+        # the command runs and completes, and the containment check that
+        # follows finds the supervisor unreachable.
+        res = runner.run("echo bg; exit 0", timeout=15, op_id=op)
         assert res.cancel_state == "unknown", \
             f"unreachable supervisor folded into completion: {res}"
         assert "UNREACHABLE" in (res.error or "").upper(), res
-        assert _cgroup_members(cg, op), "test premise: survivor must exist"
+        assert "bg" in res.output, f"command never ran: {res}"
     finally:
         monkeypatch.setattr(runner, "_control", real_control)
         _sup(script, f"cancel {op}", state)

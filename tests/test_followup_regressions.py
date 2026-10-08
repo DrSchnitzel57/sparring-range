@@ -234,7 +234,12 @@ def test_r09_absent_polarity_flips_with_host_state(client, users, fake_pve,
 # R04 — latch fail-closed, evidence invalidation, attestation schema         #
 # =========================================================================== #
 
-def test_r04_release_invalidates_previously_valid_evidence(tmp_path, monkeypatch):
+# The safety Supervisor mirrors latch/record state to the DB (audit N07), so
+# this gate regression REQUIRES the disposable database — it was the baseline's
+# unmarked-DB-dependency leak (milestone 01: honest layer classification).
+@pytest.mark.db
+def test_r04_release_invalidates_previously_valid_evidence(migrated_db,
+                                                           tmp_path, monkeypatch):
     monkeypatch.setenv("SR_ENV", "dev")
     monkeypatch.setenv("RUNNER_TRANSPORT", "local-dev")
     from srplatform.settings import get_settings
@@ -939,12 +944,27 @@ def test_r12_golden_image_calls_the_real_installer():
         "golden image must call the real installer (unit + format + spool)"
     installer = (REPO / "telemetry/install.sh").read_text()
     assert "sparring-shipper.service" in installer and "systemd" in installer.lower()
-    # the runbook must state the HONEST provisioning contract (audit N10):
-    # services are a versioned prebuilt-template requirement with enforced
-    # readiness — never "cloud-init applied" claims deploy does not perform
-    runbook = (REPO / "docs/OPERATOR_RUNBOOK.md").read_text()
-    assert "PREBUILT-TEMPLATE REQUIREMENT" in runbook and "VERIFIES readiness" in runbook
-    assert "belong to per-host scenario cloud-init" not in runbook
+    # The HONEST provisioning contract (audit N10) is enforced by CODE, not
+    # by literal runbook prose (milestone 01: replace prose-coupled checks
+    # with installer/readiness-contract assertions):
+    #   * every scenario host MUST name a prebuilt golden template — the
+    #     schema has no default, so "cloud-init applied" cannot substitute;
+    #   * deploy only clones from that template and reaches `ready` solely
+    #     after every host is created; any failure stays visible as failed.
+    import inspect
+
+    from srplatform.scenario_engine import loader, orchestrator
+
+    tmpl = loader.Host.model_fields["template_vmid"]
+    assert tmpl.is_required(), \
+        "prebuilt-template requirement must be enforced by the scenario schema"
+    deploy_src = inspect.getsource(orchestrator.deploy)
+    assert "clone_and_wait" in deploy_src, \
+        "deploy must provision by cloning the golden template"
+    assert "cloud-init" not in deploy_src.lower() and "cloudinit" not in deploy_src.lower(), \
+        "deploy must not claim service provisioning the template does not perform"
+    assert 'dep.status = "ready"' in deploy_src and 'dep.status = "failed"' in deploy_src, \
+        "readiness must be enforced: ready only after every host, failure stays visible"
 
 
 # =========================================================================== #

@@ -21,6 +21,10 @@ import uuid
 
 import pytest
 
+# Host-identity observation across the PID namespace: the pids a command
+# prints are namespace-local; only the host cgroup tree is authoritative.
+from tests.helpers import find_tree_member as _find_member, wait_value as _wait_value
+
 REPO = pathlib.Path(__file__).resolve().parents[1]
 SUPERVISOR = REPO / "infra" / "runner" / "runner_supervise.sh"
 PY = sys.executable
@@ -83,6 +87,7 @@ def _wait_until(fn, timeout=10.0):
             return True
         time.sleep(0.05)
     return False
+
 
 
 def _reap(root: str, op: str):
@@ -153,65 +158,81 @@ def enrollment_channel(monkeypatch):
 # =========================================================================== #
 
 def test_f1_same_uid_escape_to_parent_cgroup_is_impossible(local_supervisor, tmp_path):
-    """THE F1 escape probe: a redirected background child attempts to move
-    itself into the delegated PARENT cgroup (the same-UID escape that made
-    cessation a lie). Under a trusted boundary the attempt must FAIL, the
-    child must remain inside the operation tree, status must say running,
-    and cancel must actually kill it — no false 'gone', ever."""
+    """THE F1 escape probe under the namespace boundary: a redirected
+    background child attempts to move itself into the delegated PARENT
+    cgroup (the same-UID escape that made cessation a lie). Inside the
+    trusted boundary the real hierarchy above the operation is INVISIBLE
+    (cgroup namespace + rooted cgroupfs), so the attempt must FAIL; the
+    child must remain inside the operation tree — observed by its real HOST
+    identity, never the namespace-local number the command prints — status
+    must say running, and cancel must actually kill it. No false 'gone'."""
     _, state, script, cg = local_supervisor
     op = f"esc{uuid.uuid4().hex[:8]}"
-    child_file = tmp_path / "child.pid"
+    started = tmp_path / "started"
     marker = tmp_path / "escape.outcome"
-    cmd = (f"sleep 300 & CP=$!; echo $CP > {child_file}; "
-           f'if echo $CP > "$RUNNER_CGROUP_ROOT/cgroup.procs" 2>/dev/null; then '
-           f'echo ESCAPED > {marker}; else echo BLOCKED > {marker}; fi; exit 0')
-    _start(script, f"start {op} -- bash -c {chr(39)}{cmd}{chr(39)}", state)
+    # `wait` keeps the leader alive so the child is observable while the
+    # operation runs; a survivor can no longer outlive the leader (the
+    # kernel clears the whole PID namespace at leader exit — regression
+    # test_t01_leader_exit_cannot_leave_survivors...).
+    cmd = (f"sleep 300 & echo x > {started}; "
+           f'if echo $! > "$RUNNER_CGROUP_ROOT/cgroup.procs" 2>/dev/null; then '
+           f'echo ESCAPED > {marker}; else echo BLOCKED > {marker}; fi; wait')
+    conn = _start(script, f"start {op} -- bash -c {chr(39)}{cmd}{chr(39)}", state)
     try:
-        assert _wait_until(child_file.exists), "command never started"
-        child = int(child_file.read_text().strip())
+        assert _wait_until(started.exists), "command never started"
         assert _wait_until(lambda: marker.exists()), "escape attempt never ran"
         outcome = marker.read_text().strip()
         assert outcome == "BLOCKED", (
             "the command MIGRATED OUT of its operation cgroup — the boundary "
             "does not contain same-UID escape (F1)")
+        child = _wait_value(lambda: _find_member(cg, op, ("sleep", "300")))
+        assert child, ("the background child is not inside the operation tree "
+                       "on the HOST view — containment lost track of it (F1)")
         assert _alive(child), "test premise: the background child must be alive"
         st = _sup(script, f"status {op}", state)
         assert st.returncode == 0 and st.stdout.strip() == "running", \
-            f"escaped-looking survivor invisible to status: {st.stdout!r}"
+            f"contained survivor invisible to status: {st.stdout!r}"
         c = _sup(script, f"cancel {op}", state)
         assert c.returncode == 0 and c.stdout.strip() == "gone", c.stdout + c.stderr
         assert _wait_until(lambda: not _alive(child)), \
             "cancel acknowledged while the recorded child identity was alive"
     finally:
         _reap(cg, op)
+        if conn.poll() is None:
+            conn.kill()
 
 
 def test_f1_nested_membership_is_running_not_gone(local_supervisor, tmp_path):
-    """F1 nested probe: a child moves into a NESTED cgroup under the
-    operation and clears its environment. The operation's DIRECT
-    cgroup.procs is empty, but the tree is populated — status must report
-    running (recursive liveness), and cancel must reach the nested child."""
+    """F1 nested probe under the boundary: a child moves into a NESTED
+    cgroup under the operation (the namespace-rooted view — the only one
+    the command can reach) and clears its environment. The child is NOT in
+    the operation's DIRECT cgroup.procs, yet the tree is populated: status
+    must report running (recursive liveness, not the direct list), and
+    cancel must reach the nested child (kernel subtree-scoped kill)."""
     _, state, script, cg = local_supervisor
     op = f"nest{uuid.uuid4().hex[:8]}"
-    child_file = tmp_path / "child.pid"
+    started = tmp_path / "started"
     # Prefer the real op-cgroup path (pre-boundary); fall back to the
     # namespace-rooted view (post-boundary) — both nest UNDER the operation.
     cmd = (
         'cg=""; for p in "$RUNNER_CGROUP_ROOT/sr-$SR_OP_ID" /sys/fs/cgroup; do '
         '[ -w "$p" ] && cg="$p" && break; done; '
         'mkdir -p "$cg/nested" 2>/dev/null; '
-        f"env -i sleep 300 & CP=$!; echo $CP > {child_file}; "
-        'echo $CP > "$cg/nested/cgroup.procs" 2>/dev/null; exit 0')
-    _start(script, f"start {op} -- bash -c {chr(39)}{cmd}{chr(39)}", state)
+        'env -i sleep 300 & CP=$!; '
+        f'echo x > {started}; '
+        'echo $CP > "$cg/nested/cgroup.procs" 2>/dev/null; wait')
+    conn = _start(script, f"start {op} -- bash -c {chr(39)}{cmd}{chr(39)}", state)
     try:
-        assert _wait_until(child_file.exists), "command never started"
-        child = int(child_file.read_text().strip())
-        assert _wait_until(
-            lambda: child in _cgroup_tree_members(cg, op)), \
-            "test premise: child never entered a nested cgroup of the operation"
+        assert _wait_until(started.exists), "command never started"
+
+        def _nested():
+            pid = _find_member(cg, op, ("sleep", "300"))
+            return pid if pid and pid not in _cgroup_members(cg, op) else None
+
+        child = _wait_value(_nested)
+        assert child, ("test premise: child never entered a nested cgroup of "
+                       "the operation (host view)")
         assert _alive(child)
-        # the exact condition the review reproduced: direct membership empty
-        assert _wait_until(lambda: child not in _cgroup_members(cg, op), 5) or True
         st = _sup(script, f"status {op}", state)
         assert st.returncode == 0 and st.stdout.strip() == "running", (
             f"nested membership reported {st.stdout.strip()!r} while the child "
@@ -220,8 +241,12 @@ def test_f1_nested_membership_is_running_not_gone(local_supervisor, tmp_path):
         assert c.returncode == 0 and c.stdout.strip() == "gone", c.stdout + c.stderr
         assert _wait_until(lambda: not _alive(child)), \
             "cancel confirmed while the nested child lived"
+        assert not _cgroup_tree_members(cg, op), \
+            "members survived an acknowledged cancellation"
     finally:
         _reap(cg, op)
+        if conn.poll() is None:
+            conn.kill()
 
 
 def test_f1_unreadable_membership_is_unknown_not_gone(local_supervisor):
@@ -229,14 +254,20 @@ def test_f1_unreadable_membership_is_unknown_not_gone(local_supervisor):
     removing read permission from the authoritative state must NOT produce
     'gone'. The verdict must be a visible unknown, the bookkeeping must
     survive the failed read, and restoring permission must show the same
-    live process."""
+    live process. (The leader stays alive so the member genuinely lives —
+    under the namespace boundary a background child cannot outlive its
+    leader, so 'live member' requires a running operation.)"""
     _, state, script, cg = local_supervisor
     op = f"unread{uuid.uuid4().hex[:8]}"
-    _start(script, f"start {op} -- bash -c {chr(39)}env -i sleep 300 & exit 0{chr(39)}",
-           state)
+    conn = _start(script,
+                  f"start {op} -- bash -c {chr(39)}env -i sleep 300 & wait{chr(39)}",
+                  state)
     opcg = pathlib.Path(cg) / f"sr-{op}"
     try:
-        assert _wait_until(lambda: _cgroup_tree_members(cg, op)), \
+        # wait for the operation to reach its IDLE shape (the sleep child is
+        # present) before snapshotting — a mid-startup snapshot would race
+        # with the boundary's own setup processes (mount helpers)
+        assert _wait_value(lambda: _find_member(cg, op, ("sleep", "300"))), \
             "test premise: no member inside the operation cgroup"
         members = _cgroup_tree_members(cg, op)
         for f in ("cgroup.procs", "cgroup.events"):
@@ -269,6 +300,8 @@ def test_f1_unreadable_membership_is_unknown_not_gone(local_supervisor):
             except OSError:
                 pass
         _reap(cg, op)
+        if conn.poll() is None:
+            conn.kill()
 
 
 def test_f1_bookkeeping_is_not_command_writable(local_supervisor, tmp_path):
