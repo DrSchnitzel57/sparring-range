@@ -212,18 +212,55 @@ def _enrollment_channel():
     return None
 
 
-def _recover_telemetry_token(db: Session, session_id, host: str) -> tuple[str, str] | None:
+def _recover_telemetry_token(db: Session, session_id, host: str,
+                             deployment_id=None) -> tuple[str, str] | None:
     """Recover the issued plaintext + nonce after a lost deployment response:
     the ServiceToken row IS the durable record (plaintext primary key), so a
     retry resumes enrollment for the SAME capability and the SAME enrollment
-    nonce instead of issuing a second one."""
-    row = db.execute(select(ServiceToken.token, ServiceToken.enroll_nonce)
+    nonce instead of issuing a second one.
+
+    AUDIT F4: recovery RESUMES the CURRENT deployment generation's token —
+    not 'whichever matching host row happens to be newest'. A pre-existing
+    capability being safely RE-ENROLLED (older generation, or unbound) is
+    rebound to the current generation; it is never gratuitously replaced."""
+    q = (select(ServiceToken)
+         .where(ServiceToken.session_id == session_id,
+                ServiceToken.host == host,
+                ServiceToken.scope == "telemetry",
+                ServiceToken.revoked_at.is_(None)))
+    if deployment_id is not None:
+        row = db.execute(q.where(
+            ServiceToken.enrollment_deployment_id == deployment_id)
+            .order_by(ServiceToken.created_at.desc())).first()
+        if row:
+            return (row.token, row.enroll_nonce)
+    row = db.execute(q.order_by(ServiceToken.created_at.desc())).first()
+    if row is None:
+        return None
+    if deployment_id is not None and row.enrollment_deployment_id != deployment_id:
+        row.enrollment_deployment_id = deployment_id   # re-enroll: rebind
+        db.commit()
+    return (row.token, row.enroll_nonce)
+
+
+def enrollment_evidence_current(db: Session, session_id, host: str,
+                                deployment_id) -> bool:
+    """AUDIT F3/F4: valid enrollment evidence for the CURRENT deployment
+    generation means the EXACT capability bound to that generation carries
+    BOTH distinct evidence timestamps (authenticated delivery callback +
+    capture probe observed). A JSON phase alone is never evidence."""
+    if deployment_id is None:
+        return False
+    row = db.execute(select(ServiceToken.token)
                      .where(ServiceToken.session_id == session_id,
                             ServiceToken.host == host,
                             ServiceToken.scope == "telemetry",
-                            ServiceToken.revoked_at.is_(None))
-                     .order_by(ServiceToken.created_at.desc())).first()
-    return (row[0], row[1]) if row else None
+                            ServiceToken.revoked_at.is_(None),
+                            ServiceToken.enrollment_deployment_id == deployment_id,
+                            ServiceToken.enroll_confirmed_at.isnot(None),
+                            ServiceToken.enroll_capture_at.isnot(None))
+                     .limit(1)).first()
+    return row is not None
 
 
 def capture_marker(nonce: str) -> str:
@@ -253,26 +290,32 @@ def _provision_command(host: str, token: str, nonce: str, s) -> str:
             "systemctl restart sparring-shipper")
 
 
-def _enrollment_evidence(db: Session, session_id, host: str, attr: str):
-    """Newest un-revoked telemetry capability's evidence timestamp."""
-    return db.execute(select(getattr(ServiceToken, attr))
-                      .where(ServiceToken.session_id == session_id,
-                             ServiceToken.host == host,
-                             ServiceToken.scope == "telemetry",
-                             ServiceToken.revoked_at.is_(None))
-                      .order_by(ServiceToken.created_at.desc())
-                      .limit(1)).scalars().first()
+def _enrollment_evidence(db: Session, session_id, host: str, attr: str,
+                         deployment_id=None):
+    """Evidence timestamp of the capability bound to the CURRENT deployment
+    generation (audit F4) — or, when no generation is given, the newest
+    un-revoked telemetry capability."""
+    q = select(getattr(ServiceToken, attr)).where(
+        ServiceToken.session_id == session_id,
+        ServiceToken.host == host,
+        ServiceToken.scope == "telemetry",
+        ServiceToken.revoked_at.is_(None))
+    if deployment_id is not None:
+        q = q.where(ServiceToken.enrollment_deployment_id == deployment_id)
+    return db.execute(q.order_by(ServiceToken.created_at.desc()).limit(1)
+                      ).scalars().first()
 
 
 def _wait_for_enrollment_evidence(db: Session, session_id, host: str, attr: str,
-                                  timeout_s: float, poll_s: float = 0.25):
+                                  timeout_s: float, poll_s: float = 0.25,
+                                  deployment_id=None):
     """Bounded wait for the HOST-ORIGINATED evidence (the API routes set it
     when the provisioned host calls in). Returns the timestamp or None —
     a timeout is a VISIBLE enrollment failure, never an assumed pass."""
     deadline = _time.monotonic() + max(0.0, timeout_s)
     while True:
         db.expire_all()   # the callback lands on another session — read fresh
-        val = _enrollment_evidence(db, session_id, host, attr)
+        val = _enrollment_evidence(db, session_id, host, attr, deployment_id)
         if val is not None or _time.monotonic() >= deadline:
             return val
         _time.sleep(poll_s)
@@ -291,9 +334,24 @@ def _enroll_host_telemetry(db: Session, dep: Deployment, res: dict, resources: l
     visibly stuck (audit T-05)."""
     enroll = dict(res.get("telemetry_enroll") or {})
     if enroll.get("phase") == "confirmed":
-        return "confirmed"
+        # AUDIT F3: a phase that SAYS confirmed is not evidence — a
+        # pre-upgrade (phase-only) confirmation, or one whose capability lost
+        # its evidence, RESUMES enrollment instead of being trusted.
+        if enrollment_evidence_current(db, session_id, host_name, dep.deployment_id):
+            return "confirmed"
+        enroll = {k: v for k, v in enroll.items()
+                  if k not in ("phase", "stage", "error")}
+        res["telemetry_enroll"] = enroll
+        dep.resources = resources
+        flag_modified(dep, "resources")
+        db.commit()
 
     def persist(**kw) -> str:
+        # advancing PAST a failure stage clears the stale failure metadata
+        # without inventing new timestamps (audit F3)
+        if kw.get("phase") != "confirm_failed":
+            enroll.pop("stage", None)
+            enroll.pop("error", None)
         enroll.update(kw)
         res["telemetry_enroll"] = enroll
         dep.resources = resources
@@ -301,7 +359,7 @@ def _enroll_host_telemetry(db: Session, dep: Deployment, res: dict, resources: l
         db.commit()
         return enroll["phase"]
 
-    recovered = _recover_telemetry_token(db, session_id, host_name)
+    recovered = _recover_telemetry_token(db, session_id, host_name, dep.deployment_id)
     if recovered is None:
         tok, nonce = _enroll_telemetry(db, session_id, host_name, dep.deployment_id)
         res["telemetry_token_ref"] = _token_ref(tok)
@@ -338,7 +396,8 @@ def _enroll_host_telemetry(db: Session, dep: Deployment, res: dict, resources: l
     # that is merely active with a wrong API address / rejected token /
     # blocked delivery never produces this evidence.
     confirmed_at = _wait_for_enrollment_evidence(
-        db, session_id, host_name, "enroll_confirmed_at", s.enroll_confirm_timeout_s)
+        db, session_id, host_name, "enroll_confirmed_at", s.enroll_confirm_timeout_s,
+        deployment_id=dep.deployment_id)
     if confirmed_at is None:
         return persist(phase="confirm_failed", stage="delivery_confirmed",
                        error="service active but NO authenticated enrollment "
@@ -357,7 +416,8 @@ def _enroll_host_telemetry(db: Session, dep: Deployment, res: dict, resources: l
         return persist(phase="confirm_failed", stage="capture_probe",
                        error=f"capture probe failed on host: {str(tail)[:200]}")
     capture_at = _wait_for_enrollment_evidence(
-        db, session_id, host_name, "enroll_capture_at", s.enroll_capture_timeout_s)
+        db, session_id, host_name, "enroll_capture_at", s.enroll_capture_timeout_s,
+        deployment_id=dep.deployment_id)
     if capture_at is None:
         return persist(phase="confirm_failed", stage="capture_verified",
                        error="delivery confirmed but the capture probe produced "

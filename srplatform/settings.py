@@ -81,6 +81,11 @@ class Settings(BaseSettings):
     # A timeout is a visible enrollment failure, never an assumed pass.
     enroll_confirm_timeout_s: int = 30
     enroll_capture_timeout_s: int = 30
+    # local-dev command-group identity sidecar directory (audit F7): the
+    # LocalDevRunner records each command group's identity here so the API's
+    # resolution pass can verify REAL local cessation after a worker death.
+    # Empty = ~/.sparring_range/local_ops.
+    runner_local_op_dir: str = ""
 
     # --- Verifier management exec (trusted backend only, F01/F10) --------------
     verifier_ssh_user: str = "root"

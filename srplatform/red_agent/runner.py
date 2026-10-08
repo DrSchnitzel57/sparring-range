@@ -119,6 +119,112 @@ def _kill_group(proc: subprocess.Popen) -> None:
             pass
 
 
+# ------------------------------------------------- local process-group plane
+# AUDIT F7: LocalDevRunner gives every command an INDEPENDENT process group
+# (start_new_session), so a redirected background child survives the leader —
+# and after a WORKER death the API must still be able to resolve the local
+# operation with REAL cessation evidence. The runner therefore records the
+# command group's identity (pgid + leader start-time) in a sidecar the API's
+# resolution pass can verify, and confirms/removes it on cessation.
+def local_op_dir() -> "os.PathLike | None":
+    from srplatform.settings import get_settings
+    d = getattr(get_settings(), "runner_local_op_dir", "") or ""
+    if not d:
+        home = os.environ.get("HOME") or os.path.expanduser("~")
+        d = os.path.join(home, ".sparring_range", "local_ops")
+    return d
+
+
+def _local_op_file(op_id: str):
+    import pathlib
+    return pathlib.Path(local_op_dir()) / f"{op_id}.pgid"
+
+
+def _proc_start_ticks(pid: int) -> int:
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return int(f.read().rsplit(")", 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+def local_group_members(pgid: int) -> list[int]:
+    """PIDs whose process group is PGID (a group exists while any member
+    lives, even after its leader exited)."""
+    out = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+            if int(fields[2]) == pgid:
+                out.append(int(d))
+        except (OSError, IndexError, ValueError):
+            continue
+    return out
+
+
+def _record_local_op(op_id: str, pgid: int, pstart: int) -> None:
+    try:
+        import pathlib
+        p = _local_op_file(op_id)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"{pgid}:{pstart}\n")
+    except OSError:
+        pass    # dev-mode best effort; resolution then stays UNKNOWN-visible
+
+
+def _clear_local_op(op_id: str) -> None:
+    try:
+        _local_op_file(op_id).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def local_op_cessation(op_id: str) -> dict:
+    """REAL local cessation evidence for a recorded command group (audit F7):
+    the recorded identity must be verifiably gone. A group whose leader pid
+    was RECYCLED (identity mismatch) is never signalled — the row stays
+    unconfirmed instead. When the group is alive it is killed (same identity,
+    dev transport) and re-verified."""
+    f = _local_op_file(op_id)
+    try:
+        rec = f.read_text().strip()
+        pid_s, _, st_s = rec.partition(":")
+        pgid, pstart = int(pid_s), int(st_s)
+    except (OSError, ValueError):
+        return {"confirmed": False,
+                "detail": "local command identity not recorded — cessation "
+                          "UNCONFIRMED (never assumed gone)"}
+    leader_ticks = _proc_start_ticks(pgid)
+    if leader_ticks and leader_ticks != pstart:
+        # the recorded leader pid was recycled — the group number now belongs
+        # to someone else; those processes are NOT ours and are never killed
+        return {"confirmed": False,
+                "detail": f"recorded local group leader pid {pgid} was recycled — "
+                          "cessation of the recorded work UNCONFIRMED"}
+    members = local_group_members(pgid)
+    if not members:
+        _clear_local_op(op_id)
+        return {"confirmed": True,
+                "detail": f"local command group {pgid} confirmed gone (no members)"}
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    import time as _t
+    deadline = _t.monotonic() + 5.0
+    while _t.monotonic() < deadline:
+        if not local_group_members(pgid):
+            _clear_local_op(op_id)
+            return {"confirmed": True,
+                    "detail": f"local command group {pgid} killed and confirmed gone"}
+        _t.sleep(0.1)
+    return {"confirmed": False,
+            "detail": f"local command group {pgid} survived SIGKILL — cessation UNCONFIRMED"}
+
+
 def cancel_active(timeout_s: float = 10.0) -> dict:
     """Terminate every supervised operation. LOCAL groups are killed and
     CONFIRMED dead. REMOTE groups go through the runner control channel; an
@@ -249,7 +355,10 @@ def _bounded_reader(proc: subprocess.Popen, max_bytes: int,
     EOF would block until the survivor exits and fold ordinary completion
     into a timeout. Once the start process has exited, one more quiet select
     window is the end of the stream; the survivor is then handled by the
-    containment check, not by waiting on it."""
+    containment check, not by waiting on it. LOCAL transports get their own
+    cessation handling (audit F7) — this early-end behavior must never be an
+    SSH-only assumption silently applied to a runner without a check.
+    """
     import os as _os
     import select
     import time
@@ -486,8 +595,13 @@ class SshRunner(Runner):
 
     def health(self) -> tuple[bool, str]:
         r = self.run("true", timeout=15)
-        if r.exit_code == 0:
+        # AUDIT F7: an exit-zero result whose CESSATION verdict is unknown is
+        # not a healthy runner — "reachable" must never fold into "contained".
+        if r.exit_code == 0 and r.cancel_state != "unknown":
             return True, f"runner reachable at {self.s.runner_ssh_target} (supervised)"
+        if r.cancel_state == "unknown":
+            return False, ("runner health FAILED: cessation verdict UNKNOWN — "
+                           f"{(r.error or r.output or '')[:200]}")
         return False, f"runner health failed (exit {r.exit_code}): {r.output[:200] or r.error}"
 
 
@@ -516,6 +630,10 @@ class LocalDevRunner(Runner):
             _finish_op(op_id)
             return RunResult(exit_code=-1, output="", error=f"spawn failed: {e}", op_id=op_id)
         _attach_proc(op_id, proc)
+        # RECORD the independent command-group identity (audit F7): the API's
+        # resolution pass needs real cessation evidence after a worker death.
+        pgid, pstart = proc.pid, _proc_start_ticks(proc.pid)
+        _record_local_op(op_id, pgid, pstart)
         timed_out = False
         import time as _time
         raw, timed_out = _bounded_reader(proc, self.s.runner_max_output_bytes,
@@ -535,10 +653,38 @@ class LocalDevRunner(Runner):
             entry = _ACTIVE.pop(op_id, None)
         cancelled = (entry or {}).get("state") in ("cancelled", "cancelled-before-attach")
         out = raw.decode("utf-8", "replace")[: self.s.runner_max_output_bytes]
+        note, cancel_state, error = None, None, None
+        # ORDINARY COMPLETION IS GATED ON LOCAL CESSATION (audit F7): this
+        # runner gives every command its OWN process group, so the leader's
+        # exit says NOTHING about a redirected background child. Consult the
+        # group before calling the operation finished — contain and confirm,
+        # or report unknown. (The SSH runner asks its supervisor; local-dev
+        # asks the kernel.)
+        survivors = local_group_members(pgid)
+        if survivors:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            import time as _t
+            deadline = _t.monotonic() + 5.0
+            while _t.monotonic() < deadline and local_group_members(pgid):
+                _t.sleep(0.1)
+            if local_group_members(pgid):
+                cancel_state = "unknown"
+                error = ("command exited with SURVIVING local descendants and "
+                         "local cessation is UNCONFIRMED — report partial stop")
+            else:
+                note = ("command exited with surviving local descendants — "
+                        "contained (process group killed and confirmed gone)")
+        if cancel_state != "unknown":
+            _clear_local_op(op_id)   # cessation confirmed — obligation resolved
+            if cancelled:
+                cancel_state = "confirmed"
         return RunResult(exit_code=124 if timed_out else proc.returncode,
                          output=out, timed_out=timed_out, cancelled=cancelled,
-                         op_id=op_id,
-                         cancel_state="confirmed" if cancelled else None)
+                         op_id=op_id, error=error, note=note,
+                         cancel_state=cancel_state)
 
     def health(self) -> tuple[bool, str]:
         return True, "local-dev runner (NOT isolated — dev only)"

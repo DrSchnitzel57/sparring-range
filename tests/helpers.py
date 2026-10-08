@@ -96,19 +96,30 @@ def make_runner_token(session_id: str, scenario_id: str = "test") -> str:
 
 def cgroup_containment_root() -> str:
     """Resolve AND probe a delegated cgroup v2 directory for the runner
-    supervisor's authoritative containment (audit T-04). The supervisor
+    supervisor's authoritative containment (audit T-04, F8). The supervisor
     REFUSES to start work without it (unsupported execution mode), so tests
     that need real containment SKIP with an explicit reason when the host
     does not delegate one; the refusal itself is tested separately.
 
     The probe is not just mkdir: a child process must actually be movable
-    into a fresh child cgroup — that is the containment guarantee."""
+    into a fresh child cgroup — that is the containment guarantee.
+
+    AUDIT F8: in required CI/acceptance jobs set SR_REQUIRE_CONTAINMENT=1 —
+    a missing or unusable containment hierarchy is then a FAILURE, never a
+    silent green-job skip. Ordinary developer hosts keep the explicit skip."""
     import os
     import subprocess
     import sys
     import uuid as _u
 
     import pytest
+    required = os.environ.get("SR_REQUIRE_CONTAINMENT") == "1"
+
+    def _skip_or_fail(reason):
+        if required:
+            pytest.fail(f"SR_REQUIRE_CONTAINMENT=1 — {reason}", pytrace=False)
+        pytest.skip(f"{reason} — the supervisor refuses uncontained starts by design")
+
     root = os.environ.get("RUNNER_CGROUP_ROOT")
     if not root:
         try:
@@ -117,10 +128,9 @@ def cgroup_containment_root() -> str:
                             for l in f if l.startswith("0::"))
             root = "/sys/fs/cgroup" + path
         except (OSError, StopIteration):
-            pytest.skip("no cgroup v2 unified self-path — containment untestable here")
+            _skip_or_fail("no cgroup v2 unified self-path — containment untestable here")
     if not os.path.isdir(root) or not os.access(root, os.W_OK):
-        pytest.skip(f"no writable delegated cgroup v2 root at {root!r} — the "
-                    "supervisor refuses uncontained starts by design")
+        _skip_or_fail(f"no writable delegated cgroup v2 root at {root!r}")
     probe = os.path.join(root, f"srprobe-{_u.uuid4().hex[:8]}")
     try:
         os.mkdir(probe)
@@ -130,12 +140,14 @@ def cgroup_containment_root() -> str:
                 f.write(str(proc.pid))
             with open(f"/proc/{proc.pid}/cgroup") as f:
                 if "srprobe-" not in f.read():
-                    pytest.skip(f"cgroup {root!r} does not accept process moves")
+                    _skip_or_fail(f"cgroup {root!r} does not accept process moves")
         except OSError:
-            pytest.skip(f"cgroup {root!r} rejects process moves")
+            _skip_or_fail(f"cgroup {root!r} rejects process moves")
         finally:
             proc.kill()
             proc.wait()
+    except OSError as e:
+        _skip_or_fail(f"cgroup {root!r} unusable: {e}")
     finally:
         try:
             os.rmdir(probe)

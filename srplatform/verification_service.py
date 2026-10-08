@@ -148,19 +148,24 @@ def readiness_checks(db: Session, session_id) -> dict:
     s = get_settings()
     chan_ok, chan_why = management_channel_configured()
 
-    # TELEMETRY ENROLLMENT (audit T05/T-05): every created clone must be
-    # CONFIRMED — which now means host-originated delivery AND capture were
-    # observed, not that a service merely runs.
+    # TELEMETRY ENROLLMENT (audit T05/T-05, hardened for audit F3/F4): every
+    # created clone must be CONFIRMED — phase AND valid evidence (the exact
+    # capability of the CURRENT deployment generation carrying both distinct
+    # timestamps). A JSON phase alone (e.g. a pre-upgrade confirmation) is
+    # not evidence; `systemctl is-active` proves nothing.
     enroll_items = []
     dep = active_deployment(db, session_id)
+    from srplatform.scenario_engine import orchestrator
     if dep is not None:
         for r in (dep.resources or []):
             if r.get("state") != "created":
                 continue
             phase = (r.get("telemetry_enroll") or {}).get("phase")
+            evidence_ok = orchestrator.enrollment_evidence_current(
+                db, session_id, r.get("host"), dep.deployment_id)
             enroll_items.append({"host": r.get("host"), "phase": phase,
-                                 "ok": phase == "confirmed"})
-    from srplatform.scenario_engine import orchestrator
+                                 "evidence_current": evidence_ok,
+                                 "ok": phase == "confirmed" and evidence_ok})
     enroll_enforced = orchestrator.enrollment_channel_available()
 
     if not chan_ok and not enroll_enforced:

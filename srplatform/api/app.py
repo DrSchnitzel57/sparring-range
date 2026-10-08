@@ -16,6 +16,7 @@ Remediation highlights (F04/F08/F11/F13):
 from __future__ import annotations
 
 import hashlib
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -284,17 +285,42 @@ def _stop_active_run_or_conflict(db, sess):
     """Teardown/reset precondition (audit N03/T01): the worker AND its remote
     commands must be stopped and CONFIRMED dead before its machines/lease are
     released. 'stopping' and 'cancel-unknown' are NOT confirmed — a failed or
-    unconfirmed stop is a conflict, never a silent continue."""
+    unconfirmed stop is a conflict, never a silent continue. AUDIT F2: the
+    durable operation inventory is checked INDEPENDENTLY of run status — a
+    corrupt terminal row cannot hide an unresolved obligation from release."""
     active = runs_svc.active_run_for_session(db, sess.session_id)
-    if not active:
+    if active:
+        stopped = runs_svc.stop_run(db, active.run_id)
+        if not stopped.get("ok"):
+            raise HTTPException(409, {"error": "worker_stop_failed",
+                                      "run_id": str(active.run_id),
+                                      "status": stopped.get("status"),
+                                      "detail": stopped.get("detail"),
+                                      "note": "range NOT torn down; retry or engage killswitch"})
+    _require_session_operations_resolved(db, sess.session_id)
+
+
+def _require_session_operations_resolved(db, session_id) -> None:
+    """AUDIT F2: end/reset/teardown must check durable obligations even when
+    no run is ACTIVE. Attempts genuine resolution through the owning run's
+    terminal protocol; anything still unconfirmed BLOCKS the release —
+    existing inconsistent rows are repaired or block, never bypassed."""
+    rows = runs_svc.unresolved_operations(db, session_id)
+    if not rows:
         return
-    stopped = runs_svc.stop_run(db, active.run_id)
-    if not stopped.get("ok"):
-        raise HTTPException(409, {"error": "worker_stop_failed",
-                                  "run_id": str(active.run_id),
-                                  "status": stopped.get("status"),
-                                  "detail": stopped.get("detail"),
-                                  "note": "range NOT torn down; retry or engage killswitch"})
+    for rid in {str(r.run_id) for r in rows}:
+        try:
+            runs_svc.stop_run(db, rid)
+        except KeyError:
+            pass
+    rows = runs_svc.unresolved_operations(db, session_id)
+    if rows:
+        raise HTTPException(409, {
+            "error": "unresolved_operations",
+            "operations": [{"op_id": r.op_id, "state": r.state,
+                            "run_id": str(r.run_id)} for r in rows][:10],
+            "note": "unresolved command operations exist on this session's runs — "
+                    "release blocked until cessation is genuinely confirmed"})
 
 
 def _release_claim_safely(db, session_id, succeeded: bool, owner: str | None = None) -> None:
@@ -446,6 +472,10 @@ def _end_session_inner(db, sess, p, verification_service, orchestrator):
             raise HTTPException(409, {"error": "worker_stop_failed",
                                       "detail": stopped.get("detail"),
                                       "note": "session NOT ended; retry or engage killswitch"})
+    # AUDIT F2: durable obligations are checked independently of run status —
+    # a terminal row with an unresolved operation blocks the end until the
+    # cessation is genuinely confirmed.
+    _require_session_operations_resolved(db, sess.session_id)
 
     try:
         scorecard = verification_service.build_scorecard(db, sess.session_id)
@@ -721,6 +751,24 @@ def run_scenario(scenario_id: str, body: RunIn, p: Principal = Depends(any_membe
             raise HTTPException(409, {"error": "no_ready_deployment",
                                       "note": "no ready owned deployment for this session — "
                                               "launch it first"})
+        # ENROLLMENT EVIDENCE GATE (audit F3): an already-`ready` session must
+        # not let /run bypass the current enrollment requirements — readiness
+        # derives from valid CURRENT-generation enrollment evidence, not from
+        # a stale JSON phase alone.
+        from srplatform.scenario_engine import orchestrator as _orch
+        if _orch.enrollment_channel_available():
+            stale = [r.get("host") for r in (dep.resources or [])
+                     if r.get("state") == "created"
+                     and not _orch.enrollment_evidence_current(db, sess.session_id,
+                                                               r.get("host"),
+                                                               dep.deployment_id)]
+            if stale:
+                raise HTTPException(409, {
+                    "error": "enrollment_evidence_missing", "hosts": stale,
+                    "note": "current-deployment enrollment evidence (authenticated "
+                            "delivery + capture) is missing for these hosts — "
+                            "relaunch/reset to re-enroll; /run cannot bypass "
+                            "enrollment requirements"})
         try:
             run = runs_svc.start_run(db, sess.session_id, scenario_id)
         except runs_svc.GateRefused as e:
@@ -868,6 +916,14 @@ def register_run_operation(run_id: uuid.UUID, body: OperationIn,
                           ).scalars().first()
     if existing:
         return {"ok": True, "id": existing.id, "idempotent": True}
+    # DOCUMENTED TEST SEAM (inert unless set): run a command WHILE HOLDING the
+    # run-row lock, after the status fence and before the INSERT, so barrier
+    # tests can pin the registration-vs-finalization interleaving (audit F2).
+    # Production never sets it.
+    _hook = os.environ.get("SR_TEST_REGISTER_HOOK")
+    if _hook:
+        import subprocess as _sp
+        _sp.run(["/bin/sh", "-c", _hook], timeout=120, check=False)
     dep = verification_service.active_deployment(db, run.session_id)
     op = RunOperation(run_id=run.run_id, session_id=run.session_id,
                       deployment_id=dep.deployment_id if dep else None,
@@ -1278,31 +1334,40 @@ class EnrollConfirmIn(BaseModel):
 def enroll_confirm(body: EnrollConfirmIn, p: Principal = Depends(service("telemetry")),
                    db: Session = Depends(get_db)):
     """AUTHENTICATED ENROLLMENT CALLBACK FROM THE PROVISIONED HOST (audit
-    T-05): the installed shipper proves its own delivery path by presenting
-    its capability (session + host bound by the token — never by the body)
-    AND the fresh enrollment nonce provisioned with it. This is what turns
-    'service is active' into 'telemetry from THIS host can actually arrive';
-    a controller-side or test-side synthetic POST for a different enrollment
-    is rejected here. Repeated confirmations are idempotent."""
+    T-05, hardened for audit F4): evidence updates the EXACT authenticated
+    ServiceToken — never 'the newest row for this session/host'. A stale or
+    foreign capability presenting another enrollment's nonce is rejected; an
+    obsolete deployment generation (torn_down/failed) is rejected; revoked or
+    expired capabilities never reach this route. Confirmation is idempotent
+    under CONCURRENCY (guarded single-row update: exactly one timestamp,
+    exactly one event)."""
     import secrets as _secrets
-    tok = db.execute(select(ServiceToken)
-                     .where(ServiceToken.scope == "telemetry",
-                            ServiceToken.session_id == p.session_id,
-                            ServiceToken.host == p.host,
-                            ServiceToken.revoked_at.is_(None),
-                            ServiceToken.enroll_nonce.isnot(None))
-                     .order_by(ServiceToken.created_at.desc())).scalars().first()
-    if tok is None or not _secrets.compare_digest(tok.enroll_nonce or "", body.nonce):
+    from sqlalchemy import update as sa_update
+    tok = db.get(ServiceToken, p.token) if p.token else None
+    if (tok is None or tok.scope != "telemetry" or tok.revoked_at is not None
+            or str(tok.session_id) != str(p.session_id) or tok.host != p.host):
         raise HTTPException(403, "no enrollment pending for this capability/nonce")
-    if tok.enroll_confirmed_at is None:
-        tok.enroll_confirmed_at = _now()
+    if tok.enrollment_deployment_id is not None:
+        dep = db.get(Deployment, tok.enrollment_deployment_id)
+        if dep is not None and dep.status in ("torn_down", "failed"):
+            raise HTTPException(403, "enrollment belongs to an obsolete deployment "
+                                     "generation — re-enroll against the current one")
+    if not _secrets.compare_digest(tok.enroll_nonce or "", body.nonce):
+        raise HTTPException(403, "no enrollment pending for this capability/nonce")
+    now = _now()
+    res = db.execute(sa_update(ServiceToken)
+                     .where(ServiceToken.token == p.token,
+                            ServiceToken.enroll_confirmed_at.is_(None))
+                     .values(enroll_confirmed_at=now))
+    db.commit()
+    if res.rowcount:
         _log_event(db, p.session_id, "system", p.host, "telemetry_enroll_confirmed",
                    {"deployment_id": (str(tok.enrollment_deployment_id)
                                       if tok.enrollment_deployment_id else None),
                     "machine_id": body.machine_id, "boot_id": body.boot_id,
                     "note": "authenticated callback from the provisioned host — "
                             "API address, token and delivery path PROVEN"})
-        db.commit()
+    db.refresh(tok)
     return {"ok": True, "confirmed_at": tok.enroll_confirmed_at.isoformat()}
 
 
@@ -1350,31 +1415,34 @@ def ingest_auditd(body: AuditdBatch, p: Principal = Depends(service("telemetry")
                     "argv": rec.argv, "audit_key": rec.audit_key, "source_id": sid, "raw": rec.raw},
                    ts=_parse_ts(rec.ts))
         accepted += 1
-    # CAPTURE ACCEPTANCE (audit T-05): if this batch carries the enrollment's
-    # capture-probe marker, a harmless command has been observed AS AN AUDIT
-    # EVENT THROUGH THE INSTALLED SERVICE under its actual identity — the
-    # input path and command capture are proven, not assumed.
-    if accepted:
-        tok = db.execute(select(ServiceToken)
-                         .where(ServiceToken.scope == "telemetry",
-                                ServiceToken.session_id == p.session_id,
-                                ServiceToken.host == p.host,
-                                ServiceToken.revoked_at.is_(None),
-                                ServiceToken.enroll_nonce.isnot(None),
-                                ServiceToken.enroll_capture_at.is_(None))
-                         .order_by(ServiceToken.created_at.desc())).scalars().first()
-        if tok is not None:
+    # CAPTURE ACCEPTANCE (audit T-05, hardened for audit F4): if this batch
+    # carries the enrollment's capture-probe marker, a harmless command has
+    # been observed AS AN AUDIT EVENT THROUGH THE INSTALLED SERVICE under its
+    # actual identity — the input path and command capture are proven, not
+    # assumed. The evidence updates the EXACT authenticated capability, never
+    # 'the newest row for this session/host', and is idempotent under
+    # concurrency (guarded single-row update).
+    if accepted and p.token:
+        from sqlalchemy import update as sa_update
+        tok = db.get(ServiceToken, p.token)
+        if (tok is not None and tok.scope == "telemetry" and tok.revoked_at is None
+                and tok.enroll_nonce and tok.enroll_capture_at is None):
             from srplatform.scenario_engine.orchestrator import capture_marker
             marker = capture_marker(tok.enroll_nonce)
             for rec in body.events:
                 if rec.argv and marker in rec.argv:
-                    tok.enroll_capture_at = _now()
-                    _log_event(db, p.session_id, "system", p.host,
-                               "telemetry_capture_verified",
-                               {"marker": marker,
-                                "note": "harmless command observed through the "
-                                        "installed service — capture PROVEN"})
+                    now = _now()
+                    res = db.execute(sa_update(ServiceToken)
+                                     .where(ServiceToken.token == p.token,
+                                            ServiceToken.enroll_capture_at.is_(None))
+                                     .values(enroll_capture_at=now))
                     db.commit()
+                    if res.rowcount:
+                        _log_event(db, p.session_id, "system", p.host,
+                                   "telemetry_capture_verified",
+                                   {"marker": marker,
+                                    "note": "harmless command observed through the "
+                                            "installed service — capture PROVEN"})
                     break
     return {"ok": True, "accepted": accepted, "duplicates": dupes}
 

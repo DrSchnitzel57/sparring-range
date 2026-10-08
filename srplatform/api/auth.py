@@ -58,13 +58,17 @@ def verify_password(password: str, stored: str | None) -> bool:
 # ---------------------------------------------------------------- principals
 @dataclass(frozen=True)
 class Principal:
-    """Any authenticated actor."""
+    """Any authenticated actor. AUDIT F4: for ServiceToken capabilities the
+    EXACT token identity is carried through — enrollment evidence must be
+    read/written for the authenticated capability itself, never for
+    'whichever session/host row happens to be newest'."""
     kind: str                 # member | operator | service
     username: str | None = None
     user_id: object = None
     scope: str | None = None  # service scopes: bastion|telemetry|runner|score
     session_id: object = None  # service-bound session (runner/telemetry)
     host: str | None = None    # telemetry host identity
+    token: str | None = None   # exact ServiceToken value (service principals)
 
     @property
     def is_operator(self) -> bool:
@@ -116,7 +120,8 @@ def _principal_from_token(db: Session, token: str) -> Principal:
     if st:
         if not _live(st):
             raise HTTPException(401, "service token expired or revoked")
-        return Principal(kind="service", scope=st.scope, session_id=st.session_id, host=st.host)
+        return Principal(kind="service", scope=st.scope, session_id=st.session_id,
+                         host=st.host, token=token)
     # run-scoped red-worker credential (audit R01): the run manager stores ONLY
     # the sha256 of the token the worker was spawned with. It authenticates as
     # the `runner` capability bound to that run's session, and dies with the
