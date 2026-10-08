@@ -265,7 +265,7 @@ free ports 3000/8010; use an isolated fixture/configuration.
 
 ### Dev Compose
 
-Existing `docker-compose.yml`, `.env.example`, `infra/dev/seed-bastion-keys.sh`
+Existing `docker-compose.yml`, `.env.example`, `infra/dev/seed_bastion_keys.sh`
 and `rangectl bootstrap` provide a dev bootstrap path. Milestone 01 must validate
 `docker compose config`/build and a fresh **disposable** stack with supplied keys,
 role bootstrap/migrations, recording volume, idempotent operator/capability

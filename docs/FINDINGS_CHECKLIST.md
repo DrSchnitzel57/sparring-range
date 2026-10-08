@@ -85,6 +85,27 @@ These checks validate the documentation consolidation, **not** any application
 milestone. The application suite was not rerun after documentation-only edits;
 its executed baseline above remains failing and explicitly revision-bound.
 
+### Fresh milestone-01 planning rerun
+
+At clean revision `7368782`, on the same Python 3.13.5 environment, the exact
+no-admin pytest command above exited **1**: **10 failed, 106 passed, 115 skipped,
+1 deselected, 4 warnings**, **61.76s**. All nine earlier failures remain. The
+additional failure is
+`tests/test_followup_regressions.py::test_r12_golden_image_calls_the_real_installer`:
+the documentation consolidation removed the literal strings
+`PREBUILT-TEMPLATE REQUIREMENT` / `VERIFIES readiness` asserted by that old test.
+This is a documentation/test coupling regression introduced by the consolidation,
+not evidence that the application provisioning code changed. Repair its assertion
+without weakening the requirement for usable templates and enforced readiness.
+
+The exact `web/` audit command above again exited **1**, four affected packages,
+**three critical / one high**. Read-only prerequisite checks: `docker compose
+version` exited 0 (5.6.0); `docker info --format '{{.ServerVersion}}'` exited 0
+(29.8.2). DB admin variables remain unset; `psql`, `playwright-cli`, and `nft` are
+not on PATH. No Docker resources, DB schema, browser service, live range or host
+firewall were created/mutated by these checks. These results supersede assumptions
+about Docker availability, not the outstanding acceptance gates.
+
 ## Release blockers and missing work
 
 | ID / priority | Current finding and evidence boundary | Milestone |

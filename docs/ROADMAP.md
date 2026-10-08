@@ -22,15 +22,27 @@ is implementation work, not a hardware-only gate. Preserve existing useful fixes
 **Goal:** trustworthy tests/CI and a reproducible developer stack before expanding
 the product. **Depends on:** the agreed release contract.
 
-Repair the nine fresh failures by investigating namespace/PID semantics and DB
-marker leakage; do not restore unsafe containment just to make old assertions
-green. Configure explicit disposable PostgreSQL, forward-upgrade tests, reliable
+Approved implementation plan: [01-reproducible-baseline](../.openchamber/plans/01-reproducible-baseline.md)
+(2026-10-08). Implementation and milestone acceptance remain pending.
+
+Investigate the ten fresh failures (including the prose-coupled readiness test),
+namespace/PID semantics and DB marker leakage; do not restore unsafe containment just to make old assertions
+green. If a real safety defect emerges, retain its failing regression and obtain
+agreement before widening scope; milestone 01 cannot be accepted with that gap.
+Configure explicit disposable PostgreSQL, forward-upgrade tests, reliable
 layer selection, required prerequisite failures, and exact result reporting.
 Triage/patch frontend advisories and check Python lock resolution; validate the
 actual Compose config/bootstrap/build path. Reconcile legacy documentation
 references in package metadata, source comments and historical probe tooling
 without deleting regressions. Establish isolated browser/packet fixtures without
 displacing other services.
+
+Agreed defaults: infrastructure-free pytest; local PostgreSQL 16 Docker fixture;
+required privileged gates on standard GitHub-hosted Linux VMs after verifying
+free allowance and a zero-spend blocking budget; patched stable Next 16 retaining
+Pages Router/React 18 where compatible; zero high/critical production audit
+findings; isolated browser build with configurable ports and run-owned CLI session.
+Unavailable required CI leaves acceptance pending, not waived.
 
 **Areas:** `tests/`, `.github/workflows/ci.yml`, dependency manifests/locks,
 `docker-compose.yml`, `infra/dev/`, source documentation references.

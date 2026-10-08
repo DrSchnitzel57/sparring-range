@@ -346,6 +346,13 @@ Validate dependency advisories and patch supported packages before release.
 | Stop/preserve on scoring outage or exhausted model recovery | Quietly continuing an apparently normal match | Avoids misleading completed competitions |
 | Capture before automatic cleanup, indefinite evidence by default | Holding VMs indefinitely or silently deleting old evidence | Reuses the one environment while preserving review/history |
 | Preserve/retest existing boundary repairs | Framework rewrite or reverting containment to satisfy stale tests | Existing architecture is useful; correctness must be independently demonstrated |
+| Fast infrastructure-free pytest default; explicit required integration layers | Broad default with prerequisite skips mistaken for acceptance | Predictable local feedback; required jobs fail for missing prerequisites or empty selection |
+| Disposable PostgreSQL 16 Docker fixture locally; standard GitHub Linux VMs for privileged tests | Implicit existing DB access or privileged containers on the development host | Own and clean up only synthetic test resources; keep kernel-boundary setup off shared hosts |
+| Verify free Actions allowance and a zero-spend blocking budget before expanded CI runs | Authorizing paid usage through the milestone plan | No paid usage approved; unavailable CI leaves acceptance pending |
+| Patched stable Next 16, existing Pages Router and React 18 where compatible | Unsupported Next 14, short-lived Next 15 bridge, or UI rewrite | Longer support runway with focused build/workflow/replay validation |
+| Zero high/critical frontend production audit findings | Unapproved non-applicability exceptions | Clear dependency gate; document lower-severity applicability separately |
+| Isolated browser build, configurable ports and pinned local CLI with run-owned session | Reusing an API-URL-baked developer build or default browser session | Test the intended backend without displacing services or closing another browser |
+| Stop milestone 01 acceptance for agreement if a genuine safety defect emerges | Weakening regressions or silently absorbing milestone 02 | Test hygiene cannot conceal defects or expand production safety scope without approval |
 
 ## Risks and explicitly unverified inputs
 
@@ -356,8 +363,9 @@ Validate dependency advisories and patch supported packages before release.
   are not yet accepted. Their milestone plans must specify the verified mechanism.
 - Qwen alias/context/structured-response compatibility and reliable attack
   behavior are unverified. Do not equate tokens/second with exploitation skill.
-- The software baseline has nine failures and unexecuted DB/browser/hardware
-  boundaries; frontend advisories need applicability and upgrade validation.
+- The fresh milestone-01 software baseline has ten failures and unexecuted
+  DB/browser/hardware boundaries; frontend advisories need applicability and
+  upgrade validation.
 - Exact preset vulnerabilities/baselines, rubric points, inject schedule values,
   action budgets, schema/API changes, health-detector thresholds and deployment
   service/storage configuration will be designed and agreed in their milestone

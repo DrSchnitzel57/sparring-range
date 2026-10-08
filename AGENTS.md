@@ -107,6 +107,20 @@ required-containment CI wiring are software gaps, not merely hardware gates.
 Legacy source comments/package metadata may still name removed docs; reconcile
 them in milestone 01 without changing historical tests' safety intentions.
 
+### Fresh milestone-01 planning baseline
+
+At `7368782` (clean `master` before this rerun), the same no-admin pytest command
+above exited 1: **10 failed, 106 passed, 115 skipped, 1 deselected, 4 warnings**,
+61.76s. The original nine failures remain; the documentation consolidation adds
+`tests/test_followup_regressions.py::test_r12_golden_image_calls_the_real_installer`,
+which checks obsolete literal runbook wording. Preserve the service/readiness
+contract while repairing that prose-dependent assertion in milestone 01.
+
+The fresh lockfile audit still exits 1 with **three critical / one high** across
+four affected packages. Docker is now available: Compose 5.6.0, daemon 29.8.2.
+No disposable DB admin, browser CLI or nft binary was configured, and no Docker
+fixture or live/privileged gate was started during this planning baseline.
+
 ## Validation commands and safety
 
 - Fast baseline: the pytest command above, or select `not db and not browser and
