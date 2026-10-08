@@ -47,11 +47,19 @@ class Failed(Exception):
     pass
 
 
+AUDIT_SEVERITIES = ("info", "low", "moderate", "high", "critical")
+
+
 def audit_vulnerabilities(stdout: str, returncode: int) -> dict:
     """Strictly evaluate `npm audit --json` output. FAILS on an error
-    response (registry unreachable, bad lockfile...), unparsable output, or
-    missing vulnerability metadata — an audit that never ran must never read
-    as zero findings (review P2: fail-open)."""
+    response (registry unreachable, bad lockfile...), unparsable output,
+    missing/incomplete severity metadata, or an exit status inconsistent
+    with the reported findings — an audit that never ran, ran partially,
+    or disagrees with itself must never read as zero findings (review P2:
+    fail closed)."""
+    if returncode not in (0, 1):
+        raise Failed(f"production audit exited {returncode} — only 0 (clean) "
+                     "and 1 (findings present) are valid audit outcomes")
     try:
         data = json.loads(stdout)
     except (json.JSONDecodeError, TypeError):
@@ -65,7 +73,23 @@ def audit_vulnerabilities(stdout: str, returncode: int) -> dict:
     if not isinstance(meta, dict) or not isinstance(meta.get("vulnerabilities"), dict):
         raise Failed(f"production audit JSON lacks metadata.vulnerabilities "
                      f"(exit {returncode}) — refusing to treat it as clean")
-    return meta["vulnerabilities"]
+    vulns = meta["vulnerabilities"]
+    missing = [s for s in AUDIT_SEVERITIES if s not in vulns]
+    if missing:
+        raise Failed(f"production audit metadata lacks severity counts {missing} "
+                     f"(exit {returncode}) — incomplete report is not clean")
+    for key, val in vulns.items():
+        if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+            raise Failed(f"production audit severity count {key}={val!r} is not "
+                         f"a nonnegative integer (exit {returncode})")
+    total = sum(vulns[s] for s in AUDIT_SEVERITIES)
+    if returncode == 0 and total != 0:
+        raise Failed(f"audit exited 0 (clean) yet reports {total} findings — "
+                     "inconsistent result is not accepted")
+    if returncode == 1 and total == 0:
+        raise Failed("audit exited 1 (findings present) yet every severity is "
+                     "zero — inconsistent result is not accepted")
+    return vulns
 
 
 def env_summary(extra: dict | None = None) -> str:
@@ -310,6 +334,47 @@ def _pg_fixture():
     return pg_fixture.PgFixture(port=int(port) if port else None).start()
 
 
+def _fixture_collision_probe() -> None:
+    """Foreign-resource regression (review P2): a pre-existing container or
+    volume under the fixture's names must be REFUSED, never adopted and
+    never removed by cleanup."""
+    import pg_fixture
+    fx = pg_fixture.PgFixture(run_id="col" + uuid.uuid4().hex[:5])
+    pre = []
+    try:
+        for args in (["volume", "create", fx.volume],
+                     ["create", "--name", fx.container, pg_fixture.IMAGE,
+                      "true"]):
+            r = subprocess.run(["docker", *args], capture_output=True, text=True)
+            if r.returncode != 0:
+                fail("fixture collision probe setup",
+                     f"docker {args[0]}: {(r.stderr or r.stdout).strip()[:200]}")
+            pre.append(args)
+        try:
+            fx.start()
+            started_ok = True
+        except RuntimeError:
+            started_ok = False
+        if started_ok:
+            fail("fixture refuses pre-existing names", "start() succeeded")
+        problems = fx.cleanup()
+        if problems:
+            fail("fixture collision cleanup", "; ".join(problems))
+        if _docker_probe(["inspect", fx.container]) != 0:
+            fail("collision refusal leaves foreign resources untouched",
+                 f"foreign container {fx.container} was removed")
+        if _docker_probe(["volume", "inspect", fx.volume]) != 0:
+            fail("collision refusal leaves foreign resources untouched",
+                 f"foreign volume {fx.volume} was removed")
+        ok("DB fixture refuses pre-existing names and never removes "
+           "resources it did not create")
+    finally:
+        subprocess.run(["docker", "rm", "-f", fx.container],
+                       capture_output=True)
+        subprocess.run(["docker", "volume", "rm", fx.volume],
+                       capture_output=True)
+
+
 def _fixture_failure_probe() -> None:
     """Failure-path regression (review P2): a start that fails partway (here:
     an occupied port) must surface the error AND strand nothing — the run's
@@ -348,6 +413,7 @@ def _docker_probe(args: list[str]) -> int:
 
 def check_db() -> None:
     _fixture_failure_probe()
+    _fixture_collision_probe()
     fx = _pg_fixture()
     try:
         env = {"SR_PG_ADMIN_URL": fx.admin_url(), "SR_REQUIRE_DB": "1"}
@@ -752,6 +818,37 @@ def _verify_compose_stack(compose, api_port: int, head: str, attempt: int,
         fail("app-role account write visible in DB",
              f"rc {r.returncode} out {r.stdout.strip()!r}")
     ok(f"authenticated app-role account ops + idempotence (attempt {attempt})")
+
+    # 5. bastion capability: the stack hands the bastion container
+    #    SR_BASTION_TOKEN, but a running bastion proves nothing until that
+    #    capability EXISTS in service_tokens and authenticates a scoped
+    #    call. Provision the synthetic capability (operator bootstrap path,
+    #    owner role) and verify the bastion's target-resolution endpoint
+    #    accepts it — before AND after the idempotent rerun.
+    tok = run_env["SR_DEV_BASTION_TOKEN"]
+    if not re.fullmatch(r"[0-9a-f]{32}", tok):
+        fail("bastion token shape", f"expected 32 hex chars, got {tok!r}")
+    r = compose("exec", "-T", "postgres", "psql", "-U", "sr_owner",
+                "-d", "sparring_range", "-c",
+                "INSERT INTO service_tokens (token, scope) "
+                f"VALUES ('{tok}', 'bastion') ON CONFLICT (token) DO NOTHING",
+                timeout=60)
+    if r.returncode != 0:
+        fail("provision bastion capability", (r.stderr or r.stdout)[-300:])
+    # scoped operation WITH the capability: authenticated, login token
+    # absent -> 404. Without it the same call must be refused outright.
+    probe = f"{api}/tokens/{uuid.uuid4()}"
+    code, _ = _http_json("GET", probe, headers={"Authorization": f"Bearer {tok}"})
+    if code != 404:
+        fail("bastion capability authenticates a scoped call "
+             f"(attempt {attempt})",
+             f"expected 404 (authenticated, login token absent), got {code}")
+    code, _ = _http_json("GET", probe)
+    if code not in (401, 403):
+        fail("scoped call without the capability is refused",
+             f"expected 401/403, got {code}")
+    ok(f"bastion capability issued + scoped call authenticated "
+       f"(attempt {attempt})")
 
 
 # -------------------------------------------------------------------------- #

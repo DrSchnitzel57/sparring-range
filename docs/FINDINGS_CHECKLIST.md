@@ -165,6 +165,33 @@ Post-fix gate results at this revision: fast default **101 passed, 0 failed,
 PASS; `compose` PASS with default ports held (exact-head migrations,
 credential split, `/readyz`, account ops, idempotent rerun, clean teardown).
 
+**Round-3 review fixes (2026-10-08, post-`13daa88` review — VERDICT: FIX,
+all 6 items):** the invalid top-level `x-delegate-cgroup` workflow key was
+removed — the anchor now lives on a real step reused via alias, and a
+structural workflow-schema test (`test_ci_workflow_is_schema_valid`) rejects
+unknown top-level/job/step keys and nested step lists. CI now runs the db and
+containment gates **inside** the delegated subtree via
+`infra/dev/run_in_cgroup.sh`: root performs the single privileged migration
+into the subtree, verifies it took effect, then drops to the unprivileged
+user — so source and destination of every test migration are user-owned
+(the old step only chowned the destination, which the kernel refuses to
+migrate out of). The PG fixture now REFUSES pre-existing container/volume
+names (collision = not ours, never removed), claims ownership only after a
+name is verified free, and wraps the entire startup in exception-safe
+cleanup so timeouts (`TimeoutExpired`) as well as nonzero exits strand
+nothing; covered by fault-injected unit tests and a real-docker collision
+probe in `acceptance.py db`. The audit evaluator additionally requires the
+complete nonnegative-integer severity map and a consistent exit status
+(0↔zero findings, 1↔findings; anything else fails). The compose gate now
+provisions the stack's bastion token into `service_tokens` and verifies a
+scoped target-resolution call authenticates with it (404 authenticated vs
+401/403 refused) before AND after the idempotent rerun.
+
+Round-3 gate results: fast default **106 passed, 0 failed, 0 skipped,
+139 deselected** (245 total); `selection`, `frontend`, `containment` PASS;
+`db` PASS with failure-path + collision probes; `compose` PASS with bastion
+capability verified on both attempts.
+
 **Milestone 01 acceptance status:** all locally executable gates pass.
 Packet and browser gates fail closed here for missing prerequisites
 by design; per the plan they are accepted only when the required CI jobs pass

@@ -1,16 +1,19 @@
 """Regressions for the acceptance harness itself (milestone-01 review).
 
-The harness decides acceptance, so its own counting and audit-evaluation
-logic must not fail open. These are fast, infrastructure-free unit tests
-over the harness's pure functions.
+The harness decides acceptance, so its own counting, audit-evaluation,
+fixture-ownership and CI-workflow logic must not fail open. These are fast,
+infrastructure-free unit tests over the harness's pure functions (docker is
+fault-injected, never required).
 """
 from __future__ import annotations
 
 import importlib.util
 import pathlib
 import re
+import subprocess
 
 import pytest
+import yaml
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
@@ -23,6 +26,7 @@ def _load(name: str, rel: str):
 
 
 acc = _load("sr_acceptance", "infra/dev/acceptance.py")
+pgf = _load("sr_pg_fixture", "infra/dev/pg_fixture.py")
 
 
 def test_parse_counts_uses_pytest_labels_exactly():
@@ -53,6 +57,10 @@ def test_require_selection_fails_on_empty_and_passes_on_any_selection():
     acc.require_selection({"skipped": 1}, "db")  # non-empty: the layer ran
 
 
+CLEAN = ('{"metadata":{"vulnerabilities":{"info":0,"low":0,"moderate":0,'
+         '"high":0,"critical":0}}}')
+
+
 def test_audit_evaluation_fails_closed():
     F = acc.Failed
     # error response (registry unreachable) is NEVER zero findings
@@ -69,9 +77,148 @@ def test_audit_evaluation_fails_closed():
     with pytest.raises(F):
         acc.audit_vulnerabilities('{"metadata":{}}', 0)
     # clean and dirty metadata both parse to their severity map
-    assert acc.audit_vulnerabilities(
+    assert acc.audit_vulnerabilities(CLEAN, 0) == {"info": 0, "low": 0,
+                                                   "moderate": 0, "high": 0,
+                                                   "critical": 0}
+    v = acc.audit_vulnerabilities(
         '{"metadata":{"vulnerabilities":{"info":0,"low":0,"moderate":0,'
-        '"high":0,"critical":0}}}', 0) == {"info": 0, "low": 0, "moderate": 0,
-                                           "high": 0, "critical": 0}
-    v = acc.audit_vulnerabilities('{"metadata":{"vulnerabilities":{"high":2}}}', 1)
+        '"high":2,"critical":0}}}', 1)
     assert v["high"] == 2
+
+
+def test_audit_evaluation_rejects_incomplete_or_inconsistent_reports():
+    # review P2 round 3: an EMPTY severity map and an impossible exit status
+    # must not read as clean
+    F = acc.Failed
+    with pytest.raises(F):
+        acc.audit_vulnerabilities('{"metadata":{"vulnerabilities":{}}}', 0)
+    with pytest.raises(F):  # missing severity keys is an incomplete report
+        acc.audit_vulnerabilities('{"metadata":{"vulnerabilities":{"high":0}}}', 0)
+    with pytest.raises(F):  # exit 2 is an audit ERROR, not a clean run
+        acc.audit_vulnerabilities(CLEAN, 2)
+    with pytest.raises(F):
+        acc.audit_vulnerabilities(CLEAN, -1)
+    with pytest.raises(F):  # exit 0 (clean) yet findings reported
+        acc.audit_vulnerabilities(
+            '{"metadata":{"vulnerabilities":{"info":0,"low":0,"moderate":0,'
+            '"high":1,"critical":0}}}', 0)
+    with pytest.raises(F):  # exit 1 (findings) yet all counts zero
+        acc.audit_vulnerabilities(CLEAN, 1)
+    with pytest.raises(F):  # negative / non-integer counts
+        acc.audit_vulnerabilities(
+            '{"metadata":{"vulnerabilities":{"info":-1,"low":0,"moderate":0,'
+            '"high":0,"critical":0}}}', 1)
+        acc.audit_vulnerabilities(
+            '{"metadata":{"vulnerabilities":{"info":"0","low":0,"moderate":0,'
+            '"high":0,"critical":0}}}', 0)
+
+
+class _FakeR:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+def _fake_docker(monkeypatch, *, volume_exists=False, container_exists=False,
+                 fail_on=None, timeout_on=None):
+    """Fault-inject pg_fixture's docker calls; returns the call log."""
+    calls: list[list[str]] = []
+
+    def fake(args, timeout=120, check=False):
+        calls.append(list(args))
+        if timeout_on and args[:2] == list(timeout_on):
+            raise subprocess.TimeoutExpired(cmd=["docker", *args], timeout=1)
+        if fail_on and args[:2] == list(fail_on):
+            return _FakeR(1, "", "injected failure")
+        if args[:2] == ["volume", "inspect"]:
+            return _FakeR(0 if volume_exists else 1)
+        if args[0] == "inspect":
+            return _FakeR(0 if container_exists else 1)
+        return _FakeR(0)
+
+    monkeypatch.setattr(pgf, "_docker", fake)
+    return calls
+
+
+def test_pg_fixture_timeout_cleans_up_every_partial_state(monkeypatch):
+    # review P2 round 3: a TimeoutExpired (not just a nonzero exit) during
+    # startup must still run cleanup for everything already claimed
+    for timeout_on in (["volume", "create"], ["run", "-d"]):
+        calls = _fake_docker(monkeypatch, timeout_on=timeout_on)
+        fx = pgf.PgFixture(run_id="t1")
+        with pytest.raises(RuntimeError):
+            fx.start()
+        if timeout_on == ["volume", "create"]:
+            assert ["volume", "rm", fx.volume] in calls
+            assert ["rm", "-f", fx.container] not in calls  # never claimed
+        else:
+            assert ["rm", "-f", fx.container] in calls
+            assert ["volume", "rm", fx.volume] in calls
+
+
+def test_pg_fixture_nonzero_exit_cleans_up(monkeypatch):
+    calls = _fake_docker(monkeypatch, fail_on=["run", "-d"])
+    fx = pgf.PgFixture(run_id="t2")
+    with pytest.raises(RuntimeError):
+        fx.start()
+    assert ["rm", "-f", fx.container] in calls
+    assert ["volume", "rm", fx.volume] in calls
+
+
+def test_pg_fixture_refuses_foreign_names_and_never_removes_them(monkeypatch):
+    # review P2 round 3: a name collision is NOT ownership — refuse, and
+    # cleanup must never rm the foreign resource
+    calls = _fake_docker(monkeypatch, volume_exists=True)
+    fx = pgf.PgFixture(run_id="t3")
+    with pytest.raises(RuntimeError, match="already exists"):
+        fx.start()
+    assert not any(c[0] == "rm" or c[:2] == ["volume", "rm"] for c in calls)
+    assert fx.cleanup() == []  # nothing claimed, nothing touched
+
+    calls = _fake_docker(monkeypatch, container_exists=True)
+    fx = pgf.PgFixture(run_id="t4")
+    with pytest.raises(RuntimeError, match="already exists"):
+        fx.start()
+    assert ["volume", "rm", fx.volume] in calls  # OUR volume, created first
+    assert ["rm", "-f", fx.container] not in calls  # foreign container kept
+    fx.cleanup()
+
+
+# ---------------------------------------------------------------- workflow
+WORKFLOW_ALLOWED_TOP = {"name", "on", "permissions", "env", "defaults",
+                        "concurrency", "jobs"}
+WORKFLOW_ALLOWED_JOB = {"needs", "name", "if", "runs-on", "steps", "strategy",
+                        "timeout-minutes", "env", "permissions", "container",
+                        "services", "continue-on-error", "timeout-minutes"}
+WORKFLOW_ALLOWED_STEP = {"id", "name", "uses", "with", "run", "env",
+                         "continue-on-error", "timeout-minutes", "if",
+                         "working-directory", "shell"}
+
+
+def test_ci_workflow_is_schema_valid():
+    # review P1 round 3: YAML anchors alone do not validate an Actions
+    # workflow — unknown top-level keys (e.g. a bare anchor carrier) are
+    # rejected by GitHub's schema. Structural validation runs here so the
+    # mistake cannot silently return.
+    doc = yaml.safe_load((REPO / ".github" / "workflows" / "ci.yml").read_text())
+    assert isinstance(doc, dict)
+    # YAML 1.1 folds the `on:` key to boolean True — normalise before checking
+    top_keys = {("on" if k is True else k) for k in doc}
+    unknown = top_keys - WORKFLOW_ALLOWED_TOP
+    assert not unknown, f"invalid top-level workflow keys: {unknown}"
+    assert "jobs" in doc and doc["jobs"]
+    for job_id, spec in doc["jobs"].items():
+        assert isinstance(spec, dict), job_id
+        bad = set(spec) - WORKFLOW_ALLOWED_JOB
+        assert not bad, f"{job_id}: invalid job keys {bad}"
+        assert "runs-on" in spec, job_id
+        steps = spec.get("steps")
+        assert isinstance(steps, list) and steps, job_id
+        for step in steps:
+            # an aliased step must expand to a flat mapping, never a list
+            assert isinstance(step, dict), f"{job_id}: nested step list {step}"
+            bad = set(step) - WORKFLOW_ALLOWED_STEP
+            assert not bad, f"{job_id}: invalid step keys {bad}"
+            assert ("uses" in step) != ("run" in step), \
+                f"{job_id}: step needs exactly one of uses/run: {step}"
+            if "uses" in step:
+                assert isinstance(step["uses"], str) and step["uses"]
