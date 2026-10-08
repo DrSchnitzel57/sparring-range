@@ -5,8 +5,8 @@ Design: [ARCHITECTURE.md](ARCHITECTURE.md). Baseline/open evidence:
 [OPERATOR_RUNBOOK.md](OPERATOR_RUNBOOK.md).
 
 These are **new release milestones**, not retroactive completion of the old
-M0–M7 plan. No implementation milestone is accepted yet. Architecture and ordered
-scope are agreed; write the full implementation plan for **one milestone at a
+M0–M7 plan. Milestone 01 has green CI but is reopened by independent review below.
+Architecture and ordered scope are agreed; write the full implementation plan for **one milestone at a
 time**, inspect the then-current code, and obtain agreement before implementing.
 Plans go in `.openchamber/plans/NN-short-name.md`; do not write them all now.
 
@@ -17,18 +17,22 @@ is implementation work, not a hardware-only gate. Preserve existing useful fixes
 
 ## 01 — Reproducible baseline and release dependency hygiene
 
-- [x] Accept milestone 01.
+- [ ] Accept milestone 01 (reopened by independent review, 2026-10-08).
 
 **Goal:** trustworthy tests/CI and a reproducible developer stack before expanding
 the product. **Depends on:** the agreed release contract.
 
 Approved implementation plan: [01-reproducible-baseline](../.openchamber/plans/01-reproducible-baseline.md)
-(2026-10-08). **Accepted (2026-10-08):** all locally executable gates pass
+(2026-10-08). **Implementation acceptance recorded, then reopened (2026-10-08):** all locally executable gates pass
 (infrastructure-free default 114/0/0; selection/python 3.11–3.13/db/
 containment/frontend/compose via `infra/dev/acceptance.py`), and the required
 CI jobs — including the kernel-boundary packet and real-browser replay gates
 that cannot run on this host — all passed in run 37852029894 at `3539667`
 (ten jobs green). Evidence: [findings checklist](FINDINGS_CHECKLIST.md).
+Independent review at `27e2624` reproduced safe local gates and checked hosted
+logs, but found a shared/reused browser build directory and an edit to migration
+0010 contrary to the approved plan. Fix those gaps and rerun affected gates before
+closing milestone 01. Requirements are unchanged; no milestone-02 plan exists.
 
 Investigate the ten fresh failures (including the prose-coupled readiness test),
 namespace/PID semantics and DB marker leakage; do not restore unsafe containment just to make old assertions

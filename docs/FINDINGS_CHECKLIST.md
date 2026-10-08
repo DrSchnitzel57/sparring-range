@@ -7,8 +7,9 @@ Release contract: [ARCHITECTURE.md](ARCHITECTURE.md); ordered work:
 
 **Not release-ready.** This replaces accumulated remediation checkmarks. Existing
 repairs and regression tests are valuable, but historical green totals and reports
-are not fresh acceptance. No release milestone has been accepted, no live attacks
-are authorized, and documentation changes do not repair the application.
+are not fresh acceptance. Milestone 01 has verified green CI but is reopened by
+independent review below. No live attacks are authorized; later milestones remain
+unaccepted. Documentation changes do not repair the application.
 
 ## Evidence labels
 
@@ -407,11 +408,63 @@ previously-green jobs turned red on a frontend-only diff:
    vs "token expired or revoked" vs "bad token"). Bootstrap/users/login
    failures now include the body so a recurrence is classifiable.
 
-**Milestone 01 acceptance status: ACCEPTED (2026-10-08).** All locally
+**Milestone 01 implementation acceptance recorded (2026-10-08), superseded by
+independent review below.** All locally
 executable gates pass; packet and browser gates fail closed here for
 missing prerequisites by design and were accepted through their required
 CI jobs: run 37852029894 at `3539667` — selection, python 3.11/3.12/3.13,
 frontend, compose, packet, db, containment and browser-e2e all green.
+
+### Independent merged-work review (2026-10-08, `27e2624`)
+
+**VERDICT: FIX.** Safe local results were rerun independently; hosted-only
+results were read from GitHub job logs, not independently rerun on a privileged
+machine. `3539667..27e2624` changes documentation only, so the hosted application
+revision matches the reviewed application. No application code edited by review.
+
+Findings (both P2; acceptance reopened rather than requirements weakened):
+
+- **M01-R1 — browser build is shared, not run-owned.**
+  `tests/test_stage5_browser_e2e.py:144–161` defaults to `web/.next-e2e`, reuses
+  a build when its marker matches, and never removes the build. Two simultaneous
+  runs use the same directory while baking different API URLs; one can overwrite
+  the other run's build. `SR_E2E_DIST_DIR=.next` also permits overwriting a developer
+  build. An inline mocked fixture probe invoked `web_app.__wrapped__` twice and
+  observed `SR_NEXT_DIST_DIR=['.next-e2e', '.next-e2e']` (exit 0; no filesystem or
+  real subprocess changes). Use a fresh run-owned build directory, reject unsafe
+  path overrides, clean it on failure/success, and test preservation/concurrent
+  isolation. This is approved step 8 / criterion 9, not new product scope.
+- **M01-R2 — historical migration edited for a test-only calling convention.**
+  `srplatform/db/migrations/versions/0010_fifth_followup_enrollment.py:79–91`
+  adds Engine handling. `git diff da13e72..27e2624 --` that path confirms the edit;
+  `upgrade()` still passes a Connection and the SQL is unchanged. Approved step 4
+  and the architecture explicitly prohibit editing applied migrations. Restore
+  the historical migration and pass a transaction-bound Connection from the
+  helper test at `tests/test_fifth_followup_acceptance.py:978,999`. If production
+  migration behavior needs changing, use a new forward revision instead.
+
+Review environment: Linux, existing Python 3.13.5 `.venv`, Node 22.23.3;
+Docker fixtures synthetic/run-owned, existing delegated cgroup only, no sudo,
+host firewall, Proxmox or unrelated-VM changes. Commands from checkout root:
+
+| Exact command | Independent result |
+|---|---|
+| `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -ra -p no:cacheprovider` | Exit 0; 114 passed, 0 failed/skipped, 139 deselected, 4 warnings; 16.63s |
+| `.venv/bin/python infra/dev/acceptance.py selection` | Exit 0; 253 classified, 114 fast/139 integration; negative prerequisite/skip/empty controls passed; 35.4s |
+| `env SR_ACCEPTANCE_PYTHONS=3.11,3.12,3.13 .venv/bin/python infra/dev/acceptance.py python` | Exit 0; fresh locked installs, dependency checks and four imports each on 3.11.17/3.12.15/3.13.5; 13.1s |
+| `.venv/bin/python infra/dev/acceptance.py db` | Exit 0; 113 passed, 0 skipped, 140 deselected; failure/collision probes and owned cleanup passed; 102.4s |
+| `.venv/bin/python infra/dev/acceptance.py containment` | Exit 0; full boundary/migration/wrapper probes, 21 passed, 0 skipped, 232 deselected; cleanup passed; 11.2s |
+| `.venv/bin/python infra/dev/acceptance.py frontend` | Exit 0; npm ci/build and production audit passed, zero findings; 11.0s |
+| `.venv/bin/python infra/dev/acceptance.py compose` | Exit 0; fresh build, two bootstrap attempts, exact 0010 head, DB-backed readiness, app-role account/bastion checks, owned cleanup; 41.1s |
+| `.venv/bin/python infra/dev/acceptance.py packet` | Exit 1; required prerequisites root/nft missing, no packet test executed locally |
+| `.venv/bin/python infra/dev/acceptance.py browser` | Exit 1; initial attempt overlapped npm ci and saw CLI missing; rerun after install: Chromium launch prerequisite unavailable, 1 setup error, no browser test passed locally; owned DB cleaned |
+| `gh run view 37852029894 --json conclusion,headSha,jobs,url,headBranch` | Exit 0; success, happy-chipmunk at 3539667, all ten jobs succeeded |
+| `gh run view 37852029894 --log \| grep -E 'counts \|passed\|skipped\|acceptance:\|: PASS\|\[PASS\]\|\[FAIL\]'` | Exit 0; logs confirm packet 4 passed/249 deselected, browser 1 passed/0 skipped, Python matrix fast suite 114 passed each, and all acceptance commands executed |
+
+Hosted evidence: [run 37852029894](https://github.com/DrSchnitzel57/sparring-range/actions/runs/37852029894).
+Green command results remain valid, but do not prove run-owned build isolation or
+waive migration immutability. Close M01-R1/R2 and rerun affected gates before
+marking milestone 01 accepted. Billing protection remains an operator manual check.
 
 ## Release blockers and missing work
 
@@ -420,13 +473,13 @@ frontend, compose, packet, db, containment and browser-e2e all green.
 | B01 / P1 | **Repaired at `ac5a61b`, CI-accepted (see milestone-01 evidence):** baseline failures fixed on real host identities; DB marker leakage structurally prevented (fixture-closure derivation) | 01 |
 | B02 / P1 | **Repaired at `ac5a61b`:** Next 16.4.0 + patched transitive deps; `npm audit --omit=dev` reports 0 vulnerabilities; build/replay/browser validated | 01 |
 | B03 / P0 | Inspected API still constructs direct PVE adapter; current safety controller invokes privileged nft machinery. Incompatible with agreed private limited-token/no-runtime-host-root boundary | 02 |
-| B04 / P0 | Namespace/cgroup boundary and kernel kill exist, but nine-failure baseline is not containment acceptance. Missing/unreadable authority, recursive membership, bookkeeping protection, unsupported starts and all signal identities need independent proof | 01–02 |
+| B04 / P0 | Current namespace/cgroup regression gate passes locally and in CI; full production authority, missing/unreadable control, bookkeeping, start/cancel fencing and every signal identity still require milestone-02 boundary/race acceptance | 02 |
 | B05 / P0 | Run-row locking, guarded writers and any-run obligations exist. DB races and every writer/caller (spawn, callback, stop, watchdog, startup, emergency) remain unverified here; never rely on helper docstrings saying every writer is covered | 02 |
 | B06 / P0 | Exact effective PVE permissions, static bridged/routed isolation, resource budgets and independent owned-VM emergency stop are not accepted. No attacks before real gates; no permission widening to pass | 02, 11 |
 | B07 / P1 | Current image artifacts do not establish usable web/database templates. Service-present checks are not actual transactions; YAML has placeholder integrity/user baselines and seed contracts need completion | 03 |
 | B08 / P1 | Enrollment now carries exact capability/generation evidence and migration 0010 invalidation logic. Fresh/legacy upgrades, stale-token rejection, recovery and concurrent confirms require disposable DB acceptance | 04 |
 | B09 / P1 | **Missing software:** `tests/test_fifth_followup_installed_capture.py` and required installed-systemd/auditd acceptance. Subprocess synthetic stdin cannot prove `srshipper` reads real audit input or captures a real command | 04 |
-| B10 / P1 | **Wired at `ac5a61b`:** required layers run as dedicated CI jobs via `infra/dev/acceptance.py` with `SR_REQUIRE_*` (missing prerequisites/empty selections/skipped required tests fail). Installed-capture fixture still missing (milestone 04). CI execution pending operator push | 01, 04 |
+| B10 / P1 | **CI passed at `3539667`:** dedicated required layers via `infra/dev/acceptance.py` fail closed for missing prerequisites/empty selections/skips. Review M01-R1 reopens browser-build isolation; installed-capture fixture still missing (milestone 04) | 01, 04 |
 | B11 / P1 | SSH/recording/spool code exists; real pinned SSH, installed identity, input/API/token negatives, shared durable storage, delivery gaps and transport-loss recovery remain unverified | 04, 11 |
 | B12 / P1 | **Missing release behavior:** configuration snapshots for new controls, explicit timed Begin, ready-idle expiry, server clock, restart interruption and automatic post-evidence cleanup. Existing end keeps owned VMs/reservation pending separate teardown | 05 |
 | B13 / P1 | **Missing release behavior:** continuous independent HTTP/MySQL probes, availability samples/rubric, distinct live component scores, scorer-health detector and outage interruption | 06 |

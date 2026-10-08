@@ -366,9 +366,10 @@ Validate dependency advisories and patch supported packages before release.
   are not yet accepted. Their milestone plans must specify the verified mechanism.
 - Qwen alias/context/structured-response compatibility and reliable attack
   behavior are unverified. Do not equate tokens/second with exploitation skill.
-- The fresh milestone-01 software baseline has ten failures and unexecuted
-  DB/browser/hardware boundaries; frontend advisories need applicability and
-  upgrade validation.
+- Milestone-01 tests/dependencies now pass locally and in CI; independent review
+  at `27e2624` reopened acceptance for browser-build isolation and an edited
+  historical migration. These are plan-compliance gaps, not proof of unsafe
+  production migration SQL. Live/hardware boundaries remain unaccepted.
 - Exact preset vulnerabilities/baselines, rubric points, inject schedule values,
   action budgets, schema/API changes, health-detector thresholds and deployment
   service/storage configuration will be designed and agreed in their milestone
