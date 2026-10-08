@@ -10,6 +10,7 @@ export default function Replay() {
   const [data, setData] = useState(null);
   const [err, setErr] = useState(null);
   const [playerErr, setPlayerErr] = useState(null);
+  const [playerEv, setPlayerEv] = useState("");
   const [sel, setSel] = useState(0);
   const [now, setNow] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -18,6 +19,14 @@ export default function Replay() {
   const [seekAt, setSeekAt] = useState(null);
   const rootRef = useRef(null);
   const playerRef = useRef(null);
+
+  // the player's internal vt promise has NO catch inside the library: a
+  // rejection there hangs the load silently. Surface it.
+  useEffect(() => {
+    const h = (e) => setPlayerErr(prev => prev || `unhandled: ${String(e.reason?.message ?? e.reason)}`);
+    window.addEventListener("unhandledrejection", h);
+    return () => window.removeEventListener("unhandledrejection", h);
+  }, []);
 
   const sid = router.query.id;
   useEffect(() => {
@@ -41,9 +50,14 @@ export default function Replay() {
       const A = mod.default ?? mod;
       playerRef.current = A.create(url, rootRef.current, { autoPlay: false, loop: false, terminalName: "xterm-256color" });
       // a failed load/decode must be VISIBLE: a silent COLD player looks
-      // exactly like a never-mounted one from the outside
+      // exactly like a never-mounted one from the outside. Trace the
+      // lifecycle too — where the load stalls is the diagnosis.
       playerRef.current.addEventListener?.("error", (e) =>
         setPlayerErr(String(e?.message ?? e)));
+      for (const ev of ["loading", "metadata", "seeked"]) {
+        playerRef.current.addEventListener?.(ev, () =>
+          setPlayerEv(prev => prev.includes(`${ev};`) ? prev : `${prev}${ev};`));
+      }
       const t = setInterval(() => {
         if (playerRef.current?.getCurrentTime) setNow(playerRef.current.getCurrentTime());
         if (playerRef.current?.getDuration) setDuration(playerRef.current.getDuration());
@@ -86,7 +100,8 @@ export default function Replay() {
       <div className="panel" data-seek-at={seekAt === null ? "" : String(seekAt)}
            data-now={String(now)}
            data-duration={duration === undefined || duration === null ? "" : String(duration)}
-           data-player-error={playerErr || ""}>
+           data-player-error={playerErr || ""}
+           data-player-events={playerEv}>
         <h3>event timeline</h3>
         {data.timeline.map((e) => {
           const off = offsetOf(e.ts);

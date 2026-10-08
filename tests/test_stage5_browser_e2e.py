@@ -369,9 +369,11 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
         # known) — and fail loudly on a surfaced player error instead of
         # mistaking a dead player for a seek problem
         deadline = time.time() + 30
+        ev_trace = ""
         while time.time() < deadline:
             dur = _eval("document.querySelector('[data-duration]').getAttribute('data-duration')")
             perr = _eval("document.querySelector('[data-player-error]').getAttribute('data-player-error')")
+            ev_trace = _eval("document.querySelector('[data-player-events]').getAttribute('data-player-events')")
             if perr:
                 pytest.fail(f"asciinema-player failed to load the recording: {perr}")
             try:
@@ -381,7 +383,8 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
                 pass
             time.sleep(0.5)
         else:
-            pytest.fail("asciinema-player never loaded the recording (duration stayed empty)")
+            pytest.fail("asciinema-player never loaded the recording "
+                        f"(duration stayed empty; lifecycle events seen: {ev_trace or 'NONE — startup stalled'})")
 
         # paused at t=0: the 1s frame is NOT rendered yet
         assert "hardening done" not in _eval(
