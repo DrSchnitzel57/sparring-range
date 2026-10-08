@@ -48,7 +48,10 @@ export default function Replay() {
     import("asciinema-player").then((mod) => {
       if (cancelled || !rootRef.current) return;
       const A = mod.default ?? mod;
-      playerRef.current = A.create(url, rootRef.current, { autoPlay: false, loop: false, terminalName: "xterm-256color" });
+      // preload: true is REQUIRED, not an optimization — asciinema-player 3.17
+      // made loading lazy: INIT_REQUESTED in COLD does nothing without it, so
+      // a paused player would sit with no duration until the first play/seek.
+      playerRef.current = A.create(url, rootRef.current, { autoPlay: false, preload: true, loop: false, terminalName: "xterm-256color" });
       // a failed load/decode must be VISIBLE: a silent COLD player looks
       // exactly like a never-mounted one from the outside. Trace the
       // lifecycle too — where the load stalls is the diagnosis.
