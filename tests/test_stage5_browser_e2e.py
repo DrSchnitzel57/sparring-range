@@ -6,38 +6,52 @@ external services are controlled substitutes: Proxmox (FakePVEHttp), the
 model endpoint (fast fake OpenAI), the runner (local-dev transport), the
 verifier exec (controlled host state) and the datapath (fake).
 
+Isolation (milestone 01): ports are configurable and default to FREE
+ephemeral ports; the web build goes to its OWN dist dir (`.next-e2e`,
+baked with the chosen API URL) so a developer's `.next` is never touched;
+the Playwright CLI is the PINNED local one (web/node_modules, devDependency)
+and runs in a run-owned named session (`sr-e2e-<runid>`), never a shared or
+the user's session. Nothing outside this run's own ports/dir/session is
+created or removed.
+
 Browser workflow asserted end to end:
   authenticated member -> create/launch -> connection instructions ->
   captured command (session-bound telemetry ingest) -> start red (real
-  worker) -> end session (confirm dialog) -> graded report -> progress.
+  worker) -> end session (confirm dialog) -> graded report -> REPLAY
+  (player mounts, timeline click really seeks) -> progress.
 
 Run: SR_PG_ADMIN_CMD=... pytest -m browser
-Skips (does not fail) when a prerequisite is absent: playwright-cli, the
-web build/node_modules, or free ports 8010 (API — the URL baked into the web
-build) / 3000 (web — the API's CORS allowlist).
+Skips (does not fail) when a prerequisite is absent: the pinned CLI, a
+launchable browser, the web dependencies, or the chosen ports.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import socket
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 WEB = REPO / "web"
-API_PORT = 8010          # must equal the NEXT_PUBLIC_API_URL baked into web/.next
-WEB_PORT = 3000          # the API's CORS allowlist ships localhost:3000
-API = f"http://127.0.0.1:{API_PORT}"
-WEB_URL = f"http://localhost:{WEB_PORT}"   # browser-side; matches baked URL + CORS
 OP_PW = "operator-testpw-9"
 MEM_PW = "member-testpw-9"
 
 pytestmark = [pytest.mark.browser, pytest.mark.db]
+
+
+def _free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
 
 
 def _port_free(port: int) -> bool:
@@ -52,21 +66,68 @@ def _port_free(port: int) -> bool:
         s.close()
 
 
-def _pw(*args, timeout=60, check=True):
-    r = subprocess.run(["playwright-cli", *args], capture_output=True, text=True,
-                       timeout=timeout, cwd=REPO)
-    if check and r.returncode != 0:
-        raise AssertionError(f"playwright-cli {' '.join(args)} -> {r.returncode}\n"
-                             f"{r.stdout[-800:]}\n{r.stderr[-800:]}")
-    return r
+def _cli() -> str | None:
+    """The PINNED local Playwright CLI (web devDependency); PATH only as a
+    declared fallback so CI without `npm ci` still runs the same commands."""
+    local = WEB / "node_modules" / ".bin" / "playwright-cli"
+    if local.exists():
+        return str(local)
+    return shutil.which("playwright-cli")
 
 
-def _body_has(text: str, timeout=40) -> str:
+@pytest.fixture()
+def ports():
+    """Configurable, default-FREE ports — never assumes 8010/3000 are ours."""
+    api = int(os.environ.get("SR_E2E_API_PORT") or 0) or _free_port()
+    web = int(os.environ.get("SR_E2E_WEB_PORT") or 0) or _free_port()
+    if not _port_free(api):
+        pytest.skip(f"API port {api} busy — pick a free SR_E2E_API_PORT")
+    if not _port_free(web):
+        pytest.skip(f"web port {web} busy — pick a free SR_E2E_WEB_PORT")
+    return {"api": api, "web": web,
+            "api_url": f"http://127.0.0.1:{api}",
+            "web_url": f"http://localhost:{web}"}   # baked URL + CORS origin
+
+
+@pytest.fixture()
+def browser(ports):
+    """Run-owned named session on the pinned CLI; preflights a REAL browser
+    launch so an absent browser is an explicit prerequisite, never a
+    mid-test mystery. (Required mode converts the skip into a failure.)"""
+    cli = _cli()
+    if cli is None:
+        pytest.skip("pinned playwright-cli missing — run `npm ci` in web/ first")
+    session = f"sr-e2e-{uuid.uuid4().hex[:8]}"
+    ch = os.environ.get("SR_E2E_BROWSER", "chromium")
+
+    def pw(*args, timeout=90, check=True):
+        r = subprocess.run([cli, f"-s={session}", *args],
+                           capture_output=True, text=True, timeout=timeout,
+                           cwd=REPO)
+        if check and r.returncode != 0:
+            raise AssertionError(f"playwright-cli {' '.join(args)} -> {r.returncode}\n"
+                                 f"{r.stdout[-800:]}\n{r.stderr[-800:]}")
+        return r
+
+    try:
+        pw("open", "about:blank", f"--browser={ch}", timeout=120)
+    except (AssertionError, subprocess.TimeoutExpired) as e:
+        text = str(e)
+        clue = next((ln.strip() for ln in text.splitlines()
+                     if "not found" in ln or "error while loading" in ln
+                     or "install" in ln), text.strip().splitlines()[-1][:200])
+        pytest.skip(f"browser {ch!r} cannot launch here: {clue} "
+                    "(install it, e.g. `npx playwright install chromium`)")
+    yield pw
+    pw("close", check=False)
+
+
+def _body_has(pw, text: str, timeout=40) -> str:
     """Poll the rendered page until innerText contains `text`."""
     deadline = time.time() + timeout
     last = ""
     while time.time() < deadline:
-        last = _pw("--raw", "eval", "document.body.innerText").stdout
+        last = pw("--raw", "eval", "document.body.innerText").stdout
         if text in last:
             return last
         time.sleep(0.5)
@@ -74,35 +135,34 @@ def _body_has(text: str, timeout=40) -> str:
 
 
 @pytest.fixture()
-def browser():
-    if shutil.which("playwright-cli") is None:
-        pytest.skip("playwright-cli not installed — browser E2E is opt-in")
-    _pw("close", check=False)  # clean slate if a stale session lingers
-    yield
-    _pw("close", check=False)
-
-
-@pytest.fixture()
-def web_app():
-    """Serve the REAL Next.js app; build it first if the checkout has no build."""
+def web_app(ports, tmp_path):
+    """Serve the REAL Next.js app from an ISOLATED dist dir baked for THIS
+    run's API port; a developer's `.next` build is never read or replaced."""
     node_bin = WEB / "node_modules" / ".bin"
     if not (node_bin / "next").exists():
         pytest.skip("web/node_modules missing — run `npm ci` in web/ first")
-    if not _port_free(WEB_PORT):
-        pytest.skip(f"port {WEB_PORT} busy — the browser E2E needs the web port free")
-    if not (WEB / ".next" / "BUILD_ID").exists():
+    dist = WEB / os.environ.get("SR_E2E_DIST_DIR", ".next-e2e")
+    marker = dist / ".sr-e2e-baked-url"
+    baked = f"http://localhost:{ports['api']}"
+    need_build = ((not (dist / "BUILD_ID").exists())
+                  or (not marker.exists()) or marker.read_text() != baked)
+    if need_build:
         subprocess.run(["npm", "run", "build"], cwd=WEB, check=True,
-                       env={**os.environ, "NEXT_PUBLIC_API_URL": f"http://localhost:{API_PORT}",
-                            "NEXT_TELEMETRY_DISABLED": "1"}, capture_output=True, text=True)
+                       env={**os.environ, "NEXT_PUBLIC_API_URL": baked,
+                            "SR_NEXT_DIST_DIR": str(dist),
+                            "NEXT_TELEMETRY_DISABLED": "1"},
+                       capture_output=True, text=True)
+        marker.write_text(baked)
     proc = subprocess.Popen([str(node_bin / "next"), "start"], cwd=WEB,
-                            env={**os.environ, "PORT": str(WEB_PORT),
+                            env={**os.environ, "PORT": str(ports["web"]),
+                                 "SR_NEXT_DIST_DIR": str(dist),
                                  "NEXT_TELEMETRY_DISABLED": "1"},
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     import httpx
     deadline = time.time() + 40
     while time.time() < deadline:
         try:
-            if httpx.get(f"http://127.0.0.1:{WEB_PORT}", timeout=2).status_code == 200:
+            if httpx.get(f"http://127.0.0.1:{ports['web']}", timeout=2).status_code == 200:
                 break
         except Exception:
             time.sleep(0.5)
@@ -117,8 +177,8 @@ def web_app():
         proc.kill()
 
 
-def test_browser_member_practice_loop(browser, web_app, migrated_db, test_db_url_owner,
-                                      tmp_path, monkeypatch):
+def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
+                                      test_db_url_owner, tmp_path, monkeypatch):
     import httpx
     import uvicorn
     from sqlalchemy import create_engine, text
@@ -133,8 +193,9 @@ def test_browser_member_practice_loop(browser, web_app, migrated_db, test_db_url
     from tests.helpers import FakeDatapath
     from tests.test_stage5_acceptance import SlowFakeModel
 
-    if not _port_free(API_PORT):
-        pytest.skip(f"port {API_PORT} busy — the browser E2E needs the API port free")
+    pw = browser
+    API = ports["api_url"]
+    WEB_URL = ports["web_url"]
 
     # ---- controlled external services + real API process ----------------------
     model = SlowFakeModel(delay=0.05)
@@ -145,6 +206,7 @@ def test_browser_member_practice_loop(browser, web_app, migrated_db, test_db_url
     monkeypatch.setenv("SAFETY_STATE_FILE", str(tmp_path / "safety.json"))
     monkeypatch.setenv("RECORDINGS_DIR", str(tmp_path / "rec"))
     monkeypatch.setenv("API_BASE_URL", API)  # also what spawned workers inherit
+    monkeypatch.setenv("API_ALLOWED_ORIGINS", WEB_URL)  # THIS run's web origin
     st.get_settings.cache_clear()
 
     httpd = FakePVEHttp()
@@ -169,7 +231,7 @@ def test_browser_member_practice_loop(browser, web_app, migrated_db, test_db_url
         return 1, ""
     verification_service.set_verifier_exec(true_state)
 
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=API_PORT,
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=ports["api"],
                                            log_level="error"))
     threading.Thread(target=server.run, daemon=True).start()
     try:
@@ -193,21 +255,21 @@ def test_browser_member_practice_loop(browser, web_app, migrated_db, test_db_url
         ).json()["token"]}
 
         # ---- browser: authenticated member -----------------------------------
-        _pw("open", f"{WEB_URL}/")
-        _body_has("enter the gym")
-        _pw("fill", 'input[placeholder="username"]', "blue")
-        _pw("fill", 'input[placeholder="password"]', MEM_PW)
-        _pw("click", 'button[type="submit"]')
-        _body_has("scenario library")  # login worked and the library loaded
+        pw("open", f"{WEB_URL}/")
+        _body_has(pw, "enter the gym")
+        pw("fill", 'input[placeholder="username"]', "blue")
+        pw("fill", 'input[placeholder="password"]', MEM_PW)
+        pw("click", 'button[type="submit"]')
+        _body_has(pw, "scenario library")  # login worked and the library loaded
 
         # ---- create/launch through the UI ------------------------------------
-        _pw("click", 'tr:has-text("quick-win-01") button')
-        _body_has("connections")
-        path = _pw("--raw", "eval", "location.pathname").stdout.strip().strip('"')
+        pw("click", 'tr:has-text("quick-win-01") button')
+        _body_has(pw, "connections")
+        path = pw("--raw", "eval", "location.pathname").stdout.strip().strip('"')
         assert "/session/" in path, path
         sid = path.rsplit("/", 1)[-1]
         # connection instructions rendered (bastion ssh line with its port)
-        _body_has("2222")
+        _body_has(pw, "2222")
 
         # ---- captured command: ingest under the session-bound host capability
         eng = create_engine(test_db_url_owner)
@@ -223,13 +285,13 @@ def test_browser_member_practice_loop(browser, web_app, migrated_db, test_db_url
             headers={"Authorization": f"Bearer {tok}"})
         assert r.status_code == 201 and r.json()["accepted"] == 1
         # the live dashboard (2s poll) shows the captured command event
-        _body_has("web01", timeout=20)
-        recent = _pw("--raw", "eval", "document.body.innerText").stdout
+        _body_has(pw, "web01", timeout=20)
+        recent = pw("--raw", "eval", "document.body.innerText").stdout
         assert "command" in recent
 
         # ---- start red: REAL worker subprocess through the UI button ---------
-        _pw("click", 'button:has-text("start red")')
-        _body_has("red run")
+        pw("click", 'button:has-text("start red")')
+        _body_has(pw, "red run")
         deadline = time.time() + 120
         while time.time() < deadline:
             s = httpx.get(f"{API}/sessions/{sid}", headers=mem).json()
@@ -240,22 +302,66 @@ def test_browser_member_practice_loop(browser, web_app, migrated_db, test_db_url
             pytest.fail("the red run never completed through the shared model path")
 
         # ---- end session (confirm dialog) -> trusted final score -------------
-        _pw("eval", "window.confirm = () => true")
-        _pw("click", 'button:has-text("end session")')
-        _body_has("complete", timeout=60)
+        pw("eval", "window.confirm = () => true")
+        pw("click", 'button:has-text("end session")')
+        _body_has(pw, "complete", timeout=60)
 
         # ---- graded report: explicit AAR generation, trusted scorecard -------
         sc = httpx.get(f"{API}/sessions/{sid}/score", headers=mem).json()
         assert sc["status"] == "scored" and sc["earned"] > 0, sc
-        _pw("goto", f"{WEB_URL}/session/{sid}/report")
-        _body_has("generate AAR")
-        _pw("click", 'button:has-text("generate AAR")')  # fake model answers
-        body = _body_has(f"{sc['earned']}/{sc['total']}", timeout=60)
+        pw("goto", f"{WEB_URL}/session/{sid}/report")
+        _body_has(pw, "generate AAR")
+        pw("click", 'button:has-text("generate AAR")')  # fake model answers
+        body = _body_has(pw, f"{sc['earned']}/{sc['total']}", timeout=60)
         assert "UNSCORED" not in body
 
+        # ---- replay: player mounts and a timeline click REALLY seeks ---------
+        # a synthetic bastion recording (cast under RECORDINGS_DIR + row),
+        # exactly what the bastion would have registered
+        import time as _t
+        rec_dir = tmp_path / "rec"
+        rec_dir.mkdir(exist_ok=True)
+        cast = rec_dir / "e2e.cast"
+        epoch = int(_t.time()) - 30
+        cast.write_text(
+            json.dumps({"version": 2, "width": 80, "height": 24,
+                        "timestamp": epoch, "title": "e2e"}) + "\n"
+            + json.dumps([1.0, "o", "blue@web01:~$ hardening done\r\n"]) + "\n"
+            + json.dumps([5.0, "o", "flag captured\r\n"]) + "\n")
+        eng = create_engine(test_db_url_owner)
+        with eng.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO recordings (recording_id, session_id, cast_path, "
+                "status, bytes) VALUES (:r, :s, :p, 'sealed', :b)"),
+                {"r": str(uuid.uuid4()), "s": sid, "p": str(cast),
+                 "b": cast.stat().st_size})
+        eng.dispose()
+        pw("goto", f"{WEB_URL}/session/{sid}/replay")
+        _body_has(pw, "event timeline")
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if pw("--raw", "eval",
+                  "!!document.querySelector('.asciinema-player')").stdout.strip() == "true":
+                break
+            time.sleep(0.5)
+        else:
+            pytest.fail("asciinema-player never mounted on the replay page")
+        # clicking a timeline event seeks the player (observable data-seek-at)
+        pw("click", 'div[title^="#"] >> nth=0')
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            v = pw("--raw", "eval",
+                   "document.querySelector('[data-seek-at]').getAttribute('data-seek-at')"
+                   " || ''").stdout.strip().strip('"')
+            if v and v != "null":
+                break
+            time.sleep(0.5)
+        else:
+            pytest.fail("timeline click never produced a seek")
+
         # ---- progress page reflects the scored session ------------------------
-        _pw("click", 'a[href="/progress"]')
-        body = _body_has("by domain")
+        pw("click", 'a[href="/progress"]')
+        body = _body_has(pw, "by domain")
         assert "identify" in body or "protect" in body
     finally:
         verification_service.set_verifier_exec(None)

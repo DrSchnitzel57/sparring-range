@@ -9,6 +9,7 @@ recordings/
 *.egg-info/
 web/node_modules/
 web/.next/
+web/.next-e2e/
 web/npm-install.log
 .playwright-cli/
 /Claude outputs

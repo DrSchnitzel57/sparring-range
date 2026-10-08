@@ -12,6 +12,9 @@ export default function Replay() {
   const [sel, setSel] = useState(0);
   const [now, setNow] = useState(0);
   const [duration, setDuration] = useState(0);
+  // last seek is observable (data-seek-at): the player instance lives in a
+  // ref, and a browser test must assert the REAL seek happened
+  const [seekAt, setSeekAt] = useState(null);
   const rootRef = useRef(null);
   const playerRef = useRef(null);
 
@@ -76,7 +79,7 @@ export default function Replay() {
         <div ref={rootRef} style={{ minHeight: 100 }} />
         {!epoch && <p className="bad">recording has no epoch header — timeline alignment disabled</p>}
       </div>
-      <div className="panel">
+      <div className="panel" data-seek-at={seekAt === null ? "" : String(seekAt)}>
         <h3>event timeline</h3>
         {data.timeline.map((e) => {
           const off = offsetOf(e.ts);
@@ -85,7 +88,7 @@ export default function Replay() {
             <div key={e.event_id}
                  style={{ opacity: off === null ? 0.5 : (active ? 1 : 0.35), cursor: off >= 0 ? "pointer" : "default" }}
                  title={`#${e.event_id}`}
-                 onClick={() => { if (off >= 0) playerRef.current?.seek(off); }}>
+                 onClick={() => { if (off >= 0) { playerRef.current?.seek(off); setSeekAt(off); } }}>
               <span className="dim">{off === null ? "—" : (off >= 0 ? `${off.toFixed(1)}s` : "pre-rec")}</span>{" "}
               <span className={e.actor === "red" ? "bad" : (e.actor || "").startsWith("blue") ? "ok" : "dim"}>
                 {e.actor} {e.action_type} {e.phase || ""}

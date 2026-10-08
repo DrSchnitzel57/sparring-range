@@ -1,126 +1,173 @@
 name: ci
-# Real commands, real disposable database (audit F07/F22/F23). Nothing here is
-# aspirational: every step is what a developer can run locally too.
+# Real commands, real disposable infrastructure, required layers FAIL CLOSED
+# (audit F8/F22/F23): every layer runs through infra/dev/acceptance.py with
+# its SR_REQUIRE_* flag, so an absent prerequisite, empty selection, or
+# skipped required test is a red job — never a silent skip. Standard GitHub
+# Linux VMs only; privileged packet rules execute ONLY inside disposable
+# network namespaces (the tests create and remove them); nothing here
+# touches host firewall state or non-run-owned resources.
 on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
 jobs:
+  selection:
+    # classification invariants: every test is fast-default or a required
+    # layer; required modes fail for absent prereqs / empty selections
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13", cache: pip }
+      - run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.lock
+          .venv/bin/pip install --no-deps -e .
+      - run: .venv/bin/python infra/dev/acceptance.py selection
+
   python:
+    # fresh locked installs + dependency consistency + entrypoint imports
+    # across the supported matrix (no re-resolve: exact pins, --no-deps app)
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: ci_admin_pw
-          POSTGRES_DB: postgres
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s --health-retries 10
-    env:
-      # Explicit superuser admin for the disposable per-session test DBs
-      # (tests/conftest.py refuses to run DB tests without it).
-      SR_PG_ADMIN_URL: postgresql+psycopg2://postgres:ci_admin_pw@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - name: Install locked dependencies
+      - name: Fresh run-owned locked install + imports (this interpreter)
+        env:
+          SR_ACCEPTANCE_PYTHONS: ${{ matrix.python-version }}
         run: |
           python -m venv .venv
           .venv/bin/pip install -r requirements.lock
           .venv/bin/pip install --no-deps -e .
-      - name: Install nftables (real ruleset parser + privileged round-trip)
-        run: sudo apt-get update && sudo apt-get install -y nftables
-      - name: Delegate a cgroup v2 subtree for runner containment tests
-        # The supervisor REFUSES to start work without authoritative cgroup
-        # containment (audit T-04); where none is delegated the tests SKIP
-        # with an explicit reason. Delegate one so they actually run here.
-        run: |
-          if [ "$(stat -fc %T /sys/fs/cgroup)" = "cgroup2fs" ]; then
-            sudo mkdir -p /sys/fs/cgroup/srrunner
-            sudo chown "$USER" /sys/fs/cgroup/srrunner
-            echo "RUNNER_CGROUP_ROOT=/sys/fs/cgroup/srrunner" >> "$GITHUB_ENV"
-          else
-            echo "no cgroup v2 on this host — containment tests will skip"
-          fi
-      - name: Unit tests (no infrastructure)
-        run: .venv/bin/python -m pytest -m "not db and not browser and not live" -q
-      - name: "Real-datapath tests against the kernel (privileged: nft round-trip + netns packet flows)"
-        run: sudo env "PATH=$PATH" .venv/bin/python -m pytest -m "not db and not browser and not live" -k "real_nft or netns" -q
-      - name: Database + adapter tests (disposable PostgreSQL 16)
-        run: .venv/bin/python -m pytest -m "db or adapter" -q
-      - name: Import sanity (entrypoints import without services)
-        run: |
-          .venv/bin/python -c "import srplatform.api.app"
-          .venv/bin/python -c "import srplatform.bastion.proxy"
-          .venv/bin/python -c "import telemetry.shipper"
-          .venv/bin/python -c "import rangectl.cli"
+          .venv/bin/python infra/dev/acceptance.py python
+      - name: Fast default suite (infrastructure-free)
+        run: .venv/bin/python -m pytest -q -ra
 
-  frontend:
+  db:
+    # disposable postgres:16 fixture (run-owned container/volume): fresh
+    # migrations, populated forward 0010 upgrade, grants, regressions
+    timeout-minutes: 40
     runs-on: ubuntu-latest
-    defaults:
-      run: { working-directory: web }
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - run: npm ci
-      - run: npm run build
-
-  browser-e2e:
-    # Real Chromium drives the built web app against the real API + worker
-    # (controlled PVE/model/runner/verifier/datapath). Opt-in locally, but
-    # WIRED HERE so the checked-in E2E cannot silently rot (audit T05 note:
-    # this proves the UI/API/worker integration, NOT real host enrollment —
-    # that path is the netns + management-channel tests).
-    needs: [python, frontend]
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: ci_admin_pw
-          POSTGRES_DB: postgres
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s --health-retries 10
-    env:
-      SR_PG_ADMIN_URL: postgresql+psycopg2://postgres:ci_admin_pw@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-          cache: pip
+        with: { python-version: "3.13", cache: pip }
+      - run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.lock
+          .venv/bin/pip install --no-deps -e .
+      - run: .venv/bin/python infra/dev/acceptance.py db
+
+  containment:
+    # real supervisor + namespace boundary regressions under an explicitly
+    # delegated cgroup v2 subtree, unprivileged identity, required mode
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13", cache: pip }
+      - run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.lock
+          .venv/bin/pip install --no-deps -e .
+      - name: Delegate a cgroup v2 subtree for runner containment
+        run: |
+          test "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs
+          sudo mkdir -p /sys/fs/cgroup/srrunner
+          sudo chown "$USER" /sys/fs/cgroup/srrunner
+          echo "RUNNER_CGROUP_ROOT=/sys/fs/cgroup/srrunner" >> "$GITHUB_ENV"
+      - run: .venv/bin/python infra/dev/acceptance.py containment
+
+  packet:
+    # real nft round-trip + netns packet semantics; the job runs the tests
+    # as root ONLY so they can create DISPOSABLE network namespaces — the
+    # tests never apply rules to the host namespace
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13", cache: pip }
+      - run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.lock
+          .venv/bin/pip install --no-deps -e .
+      - run: sudo apt-get update && sudo apt-get install -y nftables iproute2
+      - run: sudo env "PATH=$PATH" "$GITHUB_WORKSPACE/.venv/bin/python" infra/dev/acceptance.py packet
+
+  frontend:
+    # npm ci + production build + zero high/critical production audit
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - name: Install locked dependencies
-        run: |
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13", cache: pip }
+      - run: |
           python -m venv .venv
           .venv/bin/pip install -r requirements.lock
           .venv/bin/pip install --no-deps -e .
-      - name: Build the web app (the E2E drives the real Next build)
+      - run: .venv/bin/python infra/dev/acceptance.py frontend
+
+  compose:
+    # real image build + bootstrap + idempotent rerun with run-owned
+    # project/ports and synthetic credentials; cleans only its own stack
+    timeout-minutes: 40
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13", cache: pip }
+      - run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.lock
+          .venv/bin/pip install --no-deps -e .
+      - run: .venv/bin/python infra/dev/acceptance.py compose
+
+  browser-e2e:
+    # Real Chromium drives the built web app against the real API + worker
+    # (controlled PVE/model/runner/verifier/datapath) plus replay seek. The
+    # CLI is the PINNED local one (web devDependency); the session, ports
+    # and dist dir are run-owned. Required mode: no silent skips.
+    needs: [frontend]
+    timeout-minutes: 40
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13", cache: pip }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.lock
+          .venv/bin/pip install --no-deps -e .
+      - name: Web deps (installs the pinned @playwright/cli) + Chromium
         working-directory: web
         run: |
           npm ci
-          npm run build
-      - name: Install playwright-cli + Chromium
-        run: |
-          npm install -g @playwright/cli
           npx playwright install --with-deps chromium
-      - name: Browser E2E (real Chromium + API + worker)
-        run: .venv/bin/python -m pytest tests/test_stage5_browser_e2e.py -m browser -q
+      - run: .venv/bin/python infra/dev/acceptance.py browser
