@@ -17,19 +17,18 @@ is implementation work, not a hardware-only gate. Preserve existing useful fixes
 
 ## 01 — Reproducible baseline and release dependency hygiene
 
-- [ ] Accept milestone 01.
+- [x] Accept milestone 01.
 
 **Goal:** trustworthy tests/CI and a reproducible developer stack before expanding
 the product. **Depends on:** the agreed release contract.
 
 Approved implementation plan: [01-reproducible-baseline](../.openchamber/plans/01-reproducible-baseline.md)
-(2026-10-08). **Implemented (2026-10-08, incl. review fixes):** all locally
-executable gates pass (infrastructure-free default 114/0/0; selection/python
-3.11–3.13/db/containment/frontend/compose via `infra/dev/acceptance.py`);
-packet and browser fail closed on this host for missing prerequisites and are
-accepted only when their required CI jobs pass after the operator pushes.
-Evidence: [findings checklist](FINDINGS_CHECKLIST.md). Acceptance stays
-pending until CI is green — not waived.
+(2026-10-08). **Accepted (2026-10-08):** all locally executable gates pass
+(infrastructure-free default 114/0/0; selection/python 3.11–3.13/db/
+containment/frontend/compose via `infra/dev/acceptance.py`), and the required
+CI jobs — including the kernel-boundary packet and real-browser replay gates
+that cannot run on this host — all passed in run 37852029894 at `3539667`
+(ten jobs green). Evidence: [findings checklist](FINDINGS_CHECKLIST.md).
 
 Investigate the ten fresh failures (including the prose-coupled readiness test),
 namespace/PID semantics and DB marker leakage; do not restore unsafe containment just to make old assertions
@@ -282,8 +281,10 @@ accepted and the roadmap/evidence/runbook accurately reflect the deployed revisi
 
 ## Planning and acceptance discipline
 
-Next: jointly write `.openchamber/plans/01-baseline.md` after checking this
-baseline against current code. It does not yet exist. No milestone implementation
+Milestone 01 is accepted (plan
+[01-reproducible-baseline](../.openchamber/plans/01-reproducible-baseline.md),
+CI run 37852029894). Next: jointly write the milestone 02 plan after checking
+that milestone against current code. No milestone implementation
 session is authorized by this roadmap alone. Implement code only on a user-selected
 non-default branch. Each accepted milestone ticks its checkbox and updates the
 architecture if its design changed; record reasons rather than hiding deviations.

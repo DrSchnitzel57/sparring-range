@@ -407,16 +407,17 @@ previously-green jobs turned red on a frontend-only diff:
    vs "token expired or revoked" vs "bad token"). Bootstrap/users/login
    failures now include the body so a recurrence is classifiable.
 
-**Milestone 01 acceptance status:** all locally executable gates pass.
-Packet and browser gates fail closed here for missing prerequisites
-by design; per the plan they are accepted only when the required CI jobs pass
-after the operator pushes. Milestone remains until then.
+**Milestone 01 acceptance status: ACCEPTED (2026-10-08).** All locally
+executable gates pass; packet and browser gates fail closed here for
+missing prerequisites by design and were accepted through their required
+CI jobs: run 37852029894 at `3539667` — selection, python 3.11/3.12/3.13,
+frontend, compose, packet, db, containment and browser-e2e all green.
 
 ## Release blockers and missing work
 
 | ID / priority | Current finding and evidence boundary | Milestone |
 |---|---|---|
-| B01 / P1 | **Repaired at `ac5a61b` (see milestone-01 evidence):** baseline failures fixed on real host identities; DB marker leakage structurally prevented (fixture-closure derivation). Awaits CI green for milestone close | 01 |
+| B01 / P1 | **Repaired at `ac5a61b`, CI-accepted (see milestone-01 evidence):** baseline failures fixed on real host identities; DB marker leakage structurally prevented (fixture-closure derivation) | 01 |
 | B02 / P1 | **Repaired at `ac5a61b`:** Next 16.4.0 + patched transitive deps; `npm audit --omit=dev` reports 0 vulnerabilities; build/replay/browser validated | 01 |
 | B03 / P0 | Inspected API still constructs direct PVE adapter; current safety controller invokes privileged nft machinery. Incompatible with agreed private limited-token/no-runtime-host-root boundary | 02 |
 | B04 / P0 | Namespace/cgroup boundary and kernel kill exist, but nine-failure baseline is not containment acceptance. Missing/unreadable authority, recursive membership, bookkeeping protection, unsupported starts and all signal identities need independent proof | 01–02 |

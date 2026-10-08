@@ -127,8 +127,9 @@ The ten baseline failures and the frontend audit findings above are repaired:
 the no-admin default is now **114 passed, 0 failed, 0 skipped, 139 deselected**,
 and `npm audit --omit=dev` reports 0 vulnerabilities. Layer membership derives
 from the fixture closure; per-gate acceptance runs through
-`python infra/dev/acceptance.py <check>`. Exact results and the pending CI
-gates (packet, browser) are recorded in `docs/FINDINGS_CHECKLIST.md`.
+`python infra/dev/acceptance.py <check>`. Exact results are recorded in
+`docs/FINDINGS_CHECKLIST.md`; the CI-only gates (packet, browser) passed in
+run 37852029894 at `3539667`, and milestone 01 is accepted.
 
 ## Validation commands and safety
 
