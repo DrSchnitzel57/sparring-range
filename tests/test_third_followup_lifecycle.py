@@ -279,15 +279,20 @@ def _run_id_for(client, sid):
 @pytest.mark.db
 def test_t01_api_stop_confirms_remote_cessation_via_production_recovery(
         client, users, local_supervisor, monkeypatch):
-    """Acceptance #1 at the API boundary: a remote descendant is alive;
-    stop_run must remove it through the control channel BEFORE reporting
-    success — and only then mark the run cancelled."""
+    """Acceptance #1 at the API boundary: a remote command is ACTUALLY
+    RUNNING (host identity observed in the containment tree); stop_run must
+    remove it through the control channel BEFORE reporting success — and
+    only then mark the run cancelled. (The pre-namespace premise "leader
+    exited, descendant lives on" is now kernel-impossible; the regression
+    here is that stop confirms real cessation, never blind success.)"""
     from srplatform.db.models import Run, RunOperation
     from srplatform.db.session import db as db_ctx
     from srplatform.api import runs as runs_svc
-    from tests.helpers import make_runner_token
+    from tests.helpers import (cgroup_containment_root, cgroup_tree_members,
+                               make_runner_token)
 
     runner, state, script = local_supervisor
+    cg = cgroup_containment_root()
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
     tok = make_runner_token(sid)
@@ -296,21 +301,22 @@ def test_t01_api_stop_confirms_remote_cessation_via_production_recovery(
     assert client.post(f"/internal/runs/{run_id}/operations",
                        json={"op_id": op, "kind": "remote"},
                        headers={"X-Worker-Token": tok}).status_code == 201
-    # start the actual remote job (leader exits, descendant lives)
+    # start an ACTUALLY RUNNING remote job (foreground sleep, host-visible)
     subprocess.Popen(["/bin/sh", "-c",
-                      f"{script} start {op} -- bash -c 'sleep 30 & exit 0'"],
+                      f"{script} start {op} -- sleep 30"],
                      env={**os.environ, "RUNNER_SUPERVISOR_STATE": str(state)})
-    deadline = time.time() + 10
-    while not _pids_carrying(op) and time.time() < deadline:
+    deadline = time.time() + 15
+    while not cgroup_tree_members(cg, op) and time.time() < deadline:
         time.sleep(0.1)
-    assert _pids_carrying(op)
+    assert cgroup_tree_members(cg, op), "the remote job never started"
 
     monkeypatch.setattr(runs_svc, "_control_runner", lambda: runner)
     with db_ctx() as s:
         out = runs_svc.stop_run(s, run_id)
     assert out["ok"] is True, f"stop claimed success without confirmation: {out}"
     assert out["status"] == "cancelled"
-    assert not _pids_carrying(op), "run cancelled while the remote command still lived"
+    assert not cgroup_tree_members(cg, op), \
+        "run cancelled while the remote command still lived"
     with db_ctx() as s:
         assert s.get(Run, uuid.UUID(run_id)).status == "cancelled"
         assert s.query(RunOperation).filter_by(op_id=op).first().state == "completed"
@@ -320,15 +326,17 @@ def test_t01_api_stop_confirms_remote_cessation_via_production_recovery(
 def test_t01_worker_sigkill_and_restart_recovers_persisted_operation(
         client, users, local_supervisor, monkeypatch):
     """Acceptance #2: worker SIGKILL + API restart must recover the PERSISTED
-    operation through production code (reconcile_on_startup), confirm
-    cessation, and only then finish the run."""
+    operation through production code (reconcile_on_startup), confirm the
+    REAL running remote job's cessation, and only then finish the run."""
     from srplatform.db.models import Run, RunOperation
     from srplatform.db.session import db as db_ctx
     from srplatform.api import runs as runs_svc
     from srplatform.safety.runregistry import pgid_start_time
-    from tests.helpers import make_runner_token
+    from tests.helpers import (cgroup_containment_root, cgroup_tree_members,
+                               make_runner_token)
 
     runner, state, script = local_supervisor
+    cg = cgroup_containment_root()
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
     tok = make_runner_token(sid)
@@ -344,19 +352,20 @@ def test_t01_worker_sigkill_and_restart_recovers_persisted_operation(
                        json={"op_id": op, "kind": "remote"},
                        headers={"X-Worker-Token": tok}).status_code == 201
     subprocess.Popen(["/bin/sh", "-c",
-                      f"{script} start {op} -- bash -c 'sleep 30 & exit 0'"],
+                      f"{script} start {op} -- sleep 30"],
                      env={**os.environ, "RUNNER_SUPERVISOR_STATE": str(state)})
-    deadline = time.time() + 10
-    while not _pids_carrying(op) and time.time() < deadline:
+    deadline = time.time() + 15
+    while not cgroup_tree_members(cg, op) and time.time() < deadline:
         time.sleep(0.1)
-    assert _pids_carrying(op)
+    assert cgroup_tree_members(cg, op), "the remote job never started"
     worker.kill()
     worker.wait(timeout=10)
 
     monkeypatch.setattr(runs_svc, "_control_runner", lambda: runner)
     runs_svc.reconcile_on_startup()
 
-    assert not _pids_carrying(op), "startup recovery did not cancel the persisted operation"
+    assert not cgroup_tree_members(cg, op), \
+        "startup recovery did not cancel the persisted operation"
     with db_ctx() as s:
         assert s.get(Run, uuid.UUID(run_id)).status == "failed"  # worker gone, remote confirmed
         assert s.query(RunOperation).filter_by(op_id=op).first().state == "completed"

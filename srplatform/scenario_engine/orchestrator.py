@@ -231,10 +231,10 @@ def _recover_telemetry_token(db: Session, session_id, host: str,
     if deployment_id is not None:
         row = db.execute(q.where(
             ServiceToken.enrollment_deployment_id == deployment_id)
-            .order_by(ServiceToken.created_at.desc())).first()
+            .order_by(ServiceToken.created_at.desc())).scalars().first()
         if row:
             return (row.token, row.enroll_nonce)
-    row = db.execute(q.order_by(ServiceToken.created_at.desc())).first()
+    row = db.execute(q.order_by(ServiceToken.created_at.desc())).scalars().first()
     if row is None:
         return None
     if deployment_id is not None and row.enrollment_deployment_id != deployment_id:
@@ -537,8 +537,13 @@ def deploy(db: Session, session_id, scenario_id: str, proxmox, resume: bool = Tr
         resources = [dict(r) for r in (dep.resources or [])]
         enrollments = {}
         for r in resources:
-            if r.get("state") == "created" and \
-                    (r.get("telemetry_enroll") or {}).get("phase") != "confirmed":
+            if r.get("state") == "created" and (
+                    (r.get("telemetry_enroll") or {}).get("phase") != "confirmed"
+                    or not enrollment_evidence_current(db, session_id,
+                                                       r.get("host"),
+                                                       dep.deployment_id)):
+                # F3: a phase-only confirmation with missing/stale capability
+                # evidence is re-enrolled (same token), never trusted.
                 _enroll_host_telemetry(db, dep, r, resources, session_id,
                                        r.get("host"), r.get("ip"), s, enrollments)
         return {"scenario_id": scenario_id, "action": "deploy", "idempotent": True,
@@ -563,8 +568,14 @@ def deploy(db: Session, session_id, scenario_id: str, proxmox, resume: bool = Tr
             name = _vm_name(scenario_id, host["name"], session_id)
             res = by_host.get(host["name"])
             if res and res.get("state") == "created":
-                if (res.get("telemetry_enroll") or {}).get("phase") != "confirmed":
-                    # resume path: finish interrupted enrollment (T05)
+                if (res.get("telemetry_enroll") or {}).get("phase") != "confirmed" \
+                        or not enrollment_evidence_current(
+                            db, session_id, host["name"], dep.deployment_id):
+                    # resume path: finish interrupted enrollment (T05), and
+                    # RE-ENROLL a phase-only confirmation whose capability
+                    # evidence is missing/stale (F3) — the JSON phase alone
+                    # is never proof; the same capability is resumed, not
+                    # re-cloned.
                     _enroll_host_telemetry(db, dep, res, resources, session_id,
                                            host["name"], res.get("ip"), s, enrollments)
                 continue  # already owned & completed — resume skips the clone

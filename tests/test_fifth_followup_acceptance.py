@@ -1003,6 +1003,48 @@ def test_f3_migration_downgrades_phase_only_and_binds_evidence(client, users):
             "evidence-backed confirmation must not be downgraded"
 
 
+@pytest.mark.db
+def test_m0010_forward_upgrade_transforms_populated_data(client, users):
+    """The REAL alembic chain, populated: stamp the schema back to 0009
+    (0010 is a documented data-only no-op downgrade), insert the legacy
+    pre-0010 shape (phase-only 'confirmed', capability un-bound), then run
+    `alembic upgrade head` — the upgrade() path (not a helper import) must
+    bind the capability to its generation and downgrade the phase-only
+    confirmation to stale_evidence."""
+    import subprocess
+
+    from srplatform.db.models import Deployment, ServiceToken
+    from srplatform.db.session import db
+
+    sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
+                      headers=users["member"]).json()["session_id"]
+    with db() as s:
+        legacy = Deployment(session_id=sid, scenario_id="quick-win-01",
+                            status="ready",
+                            resources=[{"host": "web01", "state": "created",
+                                        "telemetry_enroll": {"phase": "confirmed"}}])
+        s.add(legacy)
+        s.commit()
+        dep_id = str(legacy.deployment_id)
+        tok, _ = _issue_for(sid, "web01", None)  # un-bound, no evidence
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    r = subprocess.run([PY, "-m", "alembic", "downgrade", "0009"],
+                       cwd=REPO, env=env, capture_output=True, text=True)
+    assert r.returncode == 0, f"downgrade to 0009 failed:\n{r.stdout}\n{r.stderr}"
+    r = subprocess.run([PY, "-m", "alembic", "upgrade", "head"],
+                       cwd=REPO, env=env, capture_output=True, text=True)
+    assert r.returncode == 0, f"forward upgrade failed:\n{r.stdout}\n{r.stderr}"
+
+    with db() as s:
+        res = s.query(Deployment).filter_by(session_id=sid).first().resources
+        assert res[0]["telemetry_enroll"]["phase"] == "stale_evidence", \
+            "upgrade() trusted a phase-only confirmation on populated data"
+        assert res[0]["telemetry_enroll"]["stale_at_upgrade"] is True
+        row = s.get(ServiceToken, tok)
+        assert str(row.enrollment_deployment_id) == dep_id, \
+            "upgrade() left the capability un-bound (F4)"
+
+
 # =========================================================================== #
 # F8 — required gates fail instead of silently skipping                        #
 # =========================================================================== #

@@ -177,6 +177,18 @@ class HostChannel:
                 self._host_confirm()
         if "is-active" in command:
             return self.ok_code, "active\n"
+        if "list-unit-files" in command:
+            # the PROVISIONED host answers the readiness probe (service_present
+            # verifier): the exact unit exists. `fail` patterns above still
+            # model a broken channel.
+            import shlex as _shlex
+            parts = _shlex.split(command)
+            unit = ""
+            if "list-unit-files" in parts:
+                i = parts.index("list-unit-files")
+                if i + 1 < len(parts) and not parts[i + 1].startswith("-"):
+                    unit = parts[i + 1]
+            return self.ok_code, (f"{unit} enabled\n" if unit else "")
         if "SR-CAPTURE-" in command:
             if self.host_client is not None and self.deliver_capture:
                 self._host_capture(command)

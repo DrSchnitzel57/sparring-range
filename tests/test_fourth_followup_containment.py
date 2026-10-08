@@ -387,10 +387,13 @@ def _only_op(run_id) -> str:
 def test_t04_worker_completion_contains_survivors_before_api_stop(
         client, users, local_supervisor):
     """ACCEPTANCE #1 (review): the real worker/runner executes a harmless
-    command whose leader exits zero while a background child remains; the
+    command whose leader exits zero while backgrounding a child; the
     ORDINARY operation-done path runs; then the actual API stop/end path.
-    The child cannot survive a successful cessation response — and the
-    operation row records the containment."""
+    Under the namespace boundary the kernel removes every descendant at
+    leader exit, so the child CANNOT survive — the regression is that the
+    completion path still CONSULTS the authoritative containment (never
+    blind), the tree is verifiably empty by the time the row says
+    completed, and the API stop/end path stays clean."""
     from srplatform.db.models import Run, RunOperation
     from srplatform.db.session import db as db_ctx
     from srplatform.red_agent.loop import RedAgentLoop
@@ -398,6 +401,14 @@ def test_t04_worker_completion_contains_survivors_before_api_stop(
     from tests.helpers import FakeLLM, make_runner_token, tool
 
     runner, state, script, cg = local_supervisor
+    consulted: list[str] = []
+    real_status = runner.containment_status
+
+    def spy(op_id):
+        consulted.append(op_id)
+        return real_status(op_id)
+
+    runner.containment_status = spy
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
     tok = make_runner_token(sid)
@@ -414,12 +425,12 @@ def test_t04_worker_completion_contains_survivors_before_api_stop(
         ops = s.query(RunOperation).filter_by(run_id=run_id).all()
         assert len(ops) == 1, "the worker's normal path must register its operation"
         assert ops[0].state == "completed"
-        assert ops[0].detail and "surviving" in ops[0].detail.lower(), \
-            f"containment verdict not persisted: {ops[0].detail!r}"
         op_id = ops[0].op_id
-    # the survivor was contained DURING the ordinary completion path — it
-    # cannot be alive by the time the operation row says completed
-    assert not _cgroup_members(cg, op_id), "survivor outlived operation-done"
+    assert consulted == [op_id], \
+        "worker completion did not consult the containment authority (blind completion)"
+    # the survivor was impossible AND the tree is verifiably empty by the
+    # time the operation row says completed
+    assert not _tree_members(cg, op_id), "survivor outlived operation-done"
 
     stop = client.post(f"/runs/{run_id}/stop", headers=users["member"]).json()
     assert stop["ok"] is True and stop["status"] == "cancelled", stop
@@ -430,13 +441,19 @@ def test_t04_worker_completion_contains_survivors_before_api_stop(
 
 
 @pytest.mark.db
-def test_t04_unconfirmed_survivors_refuse_finalization_stop_and_end(
+def test_t04_unconfirmed_containment_refuses_finalization_stop_and_end(
         client, users, fake_pve, local_supervisor, monkeypatch):
-    """When containment cannot be confirmed the WHOLE chain refuses to call
+    """When containment CANNOT BE CONFIRMED the WHOLE chain refuses to call
     it finished: the loop halts, the worker's completion is refused
     (cancel-unknown, never completed), stop is partial, /end is 409, and the
-    reservation is retained — until containment succeeds, after which the
-    retry finalizes and the child is gone."""
+    reservation is retained — until the containment authority answers again,
+    after which the retry finalizes.
+
+    Under the namespace boundary a survivor cannot outlive the leader, so
+    "unconfirmed" is produced the way production produces it: the supervisor
+    is UNREACHABLE at completion (containment_status -> None). Unknown is
+    never folded into gone, exactly as an unreachable control channel must
+    behave even when the tree happens to be empty."""
     from srplatform.api import runs as runs_svc
     from srplatform.db.models import RangeLease, Run, RunOperation
     from srplatform.db.session import db as db_ctx
@@ -457,7 +474,9 @@ def test_t04_unconfirmed_survivors_refuse_finalization_stop_and_end(
             return False
 
     real_cancel = runner.cancel_remote
-    runner.cancel_remote = lambda op_id, timeout_s=10.0: False  # containment broken
+    real_status = runner.containment_status
+    # containment authority UNREACHABLE at completion time
+    runner.containment_status = lambda op_id: None
     monkeypatch.setattr(runs_svc, "_control_runner", lambda: BrokenControl())
 
     tr = TestClientTransport(client, tok, run_id=run_id)
@@ -468,7 +487,9 @@ def test_t04_unconfirmed_survivors_refuse_finalization_stop_and_end(
     assert result["outcome"] == "cancel_unconfirmed", result
     op_id = _only_op(run_id)
     try:
-        assert _cgroup_members(cg, op_id), "test premise: a survivor must exist"
+        # the kernel boundary means nothing survived — the refusal is about
+        # the UNCONFIRMED verdict, not about a live tree
+        assert not _tree_members(cg, op_id)
 
         # the worker reports its truthful outcome; finalization must refuse
         with db_ctx() as s:
@@ -478,7 +499,7 @@ def test_t04_unconfirmed_survivors_refuse_finalization_stop_and_end(
             assert s.query(RunOperation).filter_by(run_id=run_id).first().state \
                 == "cancel-unknown"
 
-        # stop is PARTIAL while containment fails
+        # stop is PARTIAL while containment cannot be confirmed
         stop = client.post(f"/runs/{run_id}/stop", headers=users["member"]).json()
         assert stop["ok"] is False and stop["status"] == "cancel-unknown", stop
         # end refuses to release the range
@@ -488,23 +509,22 @@ def test_t04_unconfirmed_survivors_refuse_finalization_stop_and_end(
         with db_ctx() as s:
             lease = s.get(RangeLease, 1)
             assert lease is not None and lease.released_at is None, \
-                "reservation released with live remote work"
+                "reservation released with unconfirmed remote work"
 
-        # containment repaired — the retry confirms and finalizes
+        # containment authority reachable again — the retry confirms and finalizes
+        runner.containment_status = real_status
         runner.cancel_remote = real_cancel
         monkeypatch.setattr(runs_svc, "_control_runner", lambda: runner)
         end = client.post(f"/sessions/{sid}/end", headers=users["member"])
         assert end.status_code == 200, end.text
-        deadline = time.time() + 5
-        while _cgroup_members(cg, op_id) and time.time() < deadline:
-            time.sleep(0.05)
-        assert not _cgroup_members(cg, op_id), \
+        assert not _tree_members(cg, op_id), \
             "successful cessation response with the child still alive"
         with db_ctx() as s:
             assert s.get(Run, uuid.UUID(run_id)).status == "cancelled"
             assert s.query(RunOperation).filter_by(op_id=op_id).first().state \
                 == "completed"
     finally:
+        runner.containment_status = real_status
         runner.cancel_remote = real_cancel
         _sup(script, f"cancel {op_id}", state)
         _reap(cg, op_id)

@@ -101,6 +101,20 @@ def _admin_available() -> bool:
     return bool(os.environ.get("SR_PG_ADMIN_URL") or os.environ.get("SR_PG_ADMIN_CMD"))
 
 
+def _admin_endpoint() -> tuple[str, int]:
+    """Host/port the per-test databases live on — DERIVED from the explicit
+    admin endpoint (milestone 01: no hardcoded localhost:5432; the Docker
+    fixture may use any loopback port). SR_PG_ADMIN_CMD means the local
+    cluster unless SR_PG_ADMIN_HOST/PORT say otherwise."""
+    url = os.environ.get("SR_PG_ADMIN_URL")
+    if url:
+        from sqlalchemy.engine import make_url
+        u = make_url(url)
+        return u.host or "localhost", int(u.port or 5432)
+    return (os.environ.get("SR_PG_ADMIN_HOST", "localhost"),
+            int(os.environ.get("SR_PG_ADMIN_PORT", "5432")))
+
+
 def _admin_sql(sql: str) -> None:
     """Run admin SQL through the explicitly configured mechanism only."""
     url = os.environ.get("SR_PG_ADMIN_URL")
@@ -146,14 +160,16 @@ def pg_names() -> dict:
 
 @pytest.fixture(scope="session")
 def test_db_url_app(pg_names) -> str:
+    host, port = _admin_endpoint()
     return (f"postgresql+psycopg2://{pg_names['app']}:{pg_names['app_pw']}"
-            f"@localhost:5432/{pg_names['db']}")
+            f"@{host}:{port}/{pg_names['db']}")
 
 
 @pytest.fixture(scope="session")
 def test_db_url_owner(pg_names) -> str:
+    host, port = _admin_endpoint()
     return (f"postgresql+psycopg2://{pg_names['owner']}:{pg_names['owner_pw']}"
-            f"@localhost:5432/{pg_names['db']}")
+            f"@{host}:{port}/{pg_names['db']}")
 
 
 @pytest.fixture(scope="session")
