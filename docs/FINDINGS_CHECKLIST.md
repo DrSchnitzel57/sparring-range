@@ -516,7 +516,9 @@ the initial attempt and again on the repeat-run stability check (attempt 2,
 browser-e2e included); db/selection/fast gates rerun locally at the repair
 revision (113 / PASS / 128 passed).
 
-- **M01-R4 / P2 — intermittent db-layer auth-handoff failure (OPEN).**
+- **M01-R4 / P2 — intermittent db-layer auth-handoff failure (RESOLVED
+  2026-10-09 — root cause and repair under "Milestone 02 implementation
+  evidence").**
   Docs-only commit `9a12374` turned CI `db` red:
   `test_stage5_acceptance.py::test_hint_jumps_queued_red_turns_across_processes`
   line 144 `KeyError: 'session_id'` — the POST /sessions response carried no
@@ -558,6 +560,49 @@ not an established cause. Neither a green rerun nor added diagnostics fixes this
 M01-R4 remains open; the approved milestone-02 plan requires repair/regression and
 repeat affected acceptance before authority implementation. No software/live
 deployment acceptance is claimed by saving that plan.
+
+## Milestone 02 implementation evidence (2026-10-09)
+
+Executed at code revision **`71507bb`** (branch `quick-dingo`; only these
+documentation files were dirty during the gate sweep — no code changed after
+`71507bb`): Python **3.13.5** (uv-created pip-less `.venv` from
+`requirements.lock`), Node **22.23.3**, npm **10.9.9**, Docker daemon 29.8.2 /
+Compose 5.6.0, cgroup v2 with a writable delegated subtree. No Proxmox, live
+range, host firewall, NAS or unrelated-VM access; every fixture is run-owned.
+
+**M01-R4 prerequisite resolved (`a87e83b`).** Root cause classified: FastAPI
+≥ 0.142 finalizes default-scope (`"request"`) generator dependencies **after**
+the response is sent, so each request's `DbSession` commit could land after
+the client's next request had already begun — exactly the intermittent
+r02/stage5/M01-R4/compose signatures (login succeeded, the immediately
+following request saw uncommitted state). Repair: one shared `DbSession`
+dependency pinned to `scope="function"`, so commit/close complete before the
+response; plus `_api_json`/`api_json` helpers that surface status+body on
+unexpected responses, and commit-visibility regressions. No test was weakened,
+no retry-until-green, no applied migration edited.
+
+| Gate (exact command) | Result |
+|---|---|
+| `.venv/bin/python -m pytest -q -ra -p no:cacheprovider` | Exit 0: **131 passed, 0 failed, 0 skipped, 164 deselected** — infrastructure-free default |
+| `.venv/bin/python infra/dev/acceptance.py selection` | **PASS**: 295 tests = 131 fast + 164 integration (db 117, containment 25, packet 4, **authority 22**, browser 1, live 0 until milestone 11); required modes verified to fail for absent prerequisite, skipped required test and empty selection |
+| `.venv/bin/python infra/dev/acceptance.py python` | **PASS**: fresh run-owned venv, locked install without re-resolve, `uv pip check` clean, 4 entrypoint imports on Python 3.13.5 (CI matrix covers 3.11–3.13) |
+| `.venv/bin/python infra/dev/acceptance.py db` | **PASS**: disposable `postgres:16` (unique container/volume, loopback port, synthetic creds) — **116 passed, 0 skipped, 179 deselected** in required mode; includes the 0011 upgrade-latch pair (non-torn-down deployments latch `safety_state`; downgrade never unlatches) and writer/terminal-row races; failure-path probe passes; no `srtest_*`/`sr_*` leftovers; container+volume removed |
+| `.venv/bin/python infra/dev/acceptance.py containment` | **PASS**: 21 namespace/recursive-membership/signal-identity/cancellation regressions in required mode, 0 skipped; no run-owned cgroups leaked (4 db∩containment compound tests run inside the db gate) |
+| `.venv/bin/python infra/dev/acceptance.py authority` | **PASS** (new required gate): **22 passed, 0 skipped** — real operator policy validation, durable SQLite intent-before-effect, restart-with-active-claims latch+stop, lease expiry, cross-session/generation fencing, hard-stop read-back and SPARE-on-foreign-VMID, obligations retention across broker/PVE faults, and mutual-TLS/auth negatives against a live broker over loopback (TLS 1.3 refusal, no client cert, wrong CA all refused) |
+| `.venv/bin/python infra/dev/acceptance.py packet` | **FAIL here (prerequisite)**: missing root + `nft` — CI packet job (standard Linux VM, rules only in disposable netns) is the gate |
+| `.venv/bin/python infra/dev/acceptance.py frontend` | **PASS**: `npm ci`, production `next build`, `npm audit --omit=dev` → **0 vulnerabilities** |
+| `.venv/bin/python infra/dev/acceptance.py compose` | **PASS**: real image build + fresh bootstrap + idempotent rerun (run-owned project, loopback ports, synthetic creds) — alembic at head **0011**, API holds app-role credentials only, `/readyz` at schema head, account ops idempotent, bastion behind the seed-keys gate; fixture mode is explicit env (`ALLOW_LOCAL_DEV_FIXTURE` + `SR_BROKER_FIXTURE`), no production bypass; only run-owned resources removed |
+| `.venv/bin/python infra/dev/acceptance.py browser` | **FAIL here (prerequisite)**: no launchable Chromium on this host (per operator instruction nothing was installed) — CI browser job (`playwright install --with-deps`) is the gate |
+
+Boundary actually exercised: the authority gate runs the real broker service
+(policy, ledger, mTLS server, cessation supervisor) in-process over loopback
+against synthetic PVE fixtures — private deterministic boundary, fail-closed
+cessation and durability semantics, not live Proxmox. Live ACL/isolation/stop
+proofs remain explicit operator gates (Manual checks in the plan).
+
+**Required CI at the implementation revision:** pending — the operator pushes;
+the run URL and per-job conclusions will be recorded here when they appear.
+Until then criterion 9 is open, not waived.
 
 ## Release blockers and missing work
 

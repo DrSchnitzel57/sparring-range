@@ -72,8 +72,8 @@ Do not deploy lab disks or uncontrolled recordings onto the host boot filesystem
 |---|---|---|
 | Clients | Next.js Pages Router, Typer, FastAPI | Preset builder, readiness/start flow, complete competition dashboard |
 | Sessions | Snapshot YAML, lease, deployments, worker/run-operation rows | Effective settings snapshot, match clock, deadlines, interruption, automatic cleanup |
-| Provisioning | API calls `infra/proxmox_client.py` directly | Private restricted deployment boundary; complete Linux image/service/data baselines |
-| Safety | Persisted latch, runner supervisor, privileged nft adapter | Validate containment; remove runtime host-root/firewall dependency; hypervisor-backed emergency stop |
+| Provisioning | Typed broker calls (`infra/broker/`); API holds no PVE credentials (milestone 02) | Complete Linux image/service/data baselines (milestone 03) |
+| Safety | Persisted latch, runner supervisor, static isolation + broker VM hard-stop with read-back (milestone 02) | Validate containment on the operator host; live hypervisor-backed emergency gates |
 | Capture | asyncssh casts, auditd parser/spool/enrollment | Installed-unit command-capture proof and real transport acceptance |
 | Scores | Deterministic backend snapshots | Continuous external service transactions and distinct inject/security results |
 | Attacker | Supervised worker, one shared model gateway | Sustained paced match behavior rather than 20-step/objective-completion exit |
@@ -377,6 +377,11 @@ Validate dependency advisories and patch supported packages before release.
 | Offline verified attacker enrollment and legacy reconciliation | Name/tag auto-adoption or requiring deletion of all existing deployments | Includes the fixed SSH attacker in emergency inventory while preserving evidence and deferring real images to milestone 03 |
 | Local model shell execution only in isolated harmless fixtures | Normal development local-dev execution on credential-bearing machines | Development mode must not turn model commands into control-plane administration |
 | Operator-selected separate SSD or verified suitable NAS with calculated capacity budget | Lab disks on Proxmox boot filesystem or guessed fixed disk requirements | User retained the boot-storage restriction; final sizes depend on image/clone/evidence inputs |
+| Broker intent keys carry the deployment generation; ledger claims carry session + generation | VMID- or name-keyed idempotency alone | A reset legitimately re-clones the same VMID; a retry of the same generation must never double-clone, and cross-session mutation is structurally refused |
+| Cessation spares a claim whose VM reads back with a foreign name (VMID recycled) and retains an obligation | Blindly stopping everything ever claimed | Stopping a machine that is provably not ours is not cessation; the operator resolves the mismatch |
+| Runtime `datapath_controller=nft` removed; `StaticIsolationDatapath` + broker VM stop are the runtime layers; `NftDatapath` stays operator-script/packet-test machinery only | The application executing nft/host commands at runtime | The release decision keeps host administration with the operator; the runtime cannot execute privileged host commands at all |
+| Required `authority` acceptance layer (real policy/ledger/mutual-TLS/cessation tests, infrastructure-free) | Mocked broker boundary or CI-only coverage of these invariants | The private-boundary and fail-closed invariants are checkable without PVE and must gate every run |
+| FastAPI generator dependencies pinned to `scope="function"` (one shared `DbSession`) | Default request-scope generators committing after the response | FastAPI ≥ 0.142 closes request-scope dependencies AFTER the response is observable; the intermittent CI handoff failures (login 401 after bootstrap 201, launch 404 after create 201, M01-R4) were that race — a 2xx must imply durable writes |
 
 ## Risks and explicitly unverified inputs
 

@@ -81,6 +81,17 @@ Authority implementation requires that prerequisite resolved, not waived.
 Implementation must use a user-created non-default worktree/branch; none started
 by this planning session.
 
+**Implementation record (2026-10-09, `71507bb` on `quick-dingo`):** the M01-R4
+prerequisite was root-caused and repaired (`a87e83b`), the private broker
+authority, fail-closed cessation and containment proofs landed (`e896b10`), and
+the new required `authority` gate is wired into CI. All locally executable gates
+(fast default, selection, python, db, containment, authority, frontend, compose)
+pass at `71507bb`; packet and browser remain CI-only gates on this host. Exact
+evidence: [Milestone 02 implementation evidence](FINDINGS_CHECKLIST.md#milestone-02-implementation-evidence-2026-10-09).
+**Still open:** required CI green at the implementation revision (after push),
+and every operator/live gate — real PVE ACL denials, VLAN/isolation proofs,
+identity/stop evidence on the R740 host, and the $0 CI budget check.
+
 **Goal:** model execution cannot administer the R740, and successful stop cannot
 hide surviving work. **Depends on:** 01.
 

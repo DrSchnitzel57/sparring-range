@@ -79,10 +79,31 @@ Provision a dedicated non-root automation identity and restricted PVE token for
 approved lab resources only. Validate **effective** ACLs, including denials against
 unrelated VMs/LXCs, host administration, forbidden config/mount/storage operations
 and privilege changes. An assigned resource pool does not prove isolation. The
-broker also validates typed requests, exact ownership/generation, approved
-templates/storage/network/resource budgets. If safe ACLs cannot support required
-operations on your PVE version, block deployment and revise the design explicitly;
-never widen permissions to make a test green.
+token is installed ONLY on the broker VM (`SR_PROCESS_ROLE=broker` with
+`PROXMOX_TOKEN_*`); the controller/API holds only its mutual-TLS client
+certificate (`BROKER_URL`, `BROKER_CLIENT_CERT/KEY`, `BROKER_TLS_CA_FILE`), and
+production validation refuses a controller that carries PVE credentials. The
+broker additionally validates typed requests against its operator policy file
+(`BROKER_POLICY_FILE`: node, templates, bounded VMID range, storage, clone mode,
+exact NIC/VLAN, provisioning fields, aggregate CPU/RAM/disk limits) plus exact
+ownership/generation in its protected SQLite ledger. If safe ACLs cannot support
+required operations on your PVE version, block deployment and revise the design
+explicitly; never widen permissions to make a test green.
+
+Broker startup and operations (broker VM only):
+
+```bash
+SR_PROCESS_ROLE=broker python -m infra.broker          # daemon: reconciles, then serves
+python -m infra.broker.tools status                    # claims/obligations/lease/audit
+python -m infra.broker.tools enroll --vmid N --name X --tag srsess-<hex> --operator drew
+python -m infra.broker.tools reconcile-legacy --db-url <app-db> [--adopt]
+python -m infra.broker.tools stop --yes --reason "incident"
+python -m infra.broker.tools release --operator drew   # refused while obligations open
+```
+
+Enrollment and legacy adoption require an EXACT PVE identity match (clone name +
+session ownership tag); names/tags never auto-adopt. A broker restart with active
+claims and an unverified control lease latches and hard-stops BEFORE serving.
 
 ## 4. Images, access and installed capture
 
@@ -160,12 +181,17 @@ require agreeing revised defaults; do not silently alter an in-progress match.
 
 ## 6. Emergency stop, recovery and release
 
-**Accepted design still to implement/prove:** persist latch first, fence further
-dispatch, attempt worker/operation cessation, and independently hard-stop all
-positively owned lab VMs (attacker and targets) through restricted PVE authority.
-Confirm PVE tasks plus authoritative status; API timeout/worker death is not
-confirmation. Do not wait for model report generation. Results may be partial.
-Static isolation remains installed throughout, including while the API is down.
+**Implemented (milestone 02):** the killswitch persists the latch first, then
+attempts three INDEPENDENT layers and reports each truthfully: (a) worker process
+groups, (b) the static isolation layer (operator-managed; the runtime executes no
+host commands), and (c) the broker's `hard_stop_all` — hard-stopping every owned
+lab VM including pending creations, confirming PVE task exit AND stopped/absent
+read-back, continuing across failures, and retaining an obligation plus `unknown`
+claim for anything unconfirmed. A claim whose VM reads back with a foreign name
+(VMID recycled) is NOT stopped; it becomes an operator obligation. API timeout or
+worker death is never treated as confirmation. Independently, the broker's
+control lease (5 s heartbeat / 30 s expiry) latches and stops the range by itself
+when the control plane dies; renewal can never resume a stopped range.
 
 If the platform/broker is unavailable, the operator uses trusted Proxmox UI/API
 to stop only the exact identified owned lab guests. If ownership is uncertain,
@@ -178,10 +204,16 @@ a corrupt latch, or release merely because the attacker worker disappeared.
 Record interruption and reconciliation outcomes without secrets. Safe retry is
 idempotent; old callbacks/late starts cannot revive the match.
 
-Release is an explicit operator action after genuine resolution, with fresh
-isolation/stop evidence bound to current configuration/generation. It never
-restores WAN access or resumes interrupted attacks. Milestones 02/10 will define
-the actual API/admin procedure; legacy nft commands are not prescribed here.
+Release is TWO explicit operator actions in order: (1) on the broker, resolve
+every obligation (`status`, `stop_and_confirm` reality, `reconcile-legacy`) and
+run `python -m infra.broker.tools release --operator <name>` — refused while any
+obligation is open;
+(2) release the application latch via the operator API and record fresh
+isolation/stop evidence bound to the current configuration. It never restores
+WAN access or resumes interrupted attacks. A forward upgrade that finds legacy
+pre-broker deployments starts LATCHED (migration 0011) until
+`python -m infra.broker.tools reconcile-legacy` verifies and adopts or clears
+each residual resource.
 
 ## 7. Evidence storage, backup and purge
 
@@ -219,9 +251,12 @@ This default selection is infrastructure-free (milestone 01): DB/containment/
 packet/browser/live are explicit layers, DB and containment membership derives
 from the fixture closure, and the default run has zero prerequisite skips.
 Per-gate acceptance runs through `python infra/dev/acceptance.py <check>`
-(`selection|python|db|containment|packet|frontend|compose|browser`), which
-executes the real commands and fails on absent prerequisites, empty selections
-or cleanup problems.
+(`selection|python|db|containment|authority|packet|frontend|compose|browser`),
+which executes the real commands and fails on absent prerequisites, empty
+selections or cleanup problems. The `authority` gate (milestone 02) needs no
+external service: it exercises the real broker policy, SQLite ledger, mutual-TLS
+server and cessation read-back over loopback. `packet` and `browser` remain
+CI-only on hosts without root/nft or a launchable pinned chromium.
 
 ### Disposable database integration
 
