@@ -22,19 +22,13 @@ from sqlalchemy import select, text as sa_text
 from sqlalchemy.orm import Session
 
 from srplatform.api.auth import Principal, make_auth_dependencies
+from srplatform.api.deps import DbSession  # the ONE function-scoped session
 from srplatform.db.models import Event, Recording, Session as SessionModel
-from srplatform.db.session import db as _db_ctx
 from srplatform.settings import get_settings
 
 router = APIRouter()
 
-
-def get_db():
-    with _db_ctx() as s:
-        yield s
-
-
-principal, any_member, operator, service = make_auth_dependencies(get_db)
+principal, any_member, operator, service = make_auth_dependencies()
 
 
 def _session_or_403(db: Session, p: Principal, session_id: uuid.UUID) -> SessionModel:
@@ -55,7 +49,7 @@ class RecordingIn(BaseModel):
 @router.post("/sessions/{session_id}/recordings", status_code=201)
 def register_recording(session_id: uuid.UUID, body: RecordingIn,
                        p: Principal = Depends(service("bastion")),
-                       db: Session = Depends(get_db)):
+                       db: DbSession = None):
     """Called by the bastion with its capability; the path never becomes a
     client-facing identifier — clients only ever see recording_id."""
     if p.session_id is not None and str(p.session_id) != str(session_id):
@@ -74,7 +68,7 @@ def register_recording(session_id: uuid.UUID, body: RecordingIn,
 
 @router.get("/sessions/{session_id}/recordings")
 def list_recordings(session_id: uuid.UUID, p: Principal = Depends(any_member),
-                    db: Session = Depends(get_db)):
+                    db: DbSession = None):
     _session_or_403(db, p, session_id)
     rows = db.execute(select(Recording).where(Recording.session_id == session_id)
                       .order_by(Recording.created_at)).scalars().all()
@@ -116,7 +110,7 @@ def _safe_read_cast(path: str) -> dict:
 
 @router.get("/recordings/{recording_id}")
 def get_recording(recording_id: uuid.UUID, p: Principal = Depends(any_member),
-                  db: Session = Depends(get_db)):
+                  db: DbSession = None):
     rec = db.get(Recording, recording_id)
     if rec is None:
         raise HTTPException(404, "recording not found")
@@ -127,7 +121,7 @@ def get_recording(recording_id: uuid.UUID, p: Principal = Depends(any_member),
 
 @router.get("/sessions/{session_id}/replay")
 def replay(session_id: uuid.UUID, p: Principal = Depends(any_member),
-           db: Session = Depends(get_db)):
+           db: DbSession = None):
     """Multiple recordings; each header's epoch is the sync anchor (F17)."""
     sess = _session_or_403(db, p, session_id)
     events = db.execute(sa_text(
@@ -152,7 +146,7 @@ def replay(session_id: uuid.UUID, p: Principal = Depends(any_member),
 
 # --- progress: per-domain scores from scoring ITEMS (F20) -------------------------
 @router.get("/users/{username}/progress")
-def progress(username: str, p: Principal = Depends(any_member), db: Session = Depends(get_db)):
+def progress(username: str, p: Principal = Depends(any_member), db: DbSession = None):
     if not p.is_operator and p.username != username:
         raise HTTPException(403, "own progress only")
     rows = db.execute(sa_text("""
@@ -221,7 +215,7 @@ def progress(username: str, p: Principal = Depends(any_member), db: Session = De
 # --- live dashboard: current red phase + real detections with source times -------
 @router.get("/sessions/{session_id}/live")
 def live(session_id: uuid.UUID, p: Principal = Depends(any_member),
-         db: Session = Depends(get_db)):
+         db: DbSession = None):
     sess = _session_or_403(db, p, session_id)
     state = db.execute(sa_text(
         "SELECT current_phase, summary_upto FROM agent_state WHERE session_id=:sid"),

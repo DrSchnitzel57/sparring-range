@@ -24,20 +24,15 @@ from sqlalchemy.orm import Session
 from srplatform.api.auth import Principal
 from srplatform.coach.aar import build_aar, build_hint
 from srplatform.db.models import Event, Session as SessionModel
-from srplatform.db.session import db as _db_ctx
+from srplatform.db.session import db as _db_ctx  # explicit sessions around model waits
 from srplatform.model_gateway import PRIORITY_AAR, PRIORITY_HINT, QueueFull, get_model_gateway
 
 router = APIRouter()
 
-
-def get_db():
-    with _db_ctx() as s:
-        yield s
-
-
 from srplatform.api.auth import make_auth_dependencies
+from srplatform.api.deps import DbSession  # the ONE function-scoped session
 
-_principal, any_member, _operator, _service = make_auth_dependencies(get_db)
+_principal, any_member, _operator, _service = make_auth_dependencies()
 
 # coach model; injectable for tests (set_coach_llm). Outage handling: fall back
 # to the deterministic report and RETRY PERIODICALLY (no permanent poisoning).
@@ -126,7 +121,7 @@ class AarIn(BaseModel):
 
 @router.get("/sessions/{session_id}/aar")
 def aar_get(session_id: uuid.UUID, p: Principal = Depends(any_member),
-            db: Session = Depends(get_db)):
+            db: DbSession = None):
     """Fetching a report RETRIEVES the persisted version — it never regenerates
     (silently) on page load."""
     sess = _check_access(db, p, session_id)
@@ -142,7 +137,7 @@ def aar_get(session_id: uuid.UUID, p: Principal = Depends(any_member),
 
 @router.post("/sessions/{session_id}/aar")
 def aar_post(session_id: uuid.UUID, body: AarIn, p: Principal = Depends(any_member),
-             db: Session = Depends(get_db)):
+             db: DbSession = None):
     sess = _check_access(db, p, session_id)
     if not body.regenerate:
         existing = db.execute(select(Event).where(Event.session_id == session_id,

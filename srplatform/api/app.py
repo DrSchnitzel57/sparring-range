@@ -63,12 +63,12 @@ class _StartupCORSMiddleware(CORSMiddleware):
 app.add_middleware(_StartupCORSMiddleware)
 
 
-def get_db():
-    with db() as s:
-        yield s
+# The ONE shared request DB session (function scope — commit completes before
+# the response is sent; see srplatform/api/deps.py for why) and the auth
+# dependencies built on it.
+from srplatform.api.deps import DbSession  # noqa: E402
 
-
-principal, any_member, operator, service = make_auth_dependencies(get_db)
+principal, any_member, operator, service = make_auth_dependencies()
 
 # M5 coach routes + M7 web routes (auth-wired there as well)
 from srplatform.api.coach_routes import router as coach_router  # noqa: E402
@@ -121,7 +121,7 @@ class BootstrapIn(BaseModel):
 
 
 @app.post("/auth/bootstrap", status_code=201)
-def bootstrap(body: BootstrapIn, db: Session = Depends(get_db)):
+def bootstrap(body: BootstrapIn, db: DbSession = None):
     """One-time operator self-provisioning — ONLY while no account holds a
     password. After that, users are created by the operator."""
     has_any = db.execute(select(User).where(User.password_hash.isnot(None))).scalars().first()
@@ -145,7 +145,7 @@ class LoginIn(BaseModel):
 
 
 @app.post("/auth/login")
-def login(body: LoginIn, db: Session = Depends(get_db)):
+def login(body: LoginIn, db: DbSession = None):
     u = db.execute(select(User).where(User.username == body.username)).scalar_one_or_none()
     if not u or not verify_password(body.password, u.password_hash):
         raise HTTPException(401, "invalid credentials")
@@ -159,7 +159,7 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
 def logout(p: Principal = Depends(principal),
            authorization: str | None = Header(default=None),
            x_token: str | None = Header(default=None),
-           db: Session = Depends(get_db)):
+           db: DbSession = None):
     from srplatform.api.auth import extract_token
     revoke_token(db, extract_token(authorization, x_token))
     return {"ok": True}
@@ -178,7 +178,7 @@ class UserIn(BaseModel):
 
 
 @app.post("/users", status_code=201)
-def create_user(body: UserIn, p: Principal = Depends(operator), db: Session = Depends(get_db)):
+def create_user(body: UserIn, p: Principal = Depends(operator), db: DbSession = None):
     """Member accounts are created by the operator WITH a password (F04:
     username knowledge is not authentication)."""
     if db.execute(select(User).where(User.username == body.username)).scalar_one_or_none():
@@ -207,7 +207,7 @@ def _scenario_snapshot(scenario_id: str) -> tuple[str, str]:
 
 @app.post("/sessions", status_code=201)
 def create_session(body: SessionCreate, p: Principal = Depends(any_member),
-                   db: Session = Depends(get_db)):
+                   db: DbSession = None):
     from srplatform.scenario_engine.loader import load_scenario
     load_scenario(body.scenario_id)  # validated before anything is stored
     sha, raw = _scenario_snapshot(body.scenario_id)
@@ -228,7 +228,7 @@ def create_session(body: SessionCreate, p: Principal = Depends(any_member),
 
 @app.get("/sessions")
 def list_sessions(mine: bool = Query(True), p: Principal = Depends(any_member),
-                  db: Session = Depends(get_db)):
+                  db: DbSession = None):
     q = select(SessionModel).order_by(SessionModel.started_at, SessionModel.session_id)
     if mine or not p.is_operator:
         q = q.where(SessionModel.user_id == p.user_id)
@@ -250,7 +250,7 @@ def _get_session(db, p, session_id) -> SessionModel:
 
 @app.get("/sessions/{session_id}")
 def get_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
-                db: Session = Depends(get_db)):
+                db: DbSession = None):
     sess = _get_session(db, p, session_id)
     dep = db.execute(select(Deployment).where(Deployment.session_id == session_id)
                      .order_by(Deployment.created_at.desc())).scalars().first()
@@ -362,7 +362,7 @@ def _release_claim_safely(db, session_id, succeeded: bool, owner: str | None = N
 
 @app.post("/sessions/{session_id}/launch")
 def launch_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
-                   db: Session = Depends(get_db)):
+                   db: DbSession = None):
     """Shared backend workflow for CLI and browser:
     authenticate → claim → reserve (lease) → validate → deploy → issue per-host
     connection capabilities → ready."""
@@ -449,7 +449,7 @@ def _finalize_ready(db, sess, p, result, verification_service):
 
 @app.post("/sessions/{session_id}/end")
 def end_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
-                db: Session = Depends(get_db)):
+                db: DbSession = None):
     """Idempotent finalize (F11/F13): stop worker, collect TRUSTED final score,
     append snapshot + end evidence, revoke session capabilities. The lease is
     released ONLY when no owned machine remains (audit R07): VMs are retained
@@ -554,7 +554,7 @@ def _end_session_inner(db, sess, p, verification_service, orchestrator):
 
 @app.post("/sessions/{session_id}/score")
 def score_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
-                  db: Session = Depends(get_db)):
+                  db: DbSession = None):
     """Trusted scoring endpoint (F11): the BACKEND runs the verifiers; CLI and
     browser are both plain HTTP callers."""
     from srplatform import verification_service
@@ -569,7 +569,7 @@ def score_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
 
 @app.get("/sessions/{session_id}/score")
 def get_score(session_id: uuid.UUID, p: Principal = Depends(any_member),
-              db: Session = Depends(get_db)):
+              db: DbSession = None):
     from srplatform import verification_service
     sess = _get_session(db, p, session_id)
     card = verification_service.latest_scorecard(db, sess.session_id)
@@ -604,7 +604,7 @@ def _teardown_common(db, sess, p):
 
 @app.post("/sessions/{session_id}/teardown")
 def teardown_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
-                     db: Session = Depends(get_db)):
+                     db: DbSession = None):
     from srplatform.scenario_engine import orchestrator
     sess = _get_session(db, p, session_id)
     try:
@@ -622,7 +622,7 @@ def teardown_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
 
 @app.post("/sessions/{session_id}/reset")
 def reset_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
-                  db: Session = Depends(get_db)):
+                  db: DbSession = None):
     from srplatform.scenario_engine import orchestrator
     from srplatform.api.deps import get_proxmox
     sess = _get_session(db, p, session_id)
@@ -679,7 +679,7 @@ class DeployIn(BaseModel):
 
 @app.post("/deploy/{scenario_id}")
 def deploy_scenario(scenario_id: str, body: DeployIn, p: Principal = Depends(any_member),
-                    db: Session = Depends(get_db)):
+                    db: DbSession = None):
     from srplatform.scenario_engine import orchestrator
     from srplatform.api.deps import get_proxmox
     sess = _get_session(db, p, body.session_id)
@@ -722,7 +722,7 @@ class RunIn(BaseModel):
 
 @app.post("/run/{scenario_id}", status_code=202)
 def run_scenario(scenario_id: str, body: RunIn, p: Principal = Depends(any_member),
-                 db: Session = Depends(get_db)):
+                 db: DbSession = None):
     from srplatform.scenario_engine import orchestrator
     sess = _get_session(db, p, body.session_id)
     if sess.scenario_id != scenario_id:
@@ -797,7 +797,7 @@ def run_scenario(scenario_id: str, body: RunIn, p: Principal = Depends(any_membe
 
 
 @app.get("/runs/{run_id}")
-def get_run(run_id: uuid.UUID, p: Principal = Depends(any_member), db: Session = Depends(get_db)):
+def get_run(run_id: uuid.UUID, p: Principal = Depends(any_member), db: DbSession = None):
     run = db.get(Run, run_id)
     if run is None:
         raise HTTPException(404, "run not found")
@@ -809,7 +809,7 @@ def get_run(run_id: uuid.UUID, p: Principal = Depends(any_member), db: Session =
 
 
 @app.post("/runs/{run_id}/stop")
-def stop_run(run_id: uuid.UUID, p: Principal = Depends(any_member), db: Session = Depends(get_db)):
+def stop_run(run_id: uuid.UUID, p: Principal = Depends(any_member), db: DbSession = None):
     run = db.get(Run, run_id)
     if run is None:
         raise HTTPException(404, "run not found")
@@ -851,7 +851,7 @@ def internal_model_complete(body: ModelCompleteIn, p: Principal = Depends(servic
 @app.post("/internal/runs/{run_id}/complete")
 def run_complete(run_id: uuid.UUID, result: dict,
                  x_worker_token: str | None = Header(default=None),
-                 db: Session = Depends(get_db)):
+                 db: DbSession = None):
     """Worker callback — authenticated by the one-shot run capability. A
     terminal run's state is FINAL: a late callback gets 409, never a rewrite."""
     try:
@@ -901,7 +901,7 @@ def _require_worker_locked(db, run_id: uuid.UUID, token: str | None):
 @app.post("/internal/runs/{run_id}/operations", status_code=201)
 def register_run_operation(run_id: uuid.UUID, body: OperationIn,
                            x_worker_token: str | None = Header(default=None),
-                           db: Session = Depends(get_db)):
+                           db: DbSession = None):
     """Persist a command operation BEFORE dispatch, associated with the run
     and the CURRENT deployment generation (audit T01). This is what lets the
     API recover and cancel the operation after worker death — the identity is
@@ -948,7 +948,7 @@ def register_run_operation(run_id: uuid.UUID, body: OperationIn,
 @app.post("/internal/runs/{run_id}/operations/{op_id}/done")
 def complete_run_operation(run_id: uuid.UUID, op_id: str, body: OperationDoneIn,
                            x_worker_token: str | None = Header(default=None),
-                           db: Session = Depends(get_db)):
+                           db: DbSession = None):
     """Worker reports the operation finished. 'completed' is only accepted
     from the worker; unconfirmed cancellations are set by the API's own
     recovery paths and are never downgraded here. The containment verdict
@@ -977,7 +977,7 @@ class VerifierCheckIn(BaseModel):
 
 @app.get("/sessions/{session_id}/scenario")
 def session_scenario(session_id: uuid.UUID,
-                     p: Principal = Depends(principal), db: Session = Depends(get_db)):
+                     p: Principal = Depends(principal), db: DbSession = None):
     """The session's IMMUTABLE scenario snapshot (audit N10): the worker and
     every consumer resolve objectives/targets from the bytes captured at
     session creation — never from the mutable current YAML. The run-scoped
@@ -997,7 +997,7 @@ def session_scenario(session_id: uuid.UUID,
 
 @app.post("/sessions/{session_id}/verifier_checks")
 def verifier_check(session_id: uuid.UUID, body: VerifierCheckIn,
-                   p: Principal = Depends(principal), db: Session = Depends(get_db)):
+                   p: Principal = Depends(principal), db: DbSession = None):
     """Allowed: session owner, operator, or the run-scoped runner token bound
     to THIS session. The backend runs the verifier and appends the evidence —
     the caller can request a check, never supply an outcome (F04)."""
@@ -1036,7 +1036,7 @@ class EventIn(BaseModel):
 
 @app.post("/events", status_code=201)
 def ingest_event(body: EventIn, p: Principal = Depends(principal),
-                 db: Session = Depends(get_db)):
+                 db: DbSession = None):
     """Server assigns actor + session association from the credential; the
     body carries content only. Verifier/score/system kinds are not accepted
     from ANY client — backend code appends those itself."""
@@ -1085,7 +1085,7 @@ def query_events(session_id: uuid.UUID | None = None,
                  tail: int | None = None,
                  limit: int = 500,
                  p: Principal = Depends(principal),
-                 db: Session = Depends(get_db)):
+                 db: DbSession = None):
     """Cursor pagination in DETERMINISTIC INGESTION ORDER (event_id) — F14.
     after_event_id pages forward; tail=N returns the last N (CLI status/live).
     Source timestamps are data, never the checkpoint."""
@@ -1256,7 +1256,7 @@ class AgentStateIn(BaseModel):
 
 @app.put("/agent_state/{session_id}")
 def put_agent_state(session_id: uuid.UUID, body: AgentStateIn,
-                    p: Principal = Depends(principal), db: Session = Depends(get_db)):
+                    p: Principal = Depends(principal), db: DbSession = None):
     if p.kind == "service" and not (p.scope == "runner" and str(p.session_id) == str(session_id)):
         raise HTTPException(403, "runner token mismatch")
     if p.kind in ("member", "operator"):
@@ -1277,7 +1277,7 @@ def put_agent_state(session_id: uuid.UUID, body: AgentStateIn,
 
 @app.get("/agent_state/{session_id}")
 def get_agent_state(session_id: uuid.UUID, p: Principal = Depends(principal),
-                    db: Session = Depends(get_db)):
+                    db: DbSession = None):
     st = db.get(AgentState, session_id)
     if not st:
         raise HTTPException(404, "no agent state")
@@ -1300,7 +1300,7 @@ class ServiceTokenIn(BaseModel):
 
 @app.post("/admin/service_tokens", status_code=201)
 def create_service_token(body: ServiceTokenIn, p: Principal = Depends(operator),
-                         db: Session = Depends(get_db)):
+                         db: DbSession = None):
     """Operator-provisioned capability issuance (bastion/telemetry). The
     plaintext is shown ONCE; only its value in the DB can authenticate."""
     if body.scope not in ("bastion", "telemetry"):
@@ -1318,7 +1318,7 @@ def create_service_token(body: ServiceTokenIn, p: Principal = Depends(operator),
 
 @app.get("/tokens/{token}")
 def get_token(token: str, p: Principal = Depends(service("bastion")),
-              db: Session = Depends(get_db)):
+              db: DbSession = None):
     t = db.get(LoginToken, token)
     if not t or t.revoked_at is not None:
         raise HTTPException(404, "token not found")
@@ -1344,7 +1344,7 @@ class EnrollConfirmIn(BaseModel):
 
 @app.post("/enroll/confirm", status_code=201)
 def enroll_confirm(body: EnrollConfirmIn, p: Principal = Depends(service("telemetry")),
-                   db: Session = Depends(get_db)):
+                   db: DbSession = None):
     """AUTHENTICATED ENROLLMENT CALLBACK FROM THE PROVISIONED HOST (audit
     T-05, hardened for audit F4): evidence updates the EXACT authenticated
     ServiceToken — never 'the newest row for this session/host'. A stale or
@@ -1403,7 +1403,7 @@ class AuditdBatch(BaseModel):
 
 @app.post("/ingest/auditd", status_code=201)
 def ingest_auditd(body: AuditdBatch, p: Principal = Depends(service("telemetry")),
-                  db: Session = Depends(get_db)):
+                  db: DbSession = None):
     """Host identity, session and actor come from the capability — never from
     the payload (F09). Duplicate source event ids are dropped; late records
     keep their source ts but never displace ingestion order."""

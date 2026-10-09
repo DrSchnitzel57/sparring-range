@@ -6,6 +6,19 @@ from __future__ import annotations
 import json
 
 
+def api_json(method: str, url: str, *, body=None, headers=None,
+             expect: tuple = (200, 201)):
+    """HTTP call with a SELF-EXPLANATORY failure (M01-R3/M01-R4 lesson): a bare
+    .json()["key"] on an error response raises a contentless KeyError and
+    leaves CI unclassifiable — the status + body name the branch (auth vs
+    5xx vs validation) the moment it happens."""
+    import httpx
+    r = httpx.request(method, url, json=body, headers=headers, timeout=30)
+    if r.status_code not in expect:
+        raise AssertionError(f"{method} {url} -> {r.status_code} {r.text[:400]}")
+    return r.json()
+
+
 # --------------------------------------------------------------------------- #
 # Containment observation: REAL HOST identities across the PID namespace       #
 # --------------------------------------------------------------------------- #

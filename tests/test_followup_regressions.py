@@ -21,7 +21,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 PY = sys.executable
 
-from tests.helpers import ScriptedHostExec, tool  # noqa: E402
+from tests.helpers import ScriptedHostExec, api_json, tool  # noqa: E402
 
 
 def _free_port() -> int:
@@ -1259,18 +1259,19 @@ def test_r01_real_worker_end_to_end_over_http(migrated_db, test_db_url_owner, tm
     get_settings.cache_clear()
 
     try:
-        httpx.post(f"{base}/auth/bootstrap",
-                   json={"username": "drew", "password": "operator-testpw-9"})
-        tok = httpx.post(f"{base}/auth/login",
-                         json={"username": "drew", "password": "operator-testpw-9"}
-                         ).json()["token"]
+        api_json("POST", f"{base}/auth/bootstrap",
+                 body={"username": "drew", "password": "operator-testpw-9"},
+                 expect=(201,))
+        tok = api_json("POST", f"{base}/auth/login",
+                       body={"username": "drew",
+                             "password": "operator-testpw-9"})["token"]
         H = {"Authorization": f"Bearer {tok}"}
-        r = None
-        for _ in range(5):  # tolerate a transient lock from the previous test's teardown
-            r = httpx.post(f"{base}/sessions", json={"scenario_id": "quick-win-01"}, headers=H)
-            if r.status_code == 201:
-                break
-            time.sleep(0.5)
+        # NO retry band-aid here (M02 CI repair): the old "tolerate a transient
+        # lock from the previous test's teardown" loop masked the real defect —
+        # the previous request's commit racing this request's read. The API
+        # now commits before the response (api.deps.DbSession), so a failure
+        # below is a genuine regression, not CI noise.
+        r = httpx.post(f"{base}/sessions", json={"scenario_id": "quick-win-01"}, headers=H)
         assert r.status_code == 201, r.text
         sid = r.json()["session_id"]
         r = httpx.post(f"{base}/sessions/{sid}/launch", headers=H)
@@ -1369,17 +1370,25 @@ def test_r02_bastion_token_login_binds_owner_key(migrated_db, test_db_url_owner,
     get_settings.cache_clear()
 
     try:
-        httpx.post(f"{base}/auth/bootstrap", json={"username": "drew", "password": "operator-testpw-9"})
-        tok = httpx.post(f"{base}/auth/login",
-                         json={"username": "drew", "password": "operator-testpw-9"}).json()["token"]
+        # every handoff is self-explanatory (M01-R4 lesson: a discarded body
+        # made the intermittent CI failure unclassifiable)
+        api_json("POST", f"{base}/auth/bootstrap",
+                 body={"username": "drew", "password": "operator-testpw-9"},
+                 expect=(201,))
+        tok = api_json("POST", f"{base}/auth/login",
+                       body={"username": "drew",
+                             "password": "operator-testpw-9"})["token"]
         H = {"Authorization": f"Bearer {tok}"}
-        httpx.post(f"{base}/users", headers=H,
-                   json={"username": "blue", "password": "member-testpw-9", "role": "member"})
-        tok_b = httpx.post(f"{base}/auth/login",
-                           json={"username": "blue", "password": "member-testpw-9"}).json()["token"]
+        api_json("POST", f"{base}/users", headers=H, expect=(201,),
+                 body={"username": "blue", "password": "member-testpw-9",
+                       "role": "member"})
+        tok_b = api_json("POST", f"{base}/auth/login",
+                         body={"username": "blue",
+                               "password": "member-testpw-9"})["token"]
         HB = {"Authorization": f"Bearer {tok_b}"}
-        sid = httpx.post(f"{base}/sessions", json={"scenario_id": "quick-win-01"},
-                         headers=HB).json()["session_id"]
+        sid = api_json("POST", f"{base}/sessions",
+                       body={"scenario_id": "quick-win-01"}, headers=HB,
+                       expect=(201,))["session_id"]
         r = httpx.post(f"{base}/sessions/{sid}/launch", headers=HB)
         assert r.status_code == 200, r.text
         login_token = r.json()["connections"][0]["login_token"]

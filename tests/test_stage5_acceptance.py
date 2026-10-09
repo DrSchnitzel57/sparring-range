@@ -89,15 +89,9 @@ class SlowFakeModel:
 
 def _api_json(method: str, url: str, *, body=None, headers=None,
               expect: tuple = (200, 201)):
-    """HTTP call with a SELF-EXPLANATORY failure (M01-R3 lesson): a bare
-    .json()["key"] on an error response raises a contentless KeyError and
-    leaves CI unclassifiable — the status + body name the branch (auth vs
-    5xx vs validation) the moment it happens."""
-    import httpx
-    r = httpx.request(method, url, json=body, headers=headers, timeout=30)
-    if r.status_code not in expect:
-        raise AssertionError(f"{method} {url} -> {r.status_code} {r.text[:400]}")
-    return r.json()
+    """See tests.helpers.api_json (SELF-EXPLANATORY failures, M01-R3/R4)."""
+    from tests.helpers import api_json
+    return api_json(method, url, body=body, headers=headers, expect=expect)
 
 
 @pytest.mark.db
@@ -159,7 +153,8 @@ def test_hint_jumps_queued_red_turns_across_processes(migrated_db, test_db_url_o
         sid = _api_json("POST", f"{base}/sessions",
                         body={"scenario_id": "quick-win-01"}, headers=H,
                         expect=(201,))["session_id"]
-        assert httpx.post(f"{base}/sessions/{sid}/launch", headers=H).status_code == 200
+        r = httpx.post(f"{base}/sessions/{sid}/launch", headers=H)
+        assert r.status_code == 200, f"launch -> {r.status_code} {r.text[:400]}"
         runner_token = _mint_runner_token(sid)
 
         # Warm the coach endpoint probe OUTSIDE the measured window (the

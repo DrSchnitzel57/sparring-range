@@ -23,6 +23,7 @@ from fastapi import Depends, Header, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from srplatform.api.deps import DbSession
 from srplatform.db.models import Run, ServiceToken, User, WebToken
 
 # scrypt parameters (interactive login: ~100ms class costs)
@@ -151,12 +152,13 @@ def require_session_access(db: Session, p: Principal, session) -> None:
         raise HTTPException(403, "not your session")
 
 
-def make_auth_dependencies(get_db):
-    """Build auth dependencies bound to a router's get_db."""
+def make_auth_dependencies():
+    """Build the auth dependencies on the ONE shared function-scoped DB
+    session (srplatform.api.deps.DbSession — commit-before-response)."""
 
     def principal(authorization: str | None = Header(default=None),
                   x_token: str | None = Header(default=None),
-                  db: Session = Depends(get_db)) -> Principal:
+                  db: DbSession = None) -> Principal:
         token = extract_token(authorization, x_token)
         return _principal_from_token(db, token)
 
