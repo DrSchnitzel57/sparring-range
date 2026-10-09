@@ -192,6 +192,21 @@ jobs:
             infra/dev/run_in_cgroup.sh /sys/fs/cgroup/srrunner "$USER" \
             .venv/bin/python infra/dev/acceptance.py containment
 
+  authority:
+    # broker private boundary: policy, durable ledger, real mutual-TLS,
+    # cessation read-back + lease races (infrastructure-free, required mode)
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13", cache: pip }
+      - run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.lock
+          .venv/bin/pip install --no-deps -e .
+      - run: .venv/bin/python infra/dev/acceptance.py authority
+
   packet:
     # real nft round-trip + netns packet semantics; the job runs the tests
     # as root ONLY so they can create DISPOSABLE network namespaces — the

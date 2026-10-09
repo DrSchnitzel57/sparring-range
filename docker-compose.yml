@@ -99,6 +99,12 @@ services:
       LLM_MODEL_RED: ${LLM_MODEL_RED:-qwen2.5-14b-instruct}
       LLM_MODEL_COACH: ${LLM_MODEL_COACH:-qwen2.5-32b-instruct}
       RUNNER_TRANSPORT: ${RUNNER_TRANSPORT:-local-dev}
+      # Dev compose is an ISOLATED SYNTHETIC FIXTURE: the fixture-only
+      # local-dev runner and the in-process synthetic broker stand in for the
+      # isolated runner and the broker VM. Both are ignored in production
+      # (settings refuse them), so this cannot leak into a real deployment.
+      ALLOW_LOCAL_DEV_FIXTURE: ${ALLOW_LOCAL_DEV_FIXTURE:-1}
+      SR_BROKER_FIXTURE: ${SR_BROKER_FIXTURE:-1}
     ports: ["127.0.0.1:8000:8000"]
     volumes:
       # the API registers recordings written by the bastion — the shared path
