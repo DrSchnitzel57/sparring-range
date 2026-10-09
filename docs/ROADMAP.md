@@ -40,7 +40,7 @@ regressions; migration 0010 restored byte-exact with the test passing a
 transaction-bound Connection; bounded wait for the ingested command event).
 CI run 37855269245 passed all ten jobs on the initial attempt and again on a
 repeat-run stability check (attempt 2), browser-e2e included. Requirements
-were unchanged by the review; no milestone-02 plan exists. **Open finding
+were unchanged by the review. Milestone-02 planning is recorded below. **Open finding
 M01-R4:** a docs-only push then exposed an intermittent db-layer failure
 (discarded error body on the login→session handoff); instrumented at this
 revision, tracked in the findings until classified.
@@ -72,6 +72,14 @@ failures/skips are explained; applicable release-blocking advisories are resolve
 ## 02 — Host-safe deployment authority and fail-closed cessation
 
 - [ ] Accept milestone 02.
+
+Approved implementation plan (2026-10-09):
+[02-host-safe-authority](../.openchamber/plans/02-host-safe-authority.md).
+First repair/classify remaining milestone-01 CI failures: latest run 37860676959
+at `9393a36` fails two DB tests despite a prior green run at the same revision.
+Authority implementation requires that prerequisite resolved, not waived.
+Implementation must use a user-created non-default worktree/branch; none started
+by this planning session.
 
 **Goal:** model execution cannot administer the R740, and successful stop cannot
 hide surviving work. **Depends on:** 01.
@@ -296,10 +304,9 @@ accepted and the roadmap/evidence/runbook accurately reflect the deployed revisi
 
 ## Planning and acceptance discipline
 
-Milestone 01 is accepted (plan
-[01-reproducible-baseline](../.openchamber/plans/01-reproducible-baseline.md),
-CI run 37852029894). Next: jointly write the milestone 02 plan after checking
-that milestone against current code. No milestone implementation
+Milestone 01 has recorded acceptance at `62939f7`, with the intermittent DB
+finding still open. Milestone 02's approved plan begins by resolving that CI
+prerequisite. No milestone implementation
 session is authorized by this roadmap alone. Implement code only on a user-selected
 non-default branch. Each accepted milestone ticks its checkbox and updates the
 architecture if its design changed; record reasons rather than hiding deviations.

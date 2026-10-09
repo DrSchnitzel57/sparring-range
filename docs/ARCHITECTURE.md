@@ -128,6 +128,13 @@ exception to immutable evidence, not permission to mutate historical scores.
 - Only a deterministic private deployment service holds a restricted Proxmox API
   token from a dedicated automation identity, not host root. Members and model
   workers never receive it or a general-purpose broker endpoint.
+- Milestone 02 uses separate application/control-plane and broker VMs outside a
+  new dedicated range VLAN (existing cyber-testing VLAN 30 remains untouched).
+  API-to-broker HTTPS is mutually certificate-authenticated; its client key is
+  never supplied to model workers. The broker has a protected SQLite ownership,
+  intent and latch ledger independent of application PostgreSQL. Offline operator
+  tooling enrolls the disposable attacker VM and reconciles legacy deployments;
+  names/tags alone never auto-adopt an existing VM.
 - Requests are typed operations over approved templates, storage, network,
   resource budgets, and positively owned session VM IDs. No arbitrary PVE paths,
   config dictionaries, host commands, identity changes, or user-specified mounts.
@@ -160,6 +167,14 @@ an API timeout or stopped worker does not prove cessation. Keep partial/unknown
 outcomes visible and reservations retained. A manual operator PVE stop remains
 available if the application/broker fails. Release requires an explicit operator
 action and fresh safety evidence; it never restores WAN access.
+
+The milestone-02 broker also monitors a control-plane lease: healthy DB-backed
+control renews every 5 seconds; 30 seconds without renewal latches and attempts
+owned-VM hard-stop. Broker restart/lost state fails closed. Recovery never resumes
+attacks. Broker/PVE unavailability remains an unconfirmed outcome requiring operator
+recovery, not a promise that stopped software can stop guests. Normal development
+as well as production forbids local model shell execution; harmless local adapters
+are restricted to isolated synthetic acceptance fixtures.
 
 Process-group/cgroup/namespace supervision remains useful inside the attacker
 VM, but is not the sole authority against guest compromise. Protect supervisor
@@ -356,6 +371,12 @@ Validate dependency advisories and patch supported packages before release.
 | Stop milestone 01 acceptance for agreement if a genuine safety defect emerges | Weakening regressions or silently absorbing milestone 02 | Test hygiene cannot conceal defects or expand production safety scope without approval |
 | Boundary re-root by **binding** the operation's own cgroup dir onto `/sys/fs/cgroup`; CI's unprivileged boundary runs under a real confined AppArmor profile (explicit allows + `/** rix,`) | Fresh cgroup2 superblock mount inside the userns; `flags=(unconfined)` profile or the global `apparmor_restrict_unprivileged_userns=0` sysctl | 6.8-era kernfs refuses superblock creation from a non-init userns (bind works on every kernel); unconfined-state creators are transitioned into the restrictive `unprivileged_userns` profile, and the sysctl would weaken the whole host |
 | asciinema-player 3.17 with explicit `preload: true` | Relying on the legacy load-at-create behaviour | 3.17 made loading lazy — a paused player never fetches the recording without preload, and a seek issued before the driver exists is silently dropped; the replay page and browser gate depend on observable load |
+| Separate broker VM, private mutual-TLS API channel and broker-owned SQLite ledger | Shared application/broker VM, app-DB-only emergency inventory, worker broker credentials | Separates host authority and preserves known ownership/stop obligations during application DB outages without another database server |
+| New dedicated range VLAN; no range access to inference LXC | Sharing cyber-testing VLAN 30 or opening the model port to attackers | Protects existing lab workloads; model calls originate on the trusted control plane |
+| 5-second control heartbeat, 30-second lease expiry then latched owned-VM hard-stop | Operator-only reaction to control loss or automatic attack restart | User delegated the outage choice; prefer interruption to potentially uncontrolled surviving work |
+| Offline verified attacker enrollment and legacy reconciliation | Name/tag auto-adoption or requiring deletion of all existing deployments | Includes the fixed SSH attacker in emergency inventory while preserving evidence and deferring real images to milestone 03 |
+| Local model shell execution only in isolated harmless fixtures | Normal development local-dev execution on credential-bearing machines | Development mode must not turn model commands into control-plane administration |
+| Operator-selected separate SSD or verified suitable NAS with calculated capacity budget | Lab disks on Proxmox boot filesystem or guessed fixed disk requirements | User retained the boot-storage restriction; final sizes depend on image/clone/evidence inputs |
 
 ## Risks and explicitly unverified inputs
 

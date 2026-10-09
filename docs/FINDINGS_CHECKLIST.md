@@ -532,6 +532,33 @@ revision (113 / PASS / 128 passed).
   milestone 01 acceptance rests on the twice-green `62939f7` runs, and this
   finding stays open until classified.
 
+### Milestone-02 planning baseline and prerequisite (2026-10-09)
+
+Clean `master` at **`9393a36`**, equal to locally recorded `origin/master` before
+documentation edits. Executed:
+
+- `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -ra -p no:cacheprovider`
+  — exit 0, **128 passed, 0 failed/skipped, 139 deselected, 4 warnings**, 15.09s.
+  This is infrastructure-free, not DB or live authority acceptance.
+- `gh run list --limit 4 --json databaseId,headSha,status,conclusion,url`
+  — exit 0; run **37858626650** succeeded at `9393a36`, but the later
+  **37860676959** failed at the same revision.
+- `gh run view 37860676959 --json jobs --jq '.jobs[] | {name,conclusion}'`
+  — exit 0; DB failed, all other nine jobs succeeded.
+- `gh run view 37860676959 --log-failed` — exit 0; hosted DB suite:
+  **2 failed, 111 passed, 154 deselected, 3 warnings**, 104.83s; owned fixture
+  container/volume cleanup passed. Failure gate exited 1.
+
+Failures inspected, not yet diagnosed:
+`tests/test_followup_regressions.py:1373` assumes login JSON contains `token`
+without checking status/body (`KeyError: 'token'`);
+`tests/test_stage5_acceptance.py:162` receives HTTP 404 launching a session just
+created successfully. Shared state/server/DB lifetime is an investigation target,
+not an established cause. Neither a green rerun nor added diagnostics fixes this.
+M01-R4 remains open; the approved milestone-02 plan requires repair/regression and
+repeat affected acceptance before authority implementation. No software/live
+deployment acceptance is claimed by saving that plan.
+
 ## Release blockers and missing work
 
 | ID / priority | Current finding and evidence boundary | Milestone |
