@@ -26,7 +26,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
-from infra.proxmox_client import PveUnavailable, ProxmoxError
+from infra.broker.errors import BrokerError, BrokerUnavailable
 from srplatform.db.models import (Deployment, Event, OperationClaim, RangeLease,
                                   ServiceToken,
                                   Session as SessionModel)
@@ -505,7 +505,7 @@ def _active_deployment(db: Session, session_id, scenario_id: str) -> Deployment 
     return None
 
 
-def deploy(db: Session, session_id, scenario_id: str, proxmox, resume: bool = True) -> dict:
+def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = True) -> dict:
     """Clone every host in the scenario from its golden template, configure
     network/ownership on the range bridge, and start each with task waiting.
     Caller must hold the lease (acquire_lease first).
@@ -582,7 +582,8 @@ def deploy(db: Session, session_id, scenario_id: str, proxmox, resume: bool = Tr
             if res and res.get("vmid"):
                 vmid = int(res["vmid"])          # reuse the pending intent's VMID
             else:
-                vmid = int(proxmox.next_vmid(s.deploy_vmid_base + i))
+                vmid = int(broker.next_vmid(node, s.deploy_vmid_base + i,
+                                             session_id=session_id))
                 res = {"vmid": vmid, "node": node, "name": name, "host": host["name"],
                        "template_vmid": host["template_vmid"], "state": "pending"}
                 resources.append(res)
@@ -601,17 +602,18 @@ def deploy(db: Session, session_id, scenario_id: str, proxmox, resume: bool = Tr
             # occupying that number belongs to this deployment. Uncertain
             # reads abort the deployment (intent retained); a foreign machine
             # at the intended VMID receives NO set-config/start/delete call.
-            exists = proxmox.lookup_vm(node, vmid)   # raises when uncertain
+            exists = broker.lookup_vm(node, vmid)   # raises when uncertain
             if exists is None:
-                proxmox.clone_and_wait(node, int(host["template_vmid"]), vmid, name,
-                                       full=False)
+                broker.clone_and_wait(node, int(host["template_vmid"]), vmid, name,
+                                       full=False, session_id=session_id,
+                                       generation=str(dep.deployment_id))
             else:
                 # The VM exists at our intended VMID. Identity read failures
                 # are UNCERTAIN — abort with the intent retained rather than
                 # mutate a VM we cannot positively identify (audit N01). The
                 # documented creation identity (exact clone name + full-session
                 # ownership tag) governs once the read answers again.
-                cfg = proxmox.try_lookup_config(node, vmid)
+                cfg = broker.try_lookup_config(node, vmid)
                 if cfg is None:
                     pass  # vanished between reads — set_config will fail loudly
                 elif "_unavailable" in (cfg or {}):
@@ -633,22 +635,23 @@ def deploy(db: Session, session_id, scenario_id: str, proxmox, resume: bool = Tr
                     # is failing — probe with the SAME request shape the
                     # mutation will use, then skip the mutation when it works.
                     try:
-                        proxmox.post(f"/nodes/{node}/qemu/{vmid}/config",
-                                     tags=_ownership_tag(session_id))
+                        broker.set_config(node, vmid,
+                                          tags=_ownership_tag(session_id),
+                                          session_id=session_id)
                     except Exception as e:  # noqa: BLE001
                         raise RuntimeError(
                             f"config endpoint failing for VMID {vmid} ({name}) — "
                             f"resume mutation aborted, intent retained: {e}") from e
                     # probe succeeded: finish placement (idempotent re-POST)
-                    proxmox.set_config(node, vmid,
-                                       ipconfig0=f"ip={host['ip']}/24,gw={s.range_gateway}",
-                                       net0=_net_spec(s))
-                    cfg2 = proxmox.lookup_config(node, vmid)
+                    broker.set_config(node, vmid,
+                                      ipconfig0=f"ip={host['ip']}/24,gw={s.range_gateway}",
+                                      net0=_net_spec(s), session_id=session_id)
+                    cfg2 = broker.lookup_config(node, vmid)
                     net0 = (cfg2 or {}).get("net0", "") if isinstance(cfg2, dict) else ""
                     if s.range_bridge not in net0:
                         raise RuntimeError(f"NIC placement validation failed on {name}: "
                                            f"net0={net0!r} does not use bridge {s.range_bridge}")
-                    proxmox.start_and_wait(node, vmid)
+                    broker.start_and_wait(node, vmid, session_id=session_id)
                     res.update({"state": "created", "ip": host["ip"], "node": node,
                                 "name": name})
                     _enroll_host_telemetry(db, dep, res, resources, session_id,
@@ -662,14 +665,15 @@ def deploy(db: Session, session_id, scenario_id: str, proxmox, resume: bool = Tr
                     db.commit()
                     continue
             # network placement on the range bridge/VLAN + ownership tag (F06)
-            proxmox.set_config(node, vmid,
-                               ipconfig0=f"ip={host['ip']}/24,gw={s.range_gateway}",
-                               net0=_net_spec(s),
-                               tags=_ownership_tag(session_id))
+            broker.set_config(node, vmid,
+                              ipconfig0=f"ip={host['ip']}/24,gw={s.range_gateway}",
+                              net0=_net_spec(s),
+                              tags=_ownership_tag(session_id),
+                              session_id=session_id)
             # validate NIC placement (read-back; ANY read failure — injected,
             # transport, 403 — aborts loudly, it is never treated as success)
             try:
-                cfg = proxmox.get(f"/nodes/{node}/qemu/{vmid}/config")
+                cfg = broker.read_config(node, vmid)
             except Exception as e:  # noqa: BLE001
                 raise RuntimeError(f"NIC placement validation could not read the config "
                                    f"of {name} (vmid {vmid}): {e}") from e
@@ -677,7 +681,7 @@ def deploy(db: Session, session_id, scenario_id: str, proxmox, resume: bool = Tr
             if s.range_bridge not in net0:
                 raise RuntimeError(f"NIC placement validation failed on {name}: "
                                    f"net0={net0!r} does not use bridge {s.range_bridge}")
-            proxmox.start_and_wait(node, vmid)
+            broker.start_and_wait(node, vmid, session_id=session_id)
             res.update({"state": "created", "ip": host["ip"], "node": node, "name": name})
             _enroll_host_telemetry(db, dep, res, resources, session_id,
                                    host["name"], host["ip"], s, enrollments)
@@ -754,7 +758,7 @@ def _classify_identity(cfg: dict, r: dict, session_id) -> tuple[str, str]:
                        f"name={cfg.get('name')!r})")
 
 
-def _verify_ownership(proxmox, r: dict, session_id) -> tuple[str, str]:
+def _verify_ownership(broker, r: dict, session_id) -> tuple[str, str]:
     """Positively identify a resource BEFORE any mutation (audit N01).
 
     Returns (verdict, why) with verdict in:
@@ -764,17 +768,17 @@ def _verify_ownership(proxmox, r: dict, session_id) -> tuple[str, str]:
       'absent'  — PVE CONFIRMED 404 (idempotent removal, no delete needed);
       'foreign' — the VMID now belongs to someone else: never mutate it.
 
-    Uncertain reads (timeout/403/500/transport) RAISE PveUnavailable — they
-    are NOT absence and NEVER authorize a mutation.
+    Uncertain reads (timeout/403/500/transport) RAISE BrokerUnavailable —
+    they are NOT absence and NEVER authorize a mutation.
     """
     node = r.get("node") or get_settings().proxmox_node
-    cfg = proxmox.lookup_config(node, int(r["vmid"]))   # raises when uncertain
+    cfg = broker.lookup_config(node, int(r["vmid"]))   # raises when uncertain
     if cfg is None:
         return "absent", "PVE confirms the resource does not exist"
     return _classify_identity(cfg, r, session_id)
 
 
-def _destroy_owned(db: Session, session_id, dep: Deployment, proxmox) -> dict:
+def _destroy_owned(db: Session, session_id, dep: Deployment, broker) -> dict:
     """Destroy every still-owned resource of ONE deployment with a positive
     ownership check BEFORE any mutation (audit N01/N02):
 
@@ -795,8 +799,8 @@ def _destroy_owned(db: Session, session_id, dep: Deployment, proxmox) -> dict:
             continue
         node = r.get("node") or get_settings().proxmox_node
         try:
-            verdict, why = _verify_ownership(proxmox, r, session_id)
-        except PveUnavailable as e:
+            verdict, why = _verify_ownership(broker, r, session_id)
+        except BrokerUnavailable as e:
             # UNCERTAIN: keep the resource owned, keep the lease, tell the truth
             failed.append({"vmid": r["vmid"], "name": r.get("name"),
                            "error": f"identity read unavailable: {e}"[:300]})
@@ -809,19 +813,24 @@ def _destroy_owned(db: Session, session_id, dep: Deployment, proxmox) -> dict:
         if verdict == "absent":
             r["state"] = "removed"
             removed.append(r.get("name"))
+            broker.disown(node, int(r["vmid"]), session_id=session_id,
+                          reason="confirmed-absent before teardown")
             _log(db, session_id, "teardown_already_absent", r.get("host"),
                  {"vmid": r["vmid"], "note": "confirmed absent — no delete issued"})
         elif verdict == "foreign":
             # positively NOT ours (VMID reused): disown so a later recycling
             # can never delete it either.
             r["state"] = "foreign_released"
+            broker.disown(node, int(r["vmid"]), session_id=session_id,
+                          reason=f"foreign identity: {why}"[:300])
             skipped.append({"vmid": r["vmid"], "name": r.get("name"), "why": why})
             _log(db, session_id, "teardown_skipped_foreign", r.get("host"),
                  {"vmid": r["vmid"], "reason": why})
         else:
             try:
-                outcome = proxmox.destroy_and_wait(node, int(r["vmid"]))
-            except (PveUnavailable, ProxmoxError) as e:
+                outcome = broker.destroy_and_wait(node, int(r["vmid"]),
+                                                  session_id=session_id)
+            except BrokerError as e:
                 r["state"] = "destroy_failed"
                 failed.append({"vmid": r["vmid"], "name": r.get("name"),
                                "error": str(e)[:300]})
@@ -838,7 +847,7 @@ def _destroy_owned(db: Session, session_id, dep: Deployment, proxmox) -> dict:
     return {"removed": removed, "failed": failed, "skipped": skipped}
 
 
-def teardown(db: Session, session_id, scenario_id: str, proxmox) -> dict:
+def teardown(db: Session, session_id, scenario_id: str, broker) -> dict:
     """Remove THIS session's owned resources — every deployment that still
     owns something, not just the newest (audit R07/R08). A deployment is
     marked torn_down ONLY when nothing failed; partial failure keeps the
@@ -853,7 +862,7 @@ def teardown(db: Session, session_id, scenario_id: str, proxmox) -> dict:
                 "complete": True, "note": "no deployment recorded for this session — nothing to remove"}
     removed, failed, skipped = [], [], []
     for dep in deps:
-        res = _destroy_owned(db, session_id, dep, proxmox)
+        res = _destroy_owned(db, session_id, dep, broker)
         removed += res["removed"]
         failed += res["failed"]
         skipped += res["skipped"]
@@ -882,15 +891,15 @@ def teardown(db: Session, session_id, scenario_id: str, proxmox) -> dict:
     return out
 
 
-def reset(db: Session, session_id, scenario_id: str, proxmox) -> dict:
+def reset(db: Session, session_id, scenario_id: str, broker) -> dict:
     """Destroy owned resources and redeploy fresh clones. Requires the lease
     (audit R07: a historical session must not reset over another's range)."""
     acquire_lease(db, session_id)
-    t = teardown(db, session_id, scenario_id, proxmox)
+    t = teardown(db, session_id, scenario_id, broker)
     if not t.get("complete", True):
         raise RuntimeError("teardown incomplete — refusing to redeploy over resources "
                            f"that could not be destroyed: {t.get('failed')}")
-    d = deploy(db, session_id, scenario_id, proxmox, resume=False)
+    d = deploy(db, session_id, scenario_id, broker, resume=False)
     d["action"] = "reset"
     d["removed"] = t["removed"]
     return d

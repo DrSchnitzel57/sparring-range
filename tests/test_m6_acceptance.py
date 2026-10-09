@@ -43,13 +43,17 @@ def _free_port() -> int:
 @pytest.fixture()
 def live_api(migrated_db, test_db_url_owner, tmp_path, monkeypatch):
     """Real uvicorn on a free port; doubles injected into the in-process app."""
-    from infra.proxmox_client import FakePVEHttp, ProxmoxClient
+    from infra.proxmox_client import FakePVEHttp
     httpd = FakePVEHttp()
     for vmid in (9001, 9002, 9003, 9004):
         httpd.vms[vmid] = {"name": f"tpl{vmid}", "template": vmid, "status": "stopped"}
     from tests.conftest import wipe_data
     wipe_data(test_db_url_owner)
-    deps.set_proxmox(ProxmoxClient(api=httpd))
+    from infra.broker.testing import make_broker_over, policy_from_settings
+    from srplatform.settings import get_settings as _get_settings
+    _broker, _broker_service = make_broker_over(
+        httpd, policy=policy_from_settings(_get_settings()))
+    deps.set_broker(_broker)
     set_supervisor(Supervisor(datapath=NoopDatapath(),
                               state_file=str(tmp_path / "safety.json")))
 
@@ -57,6 +61,7 @@ def live_api(migrated_db, test_db_url_owner, tmp_path, monkeypatch):
     monkeypatch.setenv("RECORDINGS_DIR", str(tmp_path / "rec"))
     monkeypatch.setenv("SAFETY_STATE_FILE", str(tmp_path / "safety.json"))
     monkeypatch.setenv("RUNNER_TRANSPORT", "local-dev")
+    monkeypatch.setenv("ALLOW_LOCAL_DEV_FIXTURE", "1")
     get_settings.cache_clear()
 
     port = _free_port()
@@ -74,7 +79,7 @@ def live_api(migrated_db, test_db_url_owner, tmp_path, monkeypatch):
     yield base
     server.should_exit = True
     t.join(timeout=10)
-    deps.set_proxmox(None)
+    deps.set_broker(None)
     set_coach_llm(None)
     verification_service.set_verifier_exec(None)
     get_settings.cache_clear()

@@ -79,10 +79,15 @@ def probes_attest_isolation(probes: dict) -> tuple[bool, list[str]]:
 class Supervisor:
     def __init__(self, datapath: DatapathController | None = None,
                  settings: Settings | None = None,
-                 state_file: str | None = None):
+                 state_file: str | None = None,
+                 broker=None):
         self.settings = settings or get_settings()
         self.datapath = datapath if datapath is not None else get_datapath(self.settings)
         self.state_file = Path(state_file or self.settings.safety_state_file)
+        # milestone 02: independent VM cessation authority (BrokerClient).
+        # Set by the app at startup; None in unit tests means the layer is
+        # reported as NOT CONFIGURED — never silently "ok".
+        self.broker = broker
         self._mirror_dh = None  # test hook: shared dict mirroring DB records
         self._records_reader = None  # test hook: callable -> DB record dicts
 
@@ -347,24 +352,52 @@ class Supervisor:
         except Exception as e:  # noqa: BLE001
             datapath = {"ok": False, "detail": f"datapath controller raised: {e}", "mechanism": "unknown"}
 
+        # (c) milestone 02: INDEPENDENT VM cessation through the broker —
+        # hard-stops every owned attacker/target VM (latch-first, read-back
+        # confirmed, obligations retained on failure). Attempted regardless
+        # of how (a) and (b) went.
+        if self.broker is None:
+            broker_stop = {"ok": True, "configured": False,
+                           "detail": "no broker configured (unit/dev scope)"}
+        else:
+            try:
+                report = self.broker.hard_stop_all(f"killswitch: {reason}")
+                failed = report.get("failed") or []
+                broker_stop = {"ok": not failed, "configured": True,
+                               "detail": f"{len(report.get('stopped', []))} stopped, "
+                                         f"{len(report.get('already-stopped', []))} already "
+                                         f"stopped, {len(report.get('absent', []))} absent, "
+                                         f"{len(failed)} UNCONFIRMED",
+                               "report": report}
+            except Exception as e:  # noqa: BLE001 — must not block reporting
+                broker_stop = {"ok": False, "configured": True,
+                               "detail": f"broker cessation failed: {e} — the "
+                                         "control-lease watchdog must stop the range"}
+
         # the LATCH ITSELF failing to persist durably (file) is a layer failure;
         # a DB-mirror-only failure is exposed as a warning, not a false "partial"
-        full_ok = workers["ok"] and datapath["ok"] and not file_err
-        self.record("engage", full_ok, {"workers": workers, "datapath": datapath, "reason": reason,
+        full_ok = workers["ok"] and datapath["ok"] and broker_stop["ok"] and not file_err
+        self.record("engage", full_ok, {"workers": workers, "datapath": datapath,
+                                        "broker": broker_stop, "reason": reason,
                                         **({"state_persistence": persist_err} if persist_err else {})})
         result = {
             "killswitch": "engaged" if full_ok else "engaged-partial",
             "latched": True,
             "workers": workers,
             "datapath": datapath,
+            "broker": broker_stop,
             "actions": [f"{r['run_id']}: {r['detail']}" for r in workers["results"]]
-                       + [f"datapath: {datapath['detail']}"],
+                       + [f"datapath: {datapath['detail']}",
+                          f"broker: {broker_stop['detail']}"],
         }
         if persist_err:
             result["state_persistence_error"] = persist_err
         if not full_ok:
             result["warning"] = ("PARTIAL engagement — at least one layer failed. "
                                  + (f"LATCH PERSISTENCE PROBLEM: {persist_err}. " if persist_err else "")
+                                 + (f"Broker cessation incomplete ({broker_stop['detail']}) — "
+                                    "VMs may still be running; check brokerctl status. "
+                                    if not broker_stop["ok"] else "")
                                  + ("Worker termination failed; network IS severed." if datapath["ok"] else
                                     "Datapath drop FAILED — range traffic may still flow; "
                                     "run infra/firewall/killswitch.sh on the Proxmox host NOW."))
@@ -408,7 +441,11 @@ class Supervisor:
         if t == "local-dev":
             if s.sr_env == "production":
                 return False, "local-dev runner forbidden in production"
-            return True, "local-dev runner (dev mode only — NOT isolated)"
+            if not s.allow_local_dev_fixture:
+                return False, ("local-dev runner is fixture-only (isolated synthetic "
+                               "acceptance fixtures; ALLOW_LOCAL_DEV_FIXTURE=1) — "
+                               "normal development uses the isolated runner")
+            return True, "local-dev runner (isolated fixture only — NOT isolated)"
         return False, f"unknown runner transport '{t}'"
 
     def start_gate(self) -> tuple[bool, list[str]]:

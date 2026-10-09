@@ -51,6 +51,23 @@ class Settings(BaseSettings):
     proxmox_insecure_lab_override: bool = False  # explicit, loud, dev-only
     proxmox_task_timeout_s: int = 300
 
+    # --- Broker (milestone 02): the ONLY component holding PVE authority ----
+    # Controller (API) side: mutual-TLS client material + broker URL. The
+    # controller must NOT hold PVE credentials in production — the broker
+    # does, and only the broker imports infra/proxmox_client.py.
+    broker_url: str | None = None            # https://broker:8443
+    broker_tls_ca_file: str | None = None    # broker CA (verifies server)
+    broker_client_cert: str | None = None    # API's client cert (mutual TLS)
+    broker_client_key: str | None = None
+    broker_heartbeat_s: int = 5              # control-lease renewal cadence
+    # Broker role only (SR_PROCESS_ROLE=broker):
+    broker_policy_file: str | None = None    # operator allowlist (required)
+    broker_ledger_path: str = "var/broker/ledger.sqlite3"
+    broker_listen_host: str = "127.0.0.1"
+    broker_listen_port: int = 8443
+    broker_server_cert: str | None = None
+    broker_server_key: str | None = None
+
     # --- Range network (control-plane-side view) ---
     range_bridge: str = "vmbr1"
     range_vlan: int = 66
@@ -119,7 +136,11 @@ class Settings(BaseSettings):
     # --- Safety (F02/F03) ---
     safety_state_file: str = "./.safety_state"
     safety_evidence_max_age_h: int = 24
-    datapath_controller: str = "nft"      # nft | noop(dev/test only)
+    datapath_controller: str = "static"     # static | noop(dev/test only)
+    # The local-dev runner transport is a FIXTURE-ONLY convenience (isolated
+    # synthetic acceptance fixtures, explicit opt-in). Normal development and
+    # production use the isolated SSH runner; production always refuses.
+    allow_local_dev_fixture: bool = False
     killswitch_script: str = "infra/firewall/killswitch.sh"  # operator-run standalone (runbook)
     nft_bin: str = "nft"
     # privileged command prefix for nft operations (e.g. "sudo -n")
@@ -141,10 +162,12 @@ class Settings(BaseSettings):
 
 
 def process_role() -> str:
-    """Which component this process is (controller | worker). The worker is
-    spawned by the API with SR_PROCESS_ROLE=worker and a SERIALIZED, minimal
-    environment — it must not need, and must not silently load, controller
-    configuration (audit N04)."""
+    """Which component this process is (controller | worker | broker). The
+    worker is spawned by the API with SR_PROCESS_ROLE=worker and a SERIALIZED,
+    minimal environment — it must not need, and must not silently load,
+    controller configuration (audit N04). The broker (milestone 02) is the
+    ONLY role that may hold PVE credentials; it validates its own policy/TLS
+    material instead of the controller's."""
     return os.environ.get("SR_PROCESS_ROLE", "controller")
 
 
@@ -167,12 +190,52 @@ def validate_production(s: Settings, role: str = "controller") -> None:
             raise RuntimeError("production WORKER config invalid:\n  - "
                                + "\n  - ".join(problems))
         return
-    if not s.proxmox_token_id or s.proxmox_token_secret in ("", "CHANGE_ME"):
-        problems.append("Proxmox API token missing")
+    if role == "broker":
+        # Milestone 02: the broker validates ITS OWN boundary — policy,
+        # mutual-TLS server material, PVE token, ledger location. It never
+        # needs bastion pins, verifier keys, or the app owner DB.
+        if not s.broker_policy_file:
+            problems.append("broker_policy_file missing (the broker refuses to "
+                            "start without an operator allowlist)")
+        for name, val in (("broker_server_cert", s.broker_server_cert),
+                          ("broker_server_key", s.broker_server_key),
+                          ("broker_tls_ca_file", s.broker_tls_ca_file)):
+            if not val:
+                problems.append(f"{name} missing (mutual TLS is the broker's "
+                                "authentication)")
+        if not s.proxmox_token_id or s.proxmox_token_secret in ("", "CHANGE_ME"):
+            problems.append("Proxmox API token missing (broker is the only "
+                            "PVE authority)")
+        if s.proxmox_insecure_lab_override:
+            problems.append("proxmox_insecure_lab_override must be false in production")
+        if not s.proxmox_tls_ca_file:
+            problems.append("proxmox_tls_ca_file must be configured in production")
+        if problems:
+            raise RuntimeError("production BROKER config invalid:\n  - "
+                               + "\n  - ".join(problems))
+        return
+    if role != "controller":
+        raise RuntimeError(f"unknown SR_PROCESS_ROLE {role!r}")
+    # Controller (API): PVE credentials are BROKER-ONLY (milestone 02).
+    if s.proxmox_token_id or s.proxmox_token_secret not in ("", "CHANGE_ME"):
+        problems.append("Proxmox credentials on the controller are forbidden — "
+                        "the broker holds the only PVE token")
     if s.proxmox_insecure_lab_override:
-        problems.append("proxmox_insecure_lab_override must be false in production")
-    if not s.proxmox_tls_ca_file:
-        problems.append("proxmox_tls_ca_file must be configured (or TLS via system CA) in production")
+        problems.append("proxmox_insecure_lab_override must be false in production "
+                        "(and PVE TLS is the broker's concern anyway)")
+    if not s.broker_url:
+        problems.append("broker_url missing (the API reaches the deployment "
+                        "boundary only through the broker)")
+    for name, val in (("broker_client_cert", s.broker_client_cert),
+                      ("broker_client_key", s.broker_client_key),
+                      ("broker_tls_ca_file", s.broker_tls_ca_file)):
+        if not val:
+            problems.append(f"{name} missing (mutual TLS to the broker)")
+    if s.runner_transport == "local-dev":
+        problems.append("local-dev runner forbidden in production")
+    if s.datapath_controller == "nft":
+        problems.append("runtime nft datapath removed — isolation is "
+                        "operator-managed static (datapath_controller=static)")
     if s.runner_transport != "ssh" or not s.runner_ssh_target or not s.runner_ssh_known_hosts:
         problems.append("isolated runner not configured (runner_transport=ssh + fixed target + pinned known_hosts)")
     if "CHANGE_ME" in s.postgres_url + s.postgres_url_owner:

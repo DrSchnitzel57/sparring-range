@@ -307,11 +307,13 @@ def _prod_env(monkeypatch):
     """A production config that PASSES validate_production (the review's
     reproduction) while the management channel stays unavailable: pins are
     merely NON-EMPTY (validation does not require existence — the T06 gap)
-    and the verifier key is missing."""
+    and the verifier key is missing. Milestone 02 contract: the controller
+    presents broker mutual-TLS material and NO PVE credentials."""
     monkeypatch.setenv("SR_ENV", "production")
-    monkeypatch.setenv("PROXMOX_TOKEN_ID", "sparring@pve!token")
-    monkeypatch.setenv("PROXMOX_TOKEN_SECRET", "s3cret")
-    monkeypatch.setenv("PROXMOX_TLS_CA_FILE", "/etc/ssl/certs/ca-certificates.crt")
+    monkeypatch.setenv("BROKER_URL", "https://broker.lab:8443")
+    monkeypatch.setenv("BROKER_CLIENT_CERT", "/etc/sr/broker-client.pem")
+    monkeypatch.setenv("BROKER_CLIENT_KEY", "/etc/sr/broker-client.key")
+    monkeypatch.setenv("BROKER_TLS_CA_FILE", "/etc/sr/broker-ca.pem")
     monkeypatch.setenv("RUNNER_TRANSPORT", "ssh")
     monkeypatch.setenv("RUNNER_SSH_TARGET", "runner.internal")
     monkeypatch.setenv("RUNNER_SSH_KNOWN_HOSTS", "/etc/sr/runner-known-hosts")
@@ -323,10 +325,11 @@ def _prod_env(monkeypatch):
 
 
 def _clear_prod(monkeypatch):
-    for k in ("SR_ENV", "PROXMOX_TOKEN_ID", "PROXMOX_TOKEN_SECRET",
-              "PROXMOX_TLS_CA_FILE", "RUNNER_TRANSPORT", "RUNNER_SSH_TARGET",
-              "RUNNER_SSH_KNOWN_HOSTS", "BASTION_TARGETS_KNOWN_HOSTS",
-              "VERIFIER_SSH_KNOWN_HOSTS", "VERIFIER_SSH_KEY_PATH"):
+    for k in ("SR_ENV", "BROKER_URL", "BROKER_CLIENT_CERT", "BROKER_CLIENT_KEY",
+              "BROKER_TLS_CA_FILE",
+              "RUNNER_TRANSPORT", "RUNNER_SSH_TARGET", "RUNNER_SSH_KNOWN_HOSTS",
+              "BASTION_TARGETS_KNOWN_HOSTS", "VERIFIER_SSH_KNOWN_HOSTS",
+              "VERIFIER_SSH_KEY_PATH"):
         monkeypatch.delenv(k, raising=False)
     from srplatform.settings import get_settings
     get_settings.cache_clear()

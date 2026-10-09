@@ -168,7 +168,7 @@ def test_r11_spool_byte_bounds_and_atomic_trim(tmp_path):
 # =========================================================================== #
 
 def test_r06_clone_posts_documented_newid_and_fake_rejects_unknowns():
-    from infra.proxmox_client import FakePVEHttp, ProxmoxClient
+    from infra.proxmox_client import FakePVEHttp, ProxmoxClient  # adapter-level test
 
     http = FakePVEHttp()
     http.vms[9001] = {"name": "tpl", "template": 9001, "status": "stopped"}
@@ -242,6 +242,7 @@ def test_r04_release_invalidates_previously_valid_evidence(migrated_db,
                                                            tmp_path, monkeypatch):
     monkeypatch.setenv("SR_ENV", "dev")
     monkeypatch.setenv("RUNNER_TRANSPORT", "local-dev")
+    monkeypatch.setenv("ALLOW_LOCAL_DEV_FIXTURE", "1")
     from srplatform.settings import get_settings
     get_settings.cache_clear()
     try:
@@ -332,7 +333,7 @@ import time; time.sleep(120)
 
 def test_r03_worker_sigterm_kills_the_command_group(tmp_path):
     pidfile = tmp_path / "cmd.pid"
-    env = {**os.environ, "SR_ENV": "dev", "RUNNER_TRANSPORT": "local-dev",
+    env = {**os.environ, "SR_ENV": "dev", "RUNNER_TRANSPORT": "local-dev", "ALLOW_LOCAL_DEV_FIXTURE": "1",
            "PYTHONPATH": str(REPO)}
     proc = subprocess.Popen([PY, "-c", _WORKER_TERM_SCRIPT, str(pidfile)],
                             cwd=REPO, env=env, start_new_session=True)
@@ -1217,7 +1218,7 @@ def test_r01_real_worker_end_to_end_over_http(migrated_db, test_db_url_owner, tm
     import httpx
     import uvicorn
 
-    from infra.proxmox_client import FakePVEHttp, ProxmoxClient
+    from infra.proxmox_client import FakePVEHttp
     from srplatform import verification_service
     from srplatform.api import deps
     from srplatform.api.app import app
@@ -1230,12 +1231,17 @@ def test_r01_real_worker_end_to_end_over_http(migrated_db, test_db_url_owner, tm
     for vmid in (9001, 9002, 9003, 9004):
         httpd.vms[vmid] = {"name": f"tpl{vmid}", "template": vmid, "status": "stopped"}
     wipe_data(test_db_url_owner)
-    deps.set_proxmox(ProxmoxClient(api=httpd))
+    from infra.broker.testing import make_broker_over, policy_from_settings
+    from srplatform.settings import get_settings as _get_settings
+    _broker, _broker_service = make_broker_over(
+        httpd, policy=policy_from_settings(_get_settings()))
+    deps.set_broker(_broker)
 
     monkeypatch.setenv("SR_ENV", "dev")
     monkeypatch.setenv("RECORDINGS_DIR", str(tmp_path / "rec"))
     monkeypatch.setenv("SAFETY_STATE_FILE", str(tmp_path / "safety.json"))
     monkeypatch.setenv("RUNNER_TRANSPORT", "local-dev")
+    monkeypatch.setenv("ALLOW_LOCAL_DEV_FIXTURE", "1")
     get_settings.cache_clear()
     sup = Supervisor(datapath=NoopDatapath(), state_file=str(tmp_path / "s.json"))
     sup.initialize_state(reason="test fixture initialization")
@@ -1307,7 +1313,7 @@ def test_r01_real_worker_end_to_end_over_http(migrated_db, test_db_url_owner, tm
     finally:
         server.should_exit = True
         fake_model.stop()
-        deps.set_proxmox(None)
+        deps.set_broker(None)
         set_supervisor(None)
         verification_service.set_verifier_exec(None)
         get_settings.cache_clear()
@@ -1331,13 +1337,17 @@ def test_r02_bastion_token_login_binds_owner_key(migrated_db, test_db_url_owner,
     from srplatform.safety.datapath import NoopDatapath
     from srplatform.settings import get_settings
     from tests.conftest import wipe_data
-    from infra.proxmox_client import FakePVEHttp, ProxmoxClient
+    from infra.proxmox_client import FakePVEHttp
 
     httpd = FakePVEHttp()
     for vmid in (9001, 9002, 9003, 9004):
         httpd.vms[vmid] = {"name": f"tpl{vmid}", "template": vmid, "status": "stopped"}
     wipe_data(test_db_url_owner)
-    deps.set_proxmox(ProxmoxClient(api=httpd))
+    from infra.broker.testing import make_broker_over, policy_from_settings
+    from srplatform.settings import get_settings as _get_settings
+    _broker, _broker_service = make_broker_over(
+        httpd, policy=policy_from_settings(_get_settings()))
+    deps.set_broker(_broker)
 
     # operator-provisioned member keys (the PRODUCTION keys file, not an override)
     key_blue = asyncssh.generate_private_key("ssh-ed25519")
@@ -1415,7 +1425,7 @@ def test_r02_bastion_token_login_binds_owner_key(migrated_db, test_db_url_owner,
         assert asyncio.run(srv.validate_public_key("blue", key_blue)) is True
     finally:
         server.should_exit = True
-        deps.set_proxmox(None)
+        deps.set_broker(None)
         set_supervisor(None)
         get_settings.cache_clear()
 

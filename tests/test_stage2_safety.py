@@ -30,6 +30,7 @@ def test_runner_output_bound_is_enforced_streaming(monkeypatch, tmp_path):
     the reader keeps at most max_bytes and the result is bounded."""
     monkeypatch.setenv("SR_ENV", "dev")
     monkeypatch.setenv("RUNNER_TRANSPORT", "local-dev")
+    monkeypatch.setenv("ALLOW_LOCAL_DEV_FIXTURE", "1")
     monkeypatch.setenv("RUNNER_MAX_OUTPUT_BYTES", "4096")
     from srplatform import settings as s
     s.get_settings.cache_clear()
@@ -62,7 +63,7 @@ print("DONE", flush=True)
 """
     proc = subprocess.Popen([PY, "-c", script], stdout=subprocess.PIPE, text=True,
                             env={**os.environ, "SR_ENV": "dev",
-                                 "RUNNER_TRANSPORT": "local-dev"})
+                                 "RUNNER_TRANSPORT": "local-dev", "ALLOW_LOCAL_DEV_FIXTURE": "1"})
     out, _ = proc.communicate(timeout=30)
     assert "DONE" in out
     pid = int(pidfile.read_text().strip())
@@ -121,7 +122,7 @@ r.run("sh -c 'echo $$ > {pidfile}; exec sleep 300'")
 """
     worker = subprocess.Popen([PY, "-c", script], start_new_session=True,
                               env={**os.environ, "SR_ENV": "dev",
-                                   "RUNNER_TRANSPORT": "local-dev"})
+                                   "RUNNER_TRANSPORT": "local-dev", "ALLOW_LOCAL_DEV_FIXTURE": "1"})
     for _ in range(100):
         if pidfile.exists() and pidfile.read_text().strip():
             break
@@ -223,6 +224,7 @@ def test_record_persistence_failure_denies_start(tmp_path, monkeypatch):
     records that cannot reach any durable store cannot authorize a run."""
     monkeypatch.setenv("SR_ENV", "dev")
     monkeypatch.setenv("RUNNER_TRANSPORT", "local-dev")
+    monkeypatch.setenv("ALLOW_LOCAL_DEV_FIXTURE", "1")
     from srplatform import settings as s
     s.get_settings.cache_clear()
     try:

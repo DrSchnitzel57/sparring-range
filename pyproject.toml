@@ -48,6 +48,8 @@ testpaths = ["tests"]
 #   db          real disposable PostgreSQL (SR_PG_ADMIN_URL/SR_PG_ADMIN_CMD)
 #   containment real cgroup v2 delegation + namespace boundary (runner supervisor)
 #   packet      real nft/netns packet semantics, disposable namespaces only
+#   authority   broker boundary/durability/cessation (infrastructure-free:
+#               real policy+ledger+mutual-TLS over loopback, no PVE/PG needed)
 #   adapter     production-adapter contract tests against simulated transports
 #   browser     end-to-end browser tests (opt-in; also needs db)
 #   live        operator live-infrastructure acceptance gate (never automatic)
@@ -55,8 +57,9 @@ markers = [
     "db: requires a real (disposable) PostgreSQL — explicit admin via SR_PG_ADMIN_URL/SR_PG_ADMIN_CMD",
     "containment: requires a delegated cgroup v2 root and working unshare namespaces",
     "packet: requires root + nft + iproute2 (rules only inside disposable netns)",
+    "authority: broker private-boundary acceptance (policy, ledger, mTLS, cessation)",
     "adapter: production-adapter contract tests against simulated transports",
     "browser: end-to-end browser tests (opt-in)",
     "live: operator live-infrastructure acceptance gate (never automatic)",
 ]
-addopts = "-m 'not db and not containment and not packet and not browser and not live'"
+addopts = "-m 'not db and not containment and not packet and not authority and not browser and not live'"

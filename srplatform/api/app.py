@@ -367,7 +367,7 @@ def launch_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
     authenticate → claim → reserve (lease) → validate → deploy → issue per-host
     connection capabilities → ready."""
     from srplatform.scenario_engine import orchestrator
-    from srplatform.api.deps import get_proxmox
+    from srplatform.api.deps import get_broker
 
     sess = db.get(SessionModel, session_id)
     if sess is None:
@@ -390,7 +390,7 @@ def launch_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
             raise HTTPException(409, {"error": "range_busy", "holder_session": e.holder_session_id,
                                       "acquired_at": e.acquired_at})
         try:
-            result = orchestrator.deploy(db, sess.session_id, sess.scenario_id, get_proxmox())
+            result = orchestrator.deploy(db, sess.session_id, sess.scenario_id, get_broker())
         except orchestrator.ForeignResourceError as e:
             raise HTTPException(409, {"error": "foreign_resource", "detail": str(e)[:500]})
 
@@ -580,13 +580,13 @@ def get_score(session_id: uuid.UUID, p: Principal = Depends(any_member),
 
 def _teardown_common(db, sess, p):
     from srplatform.scenario_engine import orchestrator
-    from srplatform.api.deps import get_proxmox
+    from srplatform.api.deps import get_broker
     # WORKER FIRST (audit N03): machines and the lease are released only after
     # the session's worker is confirmed stopped — otherwise a later session
     # could acquire the same static addresses while the old worker still
     # operates against them.
     _stop_active_run_or_conflict(db, sess)
-    t = orchestrator.teardown(db, sess.session_id, sess.scenario_id, get_proxmox())
+    t = orchestrator.teardown(db, sess.session_id, sess.scenario_id, get_broker())
     # capabilities die with their machines (audit N03 lifecycle policy)
     _revoke_session_capabilities(db, sess.session_id, "teardown")
     # release the reservation ONLY on a COMPLETE teardown (audit R07): failed
@@ -624,7 +624,7 @@ def teardown_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
 def reset_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
                   db: DbSession = None):
     from srplatform.scenario_engine import orchestrator
-    from srplatform.api.deps import get_proxmox
+    from srplatform.api.deps import get_broker
     sess = _get_session(db, p, session_id)
     try:
         _claim_owner = orchestrator.claim_operation(db, sess.session_id, "reset")
@@ -638,7 +638,7 @@ def reset_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
         _revoke_session_capabilities(db, sess.session_id, "reset")
         try:
             # orchestrator.reset ACQUIRES/VERIFIES the global lease first (R07)
-            out = orchestrator.reset(db, sess.session_id, sess.scenario_id, get_proxmox())
+            out = orchestrator.reset(db, sess.session_id, sess.scenario_id, get_broker())
         except orchestrator.LeaseConflict as e:
             raise HTTPException(409, {"error": "range_busy", "holder_session": e.holder_session_id})
         except RuntimeError as e:
@@ -681,7 +681,7 @@ class DeployIn(BaseModel):
 def deploy_scenario(scenario_id: str, body: DeployIn, p: Principal = Depends(any_member),
                     db: DbSession = None):
     from srplatform.scenario_engine import orchestrator
-    from srplatform.api.deps import get_proxmox
+    from srplatform.api.deps import get_broker
     sess = _get_session(db, p, body.session_id)
     # the legacy route must not become a side door: URL scenario == session
     # scenario, no deployment under a terminal session, same claim/lease
@@ -702,7 +702,7 @@ def deploy_scenario(scenario_id: str, body: DeployIn, p: Principal = Depends(any
             orchestrator.acquire_lease(db, sess.session_id)
         except orchestrator.LeaseConflict as e:
             raise HTTPException(409, {"error": "range_busy", "holder_session": e.holder_session_id})
-        out = orchestrator.deploy(db, sess.session_id, scenario_id, get_proxmox())
+        out = orchestrator.deploy(db, sess.session_id, scenario_id, get_broker())
         _ok = True
         return out
     finally:
@@ -1495,5 +1495,27 @@ def _startup():
         from srplatform.scenario_engine import orchestrator
         with db() as s:
             orchestrator.clear_operation_claims(s)
+    except Exception:
+        pass
+    # milestone 02: wire the independent broker cessation layer into the
+    # supervisor, and run the control-lease heartbeat when a real broker is
+    # configured (the broker's own watchdog stops the range if we die).
+    try:
+        from srplatform.api import deps
+        from srplatform.safety import get_supervisor
+        from srplatform.settings import get_settings
+        sup = get_supervisor()
+        if sup.broker is None:
+            try:
+                sup.broker = deps.get_broker()
+            except Exception:
+                pass  # unconfigured broker: readiness reports it; killswitch
+                # still latches + reports the layer honestly
+        s = get_settings()
+        if s.broker_url and sup.broker is not None:
+            from srplatform.safety.lease import ControlHeartbeat
+            hb = ControlHeartbeat(sup.broker, interval_s=s.broker_heartbeat_s)
+            hb.start()
+            app.state.control_heartbeat = hb
     except Exception:
         pass

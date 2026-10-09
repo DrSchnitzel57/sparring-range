@@ -215,6 +215,7 @@ def test_ssh_exec_refuses_unpinned_channels(tmp_path, monkeypatch):
 
     monkeypatch.setenv("SR_ENV", "dev")
     monkeypatch.setenv("RUNNER_TRANSPORT", "local-dev")
+    monkeypatch.setenv("ALLOW_LOCAL_DEV_FIXTURE", "1")
     st.get_settings.cache_clear()
     s0 = st.get_settings()
     try:

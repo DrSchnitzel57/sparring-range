@@ -59,6 +59,7 @@ REQUIRED_LAYER_ENV = {
     "db": "SR_REQUIRE_DB",
     "containment": "SR_REQUIRE_CONTAINMENT",
     "packet": "SR_REQUIRE_PACKET",
+    "authority": "SR_REQUIRE_AUTHORITY",
     "browser": "SR_REQUIRE_BROWSER",
     "live": "SR_REQUIRE_LIVE",
 }
@@ -236,7 +237,7 @@ def _reset_singletons() -> None:
         pass
     try:
         from srplatform.api import deps
-        deps.set_proxmox(None)
+        deps.set_broker(None)
     except Exception:
         pass
     try:
@@ -264,7 +265,8 @@ def env_dirs(migrated_db, tmp_path, monkeypatch):
     monkeypatch.setenv("SR_ENV", "dev")
     monkeypatch.setenv("SAFETY_STATE_FILE", str(tmp_path / "safety_state.json"))
     monkeypatch.setenv("RECORDINGS_DIR", str(tmp_path / "recordings"))
-    monkeypatch.setenv("RUNNER_TRANSPORT", "local-dev")   # dev mode only; prod rejects this
+    monkeypatch.setenv("RUNNER_TRANSPORT", "local-dev")   # fixture-only transport
+    monkeypatch.setenv("ALLOW_LOCAL_DEV_FIXTURE", "1")  # isolated fixtures only
     monkeypatch.setenv("API_BASE_URL", "http://127.0.0.1:1")  # nothing listens: accidental
     #                                              # outbound calls fail fast & loudly
     monkeypatch.setenv("MODEL_API_KEY", "")
@@ -277,7 +279,9 @@ def env_dirs(migrated_db, tmp_path, monkeypatch):
 @pytest.fixture()
 def fake_pve(env_dirs):
     """ProxmoxClient over FakePVEHttp: the REAL client code (verbs, UPID
-    polling) against a fake HTTP boundary, with the scenario templates present."""
+    polling) against a fake HTTP boundary, with the scenario templates present.
+    This is the PVE-boundary double BELOW the broker; tests inspect it via
+    fake_pve.api (FakePVEHttp)."""
     from infra.proxmox_client import FakePVEHttp, ProxmoxClient
 
     http = FakePVEHttp()
@@ -285,6 +289,21 @@ def fake_pve(env_dirs):
                        (9004, "tpl-db")):
         http.vms[vmid] = {"name": name, "template": vmid, "status": "stopped"}
     return ProxmoxClient(api=http)
+
+
+@pytest.fixture()
+def fake_broker(env_dirs, fake_pve, tmp_path):
+    """Real BrokerService (policy + SQLite ledger + typed ops) over the
+    fake_pve boundary — the milestone-02 deployment authority the API uses."""
+    from types import SimpleNamespace
+
+    from infra.broker.testing import make_broker_over, policy_from_settings
+    from srplatform.settings import get_settings
+
+    client, service = make_broker_over(
+        fake_pve.api, policy=policy_from_settings(get_settings()),
+        ledger_path=tmp_path / "broker-ledger.sqlite3")
+    return SimpleNamespace(client=client, service=service, http=fake_pve.api)
 
 
 def wipe_data(db_url_owner: str) -> None:
@@ -302,8 +321,8 @@ def wipe_data(db_url_owner: str) -> None:
 
 
 @pytest.fixture()
-def client(env_dirs, clean_singletons, fake_pve, test_db_url_owner):
-    """TestClient with supervisor(noop datapath)/proxmox doubles injected.
+def client(env_dirs, clean_singletons, fake_broker, test_db_url_owner):
+    """TestClient with supervisor(noop datapath)/broker doubles injected.
     Dev mode: evidence gate relaxed (documented), latch+runner gates LIVE."""
     from fastapi.testclient import TestClient
 
@@ -312,7 +331,7 @@ def client(env_dirs, clean_singletons, fake_pve, test_db_url_owner):
     from srplatform.safety.datapath import NoopDatapath
 
     wipe_data(test_db_url_owner)
-    deps.set_proxmox(fake_pve)
+    deps.set_broker(fake_broker.client)
     sup = Supervisor(datapath=NoopDatapath(),
                      state_file=str(env_dirs / "safety_state.json"))
     # audit N07: missing state is LOST state, not a healthy fresh store —

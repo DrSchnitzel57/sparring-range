@@ -696,7 +696,7 @@ def test_t01_worker_signal_handler_reports_unconfirmed_cancellation(tmp_path):
         "print('ready', flush=True)\n"
         "os.kill(os.getpid(), signal.SIGTERM)\n"
         "import time; time.sleep(5)\n")
-    env = {**os.environ, "SR_ENV": "dev", "RUNNER_TRANSPORT": "local-dev"}
+    env = {**os.environ, "SR_ENV": "dev", "RUNNER_TRANSPORT": "local-dev", "ALLOW_LOCAL_DEV_FIXTURE": "1"}
     p = subprocess.Popen([PY, str(script)], stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, env=env, text=True)
     out, err = p.communicate(timeout=20)

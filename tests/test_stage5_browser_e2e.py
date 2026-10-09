@@ -212,7 +212,7 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
     import uvicorn
     from sqlalchemy import create_engine, text
 
-    from infra.proxmox_client import FakePVEHttp, ProxmoxClient
+    from infra.proxmox_client import FakePVEHttp
     from srplatform import settings as st
     from srplatform import verification_service
     from srplatform.api import deps
@@ -230,6 +230,7 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
     model = SlowFakeModel(delay=0.05)
     monkeypatch.setenv("SR_ENV", "dev")
     monkeypatch.setenv("RUNNER_TRANSPORT", "local-dev")
+    monkeypatch.setenv("ALLOW_LOCAL_DEV_FIXTURE", "1")
     monkeypatch.setenv("LLM_BASE_URL", f"http://127.0.0.1:{model.port}/v1")
     monkeypatch.setenv("LLM_API_KEY", "fake")
     monkeypatch.setenv("SAFETY_STATE_FILE", str(tmp_path / "safety.json"))
@@ -242,7 +243,11 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
     for vmid in (9001, 9002, 9003, 9004):
         httpd.vms[vmid] = {"name": f"tpl{vmid}", "template": vmid, "status": "stopped"}
     wipe_data(test_db_url_owner)
-    deps.set_proxmox(ProxmoxClient(api=httpd))
+    from infra.broker.testing import make_broker_over, policy_from_settings
+    from srplatform.settings import get_settings as _get_settings
+    _broker, _broker_service = make_broker_over(
+        httpd, policy=policy_from_settings(_get_settings()))
+    deps.set_broker(_broker)
     sup = Supervisor(datapath=FakeDatapath(), state_file=str(tmp_path / "s.json"))
     sup.initialize_state(reason="browser e2e first install")
     set_supervisor(sup)

@@ -483,8 +483,47 @@ def _rules_equivalent(actual: str, expected: str) -> bool:
     return toks(actual) == toks(expected)
 
 
+class StaticIsolationDatapath:
+    """Milestone 02 runtime datapath: isolation is OPERATOR-MANAGED STATIC
+    (nft rulesets installed via the deployment boundary, verified by the
+    operator runbook and the packet acceptance layer). The application never
+    executes nft, root commands, SSH, or a shell against the host at runtime.
+
+    apply_emergency is therefore honest about what the runtime CAN do: the
+    static deny stays permanently loaded (nothing to apply), and real traffic
+    cessation happens by hard-stopping the owned VMs through the broker —
+    which the Supervisor attempts as its own independent layer.
+    """
+
+    mechanism = "static"
+
+    def baseline_status(self) -> dict:
+        return {"ok": None, "mechanism": "static",
+                "detail": "operator-managed static isolation — the runtime does "
+                          "not inspect or modify the host firewall; verify via "
+                          "the operator runbook + packet acceptance layer"}
+
+    def apply_emergency(self) -> dict:
+        return {"ok": True, "mechanism": "static",
+                "detail": "static isolation is permanently loaded by the operator; "
+                          "runtime cessation is the broker VM hard-stop layer"}
+
+    def remove_emergency(self) -> dict:
+        return {"ok": True, "mechanism": "static",
+                "detail": "static isolation is never removed by the runtime"}
+
+
 def get_datapath(settings: Settings | None = None) -> DatapathController:
     s = settings or get_settings()
     if s.datapath_controller == "noop":
         return NoopDatapath()
-    return NftDatapath(s)
+    if s.datapath_controller == "static":
+        return StaticIsolationDatapath()
+    if s.datapath_controller == "nft":
+        raise RuntimeError(
+            "runtime nft datapath was REMOVED (milestone 02): the application "
+            "never executes host firewall commands. Isolation is operator-"
+            "managed static; cessation is the broker VM hard-stop. The nft "
+            "machinery remains for operator scripts and the packet acceptance "
+            "layer only (datapath_controller=static).")
+    raise RuntimeError(f"unknown datapath_controller {s.datapath_controller!r}")

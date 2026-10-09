@@ -16,8 +16,8 @@ clean exactly what they created.
 Usage:
     python infra/dev/acceptance.py <check>
 
-Checks: selection | python | db | containment | packet | frontend
-        | compose | browser
+Checks: selection | python | db | containment | authority | packet
+        | frontend | compose | browser
 """
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ import uuid
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 PY = sys.executable
-LAYERS = ("db", "containment", "packet", "browser", "live")
+LAYERS = ("db", "containment", "packet", "authority", "browser", "live")
 COUNT_RE = re.compile(r"(\d+) (passed|failed|errors?|skipped|deselected)")
 
 
@@ -94,7 +94,8 @@ def audit_vulnerabilities(stdout: str, returncode: int) -> dict:
 
 def env_summary(extra: dict | None = None) -> str:
     keys = ("SR_PG_ADMIN_URL", "SR_REQUIRE_DB", "SR_REQUIRE_CONTAINMENT",
-            "SR_REQUIRE_PACKET", "SR_REQUIRE_BROWSER", "RUNNER_CGROUP_ROOT",
+            "SR_REQUIRE_PACKET", "SR_REQUIRE_AUTHORITY", "SR_REQUIRE_BROWSER",
+            "RUNNER_CGROUP_ROOT",
             "SR_E2E_API_PORT", "SR_E2E_WEB_PORT", "SR_COMPOSE_PROJECT")
     env = {k: os.environ.get(k, "") for k in keys if os.environ.get(k)}
     if extra:
@@ -189,7 +190,7 @@ def check_selection() -> None:
         fail("fast default excludes every integration layer",
              f"{len(leaked)} integration tests in default selection, e.g. "
              f"{sorted(leaked)[:5]}")
-    for layer in ("db", "containment", "packet", "browser"):
+    for layer in ("db", "containment", "packet", "authority", "browser"):
         if not layer_ids[layer]:
             fail(f"layer {layer} non-empty", "layer selection is empty")
     ok("all tests classified",
@@ -973,12 +974,32 @@ def check_browser() -> None:
 
 
 # -------------------------------------------------------------------------- #
+# authority: broker private boundary, durability, cessation (infra-free)      #
+# -------------------------------------------------------------------------- #
+
+def check_authority() -> None:
+    # The authority layer needs no external service (real policy/ledger/mTLS
+    # over loopback), so required mode here mainly pins the selection itself:
+    # an empty selection or any skip is a failure, never acceptance.
+    r, counts = pytest_run(["-m", "authority"],
+                           env={"SR_REQUIRE_AUTHORITY": "1"}, timeout=1200)
+    if r.returncode != 0:
+        fail("authority regressions in required mode",
+             f"exit {r.returncode}, counts {counts}:\n{r.stdout[-6000:]}")
+    if not counts.get("passed"):
+        fail("authority layer non-empty", f"selection counts {counts}")
+    ok("broker boundary/durability/cessation regressions pass (required mode)",
+       f"{counts.get('passed', 0)} passed, {counts.get('skipped', 0)} skipped")
+
+
+# -------------------------------------------------------------------------- #
 
 CHECKS = {
     "selection": check_selection,
     "python": check_python,
     "db": check_db,
     "containment": check_containment,
+    "authority": check_authority,
     "packet": check_packet,
     "frontend": check_frontend,
     "compose": check_compose,

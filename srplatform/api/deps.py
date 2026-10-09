@@ -1,11 +1,15 @@
-"""Injectable dependencies for the API (proxmox connection, DB session).
+"""Injectable dependencies for the API (broker client, DB session).
 
-In prod: real proxmoxer wrapper (token from .env). In tests: FakeProxmox via
-set_proxmox(). The API process is the only thing that talks to Postgres, and the
-only thing that talks to Proxmox.
+In prod: mutual-TLS BrokerClient (client cert from .env). In tests and the
+isolated synthetic fixtures: set_broker(). The API process is the only thing
+that talks to Postgres, and it reaches the deployment boundary ONLY through
+the broker — it holds no PVE credentials and cannot construct PVE paths
+(milestone 02). There is no direct-PVE fallback to remove, because there is
+no longer any path to one from this process.
 """
 from __future__ import annotations
 
+import os
 from typing import Annotated
 
 from fastapi import Depends
@@ -35,33 +39,37 @@ def get_db():
 
 DbSession = Annotated[Session, Depends(get_db, scope="function")]
 
-_proxmox = None
+_broker = None
 
 
-def get_proxmox():
-    global _proxmox
-    if _proxmox is None:
-        import os
-
+def get_broker():
+    global _broker
+    if _broker is None:
         from srplatform.settings import get_settings
 
         s = get_settings()
-        if os.environ.get("SR_DEMO_FAKE_PROXMOX") == "1" and s.sr_env != "production":
-            # Explicit DEV-ONLY demo double (browser/dev without a PVE).
-            from infra.proxmox_client import FakePVEHttp, ProxmoxClient
+        if os.environ.get("SR_BROKER_FIXTURE") == "1" and s.sr_env != "production":
+            # Explicit FIXTURE-ONLY in-process broker over the synthetic PVE
+            # double (compose demo / browser acceptance). Never selectable
+            # in production; production requires BROKER_URL + client TLS.
+            from infra.broker.testing import make_fake_broker, policy_from_settings
 
-            http = FakePVEHttp()
-            for vmid in (9001, 9002, 9003, 9004):
-                http.vms[vmid] = {"name": f"tpl{vmid}", "template": vmid,
-                                  "status": "stopped"}
-            _proxmox = ProxmoxClient(api=http)
-            return _proxmox
-        from infra.proxmox_client import ProxmoxClient
+            _broker, _svc, _http = make_fake_broker(policy=policy_from_settings(s))
+            return _broker
+        if not s.broker_url:
+            from infra.broker.errors import BrokerUnavailable
 
-        _proxmox = ProxmoxClient()
-    return _proxmox
+            raise BrokerUnavailable(
+                "broker not configured (BROKER_URL + mutual-TLS client material "
+                "required) — the API has no direct Proxmox path")
+        from infra.broker.client import BrokerClient, HttpTransport
+
+        _broker = BrokerClient(HttpTransport(s.broker_url, s.broker_tls_ca_file,
+                                             s.broker_client_cert,
+                                             s.broker_client_key))
+    return _broker
 
 
-def set_proxmox(p) -> None:
-    global _proxmox
-    _proxmox = p
+def set_broker(b) -> None:
+    global _broker
+    _broker = b

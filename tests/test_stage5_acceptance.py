@@ -107,7 +107,7 @@ def test_hint_jumps_queued_red_turns_across_processes(migrated_db, test_db_url_o
     import httpx
     import uvicorn
 
-    from infra.proxmox_client import FakePVEHttp, ProxmoxClient
+    from infra.proxmox_client import FakePVEHttp
     from srplatform import settings as st
     from srplatform.api import deps
     from srplatform.api.app import app
@@ -127,7 +127,11 @@ def test_hint_jumps_queued_red_turns_across_processes(migrated_db, test_db_url_o
         httpd.vms[vmid] = {"name": f"tpl{vmid}", "template": vmid, "status": "stopped"}
     from tests.conftest import wipe_data
     wipe_data(test_db_url_owner)
-    deps.set_proxmox(ProxmoxClient(api=httpd))
+    from infra.broker.testing import make_broker_over, policy_from_settings
+    from srplatform.settings import get_settings as _get_settings
+    _broker, _broker_service = make_broker_over(
+        httpd, policy=policy_from_settings(_get_settings()))
+    deps.set_broker(_broker)
 
     port = _free_port()
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port,
@@ -214,7 +218,7 @@ print("ALL-DONE", flush=True)
     finally:
         server.should_exit = True
         model.stop()
-        deps.set_proxmox(None)
+        deps.set_broker(None)
         set_model_gateway(None)
         st.get_settings.cache_clear()
 
