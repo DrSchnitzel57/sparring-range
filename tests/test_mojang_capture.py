@@ -412,7 +412,8 @@ def test_capture_end_to_end_to_synthetic_api(capture_overlay):
             timeout_s=600)
         markers = rec["markers"]
         assert "SR-GUEST-UNIT-ACTIVE-PASS" in markers, markers
-        assert "SR-GUEST-SPOOL-NONEMPTY-PASS" in markers, markers
+        assert "SR-GUEST-CURSOR-EXISTS-PASS" in markers, markers
+        assert "SR-GUEST-AUDITD-CAPTURED-PASS" in markers, markers
         assert not [m for m in markers if "-FAIL:" in m], markers
     finally:
         srv.shutdown()

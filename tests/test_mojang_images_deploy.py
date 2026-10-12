@@ -143,11 +143,10 @@ def test_images_seed_iso_builds_offline_and_parses():
         reader = pycdlib.PyCdlib()
         reader.open(str(iso))
         try:
-            assert reader.vol_ident.strip() == "CIDATA"
+            assert bytes(reader.pvd.volume_identifier).decode().strip() == "CIDATA"
             for rr, want in (("user-data", "hostname: x"), ("meta-data", "iid-1")):
-                out = reader.get_file_from_iso(iso_path=f"/{rr.upper()}.;1",
-                                               rr_path=rr)
-                assert want in out.read().decode(), rr
+                with reader.open_file_from_iso(rr_path="/" + rr) as f:
+                    assert want in f.read().decode(), rr
         finally:
             reader.close()
     # Bounds stay enforced without QEMU present.

@@ -34,6 +34,17 @@ SUPERSET_PACKAGES = ["nginx", "mysql-server", "auditd", "openssh-server",
                      "python3-pymysql", "ufw", "curl"]
 
 
+def manifest_packages(repo_root: pathlib.Path) -> list[str]:
+    """Exact pinned `name=version` install set from the manifest (single
+    source of truth; resolved from a real guest boot, re-pinned explicitly
+    when the archive drifts — never floated)."""
+    manifest = json.loads((pathlib.Path(repo_root) / "infra/images/manifest.json"
+                           ).read_text())
+    pins = manifest["packages"]
+    assert all("=" in p for p in pins), f"pins must be exact: {pins}"
+    return list(pins)
+
+
 def inputs_hash(repo_root: pathlib.Path) -> str:
     h = hashlib.sha256()
     repo = pathlib.Path(repo_root)
@@ -91,7 +102,8 @@ def build_overlay(*, repo_root: pathlib.Path, run_dir: pathlib.Path,
     seeds = json.loads((pathlib.Path(repo_root) / "scenarios/mojang-seeds.json"
                         ).read_text())
     payload = guest_userdata.payload_from_repo(str(repo_root), role, seeds)
-    user_data = guest_userdata.build_user_data(role, payload, SUPERSET_PACKAGES)
+    user_data = guest_userdata.build_user_data(
+        role, payload, manifest_packages(repo_root))
     seed_iso = guest_seed.build_seed_iso(
         run_dir / "build-seed.iso", user_data,
         guest_seed.meta_data(f"sr-build-{key[:8]}", f"sr-build-{role}"))

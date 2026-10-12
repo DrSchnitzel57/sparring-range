@@ -75,9 +75,11 @@ def _common_users() -> str:
 
 def build_user_data(role: str, payload: dict[str, str], packages: list[str]) -> str:
     """`payload`: guest-absolute path -> file text (from the repo payload
-    trees + seeds + shipper inputs). `packages`: apt package NAMES for the
-    build phase (pinned names; resolved versions are RECORDED into the
-    overlay at build time)."""
+    trees + seeds + shipper inputs). `packages`: EXACT pinned `name=version`
+    install set from the manifest — installed via apt in the build phase
+    (cloud-init's `packages:` cannot pin versions, so pins are installed
+    explicitly and fail closed on archive drift; resolved versions are
+    RECORDED into the overlay at build time)."""
     files = "".join(_write_file_entry(p, c,
                                       perms="0755" if p.endswith("mojang-maintenance") else "0644")
                     for p, c in sorted(payload.items()))
@@ -89,15 +91,15 @@ def build_user_data(role: str, payload: dict[str, str], packages: list[str]) -> 
                                "MOJANG_MYSQL_DB=mojang\n"
                                "MOJANG_MYSQL_USER=mojang_reader\n"
                                "MOJANG_DIAG_ENABLED=on\n")
-    pkg_list = "\n".join(f"  - {p}" for p in packages)
-    setup = "\n".join(f"  - {line}" for line in _build_runcmd(role, packages))
+    pins = " ".join(_shlex_quote(p) for p in packages)
+    setup = "\n".join(f"  - {line}" for line in
+                      [f"DEBIAN_FRONTEND=noninteractive apt-get install -y {pins}"]
+                      + _build_runcmd(role, [p.split('=')[0] for p in packages]))
     return f"""#cloud-config
 hostname: sr-build-{role}
 manage_etc_hosts: true
 package_update: true
 package_upgrade: false
-packages:
-{pkg_list}
 {_common_users()}
 write_files:
 {files}  - path: /srv/sr-build/role
@@ -106,6 +108,11 @@ write_files:
 runcmd:
 {setup}
 """
+
+
+def _shlex_quote(s: str) -> str:
+    import shlex
+    return shlex.quote(s)
 
 
 def _build_runcmd(role: str, packages: list[str]) -> list[str]:
@@ -298,7 +305,8 @@ chk UNIT-ACTIVE systemctl is-active --quiet sparring-shipper
 MARKER="SR-CAPTURE-{nonce[:12]}"
 /bin/true "$MARKER"
 sleep 10
-chk SPOOL-NONEMPTY bash -c 'test -s /var/lib/sparring-range/shipper/pending.ndjson'
+chk CURSOR-EXISTS bash -c 'test -s /var/lib/sparring-range/shipper/audit-cursor.json'
+chk AUDITD-CAPTURED bash -c 'grep -q "$MARKER" /var/log/audit/audit.log'
 echo "SR-GUEST-DONE rc=$fails" > {SERIAL}
 poweroff
 """)
