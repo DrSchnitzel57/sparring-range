@@ -701,8 +701,8 @@ Scope decisions (ambiguous points judged per plan intent, visible on review):
 | `.venv/bin/python infra/dev/acceptance.py authority` | **PASS**: **24 passed** (22 prior + FileRead/budget identity), 0 skipped |
 | `.venv/bin/python infra/dev/acceptance.py containment` | **PASS**: 21 passed, 0 skipped; no run-owned cgroups leaked |
 | `.venv/bin/python infra/dev/acceptance.py frontend` | **PASS**: `npm ci` + production build + `npm audit --omit=dev` 0 findings |
-| `.venv/bin/python infra/dev/acceptance.py images` | **FAIL here (prerequisite)**: no QEMU on this host — CI images job (QEMU + delegated cgroup + disposable DB) is the gate. Non-QEMU images tests: 14 passed locally via `-o addopts= -m images` (DB-backed subset 11 passed against disposable PG) |
-| `.venv/bin/python infra/dev/acceptance.py capture` | **FAIL here (prerequisite)**: no QEMU on this host — CI capture job is the gate. Non-QEMU capture tests: 9 passed locally (DB-backed subset verified) |
+| `.venv/bin/python infra/dev/acceptance.py images` | **PASS here (2026-10-12, operator-installed QEMU 10.0.13)**: **14 passed, 0 skipped, 304 deselected** incl. the real isolated QEMU boot (TCG, `-net none`, run-owned disk/serial, owned cleanup); disposable-DB subset included; gate time 5.5s |
+| `.venv/bin/python infra/dev/acceptance.py capture` | **PASS here (2026-10-12, QEMU 10.0.13)**: **9 passed, 0 skipped, 309 deselected** incl. the real isolated QEMU boot; disposable-DB subset included; gate time 6.8s |
 | `.venv/bin/python infra/dev/acceptance.py packet` | **FAIL here (prerequisite)**: missing root + `nft` — CI packet job is the gate (unchanged) |
 | `.venv/bin/python infra/dev/acceptance.py browser` | **FAIL here (prerequisite)**: no launchable Chromium — CI browser job is the gate (unchanged) |
 | `.venv/bin/python infra/dev/acceptance.py compose` | Not rerun here (no application change to the compose path); last green per milestone-02 evidence |
@@ -747,8 +747,8 @@ Delivered (addresses B07–B11 as software, acceptance pending):
   60-minute timeout) + `images`/`capture` markers (fast default excludes them).
 
 **Not claimed:** required CI green (13 jobs) at this revision — the two new
-jobs have never run on hosted runners from here; run them before ticking 03
-or 04. Live/operator gates (real PVE FileRead ACL, clone/storage/NIC,
+jobs have passed locally with operator-installed QEMU but never on hosted
+runners from here; run them before ticking 03 or 04. Live/operator gates (real PVE FileRead ACL, clone/storage/NIC,
 isolation/stop, installed-capture on R740, $0 budget check) remain explicitly
 open. The base-image SHA256 placeholder must be replaced with the published
 noble SHA256SUMS value at operator build time.
