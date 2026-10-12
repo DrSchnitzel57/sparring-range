@@ -746,12 +746,19 @@ Delivered (addresses B07–B11 as software, acceptance pending):
   `images`/`capture` CI jobs (QEMU install, userns profile, delegated cgroup,
   60-minute timeout) + `images`/`capture` markers (fast default excludes them).
 
-**Not claimed:** required CI green (13 jobs) at this revision — the two new
-jobs have passed locally with operator-installed QEMU but never on hosted
-runners from here; run them before ticking 03 or 04. Live/operator gates (real PVE FileRead ACL, clone/storage/NIC,
-isolation/stop, installed-capture on R740, $0 budget check) remain explicitly
-open. The base-image SHA256 placeholder must be replaced with the published
-noble SHA256SUMS value at operator build time.
+**Required CI: GREEN** —
+[run 38316796599](https://github.com/DrSchnitzel57/sparring-range/actions/runs/38316796599)
+at `1fd74b4` (branch `warm-narwhal`, 2026-10-12), conclusion `success`. All
+thirteen jobs `success` on the initial attempt: selection, python (3.11),
+python (3.12), python (3.13), db, containment, authority, packet, frontend,
+compose, browser-e2e, **images**, **capture**. The CI-only packet and browser
+gates pass on the hosted runners, and the two new QEMU gates pass there with
+apt-installed QEMU (TCG), the scoped userns profile, and the delegated cgroup
+— matching the local QEMU-10.0.13 results above. Software acceptance is
+complete; tick 03/04 in the roadmap. Live/operator gates (real PVE FileRead
+ACL, clone/storage/NIC, isolation/stop, installed-capture on R740, $0 budget
+check) remain explicitly open. The base-image SHA256 placeholder must be
+replaced with the published noble SHA256SUMS value at operator build time.
 
 ## Historical finding coverage retained
 

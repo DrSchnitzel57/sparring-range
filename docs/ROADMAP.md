@@ -121,7 +121,7 @@ authority; exact live ACL and isolation proof remains an explicit operator gate.
 
 ## 03 — Real Linux preset templates and owned deployment
 
-- [ ] Accept milestone 03.
+- [x] Accept milestone 03 (software acceptance 2026-10-12; live/operator gates stay open — see below).
 
 Paired 03+04 plan approved 2026-10-12 (linked above). Software work only;
 real PVE version/storage/ACL/isolation acceptance remains deferred operator work.
@@ -146,7 +146,7 @@ works without relying on unavailable reads as proof of absence.
 
 ## 04 — Installed telemetry, bastion access and durable recordings
 
-- [ ] Accept milestone 04.
+- [x] Accept milestone 04 (software acceptance 2026-10-12; live/operator gates stay open — see below).
 
 Paired with 03 under the approved exception, not absorbed into image-only acceptance.
 
