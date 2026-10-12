@@ -246,6 +246,50 @@ class ProxmoxClient:
         """Resource DELETE (the documented operation), returns UPID."""
         return self.delete(f"/nodes/{node}/qemu/{vmid}")
 
+    # --- typed guest-agent file read (paired 03+04, step 3) -------------------
+    # The ONLY guest-agent operation the release uses: read the fresh clone's
+    # PUBLIC SSH host key during initial provisioning. Fixed path, bounded
+    # response, ownership verified by the broker before AND after the read.
+    # No arbitrary paths, no guest exec, no host shell. Requires the scoped
+    # `VM.GuestAgent.FileRead` privilege on approved lab resources in
+    # production; broad `VM.Monitor` / `VM.GuestAgent.Unrestricted` fallback
+    # is forbidden and fails closed.
+    GUEST_HOST_KEY_PATH = "/etc/ssh/ssh_host_ed25519_key.pub"
+
+    def read_guest_file(self, node: str, vmid: int, path: str) -> str:
+        """Read ONE allowlisted guest-agent path. Returns the file content.
+
+        Only `GUEST_HOST_KEY_PATH` is representable; anything else raises
+        ProxmoxError before any HTTP call. Response must be a dict with a
+        `content` string that parses as a single-line `ssh-ed25519` public
+        key — anything else raises PveUnavailable (uncertain, retain).
+        """
+        if path != self.GUEST_HOST_KEY_PATH:
+            raise ProxmoxError(
+                f"guest-agent read refused: {path!r} is not the allowlisted "
+                f"host-key path {self.GUEST_HOST_KEY_PATH!r} (no arbitrary "
+                "paths, no exec, no host shell)")
+        import urllib.parse
+        query = urllib.parse.urlencode({"file": path})
+        try:
+            resp = self.get(f"/nodes/{node}/qemu/{vmid}/agent/file-read?{query}")
+        except Exception as e:  # noqa: BLE001 — classified uncertainty
+            raise classify_pve_error(e) from e
+        if not isinstance(resp, dict) or not isinstance(resp.get("content"), str):
+            raise PveUnavailable(
+                f"malformed guest-agent file-read response for vmid {vmid}: "
+                f"{resp!r}")
+        content = resp["content"].strip()
+        parts = content.split()
+        if len(parts) != 2 or parts[0] != "ssh-ed25519" or len(parts[1]) < 32:
+            raise PveUnavailable(
+                f"guest-agent host-key response for vmid {vmid} is not a "
+                "bounded ssh-ed25519 public key")
+        if len(content) > 1024 or "\n" in content:
+            raise PveUnavailable(
+                f"guest-agent host-key response for vmid {vmid} exceeds bounds")
+        return content
+
     # --- high-level sequences used by the orchestrator ---------------------------
     def clone_and_wait(self, node, template_vmid, new_vmid, name, full=False) -> None:
         upid = self.clone_template(node, template_vmid, new_vmid, name, full=full)
@@ -323,6 +367,33 @@ class FakePVEHttp:
     def get(self, path, **kw):
         self.requests.append(("GET", path, kw))
         self._maybe_fail(path)
+        if "/agent/file-read" in path:
+            # Typed guest-agent FileRead (paired 03+04, step 3): the fake
+            # models the documented GET /nodes/{node}/qemu/{vmid}/agent/
+            # file-read?file=... endpoint. ONLY the allowlisted host-key path
+            # is served; anything else is a 400 (like real PVE parameter
+            # validation). The key is FRESH per clone (VMID + name bound),
+            # modeling scrubbed-template + first-boot regeneration.
+            import hashlib
+            import urllib.parse
+            vmid = int(path.split("/qemu/")[1].split("/")[0])
+            v = self.vms.get(vmid)
+            if not v:
+                raise PveNotFound(f"no VM {vmid}")
+            qs = urllib.parse.urlparse(path).query
+            file_param = urllib.parse.parse_qs(qs).get("file", [""])[0]
+            if file_param != "/etc/ssh/ssh_host_ed25519_key.pub":
+                raise PveHttpError(400, f"file-read refused for {file_param!r}")
+            digest = hashlib.sha256(
+                f"{vmid}:{v.get('name', '')}".encode()).hexdigest()[:32]
+            # Synthetic but well-formed ed25519 public key body (base64-ish).
+            import base64
+            raw = hashlib.sha256(f"hostkey:{vmid}:{v.get('name', '')}".encode()).digest()
+            b64 = base64.b64encode(raw + raw).decode()[:68]
+            override = v.get("guest_host_key")
+            if override is not None:
+                return {"content": override}
+            return {"content": f"ssh-ed25519 {b64}"}
         if path.startswith("/cluster/resources"):
             return [{"vmid": vmid, "name": v["name"], "node": "fake", "type": "qemu",
                      "status": v["status"]} for vmid, v in self.vms.items()]
@@ -391,8 +462,21 @@ class FakePVEHttp:
                 raise PveHttpError(400, f"template {tpl} not found")
             # the clone only materializes when the task COMPLETES (async semantics)
             upid = self._new_upid(path)
-            self.tasks[upid]["_done_cb"] = lambda: self.vms.setdefault(
-                new, {"name": kw["name"], "template": tpl, "status": "stopped"})
+            def _finish_clone(new=new, kw=kw, tpl=tpl):
+                # Fresh clone identity: first-boot host keys are regenerated
+                # (the template's keys are scrubbed), so every clone gets a
+                # FRESH synthetic host key — never the template's, never reused.
+                import base64
+                import hashlib
+                import uuid as _uuid
+                raw = hashlib.sha256(
+                    f"hostkey:{new}:{kw['name']}:{_uuid.uuid4().hex}".encode()
+                ).digest()
+                fresh_key = "ssh-ed25519 " + base64.b64encode(raw + raw).decode()[:68]
+                self.vms.setdefault(
+                    new, {"name": kw["name"], "template": tpl, "status": "stopped",
+                          "guest_host_key": fresh_key})
+            self.tasks[upid]["_done_cb"] = _finish_clone
             return upid
         if path.endswith("/status/start"):
             vmid = int(path.split("/qemu/")[1].split("/")[0])

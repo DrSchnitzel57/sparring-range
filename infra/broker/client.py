@@ -110,6 +110,10 @@ class BrokerClient:
     def read_config(self, node, vmid):
         return self._call("read_config", node=node, vmid=int(vmid))
 
+    def read_host_key(self, node, vmid, session_id=None, generation=1):
+        return self._call("read_host_key", node=node, vmid=int(vmid),
+                          session_id=session_id, generation=str(generation))
+
     def vm_status(self, node, vmid):
         return self._call("vm_status", node=node, vmid=int(vmid))
 

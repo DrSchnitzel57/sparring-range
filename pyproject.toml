@@ -61,5 +61,7 @@ markers = [
     "adapter: production-adapter contract tests against simulated transports",
     "browser: end-to-end browser tests (opt-in)",
     "live: operator live-infrastructure acceptance gate (never automatic)",
+    "images: Mojang guest-image acceptance (paired 03+04 milestone 03; QEMU boot when available)",
+    "capture: installed telemetry/capture acceptance (paired 03+04 milestone 04; QEMU boot when available)",
 ]
-addopts = "-m 'not db and not containment and not packet and not authority and not browser and not live'"
+addopts = "-m 'not db and not containment and not packet and not authority and not browser and not live and not images and not capture'"

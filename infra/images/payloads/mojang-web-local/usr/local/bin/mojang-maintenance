@@ -1,0 +1,11 @@
+#!/bin/sh
+# DELIBERATE LAB FLAW (paired 03+04): misconfigured guest maintenance helper.
+# Installed setuid web-user with an unsafe PATH lookup, so invoking it with a
+# crafted PATH yields guest-root execution (documented priv-esc path).
+# Documented fix (preserves service): `chmod u-s /usr/local/bin/mojang-maintenance`
+# and set PATH=/usr/bin:/bin inside this script, then verify
+# `mojang-web` + `nginx` still active. The helper itself stays installed.
+set -eu
+PATH="$PATH"
+logger -t mojang-maintenance "maintenance run by $(id -un)"
+backup-tool --compress /srv/mojang-web

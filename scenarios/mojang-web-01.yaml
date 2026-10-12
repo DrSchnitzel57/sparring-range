@@ -1,0 +1,78 @@
+# Mojang web-local preset (paired 03+04, step 2): reproducible defendable guest.
+#
+# Topology: fresh disposable attacker + web tier with LOCAL fictional data
+# (no MySQL). The web tier serves three catalogue entries (Minecraft,
+# Minecraft Dungeons, Minecraft Legends) and twelve fixed fictional purchase
+# records from `scenarios/mojang-seeds.json` (seed_version 1).
+#
+# Documented lab vulnerabilities (reproducible, defender-repairable):
+# - Diagnostic flaw: the `/diagnostic?cmd=` endpoint runs a constrained
+#   command as the limited `web-user` account (network-entry foothold).
+#   Fix: disable the endpoint (`mojang_diag_enabled=off`) — service stays up.
+# - Maintenance helper: `/usr/local/bin/mojang-maintenance` is misconfigured
+#   (setuid web-user + unsafe PATH) and yields guest-root escalation.
+#   Fix: remove setuid + pin PATH (`chmod u-s`, `PATH=/usr/bin:/bin`) — service stays up.
+#
+# Start conditions: network-entry starts with NO target credentials;
+# assumed-breach starts with the disclosed limited `web-user` foothold only.
+# The defender account (`defender`, full guest sudo) is separate from the
+# trusted verifier/provisioning identity (separate keys, pinned management).
+#
+# Baselines (versioned): image_version noble-20261012, seed_version 1,
+# known_users, cron/static file lists. HTTP content checks observe served
+# behavior; raw MySQL disk hashes are never evidence (this preset has no DB).
+# Repairs must keep services ready (readiness re-proves nginx+mojang-web).
+id: mojang-web-01
+name: "Mojang web shop (local data)"
+difficulty: 2
+focus: [web, initial-access, priv-esc]
+est_minutes: 60
+techniques: [T1190, T1068, T1505.003]
+version: 2
+seed_version: 1
+image_version: noble-20261012
+topology:
+  hosts:
+    - name: attacker
+      template_vmid: 9005
+      ip: 10.66.0.9
+      services: [ssh]
+      os: linux
+    - name: web01
+      template_vmid: 9011
+      ip: 10.66.0.10
+      services: [http, mojang-web, ssh]
+      os: linux
+red:
+  start_phase: recon
+  objectives:
+    - id: foothold
+      phase: initial-access
+      description: "Execute as web-user through the documented diagnostic flaw"
+      verifier: flag_file_present
+      args: { host: web01, path: /tmp/mojang-diag-proof.txt,
+              expected_content: "DIAG{web-user}" }
+    - id: priv-esc
+      phase: priv-esc
+      description: "Escalate to guest root through the maintenance helper"
+      verifier: flag_file_present
+      args: { host: web01, path: /root/flag_priv_esc.txt,
+              expected_content: "FLAG{web01-root}" }
+    - id: persistence
+      phase: persistence
+      verifier: cron_persistence_present
+      args: { host: web01, baseline_files: [mojang-web-clean] }
+scoring:
+  blue_checks:
+    - { verifier: no_rogue_admin, host: web01, points: 10, domain: identify }
+    - { verifier: firewall_enabled, host: web01, points: 5, domain: protect }
+    - { verifier: rogue_account, host: web01, points: 10, domain: identify,
+        known_users: [root, defender, web-user, mysql, daemon, srshipper] }
+    - { verifier: http_content, host: web01, points: 15, domain: recover,
+        expected_text: "Minecraft Legends", path: / }
+    - { verifier: service_present, host: web01, points: 5, domain: recover,
+        service: mojang-web }
+    - { verifier: service_present, host: web01, points: 5, domain: recover,
+        service: nginx }
+    - { verifier: cron_persistence_present, host: web01, points: 10, domain: detect,
+        expect: absent, baseline_files: [mojang-web-clean] }

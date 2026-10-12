@@ -1,0 +1,73 @@
+# Mojang web+DB preset (paired 03+04, step 2): web tier + MySQL tier.
+#
+# Same catalogue/seeds/flaws as mojang-web-01, except the web app reads the
+# twelve fictional purchases from MySQL 8.0 through PyMySQL with a read-only
+# application role (SELECT-only). Logical integrity is checked with an
+# authenticated read-only SELECT (`mysql_rows`, exact count 12 + pinned buyer
+# text) — never a raw disk hash of `/var/lib/mysql/*`, which changes on
+# ordinary writes by design.
+id: mojang-web-db-01
+name: "Mojang web shop (MySQL)"
+difficulty: 3
+focus: [web, data, lateral, priv-esc]
+est_minutes: 90
+techniques: [T1190, T1068, T1005, T1505.003]
+version: 2
+seed_version: 1
+image_version: noble-20261012
+topology:
+  hosts:
+    - name: attacker
+      template_vmid: 9005
+      ip: 10.66.0.9
+      services: [ssh]
+      os: linux
+    - name: web01
+      template_vmid: 9011
+      ip: 10.66.0.10
+      services: [http, mojang-web, ssh]
+      os: linux
+    - name: db01
+      template_vmid: 9012
+      ip: 10.66.0.11
+      services: [mysql, ssh]
+      os: linux
+red:
+  start_phase: recon
+  objectives:
+    - id: foothold
+      phase: initial-access
+      description: "Execute as web-user through the documented diagnostic flaw"
+      verifier: flag_file_present
+      args: { host: web01, path: /tmp/mojang-diag-proof.txt,
+              expected_content: "DIAG{web-user}" }
+    - id: priv-esc
+      phase: priv-esc
+      description: "Escalate to guest root through the maintenance helper"
+      verifier: flag_file_present
+      args: { host: web01, path: /root/flag_priv_esc.txt,
+              expected_content: "FLAG{web01-root}" }
+    - id: loot
+      phase: objectives
+      description: "Stage exfiltrated customer rows on the web tier"
+      args: { host: web01, path: /tmp/exfil/loot,
+              expected_content: "buy-001" }
+      verifier: exfil_flag
+    - id: persistence
+      phase: persistence
+      verifier: cron_persistence_present
+      args: { host: web01, baseline_files: [mojang-web-clean] }
+scoring:
+  blue_checks:
+    - { verifier: no_rogue_admin, host: web01, points: 10, domain: identify }
+    - { verifier: firewall_enabled, host: web01, points: 5, domain: protect }
+    - { verifier: rogue_account, host: db01, points: 10, domain: identify,
+        known_users: [root, defender, mysql, daemon, srshipper] }
+    - { verifier: http_content, host: web01, points: 10, domain: recover,
+        expected_text: "Minecraft Legends", path: / }
+    - { verifier: mysql_rows, host: db01, points: 15, domain: recover,
+        table: purchases, expected_count: 12, expected_text: "buy-001" }
+    - { verifier: service_present, host: web01, points: 5, domain: recover,
+        service: mojang-web }
+    - { verifier: cron_persistence_present, host: web01, points: 10, domain: detect,
+        expect: absent, baseline_files: [mojang-web-clean] }

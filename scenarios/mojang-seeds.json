@@ -1,0 +1,95 @@
+{
+  "games": [
+    {
+      "description": "Block-building sandbox (fictional catalogue entry).",
+      "game_id": "minecraft",
+      "title": "Minecraft"
+    },
+    {
+      "description": "Dungeon-crawler spin-off (fictional catalogue entry).",
+      "game_id": "dungeons",
+      "title": "Minecraft Dungeons"
+    },
+    {
+      "description": "Strategy spin-off (fictional catalogue entry).",
+      "game_id": "legends",
+      "title": "Minecraft Legends"
+    }
+  ],
+  "note": "All business data is fictional and fixed. The seed artifact defines exact IDs/rows/prices; probes check logical content, never live MySQL disk hashes.",
+  "purchases": [
+    {
+      "buyer": "blue-alex",
+      "game_id": "minecraft",
+      "price_cents": 2695,
+      "purchase_id": "buy-001"
+    },
+    {
+      "buyer": "blue-sam",
+      "game_id": "minecraft",
+      "price_cents": 2695,
+      "purchase_id": "buy-002"
+    },
+    {
+      "buyer": "blue-alex",
+      "game_id": "dungeons",
+      "price_cents": 1999,
+      "purchase_id": "buy-003"
+    },
+    {
+      "buyer": "blue-jules",
+      "game_id": "dungeons",
+      "price_cents": 1999,
+      "purchase_id": "buy-004"
+    },
+    {
+      "buyer": "blue-sam",
+      "game_id": "legends",
+      "price_cents": 3999,
+      "purchase_id": "buy-005"
+    },
+    {
+      "buyer": "blue-riley",
+      "game_id": "legends",
+      "price_cents": 3999,
+      "purchase_id": "buy-006"
+    },
+    {
+      "buyer": "blue-alex",
+      "game_id": "minecraft",
+      "price_cents": 1499,
+      "purchase_id": "buy-007"
+    },
+    {
+      "buyer": "blue-jules",
+      "game_id": "minecraft",
+      "price_cents": 1499,
+      "purchase_id": "buy-008"
+    },
+    {
+      "buyer": "blue-riley",
+      "game_id": "dungeons",
+      "price_cents": 999,
+      "purchase_id": "buy-009"
+    },
+    {
+      "buyer": "blue-sam",
+      "game_id": "dungeons",
+      "price_cents": 999,
+      "purchase_id": "buy-010"
+    },
+    {
+      "buyer": "blue-jules",
+      "game_id": "legends",
+      "price_cents": 599,
+      "purchase_id": "buy-011"
+    },
+    {
+      "buyer": "blue-riley",
+      "game_id": "legends",
+      "price_cents": 599,
+      "purchase_id": "buy-012"
+    }
+  ],
+  "seed_version": 1
+}

@@ -115,12 +115,19 @@ class Settings(BaseSettings):
     # --- Deploy (M1) ---
     proxmox_node: str = "r740"
     deploy_vmid_base: int = 210
+    # Explicit clone mode (paired 03+04, step 4): operator policy selects
+    # "linked" or "full" — no silent fallback. The broker validates the mode.
+    deploy_clone_mode: str = "linked"
 
     # --- Golden image templates ---
     template_vmid_web: int = 9001
     template_vmid_win_dc: int = 9002
     template_vmid_win10: int = 9003
     template_vmid_linux: int = 9004
+    # Paired 03+04 Mojang guests (new IDs; legacy snapshots preserved).
+    template_vmid_attacker: int = 9005
+    template_vmid_mojang_web: int = 9011
+    template_vmid_mojang_db: int = 9012
 
     # --- LLM serving (OpenAI-compatible; swappable per Part 6.1) ---
     llm_base_url: str = "http://localhost:8001/v1"

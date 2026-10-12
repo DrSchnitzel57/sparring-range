@@ -1,0 +1,50 @@
+# cloud-init for mojang-web-local (paired 03+04, steps 1/6).
+#
+# Ubuntu 24.04 guest: nginx + local Python catalogue app + sshd + auditd +
+# srshipper + ufw. Defender (`defender`, full guest sudo) is separate from the
+# trusted provisioning/verifier identity (separate pinned keys — never shared
+# with the attacker). Bake ONLY public keys; scrub secrets/logs/spools/host
+# keys/machine IDs; no runtime package fetching.
+hostname: mojang-web-local
+manage_etc_hosts: true
+
+users:
+  - name: defender
+    groups: [sudo]
+    shell: /bin/bash
+    ssh_authorized_keys: []
+  - name: web-user
+    shell: /usr/sbin/nologin
+    ssh_authorized_keys: []
+  - name: srshipper
+    system: true
+    groups: [adm]
+    shell: /usr/sbin/nologin
+
+package_update: false
+package_upgrade: false
+
+write_files:
+  - path: /etc/sparring-range/role
+    content: "mojang-web-local\n"
+  - path: /etc/sparring-range/shipper.conf
+    content: |
+      INGEST_URL=http://CHANGEME-control-plane:8000/ingest/auditd
+      HOST_TAG=web01
+  - path: /etc/mojang-web/config.env
+    content: |
+      MOJANG_DATA_BACKEND=local
+      MOJANG_SEED_PATH=/srv/mojang-web/seeds.json
+      MOJANG_DIAG_ENABLED=on
+  - path: /etc/sudoers.d/90-defender
+    content: "defender ALL=(ALL) NOPASSWD:ALL\n"
+
+runcmd:
+  - systemctl enable --now auditd
+  - systemctl enable --now sparring-shipper
+  - systemctl enable --now nginx
+  - systemctl enable --now mojang-web
+  - systemctl enable --now ssh
+  - ufw --force enable
+  - ufw allow 22/tcp
+  - ufw allow 80/tcp

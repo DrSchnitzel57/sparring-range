@@ -1,0 +1,14 @@
+[Unit]
+Description=Mojang fictional shop (local data)
+After=network.target
+
+[Service]
+User=web-user
+Group=web-user
+EnvironmentFile=/etc/mojang-web/config.env
+ExecStart=/usr/bin/python3 /srv/mojang-web/app.py
+Restart=always
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

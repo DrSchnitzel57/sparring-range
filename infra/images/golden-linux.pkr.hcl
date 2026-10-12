@@ -1,3 +1,8 @@
+# RETIRED (paired 03+04, 2026-10-12): Packer is NOT the release build path.
+# The supported path is `python infra/images/build.py` from the pinned inputs
+# in `infra/images/manifest.json` (+ `infra/images/README.md`). This file
+# remains for history only; release builds must not use it.
+#
 # Packer config for the Linux golden image (OPTIONAL per plan). The supported,
 # primary path remains manual: import a stock Ubuntu cloud image once (VMID
 > 9000), boot it, run telemetry/install.sh + provision-linux-golden.sh, then

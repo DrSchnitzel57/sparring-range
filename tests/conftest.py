@@ -62,6 +62,8 @@ REQUIRED_LAYER_ENV = {
     "authority": "SR_REQUIRE_AUTHORITY",
     "browser": "SR_REQUIRE_BROWSER",
     "live": "SR_REQUIRE_LIVE",
+    "images": "SR_REQUIRE_IMAGES",
+    "capture": "SR_REQUIRE_CAPTURE",
 }
 
 

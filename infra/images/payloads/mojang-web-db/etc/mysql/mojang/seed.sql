@@ -1,0 +1,13 @@
+USE mojang;
+INSERT INTO purchases (purchase_id, game_id, buyer, price_cents) VALUES ('buy-001', 'minecraft', 'blue-alex', 2695) ON DUPLICATE KEY UPDATE game_id=VALUES(game_id), buyer=VALUES(buyer), price_cents=VALUES(price_cents);
+INSERT INTO purchases (purchase_id, game_id, buyer, price_cents) VALUES ('buy-002', 'minecraft', 'blue-sam', 2695) ON DUPLICATE KEY UPDATE game_id=VALUES(game_id), buyer=VALUES(buyer), price_cents=VALUES(price_cents);
+INSERT INTO purchases (purchase_id, game_id, buyer, price_cents) VALUES ('buy-003', 'dungeons', 'blue-alex', 1999) ON DUPLICATE KEY UPDATE game_id=VALUES(game_id), buyer=VALUES(buyer), price_cents=VALUES(price_cents);
+INSERT INTO purchases (purchase_id, game_id, buyer, price_cents) VALUES ('buy-004', 'dungeons', 'blue-jules', 1999) ON DUPLICATE KEY UPDATE game_id=VALUES(game_id), buyer=VALUES(buyer), price_cents=VALUES(price_cents);
+INSERT INTO purchases (purchase_id, game_id, buyer, price_cents) VALUES ('buy-005', 'legends', 'blue-sam', 3999) ON DUPLICATE KEY UPDATE game_id=VALUES(game_id), buyer=VALUES(buyer), price_cents=VALUES(price_cents);
+INSERT INTO purchases (purchase_id, game_id, buyer, price_cents) VALUES ('buy-006', 'legends', 'blue-riley', 3999) ON DUPLICATE KEY UPDATE game_id=VALUES(game_id), buyer=VALUES(buyer), price_cents=VALUES(price_cents);
+INSERT INTO purchases (purchase_id, game_id, buyer, price_cents) VALUES ('buy-007', 'minecraft', 'blue-alex', 1499) ON DUPLICATE KEY UPDATE game_id=VALUES(game_id), buyer=VALUES(buyer), price_cents=VALUES(price_cents);
+INSERT INTO purchases (purchase_id, game_id, buyer, price_cents) VALUES ('buy-008', 'minecraft', 'blue-jules', 1499) ON DUPLICATE KEY UPDATE game_id=VALUES(game_id), buyer=VALUES(buyer), price_cents=VALUES(price_cents);
+INSERT INTO purchases (purchase_id, game_id, buyer, price_cents) VALUES ('buy-009', 'dungeons', 'blue-riley', 999) ON DUPLICATE KEY UPDATE game_id=VALUES(game_id), buyer=VALUES(buyer), price_cents=VALUES(price_cents);
+INSERT INTO purchases (purchase_id, game_id, buyer, price_cents) VALUES ('buy-010', 'dungeons', 'blue-sam', 999) ON DUPLICATE KEY UPDATE game_id=VALUES(game_id), buyer=VALUES(buyer), price_cents=VALUES(price_cents);
+INSERT INTO purchases (purchase_id, game_id, buyer, price_cents) VALUES ('buy-011', 'legends', 'blue-jules', 599) ON DUPLICATE KEY UPDATE game_id=VALUES(game_id), buyer=VALUES(buyer), price_cents=VALUES(price_cents);
+INSERT INTO purchases (purchase_id, game_id, buyer, price_cents) VALUES ('buy-012', 'legends', 'blue-riley', 599) ON DUPLICATE KEY UPDATE game_id=VALUES(game_id), buyer=VALUES(buyer), price_cents=VALUES(price_cents);

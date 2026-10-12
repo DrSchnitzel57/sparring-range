@@ -1,0 +1,41 @@
+# cloud-init for the disposable attacker VM (paired 03+04, step 1/4).
+#
+# Fresh clone every session, fixed address 10.66.0.9, current pins. The
+# attacker carries NO target credentials in network-entry mode; assumed-breach
+# provisioning is an explicit disclosed web-user foothold, never silent.
+# Bake ONLY operator public keys here — never private keys/live tokens.
+# Host keys/machine IDs are FRESH per clone (scrubbed from the template,
+# regenerated on first boot); the broker pins the fresh ed25519 host key
+# through the PVE guest-agent FileRead channel (never keyscan/TOFU).
+hostname: attacker
+manage_etc_hosts: true
+
+users:
+  - name: attacker
+    groups: [sudo]
+    shell: /bin/bash
+    # Operator attacker-access PUBLIC key goes here at build time (empty in git).
+    ssh_authorized_keys: []
+  - name: defender
+    groups: [sudo]
+    shell: /bin/bash
+    ssh_authorized_keys: []
+
+package_update: false
+package_upgrade: false
+
+write_files:
+  - path: /etc/sparring-range/role
+    content: "attacker\n"
+  - path: /etc/sparring-range/scrub-machine-id.sh
+    content: |
+      #!/bin/sh
+      # Fresh clone identity: truncate machine-id so first boot regenerates it,
+      # remove host keys so sshd regenerates them, clear logs/spools.
+      set -eu
+      truncate -s 0 /etc/machine-id 2>/dev/null || true
+      rm -f /etc/ssh/ssh_host_* 2>/dev/null || true
+      rm -rf /var/log/sparring-range/* /var/lib/sparring-range/shipper/* 2>/dev/null || true
+
+runcmd:
+  - systemctl enable --now ssh

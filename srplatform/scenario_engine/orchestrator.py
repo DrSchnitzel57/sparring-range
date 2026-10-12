@@ -493,6 +493,67 @@ def _net_spec(s) -> str:
     return f"virtio,bridge={s.range_bridge},tag={s.range_vlan}"
 
 
+def _pin_host_key(broker, db: Session, session_id, dep: Deployment,
+                    res: dict, resources: list, node: str) -> None:
+    """Pin the fresh clone's public SSH host key through the broker's typed
+    guest-agent FileRead channel (paired 03+04, step 3/4). The pin binds the
+    current ownership/generation; fresh clone/reset generations pin fresh
+    keys. A same-generation change is refused by the broker (possible
+    compromise) and surfaces here as a visible deployment failure — the
+    resource stays owned and the lease is retained, never silently re-pinned.
+    """
+    read = getattr(broker, "read_host_key", None)
+    if read is None:
+        return  # pre-03+04 broker double in old unit tests — pins unenforced
+    key = read(node, int(res["vmid"]), session_id=session_id,
+               generation=str(dep.deployment_id))
+    res["host_key_ref"] = f"{key[:24]}…{key[-8:]}"
+    dep.resources = resources
+    flag_modified(dep, "resources")
+    _log(db, session_id, "host_key_pinned", res.get("host"),
+         {"vmid": res["vmid"], "key_ref": res["host_key_ref"]})
+
+
+def _reserve_guest_budgets(scenario_id: str, spec: dict) -> dict:
+    """Reserve/enforce guest + aggregate CPU/RAM/disk BEFORE any side effect
+    (paired 03+04, step 4). Mojang presets must use their pinned templates;
+    legacy snapshots are preserved but are NOT release-ready (their budgets
+    are checked generically, and readiness requires the mojang manifest).
+
+    Returns the aggregate reservation. Raises RuntimeError (no side effects
+    yet) when the topology exceeds the canonical range totals or references
+    an unknown template — the caller retains the lease and reports the truth.
+    """
+    try:
+        from infra.images import specs as _specs
+    except ImportError as e:  # pragma: no cover — repo layout guarantees this
+        raise RuntimeError(f"guest budget specs unavailable: {e}") from e
+    total = {"vcpus": 0, "memory_mb": 0, "disk_gb": 0}
+    for host in (spec.get("topology") or {}).get("hosts", []):
+        role = _specs.guest_for_template(int(host.get("template_vmid", 0)))
+        if role is None:
+            # Legacy template: generic per-guest ceiling (2 vCPU/2 GiB/16 GiB)
+            # so old scenarios keep deploying in tests, but they are not
+            # release evidence without manifests (plan step 2).
+            total["vcpus"] += 2
+            total["memory_mb"] += 2048
+            total["disk_gb"] += 16
+            continue
+        budget = _specs.check_guest_budget(role)
+        total["vcpus"] += budget["vcpus"]
+        total["memory_mb"] += budget["memory_mb"]
+        total["disk_gb"] += budget["disk_gb"]
+    # Canonical ceiling for the largest release preset (web+DB): exceeding it
+    # is a deployment refusal, never a silent resize.
+    ceiling = {"vcpus": 6, "memory_mb": 6144, "disk_gb": 44}
+    for k in ("vcpus", "memory_mb", "disk_gb"):
+        if total[k] > ceiling[k]:
+            raise RuntimeError(
+                f"guest budget reservation refused: {total} exceeds release "
+                f"ceiling {ceiling} for scenario {scenario_id!r}")
+    return total
+
+
 def _active_deployment(db: Session, session_id, scenario_id: str) -> Deployment | None:
     """Latest deployment for this session+scenario that still OWNS something
     (not torn_down) — the idempotency/resume anchor (audit R08)."""
@@ -528,6 +589,12 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
     else:
         spec = load_scenario(scenario_id)
     node = s.proxmox_node
+    # Paired 03+04, step 4: explicit clone mode (no silent fallback) +
+    # aggregate budget reservation BEFORE any side effect. Unknown retains
+    # obligations/lease; stale work is fenced by the claim/generation checks
+    # below (preserved from the R08/N01 paths).
+    clone_full = str(getattr(s, "deploy_clone_mode", "linked")).lower() == "full"
+    _reserve_guest_budgets(scenario_id, spec)
 
     dep = _active_deployment(db, session_id, scenario_id) if resume else None
     if dep is not None and dep.status == "ready":
@@ -605,7 +672,7 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
             exists = broker.lookup_vm(node, vmid)   # raises when uncertain
             if exists is None:
                 broker.clone_and_wait(node, int(host["template_vmid"]), vmid, name,
-                                       full=False, session_id=session_id,
+                                       full=clone_full, session_id=session_id,
                                        generation=str(dep.deployment_id))
             else:
                 # The VM exists at our intended VMID. Identity read failures
@@ -654,13 +721,14 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
                     broker.start_and_wait(node, vmid, session_id=session_id)
                     res.update({"state": "created", "ip": host["ip"], "node": node,
                                 "name": name})
+                    _pin_host_key(broker, db, session_id, dep, res, resources, node)
                     _enroll_host_telemetry(db, dep, res, resources, session_id,
                                            host["name"], host["ip"], s, enrollments)
                     created = [r for r in resources if r.get("state") == "created"]
                     dep.resources = resources
                     flag_modified(dep, "resources")
                     _log(db, session_id, "deploy", host["name"],
-                         {"vmid": vmid, "name": name, "linked": True, "net0": net0,
+                         {"vmid": vmid, "name": name, "clone_full": clone_full, "net0": net0,
                           "resumed": True})
                     db.commit()
                     continue
@@ -683,13 +751,14 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
                                    f"net0={net0!r} does not use bridge {s.range_bridge}")
             broker.start_and_wait(node, vmid, session_id=session_id)
             res.update({"state": "created", "ip": host["ip"], "node": node, "name": name})
+            _pin_host_key(broker, db, session_id, dep, res, resources, node)
             _enroll_host_telemetry(db, dep, res, resources, session_id,
                                    host["name"], host["ip"], s, enrollments)
             created = [r for r in resources if r.get("state") == "created"]
             dep.resources = resources
             flag_modified(dep, "resources")
             _log(db, session_id, "deploy", host["name"],
-                 {"vmid": vmid, "name": name, "linked": True, "net0": net0})
+                 {"vmid": vmid, "name": name, "clone_full": clone_full, "net0": net0})
             # OWNERSHIP COMMITTED PER RESOURCE: if a later host fails (or the
             # process dies), everything already created remains accounted for
             db.commit()

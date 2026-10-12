@@ -7,6 +7,7 @@ from verifiers.library.ccdc import (
     NoRogueAdmin, RogueAccount, FirewallEnabled, AvEnabled, ServicePresent,
     ScheduledTaskPresent, PersistenceRunKey, UnpatchedService, DataIntegrity, ExfilFlag,
 )
+from verifiers.library.mojang import HttpContent, MysqlRows
 
 REGISTRY: dict[str, Verifier] = {}
 
@@ -23,5 +24,6 @@ def get(verifier_id: str) -> Verifier:
 
 for _v in (FlagFilePresent(), CronPersistencePresent(), NoRogueAdmin(), RogueAccount(),
            FirewallEnabled(), AvEnabled(), ServicePresent(), ScheduledTaskPresent(),
-           PersistenceRunKey(), UnpatchedService(), DataIntegrity(), ExfilFlag()):
+           PersistenceRunKey(), UnpatchedService(), DataIntegrity(), ExfilFlag(),
+           HttpContent(), MysqlRows()):
     register(_v)

@@ -1,0 +1,52 @@
+# cloud-init for mojang-web-db (paired 03+04, steps 1/6).
+#
+# Same as mojang-web-local, plus MySQL 8.0 with the seeded fictional shop DB.
+# The app reads through PyMySQL as the read-only `mojang_reader` role
+# (SELECT-only); the DB administrator credential never leaves provisioning.
+hostname: mojang-web-db
+manage_etc_hosts: true
+
+users:
+  - name: defender
+    groups: [sudo]
+    shell: /bin/bash
+    ssh_authorized_keys: []
+  - name: web-user
+    shell: /usr/sbin/nologin
+    ssh_authorized_keys: []
+  - name: srshipper
+    system: true
+    groups: [adm]
+    shell: /usr/sbin/nologin
+
+package_update: false
+package_upgrade: false
+
+write_files:
+  - path: /etc/sparring-range/role
+    content: "mojang-web-db\n"
+  - path: /etc/sparring-range/shipper.conf
+    content: |
+      INGEST_URL=http://CHANGEME-control-plane:8000/ingest/auditd
+      HOST_TAG=db01
+  - path: /etc/mojang-web/config.env
+    content: |
+      MOJANG_DATA_BACKEND=mysql
+      MOJANG_MYSQL_HOST=127.0.0.1
+      MOJANG_MYSQL_DB=mojang
+      MOJANG_MYSQL_USER=mojang_reader
+      MOJANG_DIAG_ENABLED=on
+  - path: /etc/sudoers.d/90-defender
+    content: "defender ALL=(ALL) NOPASSWD:ALL\n"
+
+runcmd:
+  - systemctl enable --now auditd
+  - systemctl enable --now sparring-shipper
+  - systemctl enable --now mysql
+  - systemctl enable --now nginx
+  - systemctl enable --now mojang-web
+  - systemctl enable --now ssh
+  - ufw --force enable
+  - ufw allow 22/tcp
+  - ufw allow 80/tcp
+  - ufw allow 3306/tcp

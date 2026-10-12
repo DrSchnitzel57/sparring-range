@@ -258,6 +258,58 @@ jobs:
           .venv/bin/pip install --no-deps -e .
       - run: .venv/bin/python infra/dev/acceptance.py compose
 
+  images:
+    # Mojang guest-image acceptance (paired 03+04, milestone 03): pinned
+    # manifests, deterministic builds, services/seeds/flaws/fixes/readiness,
+    # clone modes/budgets/identity, FileRead pins, and a REAL isolated QEMU
+    # boot of an actual build artifact (TCG software emulation; KVM optional).
+    # Max 3 VMs / 6 GiB guest RAM / 60-minute job; run-owned disks/processes;
+    # no host shares, no general egress; synthetic API/DB/SSH (the gate starts
+    # its own disposable postgres:16). The boundary probe needs the same
+    # delegated-cgroup + userns-profile prerequisites as db/containment.
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13", cache: pip }
+      - run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.lock
+          .venv/bin/pip install --no-deps -e .
+      - run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 qemu-utils
+      - *userns-boundary
+      - *delegate-cgroup
+      - name: Run images unprivileged INSIDE the delegated subtree
+        run: |
+          sudo env "PATH=$PATH" "HOME=$HOME" \
+            infra/dev/run_in_cgroup.sh /sys/fs/cgroup/srrunner "$USER" \
+            .venv/bin/python infra/dev/acceptance.py images
+
+  capture:
+    # Installed capture/access acceptance (paired 03+04, milestone 04):
+    # installed auditd/srshipper, enrollment negatives/recovery, spool
+    # crash/outage/reboot/overflow, bastion casts/replay, and a REAL isolated
+    # QEMU boot. Same bounds/isolation/prerequisites as the images job.
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13", cache: pip }
+      - run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.lock
+          .venv/bin/pip install --no-deps -e .
+      - run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 qemu-utils
+      - *userns-boundary
+      - *delegate-cgroup
+      - name: Run capture unprivileged INSIDE the delegated subtree
+        run: |
+          sudo env "PATH=$PATH" "HOME=$HOME" \
+            infra/dev/run_in_cgroup.sh /sys/fs/cgroup/srrunner "$USER" \
+            .venv/bin/python infra/dev/acceptance.py capture
+
   browser-e2e:
     # Real Chromium drives the built web app against the real API + worker
     # (controlled PVE/model/runner/verifier/datapath) plus replay seek. The

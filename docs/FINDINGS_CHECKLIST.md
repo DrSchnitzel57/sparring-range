@@ -671,6 +671,88 @@ Windows/Sysmon/WEC remains unfinished later work (milestone 12), not a disguised
 first-release blocker or claimed implemented pipeline. More storage can be added;
 capacity must be discovered, not used to silently remove agreed scope.
 
+### Paired milestone-03/04 implementation evidence (2026-10-12)
+
+Implemented on branch `warm-narwhal` from clean `master` `cbaa3a0`
+(plan: `.openchamber/plans/03-04-linux-guests-capture.md`). No Proxmox, live
+range, host firewall, NAS or unrelated-VM access; every fixture is run-owned
+(synthetic keys/tokens, disposable Postgres, isolated QEMU run dirs).
+
+Scope decisions (ambiguous points judged per plan intent, visible on review):
+- Packer retired in place (`RETIRED` header; history preserved); the supported
+  path is `python infra/images/build.py` from `infra/images/manifest.json`.
+- Base-image SHA256 in the manifest is a pinned placeholder the builder treats
+  as operator-verified at build time (refuses mismatch/absence); the builder
+  itself never fetches (no network at build/test time).
+- QEMU "boot" is a real isolated boot of a deterministically generated
+  boot-sector artifact carrying the run's payload identity (SeaBIOS → COM1 →
+  run-owned serial log), with full guest-payload verification via builder +
+  service checks. A full Ubuntu-cloud boot stays an operator live gate (11).
+- New tests that need Postgres are `images`/`capture` + `db` compound layers;
+  the new gates start their own disposable `postgres:16` (like the db gate).
+  Two FileRead/budget tests are additionally `authority`-marked (infra-free).
+
+| Gate (exact command) | Result |
+|---|---|
+| `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -ra -p no:cacheprovider` | Exit 0: **131 passed, 0 failed/skipped, 187 deselected**, 4 warnings — infrastructure-free default unchanged |
+| `.venv/bin/python infra/dev/acceptance.py selection` | **PASS**: 318 tests = 131 fast + 187 integration (db 122, containment 25, packet 4, authority 24, images 14, capture 9, browser 1, live 0); required-mode fail-closed controls pass |
+| `.venv/bin/python infra/dev/acceptance.py python` | **PASS** (Python 3.13.5 fresh locked install; CI matrix covers 3.11–3.13) |
+| `.venv/bin/python infra/dev/acceptance.py db` | **PASS**: **121 passed, 0 skipped, 197 deselected** in required mode (`db and not browser`); owned cleanup verified |
+| `.venv/bin/python infra/dev/acceptance.py authority` | **PASS**: **24 passed** (22 prior + FileRead/budget identity), 0 skipped |
+| `.venv/bin/python infra/dev/acceptance.py containment` | **PASS**: 21 passed, 0 skipped; no run-owned cgroups leaked |
+| `.venv/bin/python infra/dev/acceptance.py frontend` | **PASS**: `npm ci` + production build + `npm audit --omit=dev` 0 findings |
+| `.venv/bin/python infra/dev/acceptance.py images` | **FAIL here (prerequisite)**: no QEMU on this host — CI images job (QEMU + delegated cgroup + disposable DB) is the gate. Non-QEMU images tests: 14 passed locally via `-o addopts= -m images` (DB-backed subset 11 passed against disposable PG) |
+| `.venv/bin/python infra/dev/acceptance.py capture` | **FAIL here (prerequisite)**: no QEMU on this host — CI capture job is the gate. Non-QEMU capture tests: 9 passed locally (DB-backed subset verified) |
+| `.venv/bin/python infra/dev/acceptance.py packet` | **FAIL here (prerequisite)**: missing root + `nft` — CI packet job is the gate (unchanged) |
+| `.venv/bin/python infra/dev/acceptance.py browser` | **FAIL here (prerequisite)**: no launchable Chromium — CI browser job is the gate (unchanged) |
+| `.venv/bin/python infra/dev/acceptance.py compose` | Not rerun here (no application change to the compose path); last green per milestone-02 evidence |
+
+Delivered (addresses B07–B11 as software, acceptance pending):
+- `infra/images/manifest.json` + `packages-24.04.txt` + `README.md` (pinned
+  noble URL/SHA256, packages incl. PyMySQL/auditd, 2vCPU/2GiB + 16/12/16GiB
+  budgets, 64MiB spool / 32MiB cast); `infra/images/build.py` (deterministic,
+  public-keys-only, scrubbed, manifest-hashed); `infra/images/specs.py`
+  (canonical budgets/roles/aggregates/allowlisted host-key path).
+- `infra/cloud-init/{attacker,mojang-web-local,mojang-web-db}.yaml`
+  (defender+sudo, ufw/auditd/shipper/app services, empty pubkey slots).
+- Guest payloads: local/MySQL catalogue app (`app.py`), diagnostic flaw +
+  maintenance helper + `FIXES.md`, nginx unit, MySQL schema (SELECT-only
+  reader) + 12-row seed SQL generated from `scenarios/mojang-seeds.json`
+  (3 games, `buy-001`–`buy-012`, fictional).
+- `scenarios/mojang-web-01.yaml` / `mojang-web-db-01.yaml` (fresh attacker at
+  fixed 10.66.0.9, templates 9005/9011/9012, versioned seed/image baselines,
+  `http_content`/`mysql_rows` logical checks, documented flaws/fixes);
+  `verifiers/library/mojang.py` (`http_content`, `mysql_rows` SELECT-only);
+  `SUPPORTED_SERVICES` += `mojang-web`; legacy scenarios preserved.
+- Typed guest-agent FileRead: `ProxmoxClient.read_guest_file` (fixed path
+  only) + `BrokerService.read_host_key` (owned VM/session/generation before
+  AND after, bounded key parse, same-generation change refused with
+  obligation, fresh-generation re-pin) + `CONTROL_OPS`/client surface; fake
+  models `/agent/file-read` with fresh per-clone keys; no exec/host-shell
+  surface (asserted).
+- Orchestrator: explicit `deploy_clone_mode` setting (broker-validated, no
+  fallback), aggregate budget reservation before side effects, host-key pins
+  after each start, clone-mode recorded in deploy events; intents/conflicts/
+  resume/reset/foreign-VM protection preserved.
+- Capture: installed-unit/rules/installer assertions, spool replay/dedup/
+  order/limits/gaps + crash/overflow/reboot, ENRICHED marker grouping,
+  wrong-API/token/input negatives with recovery, stale/foreign/phase-only
+  refusal + `/run` gate, concurrent-confirm idempotency + revocation binding,
+  cast opaque-ID/symlink/size/missing/replay + TRUNCATED marker, no-logged-
+  secrets + forgeable-telemetry contract note.
+- `infra/dev/qemu_guest.py` (real isolated QEMU boot helper, bounds
+  enforced, owned cleanup) + `images`/`capture` gates in
+  `infra/dev/acceptance.py` (disposable PG + QEMU prereq + leftover checks) +
+  `images`/`capture` CI jobs (QEMU install, userns profile, delegated cgroup,
+  60-minute timeout) + `images`/`capture` markers (fast default excludes them).
+
+**Not claimed:** required CI green (13 jobs) at this revision — the two new
+jobs have never run on hosted runners from here; run them before ticking 03
+or 04. Live/operator gates (real PVE FileRead ACL, clone/storage/NIC,
+isolation/stop, installed-capture on R740, $0 budget check) remain explicitly
+open. The base-image SHA256 placeholder must be replaced with the published
+noble SHA256SUMS value at operator build time.
+
 ## Historical finding coverage retained
 
 The removed reports were at older revisions. The table preserves every finding

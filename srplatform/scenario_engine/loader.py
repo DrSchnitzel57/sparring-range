@@ -37,6 +37,11 @@ SUPPORTED_SERVICES: dict[str, str] = {
     "http": "nginx",     # golden linux template serves HTTP via nginx
     "mysql": "mysql",
     "ssh": "sshd",
+    # Mojang catalogue app (paired 03+04): a local Python service fronted by
+    # nginx. Web-local reads its fictional data from a local file; web+DB
+    # reads MySQL through PyMySQL with a read-only application role
+    # (SELECT-only; the verifier enforces the same direction).
+    "mojang-web": "mojang-web",
 }
 
 
@@ -124,6 +129,11 @@ class ScenarioSpec(Strict):
     techniques: list[str] = []
     version: int = 1
     rubric_version: int | None = None
+    # Paired 03+04: versioned seed/image/user/cron/static baselines. Legacy
+    # scenarios without manifests are NOT release-ready (their checks run,
+    # but readiness requires the manifest on mojang presets).
+    seed_version: int | None = None
+    image_version: str | None = None
     topology: Topology
     red: Red
     scoring: Scoring | None = None

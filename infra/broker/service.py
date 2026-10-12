@@ -96,6 +96,76 @@ class BrokerService:
                                     f"{cfg['_unavailable']}")
         return cfg
 
+    # ------------------------------------------------- guest host-key pin ---
+    # Paired 03+04, step 3: initial typed guest-agent FileRead ONLY for the
+    # fresh clone's PUBLIC SSH host key. The path is fixed by construction
+    # (no caller-supplied path — arbitrary paths are unrepresentable), the
+    # response is bounded/validated by the adapter, and ownership (claimed
+    # VM/session/generation) is verified BEFORE and AFTER the read. Fresh
+    # clone/reset generations pin fresh keys; a same-generation key change
+    # (post-compromise re-pin attempt) is refused with an obligation retained.
+    # Production requires the scoped `VM.GuestAgent.FileRead` privilege;
+    # `VM.Monitor` / `VM.GuestAgent.Unrestricted` fallback is forbidden.
+    def read_host_key(self, node: str, vmid: int, session_id: str | None = None,
+                      generation: str | int = 1) -> str:
+        from infra.proxmox_client import ProxmoxClient as _PC
+        self._node(node)
+        self.policy.check_vmid(int(vmid))
+        with self._op_lock:
+            claim = self._active_claim(int(vmid), session_id)
+            if str(claim.get("generation", 1)) != str(generation):
+                raise BrokerConflict(
+                    f"VMID {vmid} is generation {claim.get('generation')!r}, "
+                    f"not {generation!r} — refusing host-key read for a stale "
+                    "generation")
+            # Ownership verified BEFORE the read (claim) — now read the key.
+            try:
+                key = self.pve.read_guest_file(node, int(vmid),
+                                               _PC.GUEST_HOST_KEY_PATH)
+            except Exception as e:  # noqa: BLE001 — uncertain, retain
+                self.ledger.add_obligation("host-key-read-uncertain", int(vmid),
+                                           str(e)[:300])
+                self.ledger.audit("host-key-read-uncertain",
+                                  {"vmid": int(vmid), "error": str(e)[:200]})
+                from .errors import BrokerUnavailable as _BU
+                raise _BU(f"host-key read uncertain for VMID {vmid}: {e}") from e
+            # Verify ownership AFTER the read too (VMID recycled mid-read
+            # must not pin a foreign machine's key).
+            cfg = self.pve.try_lookup_config(node, int(vmid)) or {}
+            if cfg.get("name") not in (None, claim.get("name")):
+                self.ledger.add_obligation(
+                    "host-key-foreign-identity", int(vmid),
+                    f"claimed {claim.get('name')!r}, found {cfg.get('name')!r}")
+                raise BrokerConflict(
+                    f"VMID {vmid} identity changed during host-key read "
+                    f"(claimed {claim.get('name')!r}, found {cfg.get('name')!r}) "
+                    "— refusing to pin a possibly foreign key")
+            detail = dict(claim.get("detail") or {})
+            pinned = detail.get("host_key")
+            pinned_gen = detail.get("host_key_generation")
+            if pinned is not None and str(pinned_gen) == str(generation) \
+                    and pinned != key:
+                # Same generation, different key: possible compromise —
+                # NEVER re-pin silently. Operator resolves.
+                self.ledger.add_obligation(
+                    "host-key-changed-same-generation", int(vmid),
+                    "key changed without a new generation — refusing re-pin")
+                raise BrokerConflict(
+                    f"VMID {vmid} host key changed within generation "
+                    f"{generation!r} — refusing post-compromise re-pin "
+                    "(reset to a new generation for a fresh pin)")
+            detail["host_key"] = key
+            detail["host_key_generation"] = str(generation)
+            self.ledger.upsert_claim(int(vmid), node=node, state=claim.get("state"),
+                                     name=claim.get("name"),
+                                     session_id=claim.get("session_id"),
+                                     generation=claim.get("generation", generation),
+                                     kind=claim.get("kind", "clone"),
+                                     detail=detail)
+            self.ledger.audit("host-key-pinned",
+                              {"vmid": int(vmid), "generation": str(generation)})
+            return key
+
     def vm_status(self, node: str, vmid: int) -> str:
         self._node(node)
         return self.pve.vm_status(node, int(vmid))

@@ -17,7 +17,7 @@ Usage:
     python infra/dev/acceptance.py <check>
 
 Checks: selection | python | db | containment | authority | packet
-        | frontend | compose | browser
+        | frontend | compose | browser | images | capture
 """
 from __future__ import annotations
 
@@ -35,7 +35,8 @@ import uuid
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 PY = sys.executable
-LAYERS = ("db", "containment", "packet", "authority", "browser", "live")
+LAYERS = ("db", "containment", "packet", "authority", "browser", "live",
+          "images", "capture")
 COUNT_RE = re.compile(r"(\d+) (passed|failed|errors?|skipped|deselected)")
 
 
@@ -95,6 +96,7 @@ def audit_vulnerabilities(stdout: str, returncode: int) -> dict:
 def env_summary(extra: dict | None = None) -> str:
     keys = ("SR_PG_ADMIN_URL", "SR_REQUIRE_DB", "SR_REQUIRE_CONTAINMENT",
             "SR_REQUIRE_PACKET", "SR_REQUIRE_AUTHORITY", "SR_REQUIRE_BROWSER",
+            "SR_REQUIRE_IMAGES", "SR_REQUIRE_CAPTURE",
             "RUNNER_CGROUP_ROOT",
             "SR_E2E_API_PORT", "SR_E2E_WEB_PORT", "SR_COMPOSE_PROJECT")
     env = {k: os.environ.get(k, "") for k in keys if os.environ.get(k)}
@@ -190,7 +192,8 @@ def check_selection() -> None:
         fail("fast default excludes every integration layer",
              f"{len(leaked)} integration tests in default selection, e.g. "
              f"{sorted(leaked)[:5]}")
-    for layer in ("db", "containment", "packet", "authority", "browser"):
+    for layer in ("db", "containment", "packet", "authority", "browser",
+                  "images", "capture"):
         if not layer_ids[layer]:
             fail(f"layer {layer} non-empty", "layer selection is empty")
     ok("all tests classified",
@@ -993,6 +996,93 @@ def check_authority() -> None:
 
 
 # -------------------------------------------------------------------------- #
+# images (03): real builds/boots/services/seeds/flaws/fixes/readiness         #
+# capture (04): installed auditd/srshipper/negatives/recovery/access/replay   #
+# -------------------------------------------------------------------------- #
+# Both gates boot the ACTUAL built artifacts in isolated QEMU (synthetic
+# API/DB/SSH, no host shares, no general egress, run-owned disks/processes,
+# bounded cleanup). Max 3 VMs / 6 GiB guest RAM / 60-minute job; KVM optional,
+# software emulation (TCG) is the fallback. A missing QEMU prerequisite, an
+# empty selection, or a skipped required test FAILS the gate — never a silent
+# skip. QEMU is installed in the CI images/capture jobs; on hosts without it
+# the gate fails closed with the exact missing prerequisite.
+
+def _qemu_prereqs() -> list[str]:
+    missing = []
+    if not shutil.which("qemu-system-x86_64") and not shutil.which("qemu-system-x86"):
+        missing.append("qemu-system-x86_64 (QEMU with TCG software emulation)")
+    if not shutil.which("qemu-img"):
+        missing.append("qemu-img (run-owned disk creation)")
+    return missing
+
+
+def check_images() -> None:
+    missing = _qemu_prereqs()
+    if missing:
+        fail("images prerequisites (QEMU for isolated artifact boot)",
+             f"missing {missing} — required layer; run in the CI images job "
+             "(isolated QEMU, run-owned disks, synthetic secrets, no host shares)")
+    fx = _pg_fixture()
+    try:
+        env = {"SR_PG_ADMIN_URL": fx.admin_url(), "SR_REQUIRE_IMAGES": "1",
+               "SR_REQUIRE_DB": "1"}
+        r, counts = pytest_run(["-m", "images"], env=env, timeout=3600)
+        require_selection(counts, "images")
+        if r.returncode != 0:
+            fail("images regressions in required mode",
+                 f"exit {r.returncode}, counts {counts}:\n{r.stdout[-6000:]}")
+        ok("mojang image builds/boots/services/seeds/flaws/fixes/readiness pass",
+           f"{counts.get('passed', 0)} passed, {counts.get('skipped', 0)} skipped")
+        leftovers = fx.leftover_test_databases()
+        if leftovers:
+            fail("owned DB resources cleaned", f"leftovers: {leftovers}")
+        ok("owned DB resources cleaned", "no srtest_*/sr_* databases or roles remain")
+    finally:
+        problems = fx.cleanup()
+        if problems:
+            fail("images DB fixture cleanup", "; ".join(problems))
+        ok("images DB fixture container/volume removed", fx.container)
+    _assert_no_owned_qemu_leftovers()
+
+
+def check_capture() -> None:
+    missing = _qemu_prereqs()
+    if missing:
+        fail("capture prerequisites (QEMU for installed-capture boot)",
+             f"missing {missing} — required layer; run in the CI capture job "
+             "(installed auditd/srshipper under QEMU, synthetic API/DB/SSH)")
+    fx = _pg_fixture()
+    try:
+        env = {"SR_PG_ADMIN_URL": fx.admin_url(), "SR_REQUIRE_CAPTURE": "1",
+               "SR_REQUIRE_DB": "1"}
+        r, counts = pytest_run(["-m", "capture"], env=env, timeout=3600)
+        require_selection(counts, "capture")
+        if r.returncode != 0:
+            fail("capture regressions in required mode",
+                 f"exit {r.returncode}, counts {counts}:\n{r.stdout[-6000:]}")
+        ok("installed auditd/srshipper negatives/recovery/access/replay pass",
+           f"{counts.get('passed', 0)} passed, {counts.get('skipped', 0)} skipped")
+        leftovers = fx.leftover_test_databases()
+        if leftovers:
+            fail("owned DB resources cleaned", f"leftovers: {leftovers}")
+        ok("owned DB resources cleaned", "no srtest_*/sr_* databases or roles remain")
+    finally:
+        problems = fx.cleanup()
+        if problems:
+            fail("capture DB fixture cleanup", "; ".join(problems))
+        ok("capture DB fixture container/volume removed", fx.container)
+    _assert_no_owned_qemu_leftovers()
+
+
+def _assert_no_owned_qemu_leftovers() -> None:
+    import glob
+    leftovers = [p for p in glob.glob("/tmp/sr-qemu-*")]
+    if leftovers:
+        fail("QEMU owned-disk/process cleanup", f"leftovers: {leftovers[:5]}")
+    ok("no QEMU owned run-dirs leaked")
+
+
+# -------------------------------------------------------------------------- #
 
 CHECKS = {
     "selection": check_selection,
@@ -1004,6 +1094,8 @@ CHECKS = {
     "frontend": check_frontend,
     "compose": check_compose,
     "browser": check_browser,
+    "images": check_images,
+    "capture": check_capture,
 }
 
 

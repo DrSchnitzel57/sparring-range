@@ -21,7 +21,7 @@ from .service import BrokerService
 
 DEFAULT_TEST_POLICY = {
     "node": "r740",
-    "templates": [9001, 9002, 9003, 9004],
+    "templates": [9001, 9002, 9003, 9004, 9005, 9011, 9012],
     "vmid_range": [200, 999],
     "storage": ["local-zfs"],
     "clone_mode": "linked",
@@ -35,7 +35,7 @@ DEFAULT_TEST_POLICY = {
     "heartbeat_interval_s": 5,
 }
 
-DEFAULT_TEMPLATES = (9001, 9002, 9003, 9004)
+DEFAULT_TEMPLATES = (9001, 9002, 9003, 9004, 9005, 9011, 9012)
 
 
 def policy_from_settings(s) -> BrokerPolicy:
@@ -44,10 +44,13 @@ def policy_from_settings(s) -> BrokerPolicy:
     raw = dict(DEFAULT_TEST_POLICY)
     raw["node"] = s.proxmox_node
     raw["templates"] = sorted({s.template_vmid_web, s.template_vmid_win_dc,
-                               s.template_vmid_win10, s.template_vmid_linux})
+                               s.template_vmid_win10, s.template_vmid_linux,
+                               s.template_vmid_attacker, s.template_vmid_mojang_web,
+                               s.template_vmid_mojang_db})
     raw["vmid_range"] = [s.deploy_vmid_base, s.deploy_vmid_base + 89]
     raw["nic"] = {"bridge": s.range_bridge, "vlan": s.range_vlan}
     raw["provision"] = {"cidr": s.range_cidr, "gateway": s.range_gateway}
+    raw["clone_mode"] = getattr(s, "deploy_clone_mode", "linked")
     return BrokerPolicy.from_dict(raw)
 
 
