@@ -1,15 +1,20 @@
-"""Mojang deployment/budget/identity/QEMU acceptance (paired 03+04, step 4/7).
+"""Mojang deployment/budget/identity/Ubuntu-guest acceptance (03+04, steps 4/7).
 
 Compound layer (images + db where noted): deploy/budget/identity tests use the
-disposable Postgres + FakePVEHttp boundary; the QEMU test boots the actual
-built artifact in isolation. Required mode fails closed on missing QEMU.
+disposable Postgres + FakePVEHttp boundary; the Ubuntu tests boot the REAL
+guest (pinned base + superset overlay + NoCloud seed) in isolated QEMU.
+Required mode fails closed on missing QEMU, unverified base, or absent
+serial evidence — never a skip.
 """
 from __future__ import annotations
 
+import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
+import uuid
 
 import pytest
 
@@ -17,9 +22,143 @@ pytestmark = pytest.mark.images
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
+#: Shared overlay cache across gate runs on one machine (keyed by every
+#: build input; `qemu-img check` on hit). Cold in CI, warm on reruns.
+GUEST_CACHE = pathlib.Path("/tmp/sr-guest-cache")
+
+
 def _qemu_available() -> bool:
     import shutil
     return bool(shutil.which("qemu-system-x86_64") or shutil.which("qemu-system-x86"))
+
+
+@pytest.fixture(scope="module")
+def superset_overlay():
+    """Build-once superset overlay for this gate run (real Ubuntu boot with
+    package install). Run-owned; removed with the run dir afterwards."""
+    from infra.dev import qemu_guest
+    from infra.images import guest_build
+    qemu_guest.require_qemu()  # fail closed here, not inside the build
+    run = qemu_guest.make_run_dir()
+    try:
+        rec = guest_build.build_overlay(
+            repo_root=REPO, run_dir=run, cache_dir=GUEST_CACHE,
+            role="mojang-web-db", memory_mb=2048, timeout_s=1500)
+        yield {"run": run, "overlay": pathlib.Path(rec["overlay"]), "record": rec}
+    finally:
+        shutil.rmtree(run, ignore_errors=True)
+
+
+def test_images_ubuntu_build_superset_overlay(superset_overlay):
+    """The build boot installs the pinned families on real Ubuntu and records
+    resolved versions from the guest itself (no host-side guessing)."""
+    rec = superset_overlay["record"]
+    pkgs = rec["packages"]
+    assert any(n == "nginx" or n.startswith("nginx-") for n in pkgs), pkgs
+    assert any("mysql" in n for n in pkgs), pkgs
+    assert any(n == "auditd" or n.startswith("audit") for n in pkgs), pkgs
+    overlay = superset_overlay["overlay"]
+    assert overlay.exists() and overlay.stat().st_size > 0
+    r = subprocess.run(["qemu-img", "info", str(overlay)], capture_output=True,
+                       text=True, timeout=60)
+    assert r.returncode == 0 and "qcow2" in r.stdout, r.stdout[:300]
+
+
+def _verify_markers(record: dict, *required: str) -> None:
+    markers = record["markers"]
+    for name in required:
+        assert f"SR-GUEST-{name}-PASS" in markers, markers
+    assert not [m for m in markers if "-FAIL:" in m], markers
+
+
+def test_images_ubuntu_verify_web_local(superset_overlay):
+    """Real offline boot (`-net none`): local-data catalogue, live diagnostic
+    flaw + service-preserving fix, auditd/shipper/users/firewall — all on the
+    installed guest, reported over serial."""
+    from infra.dev import qemu_guest
+    from infra.images import guest_build, guest_userdata
+    run, overlay = superset_overlay["run"], superset_overlay["overlay"]
+    rec = guest_build.verify_overlay(
+        overlay=overlay, run_dir=run, name="web-local",
+        user_data=guest_userdata.verify_user_data("mojang-web-local", {},
+                                                  backend="local"),
+        instance_id=f"sr-vlocal-{uuid.uuid4().hex[:8]}",
+        hostname="sr-verify-weblocal", memory_mb=2048, net="none",
+        timeout_s=600)
+    _verify_markers(rec, "BOOT", "UNITS-ACTIVE", "CATALOGUE", "CATALOGUE-COUNT",
+                    "DIAG-FLAW", "DIAG-FIX", "MAINT-HELPER", "AUDITD-RULES",
+                    "SHIPPER-UNIT", "SHIPPER-SPOOL", "SEEDS", "USERS", "FIREWALL")
+
+
+def test_images_ubuntu_verify_web_db(superset_overlay):
+    """Real offline boot with the MySQL backend: 12 seeded rows through the
+    read-only role, plus the full local-behavior battery."""
+    from infra.dev import qemu_guest
+    from infra.images import guest_build, guest_userdata
+    run, overlay = superset_overlay["run"], superset_overlay["overlay"]
+    rec = guest_build.verify_overlay(
+        overlay=overlay, run_dir=run, name="web-db",
+        user_data=guest_userdata.verify_user_data("mojang-web-db", {},
+                                                  backend="mysql"),
+        instance_id=f"sr-vdb-{uuid.uuid4().hex[:8]}",
+        hostname="sr-verify-webdb", memory_mb=2048, net="none",
+        timeout_s=600)
+    _verify_markers(rec, "BOOT", "UNITS-ACTIVE", "CATALOGUE", "MYSQL-COUNT",
+                    "MYSQL-ROW", "DIAG-FLAW", "DIAG-FIX", "AUDITD-RULES",
+                    "SEEDS")
+
+
+def test_images_ubuntu_verify_attacker():
+    """Attacker boots from a FRESH overlay of the verified base (never the
+    payload overlay): sshd up, fresh host keys, none of the target payload."""
+    from infra.dev import qemu_guest
+    from infra.images import guest_build, guest_seed, guest_userdata
+    qemu_guest.require_qemu()
+    run = qemu_guest.make_run_dir()
+    try:
+        base = qemu_guest.ensure_verified_base(GUEST_CACHE / "base")
+        overlay = qemu_guest.make_overlay(base, run, "attacker")
+        rec = guest_build.verify_overlay(
+            overlay=overlay, run_dir=run, name="attacker",
+            user_data=guest_userdata.attacker_verify_user_data(),
+            instance_id=f"sr-atk-{uuid.uuid4().hex[:8]}",
+            hostname="sr-verify-attacker", memory_mb=1024, net="none",
+            timeout_s=600)
+        _verify_markers(rec, "BOOT", "SSHD", "HOSTKEYS", "NO-MOJANG", "NO-MYSQL")
+    finally:
+        shutil.rmtree(run, ignore_errors=True)
+
+
+def test_images_seed_iso_builds_offline_and_parses():
+    """No-QEMU unit: the seed ISO carries CIDATA label + readable
+    user-data/meta-data (pure local build, pycdlib)."""
+    from infra.images import guest_seed
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="sr-seed-") as td:
+        iso = guest_seed.build_seed_iso(
+            pathlib.Path(td) / "seed.iso", "#cloud-config\nhostname: x\n",
+            guest_seed.meta_data("iid-1", "h1"))
+        assert iso.stat().st_size > 0
+        import pycdlib
+        reader = pycdlib.PyCdlib()
+        reader.open(str(iso))
+        try:
+            assert reader.vol_ident.strip() == "CIDATA"
+            for rr, want in (("user-data", "hostname: x"), ("meta-data", "iid-1")):
+                out = reader.get_file_from_iso(iso_path=f"/{rr.upper()}.;1",
+                                               rr_path=rr)
+                assert want in out.read().decode(), rr
+        finally:
+            reader.close()
+    # Bounds stay enforced without QEMU present.
+    from infra.dev import qemu_guest
+    import pathlib as _pl
+    try:
+        qemu_guest.boot_full_guest(disk=_pl.Path("/none"), seed_iso=_pl.Path("/none"),
+                                   memory_mb=8192, timeout_s=5)
+        raise AssertionError("per-VM RAM bound was not enforced")
+    except ValueError:
+        pass
 
 
 def test_images_readiness_proves_services_and_enrollment(client, users, fake_pve,
@@ -187,31 +326,6 @@ def test_images_host_key_fileread_only_allowlisted_owned_pinned(tmp_path):
     kinds = [p for m, p, _ in http.requests]
     assert not any("exec" in p for p in kinds), kinds
     assert any("file-read" in p for p in kinds), kinds
-
-
-def test_images_qemu_boots_actual_artifact_isolated():
-    """Real isolated QEMU boot of an actual build artifact (step 7).
-
-    Bounds: 1 VM, 256 MiB (well under 3 VMs / 6 GiB), 120s timeout (well
-    under the 60-minute job). No host shares, `-net none`, run-owned disk +
-    serial log, owned cleanup verified by the helper (leftovers raise).
-    """
-    if not _qemu_available():
-        pytest.skip("qemu-system-x86_64 absent — required in CI images job")
-    from infra.dev import qemu_guest
-    import uuid
-    identity = f"SR-IMAGES-{uuid.uuid4().hex[:8]}"
-    record = qemu_guest.boot_and_expect_serial(
-        name="images", identity=identity, memory_mb=256, timeout_s=120)
-    assert record["identity"] == identity
-    assert record["memory_mb"] <= 2048
-    # Bounds are enforced, not advisory.
-    try:
-        qemu_guest.boot_and_expect_serial(
-            name="x", identity="y", memory_mb=8192, timeout_s=5)
-        raise AssertionError("per-VM RAM bound was not enforced")
-    except ValueError:
-        pass
 
 
 def test_images_supervisor_cgroup_apparmor_boundary_provable():

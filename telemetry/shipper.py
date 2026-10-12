@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Telemetry shipper (F09 rewrite): a real, deliverable auditd → API pipeline.
+"""Telemetry shipper (F09 rewrite, 03+04 cursor): a real, deliverable auditd → API pipeline.
 
-Input: RAW auditd records on stdin (the documented `log_format=ENRICHED`
-audit.log lines via audisp/`tail -F`, or plain audit.log). Multi-record events
+Input: RAW auditd records — either on stdin (fixtures/compat) or, in the
+installed unit, the REAL audit.log followed with a DURABLE persisted byte
+cursor (`--audit-log`; crash/outage/reboot-safe, rotation/truncation gaps
+visible — never the old `tail -F -n 0` loss). Multi-record events
 (PROCTITLE/EXECVE/SYSCALL sharing one audit id) are GROUPED into exactly one
 command event. argv is decoded correctly: QUOTED values keep their literal
 text; only UNQUOTED hex-encoded values are hex-decoded (audit N08).
@@ -247,6 +249,126 @@ def build_command_event(host: str, group: dict, machine_id: str, boot_id: str) -
     if group.get("duplicates"):
         ev["raw"]["duplicate_records"] = sorted(set(group["duplicates"]))
     return ev
+
+
+class AuditLogFollower:
+    """Durable audit-INPUT cursor (paired 03+04, step 5).
+
+    Replaces the old `tail -F -n 0` pipe (which silently LOST every unread
+    audit.log byte on each restart): the byte offset plus file identity are
+    persisted atomically after every poll batch, so a crash, outage, reboot
+    or overflow resumes exactly where input stopped. Rotation (new inode)
+    and truncation (size < offset) restart at byte 0 with a VISIBLE gap
+    record — never silent loss. Delivery across a crash is at-least-once (a
+    few trailing lines may replay); the API's boot:source dedup makes such
+    replays idempotent, and the spool's ack-by-ID keeps in-flight batches.
+    """
+
+    def __init__(self, path: str, spool_dir: str, on_gap=None,
+                 poll_s: float = 0.5):
+        self.path = path
+        self.cursor_path = os.path.join(spool_dir, "audit-cursor.json")
+        self.on_gap = on_gap or (lambda reason, n=1: None)
+        self.poll_s = poll_s
+        os.makedirs(spool_dir, exist_ok=True)
+        self._fh = None
+        self._dev = None
+        self._ino = None
+        self._offset = 0
+        self._fragb = b""
+        self._load_cursor()
+
+    def _load_cursor(self) -> None:
+        try:
+            with open(self.cursor_path) as f:
+                cur = json.load(f)
+            self._dev, self._ino, self._offset = (
+                cur.get("dev"), cur.get("ino"), int(cur.get("offset", 0)))
+        except (OSError, ValueError, TypeError, AttributeError):
+            self._dev, self._ino, self._offset = None, None, 0
+
+    def _save_cursor(self) -> None:
+        tmp = self.cursor_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"dev": self._dev, "ino": self._ino,
+                       "offset": self._offset}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.cursor_path)
+
+    def _open(self) -> None:
+        self._fh = open(self.path, "rb")
+        st = os.fstat(self._fh.fileno())
+        if (st.st_dev, st.st_ino) != (self._dev, self._ino):
+            # Rotation (or first start): a NEW file starts at byte 0 with a
+            # visible gap unless there is no cursor at all yet.
+            if self._dev is not None:
+                self.on_gap("audit-input rotated", 1)
+            self._dev, self._ino, self._offset = st.st_dev, st.st_ino, 0
+            self._fragb = b""
+            self._save_cursor()
+        elif st.st_size < self._offset:
+            self.on_gap("audit-input truncated", 1)
+            self._offset, self._fragb = 0, b""
+            self._save_cursor()
+        else:
+            self._fh.seek(self._offset)
+
+    def poll_once(self) -> list[str]:
+        """Read newly completed lines since the cursor; advances + persists
+        past COMPLETE lines only, byte-exact (a torn tail is re-read after a
+        crash, so outages never lose input and restarts never skip)."""
+        if self._fh is None:
+            self._open()
+        try:
+            cur = os.stat(self.path)
+        except OSError:
+            return []
+        if (cur.st_dev, cur.st_ino) != (self._dev, self._ino):
+            self._fh.close()
+            self._fh = None
+            self._open()
+            return self.poll_once() if self._fh is not None else []
+        if cur.st_size < self._offset:
+            # Same file truncated under us (copytruncate / operator reset):
+            # reopen so the truncation branch records the visible gap.
+            self._fh.close()
+            self._fh = None
+            self._open()
+            return self.poll_once() if self._fh is not None else []
+        data = self._fh.read()
+        if not data:
+            return []
+        buf = self._fragb + data
+        idx = buf.rfind(b"\n")
+        if idx < 0:
+            if len(buf) > 4 * 1024 * 1024:
+                # A single line that never terminates is not audit input we
+                # can parse — skip it with a VISIBLE gap, never hang on it.
+                self._fragb = b""
+                self._offset += len(buf)
+                self._save_cursor()
+                self.on_gap("audit-input overlong line skipped", 1)
+            else:
+                self._fragb = buf
+            return []
+        complete, self._fragb = buf[:idx + 1], buf[idx + 1:]
+        self._offset += len(complete)
+        self._save_cursor()
+        text = complete.decode("utf-8", errors="replace")
+        return [l + "\n" for l in text.split("\n")[:-1]]
+
+    def run(self, put, stop) -> None:
+        while not stop.is_set():
+            try:
+                for line in self.poll_once():
+                    put(line)
+            except OSError as e:
+                print(f"shipper: audit input unreadable ({e}) — retrying, "
+                      "gap visible, nothing assumed delivered", file=sys.stderr)
+                time.sleep(self.poll_s)
+                continue
+            stop.wait(self.poll_s)
 
 
 class Spooler:
@@ -619,6 +741,10 @@ def main() -> None:
                     help="fresh enrollment nonce provisioned with the capability; "
                          "when set, the service confirms its own delivery path "
                          "(audit T-05)")
+    ap.add_argument("--audit-log", default=os.environ.get("SR_AUDIT_LOG"),
+                    help="durable audit-input mode: follow this audit.log with a "
+                         "persisted byte cursor (crash/outage/reboot-safe) "
+                         "instead of reading stdin")
     args = ap.parse_args()
     if not all([args.api, args.token, args.host]):
         print("shipper requires --api/--token/--host (or SR_* env)", file=sys.stderr)
@@ -649,20 +775,31 @@ def main() -> None:
         confirmer.start()
 
     exit_code = 0
+    stop_input = threading.Event()
     try:
-        # LIVE stream (audit N08): read stdin in a thread; the main loop uses
+        # LIVE stream (audit N08): read input in a thread; the main loop uses
         # a queue timeout so an IDLE stream still closes its last event after
         # the bounded completion timeout — the final command of a quiet
         # session is deliverable without EOF.
         import queue
         q: queue.Queue = queue.Queue()
 
-        def _reader():
-            for line in sys.stdin:
-                q.put(line)
-            q.put(None)  # EOF sentinel
+        if args.audit_log:
+            # Installed mode: durable cursor over the REAL audit input (never
+            # `tail -n 0` loss, never stdin fabrication). Rotation gaps are
+            # recorded on the spool's visible gap counter.
+            follower = AuditLogFollower(
+                args.audit_log, args.spool_dir,
+                on_gap=lambda reason, n=1: spool._gap(reason, n))
+            threading.Thread(target=follower.run, args=(q.put, stop_input),
+                             daemon=True, name="shipper-auditlog").start()
+        else:
+            def _reader():
+                for line in sys.stdin:
+                    q.put(line)
+                q.put(None)  # EOF sentinel
 
-        threading.Thread(target=_reader, daemon=True, name="shipper-stdin").start()
+            threading.Thread(target=_reader, daemon=True, name="shipper-stdin").start()
         grouper = LiveGrouper(close_after_s=args.close_after_s, source=machine_id)
         eof = False
         while not eof:
@@ -688,6 +825,7 @@ def main() -> None:
     except KeyboardInterrupt:
         exit_code = 0
     finally:
+        stop_input.set()
         # EOF/shutdown: stop the loop and make ONE final delivery attempt —
         # the last events of a session must not wait for the next input line.
         delivery.stop(final_flush=True)

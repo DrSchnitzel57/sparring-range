@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import shutil
 import uuid as uuidlib
 
 import pytest
@@ -26,10 +27,16 @@ def test_capture_installed_unit_rules_and_hardening():
     assert "User=srshipper" in unit and "adm" in unit, \
         "shipper runs as srshipper:adm (declared input/group/sandbox perms)"
     assert "Restart=always" in unit
-    assert "tail -F" in unit or "audit.log" in unit, \
-        "unit tails the real audit input (not synthetic stdin)"
+    assert "/var/log/audit/audit.log" in unit, \
+        "unit follows the real audit input (not synthetic stdin)"
     rules = (REPO / "telemetry/auditd.rules").read_text()
     assert "sparring_cmd" in rules and "EXECVE" in rules.upper()
+    # Durable input (03+04 step 5): the installed unit follows the REAL audit
+    # input with a persisted cursor — the old `tail -F -n 0` restart loss is
+    # retired, not shipped.
+    assert "--audit-log" in unit and "/var/log/audit/audit.log" in unit
+    assert "tail -F -n 0" not in unit, \
+        "installed input must be cursor-tracked, not tail-skipped"
     installer = (REPO / "telemetry/install.sh").read_text()
     assert "ENRICHED" in installer and "adm" in installer
     assert "srshipper" in installer and "spool" in installer.lower()
@@ -307,14 +314,117 @@ def test_capture_no_logged_secrets_and_forgeable_telemetry_note(client, users):
         REPO / "srplatform/scenario_engine/orchestrator.py").read_text()
 
 
-def test_capture_qemu_boots_installed_artifact_isolated():
-    """Real isolated QEMU boot for the capture gate (installed-capture shape:
-    same helper, capture identity). Bounds: 1 VM / 256 MiB / 120s."""
-    import shutil
-    if not (shutil.which("qemu-system-x86_64") or shutil.which("qemu-system-x86")):
-        pytest.skip("qemu-system-x86_64 absent — required in CI capture job")
+#: Shared overlay cache with the images gate (same inputs key; cold in CI).
+GUEST_CACHE = pathlib.Path("/tmp/sr-guest-cache")
+
+
+@pytest.fixture(scope="module")
+def capture_overlay():
+    """Superset overlay for the capture gate (own build; cache-hit when the
+    images gate ran first on this machine). Run-owned; fully removed."""
     from infra.dev import qemu_guest
-    identity = f"SR-CAPTURE-{uuidlib.uuid4().hex[:12]}"
-    record = qemu_guest.boot_and_expect_serial(
-        name="capture", identity=identity, memory_mb=256, timeout_s=120)
-    assert record["identity"] == identity
+    from infra.images import guest_build
+    qemu_guest.require_qemu()
+    run = qemu_guest.make_run_dir()
+    try:
+        rec = guest_build.build_overlay(
+            repo_root=REPO, run_dir=run, cache_dir=GUEST_CACHE,
+            role="mojang-web-db", memory_mb=2048, timeout_s=1500)
+        yield {"run": run, "overlay": pathlib.Path(rec["overlay"]), "record": rec}
+    finally:
+        shutil.rmtree(run, ignore_errors=True)
+
+
+def test_capture_installed_negatives_on_real_guest(capture_overlay):
+    """The INSTALLED unit stays ACTIVE while delivery is impossible: real
+    auditd captures the marker locally (audit.log has it) yet NO delivery
+    evidence can exist — distinct delivery vs real capture on a real system,
+    with `-net none` (no egress at all)."""
+    from infra.images import guest_build, guest_userdata
+    run, overlay = capture_overlay["run"], capture_overlay["overlay"]
+    rec = guest_build.verify_overlay(
+        overlay=overlay, run_dir=run, name="capneg",
+        user_data=guest_userdata.capture_negative_user_data(),
+        instance_id=f"sr-capneg-{uuidlib.uuid4().hex[:8]}",
+        hostname="sr-capture-neg", memory_mb=2048, net="none",
+        timeout_s=600)
+    markers = rec["markers"]
+    for name in ("BOOT", "UNIT-ACTIVE", "AUDITD-CAPTURED", "NO-DELIVERY"):
+        assert f"SR-GUEST-{name}-PASS" in markers, markers
+    assert not [m for m in markers if "-FAIL:" in m], markers
+
+
+def test_capture_end_to_end_to_synthetic_api(capture_overlay):
+    """End-to-end installed capture: a REAL marker command through real
+    auditd and the INSTALLED cursor-tracking shipper reaches the host
+    synthetic API (Bearer capability + nonce + marker bytes asserted on the
+    host side). The ONLY guest channel out is SLIRP to 10.0.2.2:<stub-port>
+    — a narrow synthetic control path, never general egress."""
+    import json as _json
+    import socket
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from infra.images import guest_build, guest_userdata
+
+    received: list[tuple[str, dict, str | None]] = []
+
+    class Stub(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _reply(self):
+            body = self._read_json()
+            received.append((self.path, body,
+                             self.headers.get("Authorization")))
+            raw = b"{}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def _read_json(self):
+            try:
+                return _json.loads(self.rfile.read(
+                    int(self.headers.get("Content-Length") or 0)) or b"{}")
+            except (ValueError, OSError):
+                return {}
+
+        do_POST = _reply
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    srv = HTTPServer(("127.0.0.1", port), Stub)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        token = f"sr-test-{uuidlib.uuid4().hex}"
+        nonce = uuidlib.uuid4().hex
+        run, overlay = capture_overlay["run"], capture_overlay["overlay"]
+        rec = guest_build.verify_overlay(
+            overlay=overlay, run_dir=run, name="cappos",
+            user_data=guest_userdata.capture_positive_user_data(
+                port, token, nonce),
+            instance_id=f"sr-cappos-{uuidlib.uuid4().hex[:8]}",
+            hostname="sr-capture-pos", memory_mb=2048, net="user",
+            timeout_s=600)
+        markers = rec["markers"]
+        assert "SR-GUEST-UNIT-ACTIVE-PASS" in markers, markers
+        assert "SR-GUEST-SPOOL-NONEMPTY-PASS" in markers, markers
+        assert not [m for m in markers if "-FAIL:" in m], markers
+    finally:
+        srv.shutdown()
+        thread.join(timeout=10)
+    # Host-side proof: the installed service authenticated with the EXACT
+    # capability + nonce and delivered the marker command bytes.
+    confirms = [(p, b) for p, b, _ in received if p == "/enroll/confirm"]
+    assert confirms, f"no enrollment callback reached the stub: {[p for p, _, _ in received]}"
+    assert any(b.get("nonce") == nonce for _, b in confirms), confirms
+    ingests = [(p, b, a) for p, b, a in received if p == "/ingest/auditd"]
+    assert ingests, "no audit delivery reached the stub"
+    assert any(a == f"Bearer {token}" for _, _, a in ingests), ingests
+    marker = f"SR-CAPTURE-{nonce[:12]}"
+    assert any(marker in _json.dumps(b) for _, b, _ in ingests), \
+        f"marker {marker} missing from delivered events"

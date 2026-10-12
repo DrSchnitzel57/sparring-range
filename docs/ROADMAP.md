@@ -121,7 +121,7 @@ authority; exact live ACL and isolation proof remains an explicit operator gate.
 
 ## 03 — Real Linux preset templates and owned deployment
 
-- [x] Accept milestone 03 (software acceptance 2026-10-12; live/operator gates stay open — see below).
+- [ ] Accept milestone 03 (reopened 2026-10-12: review found the images/capture QEMU gates boot a synthetic boot sector, not the Ubuntu guests; software acceptance is redone under the strengthened gate, live/operator gates stay open).
 
 Paired 03+04 plan approved 2026-10-12 (linked above). Software work only;
 real PVE version/storage/ACL/isolation acceptance remains deferred operator work.
@@ -146,7 +146,7 @@ works without relying on unavailable reads as proof of absence.
 
 ## 04 — Installed telemetry, bastion access and durable recordings
 
-- [x] Accept milestone 04 (software acceptance 2026-10-12; live/operator gates stay open — see below).
+- [ ] Accept milestone 04 (reopened 2026-10-12 with 03 under the same review finding; separate gates remain mandatory).
 
 Paired with 03 under the approved exception, not absorbed into image-only acceptance.
 

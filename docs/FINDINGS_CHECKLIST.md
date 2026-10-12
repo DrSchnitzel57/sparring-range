@@ -671,12 +671,37 @@ Windows/Sysmon/WEC remains unfinished later work (milestone 12), not a disguised
 first-release blocker or claimed implemented pipeline. More storage can be added;
 capacity must be discovered, not used to silently remove agreed scope.
 
-### Paired milestone-03/04 implementation evidence (2026-10-12)
+### Paired milestone-03/04 rework evidence (2026-10-13, in progress)
 
-Implemented on branch `warm-narwhal` from clean `master` `cbaa3a0`
-(plan: `.openchamber/plans/03-04-linux-guests-capture.md`). No Proxmox, live
-range, host firewall, NAS or unrelated-VM access; every fixture is run-owned
-(synthetic keys/tokens, disposable Postgres, isolated QEMU run dirs).
+> **Reopened 2026-10-12 (review finding, no code changed by review):** the
+> images/capture QEMU gates boot a synthetic boot sector, not the Ubuntu
+> guests with installed services/auditd the paired plan requires. That is a
+> software-validation gap, not deferred live testing: 03/04 software
+> acceptance is redone here under a strengthened gate (real Ubuntu boots);
+> CI run 38316796599 no longer counts for 03/04. Milestone-05 planning waits
+> for the re-acceptance decision.
+
+Plan adjustment (step 7, recorded here; the paired plan lives in OpenChamber
+UI): "boot actual artifacts in isolated QEMU" now explicitly means booting
+assembled Ubuntu guest disks — pinned, checksum-verified noble base plus a
+run-owned qcow2 overlay carrying the actually installed packages
+(nginx/MySQL/auditd/shipper), payload, seeds, flaws and units — with a
+NoCloud seed ISO, asserting live services/seeds/flaws/fixes/readiness
+(images) and installed-capture negatives plus end-to-end delivery (capture)
+over the serial console. The synthetic boot-sector helper is removed. Build-
+phase package fetching uses pinned NAMES with guest-reported resolved
+versions; verification boots run `-net none`. The overlay is a documented
+superset build (role differences are config-level) so the 60-minute TCG job
+budget holds. Also repaired en route: the installed shipper input is now a
+durable persisted cursor (`--audit-log`), retiring the `tail -F -n 0`
+restart loss the planning baseline flagged; the unit ExecStarts the artifact
+directly.
+
+> Superseded runs (kept for provenance; do NOT count as 03/04 acceptance
+> after the reopening above): the first-round implementation ran on branch
+> `warm-narwhal` from clean `master` `cbaa3a0`. No Proxmox, live
+> range, host firewall, NAS or unrelated-VM access; every fixture was run-owned
+> (synthetic keys/tokens, disposable Postgres, isolated QEMU run dirs).
 
 Scope decisions (ambiguous points judged per plan intent, visible on review):
 - Packer retired in place (`RETIRED` header; history preserved); the supported

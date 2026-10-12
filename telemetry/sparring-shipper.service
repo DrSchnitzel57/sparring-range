@@ -5,11 +5,13 @@ Wants=auditd.service
 
 [Service]
 Type=simple
-# Input: the REAL audit.log in ENRICHED format (documented in install.sh).
+# Input: the REAL audit.log in ENRICHED format (documented in install.sh),
+# followed with a DURABLE persisted byte cursor (no `tail -n 0` loss across
+# restarts, no stdin fabrication).
 # /usr/local/bin/sparring-shipper is the shipper installed WITH its
 # `#!/usr/bin/env python3` shebang (audit N08: the installed artifact must be
 # directly executable — a bare .py copy was not).
-ExecStart=/bin/sh -c 'tail -F -n 0 /var/log/audit/audit.log | /usr/local/bin/sparring-shipper'
+ExecStart=/usr/local/bin/sparring-shipper --audit-log /var/log/audit/audit.log
 Restart=always
 RestartSec=3
 EnvironmentFile=-/etc/sparring-range/shipper.env
