@@ -604,9 +604,15 @@ against synthetic PVE fixtures — private deterministic boundary, fail-closed
 cessation and durability semantics, not live Proxmox. Live ACL/isolation/stop
 proofs remain explicit operator gates (Manual checks in the plan).
 
-**Required CI at the implementation revision:** pending — the operator pushes;
-the run URL and per-job conclusions will be recorded here when they appear.
-Until then criterion 9 is open, not waived.
+**Required CI at the implementation revision:** GREEN —
+[run 38264738484](https://github.com/DrSchnitzel57/sparring-range/actions/runs/38264738484)
+at `e6a1d4d` (branch `quick-dingo`, 2026-10-12), conclusion `success`. All
+eleven jobs `success`: selection, authority, frontend, packet, containment,
+python (3.11), db, python (3.13), compose, python (3.12), browser-e2e. The
+CI-only packet and browser gates pass on the hosted runners, covering the two
+prerequisites this host cannot provide. Operator/live gates (real PVE ACL
+denials, VLAN/isolation proofs, identity/stop evidence, $0 budget check) remain
+explicitly open — software acceptance only.
 
 ## Release blockers and missing work
 

@@ -71,7 +71,7 @@ failures/skips are explained; applicable release-blocking advisories are resolve
 
 ## 02 — Host-safe deployment authority and fail-closed cessation
 
-- [ ] Accept milestone 02.
+- [x] Accept milestone 02 (software acceptance 2026-10-12; live/operator gates stay open — see below).
 
 Approved implementation plan (2026-10-09):
 [02-host-safe-authority](../.openchamber/plans/02-host-safe-authority.md).
@@ -88,9 +88,13 @@ the new required `authority` gate is wired into CI. All locally executable gates
 (fast default, selection, python, db, containment, authority, frontend, compose)
 pass at `71507bb`; packet and browser remain CI-only gates on this host. Exact
 evidence: [Milestone 02 implementation evidence](FINDINGS_CHECKLIST.md#milestone-02-implementation-evidence-2026-10-09).
-**Still open:** required CI green at the implementation revision (after push),
-and every operator/live gate — real PVE ACL denials, VLAN/isolation proofs,
+**Still open:** every operator/live gate — real PVE ACL denials, VLAN/isolation proofs,
 identity/stop evidence on the R740 host, and the $0 CI budget check.
+**Accepted (2026-10-12, `e6a1d4d` on `quick-dingo`):** all locally executable
+gates pass (criterion table in the findings evidence section), and required CI
+run 38264738484 is green on all eleven jobs at the same revision — including
+the CI-only packet and browser gates. Software acceptance only; live gates
+remain explicit operator work.
 
 **Goal:** model execution cannot administer the R740, and successful stop cannot
 hide surviving work. **Depends on:** 01.
