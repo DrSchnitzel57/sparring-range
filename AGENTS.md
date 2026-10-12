@@ -27,6 +27,10 @@ to investigate, not current instructions or proof of acceptance.
   at most ten command-based or observable acceptance criteria. Hardware/access
   prerequisites go under `Manual checks`. Its last step updates the roadmap and
   architecture if needed. Commit agreed plans on `master`.
+- The user approved one specific planning exception on 2026-10-12: milestones
+  03 and 04 share `.openchamber/plans/03-04-linux-guests-capture.md`, with
+  separate acceptance gates and roadmap checkboxes. All other milestones remain
+  separately planned. This does not authorize implementation or live testing.
 - Implementation follows an agreed plan, with small commits, explicit decisions,
   and automated acceptance. Skip its manual checks; they belong to the operator.
   End the handoff with an acceptance-criterion PASS/FAIL table and nothing after.

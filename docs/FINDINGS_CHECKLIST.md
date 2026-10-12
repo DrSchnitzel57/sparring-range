@@ -616,6 +616,34 @@ explicitly open — software acceptance only.
 
 ## Release blockers and missing work
 
+### Paired milestone-03/04 planning baseline (2026-10-12)
+
+Clean `master` at `cbaa3a0`, equal to locally recorded `origin/master`; no
+unpushed commits. Approved paired scope and separate acceptance gates:
+`.openchamber/plans/03-04-linux-guests-capture.md`.
+
+Executed from checkout root:
+
+```bash
+env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 \
+  .venv/bin/python -m pytest -q -ra -p no:cacheprovider
+```
+
+Exit **0**: **131 passed, 0 failed/skipped, 164 deselected, 4 warnings**,
+**14.80s**, existing Python 3.13 venv. This is only the infrastructure-free
+planning baseline. No new image, installed capture, database integration,
+QEMU/CI or live PVE acceptance was executed during planning.
+
+Inspected: `infra/images/golden-linux.pkr.hcl` remains invalid/incomplete;
+the golden script installs capture but no scenario services; DB YAML has
+placeholder user/hash baselines; deployment requests linked clones and weakly
+checks bridge placement; broker clone path does not enforce declared resource
+budgets; installed shipper uses `tail -n 0`, losing unread input on restart.
+These are paired-plan work, not accepted behaviors or proof of live exploits.
+The current published PVE API describes `/agent/file-read` and scoped
+`VM.GuestAgent.FileRead`; actual installed-version/ACL support stays unverified.
+User explicitly deferred storage selection and all live-lab testing.
+
 | ID / priority | Current finding and evidence boundary | Milestone |
 |---|---|---|
 | B01 / P1 | **Repaired at `ac5a61b`, CI-accepted (see milestone-01 evidence):** baseline failures fixed on real host identities; DB marker leakage structurally prevented (fixture-closure derivation) | 01 |

@@ -342,6 +342,40 @@ Validate dependency advisories and patch supported packages before release.
 
 ## Decisions and why
 
+### Paired milestones 03+04 (approved 2026-10-12)
+
+This is a specific exception to separate milestone planning, not permission to
+combine later work. Plan: `.openchamber/plans/03-04-linux-guests-capture.md`.
+Separate image/deployment and installed-capture/access gates remain mandatory.
+
+| Chosen | Rejected / deferred | Why |
+|---|---|---|
+| Ubuntu Server 24.04 LTS cloud-image provisioning; pinned source checksum, package/artifact manifests and retained build inputs | Repairing the broken optional Packer path; unpinned package resolution treated as reproducibility | One supported build path, rebuilt and boot-tested from recorded artifacts; retire Packer explicitly |
+| New `mojang-web-01` and `mojang-web-db-01` IDs; local nginx/Python guest app, PyMySQL for the DB-backed variant | Reinterpreting legacy IDs/snapshots; actual Minecraft server, Microsoft login or proprietary assets | Preserve history and keep the agreed HTTP/MySQL scope; label all business data fictional |
+| Three catalogue entries (Minecraft, Dungeons, Legends), twelve fixed fictional purchase records; web-only local data, web+DB reads MySQL | Disconnected web/DB services; raw live MySQL disk hashes | Useful business transactions and stable logical data checks; pinned seed artifact defines exact IDs/rows/prices |
+| Deliberately vulnerable diagnostic feature runs as limited web user; misconfigured guest maintenance helper allows guest-root escalation | Old vulnerable OS packages or hidden foothold fallback | Reproducible documented attack paths and defender repairs; patched base packages, no external targets |
+| Network-entry has no target capability; assumed-breach has only disclosed web-user access; defender account has full guest sudo | Initial attacker root/DB administrator access; shared defender/verifier keys | Separate role identities and explicit start contracts; control secrets never enter attacker/model execution |
+| Fresh attacker clone each session, fixed network destination bound to current ownership/generation | Reusing a potentially compromised attacker disk | Stop/reset/cleanup cover the attacker as well as targets; no stale runner pins or operations |
+| Fresh clone host keys/machine IDs; broker reads only `/etc/ssh/ssh_host_ed25519_key.pub` through the PVE guest-agent file-read API during initial provisioning | Shared template host keys, TOFU/keyscan, arbitrary paths, guest exec, host shell or re-pinning after compromise | Trusted hypervisor channel to the positively owned fresh guest; enforce bounded key parsing, exact identity/generation and pin invalidation on reset |
+| Require narrowly scoped `VM.GuestAgent.FileRead` on approved lab resources; block unsupported PVE versions/ACLs | `VM.Monitor` or `VM.GuestAgent.Unrestricted` fallback | Current published PVE API supports FileRead separately; actual installed version and effective denial tests remain operator prerequisites, not assumed proof |
+| Bake only operator public access keys into protected build inputs, never private keys/live tokens; separate provisioning/verifier and bastion keys | Credential-bearing image builds or relying on implicit SSH-agent identities | Pinned management provisions per-generation secrets; bastion uses explicit guest credentials; guest root can forge guest telemetry, never independent score truth |
+| Full and linked clones selected explicitly by operator policy; template/resource/storage/NIC validation before start | Hard-coded linked clones, automatic fallback, declared-but-unused budgets | Test both modes, reject mismatches, reserve aggregate budgets before effects; all uncertainty retains durable obligations/lease |
+| Each guest: 2 vCPUs/2 GiB RAM; attacker/web/DB disks 16/12/16 GiB | Assuming live storage capacity or resizing to get green tests | Larger range totals 6 vCPUs/6 GiB/44 GiB disks; templates/control/evidence/reserve are additional; enforce actual PVE read-back and operator-owned CPU ceilings |
+| Durable audit-input tracking, spool replay/dedup and visible unrecoverable gaps; 64 MiB spool, 32 MiB/cast | `tail -n 0` restart loss; silent truncation or stronger attribution claims | Installed fixture tests real auditd/systemd under srshipper, rotation, outages/crashes and recovery; preserve source identity/order |
+| Protected durable shared recordings directory for API/bastion | New recording-transfer protocol | Fits current shared-volume model; explicit permissions, pinned SSH/revocation/resize/reconnect/restart/replay and missing-file checks; production packaging stays in 10 |
+| Required QEMU VM gates: max three VMs/6 GiB guest RAM, 60-minute job timeout; KVM optional, software emulation supported | Shared-kernel auditd fixtures, installing auditd on this host, privileged live-lab testing | Boot actual artifacts with isolated networking, run-owned disks and synthetic secrets; missing prerequisites/skip/cleanup failure blocks acceptance, never touches R740 |
+
+Image builds may fetch pinned inputs in a separate build phase. Practice and
+negative-path tests run without general egress; only narrow synthetic control
+paths are allowed. QEMU serial-console bootstrap is a test-only trusted transport,
+not proof of real PVE guest-agent permissions. Production PVE adapter behavior is
+tested with simulated API responses until operator-authorized live checks.
+No model-driven attacks precede real isolation/emergency gates. No paid CI usage
+is authorized; verify the existing free-allowance/$0-budget operator prerequisite.
+Match controls/timers, ongoing availability scores, injects and dashboard changes
+remain milestones 05 onward. The attacker start-condition artifact contract is
+implemented here; full member controls and sustained AI behavior remain later work.
+
 | Chosen | Rejected / deferred | Why |
 |---|---|---|
 | Canonical AGENTS, architecture, roadmap and current evidence/runbook | Multiple master plans, audit handoffs and completion claims as authorities | One current contract; history remains in Git; no contradictory checkmarks |

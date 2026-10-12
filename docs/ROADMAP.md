@@ -10,6 +10,10 @@ closed by the repair round recorded in the findings).
 Architecture and ordered scope are agreed; write the full implementation plan for **one milestone at a
 time**, inspect the then-current code, and obtain agreement before implementing.
 Plans go in `.openchamber/plans/NN-short-name.md`; do not write them all now.
+Exception approved 2026-10-12: milestones 03+04 share one paired plan,
+[03-04-linux-guests-capture](../.openchamber/plans/03-04-linux-guests-capture.md),
+because guest construction, access and installed capture share the same fixtures.
+Their acceptance gates and checkboxes remain separate; no other milestone is combined.
 
 Each milestone requires independently executed acceptance, not old reports or
 unchecked implementer claims. Its plan ends with at most ten command/behavior
@@ -119,6 +123,9 @@ authority; exact live ACL and isolation proof remains an explicit operator gate.
 
 - [ ] Accept milestone 03.
 
+Paired 03+04 plan approved 2026-10-12 (linked above). Software work only;
+real PVE version/storage/ACL/isolation acceptance remains deferred operator work.
+
 **Goal:** web and web+database presets have reproducible, defendable guests—not
 just YAML claiming services exist. **Depends on:** 02.
 
@@ -140,6 +147,8 @@ works without relying on unavailable reads as proof of absence.
 ## 04 — Installed telemetry, bastion access and durable recordings
 
 - [ ] Accept milestone 04.
+
+Paired with 03 under the approved exception, not absorbed into image-only acceptance.
 
 **Goal:** a real command through the installed service reaches the correct current
 session and is replayable. **Depends on:** 03.

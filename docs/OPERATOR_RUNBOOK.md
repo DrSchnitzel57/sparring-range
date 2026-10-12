@@ -107,6 +107,18 @@ claims and an unverified control lease latches and hard-stops BEFORE serving.
 
 ## 4. Images, access and installed capture
 
+Approved paired software plan (2026-10-12):
+[03+04 Linux guests and capture](../.openchamber/plans/03-04-linux-guests-capture.md).
+This is not an installation acceptance claim. Automated work uses isolated
+disposable QEMU fixtures, not the R740. All live testing and storage selection
+are deferred; each live gate still requires operator approval. Before deployment,
+verify the installed PVE supports scoped `VM.GuestAgent.FileRead` for approved
+lab VMs and denies other guest-agent/host operations; never substitute broad
+`VM.Monitor` or unrestricted-agent privileges. The proposed broker reads only a
+fresh owned clone's public SSH host key; network keyscan/TOFU is not enrollment.
+Resource profiles and capacity prerequisites are recorded in the architecture;
+templates, control services, recordings and free-space reserve are additional.
+
 Milestone 03 must deliver reproducible Linux web and web+MySQL templates with
 synthetic seeded business data, usable services, declared vulnerabilities/limited
 footholds, defender guest administration, trusted verification channels and stable
