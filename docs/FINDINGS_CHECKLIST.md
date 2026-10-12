@@ -563,11 +563,15 @@ deployment acceptance is claimed by saving that plan.
 
 ## Milestone 02 implementation evidence (2026-10-09)
 
-Executed at code revision **`71507bb`** (branch `quick-dingo`; only these
-documentation files were dirty during the gate sweep — no code changed after
-`71507bb`): Python **3.13.5** (uv-created pip-less `.venv` from
-`requirements.lock`), Node **22.23.3**, npm **10.9.9**, Docker daemon 29.8.2 /
-Compose 5.6.0, cgroup v2 with a writable delegated subtree. No Proxmox, live
+Executed at code revision **`71507bb`** (branch `quick-dingo`; the follow-up
+docs commit **`bab084f`** touches only the four `docs/` files — `git diff
+71507bb..bab084f --name-only` lists nothing else — so the exercised code is
+identical). Full sweep environment: Python **3.13.5** (uv-created pip-less
+`.venv` from `requirements.lock`), Node **22.23.3**, npm **10.9.9**, Docker
+daemon 29.8.2 / Compose 5.6.0, cgroup v2 with a writable delegated subtree.
+Re-anchored at **`bab084f`** on 2026-10-12: fast default **131 passed,
+0 skipped, 164 deselected**, `selection` PASS, `authority` PASS (22 passed).
+No Proxmox, live
 range, host firewall, NAS or unrelated-VM access; every fixture is run-owned.
 
 **M01-R4 prerequisite resolved (`a87e83b`).** Root cause classified: FastAPI
