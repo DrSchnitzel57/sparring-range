@@ -856,6 +856,134 @@ promoted to acceptance. Source/test comments and package metadata still naming
 old docs are legacy references to reconcile in milestone 01 without changing
 regression intentions; they cannot override `AGENTS.md` or the release design.
 
+## Tomorrow-pilot implementation evidence (2026-10-13, plan 12-tomorrow-pilot)
+
+Cross-cutting authorized exception plan (see `docs/ROADMAP.md` "Planning and
+acceptance discipline"). It accepts NO milestone; everything below is pilot
+evidence only. Branch `openchamber/tomorrow-pilot`, baseline `edb8df3`
+(fast suite at baseline: 135 passed / 192 deselected). Implementation
+commits `e789a8d..24f84ef` (8 commits). Environment: Python 3.13.5 venv;
+Docker daemon 29.8.2 / Compose 5.6.0; QEMU 10.0.13 (TCG, 4-CPU/16G host,
+one guest at a time); Node v22.23.3 + Playwright chromium-headless-shell
+155.0.8059.12 (installed this session — the browser binary was the only
+missing prerequisite); disposable PostgreSQL = run-owned container
+`sr-acc-pg-52b3cf2b` on loopback `127.0.0.1:49003` (acceptance-harness
+fixture image; superuser password reset in-container, no host DB touched).
+
+### Fast suite (criterion 1) — PASS
+
+`env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1
+.venv/bin/python -m pytest -q -ra -p no:cacheprovider` at `24f84ef`:
+exit 0, **152 passed, 0 failed, 0 skipped, 206 deselected**, 17.2 s.
+
+### DB layer + browser (criteria 3, 5, 6) — PASS
+
+`env SR_PG_ADMIN_URL=<disposable> SR_REQUIRE_DB=1 PYTHONDONTWRITEBYTECODE=1
+.venv/bin/python -m pytest -q -p no:cacheprovider -m db
+--ignore=tests/test_stage5_browser_e2e.py`: exit 0, **135 passed, 0 failed,
+222 deselected**, 144.8 s. The browser e2e (also db-classified) ran
+separately with `SR_REQUIRE_BROWSER=1 -m browser`: **1 passed**, 43.2 s —
+real chromium drives login → launch → API-served connections → ingest →
+Begin (server clock + deadline) → sustained run stopped via UI → end
+(destroy + release) → AAR. New pilot db tests: `tests/test_pilot_lifecycle.py`
+(10: snapshot at creation, Begin idempotence/never-extends, idle expiry with
+safe cleanup, deadline end, end destroys + frees range, failed destroy keeps
+lease and retries, restart interrupts and never resumes, connections served
+by API, worker-env snapshot values) and `tests/test_pilot_uptime.py` (2 db:
+identity-bound samples through the real prober, append-only grants — app-role
+UPDATE/DELETE raise `InsufficientPrivilege` — dashboard/end reporting).
+Plan-authorized semantics change: END now destroys owned VMs and releases the
+lease; the R07 invariant (a machine that still exists keeps the reservation)
+is preserved and newly covered (`test_end_with_failed_destroy_keeps_lease_and_retries`,
+updated `test_r07_*`).
+
+### Sustained attacker + uptime (criteria 4, 5) — PASS (fast layer)
+
+`tests/test_pilot_sustained_attacker.py` (9) and `tests/test_pilot_uptime.py`
+(8 fast) pass within the suite above: loop runs to the SERVER deadline (not
+20 steps / objective completion), per-action throttle is deadline-aware and
+non-overlapping, DONE never ends a match, gateway retry policy 3 attempts
+(5 s/15 s, 60 s timeout) then truthful interrupt; uptime math scores only
+valid checks, zero-valid is unscored, staleness/coverage surfaced, and a
+confirmed probe-infrastructure failure interrupts instead of fabricating
+downtime.
+
+### Attack chain on real boots (criterion 2) — PASS
+
+`env SR_PG_ADMIN_URL=<disposable> PYTHONDONTWRITEBYTECODE=1
+SR_REQUIRE_IMAGES=1 .venv/bin/python -m pytest -q -p no:cacheprovider
+-m "images or db" tests/test_mojang_images_deploy.py` at the final
+revision: **10 passed, 0 failed**, 393.8 s (warm overlay cache). Markers
+proven on real Ubuntu 24.04 boots: `DIAG-FLAW` (genuine
+`subprocess.run(shell=True)` as the web user over HTTP), `ROOT-FLAW`
+(HTTP-driven plant → `sudo -n` helper → uid-0 proof file), `MAINT-HELPER`,
+`MAINT-FIX` (revoke sudoers rule → chain dead, services active),
+`DIAG-FIX-PASS` (endpoint disabled → 403, catalogue still serves), plus
+MYSQL-READY/COUNT/ROW on the DB variant.
+
+**Two real gate bugs found and fixed while chasing a "flaky MYSQL-COUNT":**
+(1) `boot_full_guest` judged a NEW boot on the PREVIOUS boot's serial file:
+two verify tests share one overlay + run dir, so both wrote
+`guest.serial.log`; the poll loop saw the stale `DONE rc=0` before QEMU
+opened the file and returned the old markers instantly (web-local's serial
+has no MYSQL checks — hence "MYSQL-COUNT missing, no FAIL, DONE rc=0").
+Fix: unique `serial_name` per boot + unlink before start. This is very
+likely the pre-existing images-CI failure at `fe940fc`.
+(2) The chain battery is state-mutating BY DESIGN (MAINT-FIX removes the
+sudoers rule, DIAG-FIX disables the endpoint) and writes persist in the
+overlay booted; a module-scoped shared overlay made the second verify boot
+start already-fixed (flaw checks then correctly failed). Fix: fresh
+overlay copy per verify test (cache copy+rebase, no extra boots).
+Serial hardening (marker double-emit, `dmesg -n 1`, getty stop, always
+preserve serials) is retained as defense in depth, but the initial
+corruption theory was wrong — evidence over theory.
+
+### Gates (criteria 7, 8) — PASS
+
+`python infra/dev/acceptance.py frontend`: PASS 7.1 s (lockfile-faithful
+`npm ci`, `next build`, `npm audit --omit=dev` zero findings — moderate=0
+low=0). `python infra/dev/acceptance.py compose`: PASS 63.2 s — fresh
+bootstrap + idempotent rerun, migrations at head **0013**, API runtime holds
+app-role credentials only, bastion capability + running, run-owned project
+fully cleaned.
+
+### Template build (criterion 9) — PASS
+
+`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python infra/images/pve_template_build.py
+--out /tmp/sr-templates --pubkey <ed25519.pub> --cache-dir /tmp/sr-guest-cache
+--roles attacker,mojang-web-local`: exit 0. Base `noble-20261012`
+(sha256 `6a81c375…5bb4d2`, verified against the published
+cloud-images SHA256SUMS). Flattened standalone qcow2s verified (format qcow2,
+no backing file, budgeted 16 GiB virtual, `qemu-img check` clean — the
+initial `-r no` invocation was invalid and is fixed). FINAL artifacts —
+rebuilt at the final revision with the OPERATOR's bastion public key
+(`charl@lenovo`, SHA256 `fM6V/cZLUQny3u159PnxRowPIlM1Y6S94cJ7aXe9tOE`,
+fingerprint confirmed against the operator's own keygen output) baked in:
+attacker VMID 9005 sha256
+`a8c78964f1d6629df37176a188dc143a73b1867d44f651232b5f0f9d43a4032a`,
+mojang-web-local VMID 9011 sha256
+`653259af19c1b6b0ea617830a16f2cfbb31796dd363a5948021652a94b87e17c`;
+`sha256sum -c SHA256SUMS` OK; `IMPORT-STEPS.md` + `TEMPLATE-INFO.json`
+emitted. The finalize boot bakes the ONE operator/bastion PUBLIC key into
+root/defender/attacker (chk BAKE passed) and scrubs per-clone identity.
+Earlier test-key builds (attacker `77add10c…`, web-local `aedfae4d…`) are
+superseded; key rotation = rebuild + reimport per generation.
+
+### Still open after the pilot (honest ledger)
+
+Milestones 03–11 acceptance states unchanged. Live/operator gates (VLAN
+default-deny positive controls, emergency-stop drill, PVE token/ACL, template
+import, full two-teammate rehearsal, model smoke through the gateway) are
+Manual checks for the operator — attacks stay latched until they pass.
+Installed-capture acceptance stays open (pilot command truth is events/casts).
+CI images/capture jobs at `fe940fc` remain failing (pre-existing; the stale
+serial bug fixed here is the likely images-gate cause — CI re-greening on
+push stays open, not a pilot gate). The web-db verify's intermittent
+missing-`MYSQL-COUNT` was root-caused to two real gate bugs (above) and
+fixed; contradictory single-boot outcomes must be reproduced before being
+believed. Browser/packet gates remain CI-required for acceptance; local
+chromium passing does not replace them.
+
 ## Recording new acceptance evidence
 
 For every gate record: date, evidence Git revision and dirty status, exact command

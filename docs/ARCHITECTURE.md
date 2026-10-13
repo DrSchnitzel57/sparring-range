@@ -417,6 +417,23 @@ implemented here; full member controls and sustained AI behavior remain later wo
 | Required `authority` acceptance layer (real policy/ledger/mutual-TLS/cessation tests, infrastructure-free) | Mocked broker boundary or CI-only coverage of these invariants | The private-boundary and fail-closed invariants are checkable without PVE and must gate every run |
 | FastAPI generator dependencies pinned to `scope="function"` (one shared `DbSession`) | Default request-scope generators committing after the response | FastAPI ≥ 0.142 closes request-scope dependencies AFTER the response is observable; the intermittent CI handoff failures (login 401 after bootstrap 201, launch 404 after create 201, M01-R4) were that race — a 2xx must imply durable writes |
 
+### Tomorrow pilot (authorized 2026-10-13, cross-cutting exception)
+
+Plan: `.openchamber/plans/12-tomorrow-pilot.md`. Accepts no milestone; the
+decisions below are pilot-scope and stand unless a later milestone plan
+revisits them with evidence.
+
+| Chosen | Rejected / deferred | Why |
+|---|---|---|
+| ONE durable end/expiry path (`lifecycle.finalize_match`) shared by user end, deadline, idle expiry and startup reconcile; `finalizing` is a durable intent marker the scheduler retries | Request-scoped best-effort cleanup; separate end vs expiry code paths | A crash or blocked step mid-cleanup must leave a retryable intent; unknown cleanup is never reported as success |
+| End/expiry destroys owned VMs and releases the lease; a failed destroy keeps the lease and stays visible for retry (R07 invariant retained) | End retaining machines behind a separate explicit teardown (previous pilot behavior) | Take-turns demo needs the range free immediately after a match; the reservation invariant only binds while a machine still exists |
+| Server clock is the only match authority: preset/duration/pace SNAPSHOTTED at session creation; Begin binds `started_at`/`deadline_at`; duplicate Begin can never extend | Client-side timers; re-reading preset parameters mid-match | The match must end at a deterministic server deadline and behave identically from every client |
+| API restart INTERRUPTS running matches and reconciles cleanup; never resumes | Silent resume of attacks after a restart | Attack workers are children of the API; resuming without supervision would be unmanaged execution |
+| Sustained attacker runs to the deadline (objective completion never ends the match); per-action throttle from the snapshot; gateway retry 3×(5 s/15 s, 60 s timeout) then truthful interrupt | Fixed 20-step or complete-then-stop loop; infinite retry | Practice is continuous pressure under a fixed clock; a broken model endpoint must surface as `model_unavailable`, not a hang or a fake success |
+| Uptime samples in a dedicated append-only table (app role SELECT+INSERT only); score = % up among VALID checks with unknown first-class; zero valid ⇒ unscored; confirmed probe-infrastructure failure INTERRUPTS the match | Folding uptime into the security scorecard; counting unknown as downtime | Separate honest scores; a broken probe must never fabricate downtime |
+| Bastion dials guests as `defender` with its own keypair (public half baked at template finalize, rotated per generation); SSH instructions served by `GET /sessions/{id}/connections` | Implicit root dial default; browser sessionStorage holding connection secrets | Least-privilege guest identity; instructions survive refresh/other devices without browser-resident secrets |
+| Scheduler thread + startup match reconcile opt-in (`SR_MATCH_SCHEDULER_ENABLED=1`, production env only) | Always-on background cleanup in every process | Shared-database test processes must never run destructive background cleanup against other sessions' fixtures |
+
 ## Risks and explicitly unverified inputs
 
 - Same physical host retains hypervisor/resource-contention risk even with no

@@ -336,3 +336,16 @@ non-default branch. Each accepted milestone ticks its checkbox and updates the
 architecture if its design changed; record reasons rather than hiding deviations.
 Early operator discovery may de-risk storage/PVE/model inputs, but no real
 model-driven attacks are authorized before the safety gates pass.
+
+**Authorized cross-cutting exception (2026-10-13):** the user approved
+`.openchamber/plans/12-tomorrow-pilot.md` — a combined overnight pilot plan
+(attack-chain repair, PVE template build, sustained AI attacker, durable
+match lifecycle, optional uptime scoring, browser flow, deployment artifacts)
+to demo a web-only AI-defense practice. It is an explicit exception to
+one-plan-per-milestone and its plan number does NOT refer to roadmap
+milestone 12 (Windows/AD) below. It accepts and ticks NO milestone: milestones
+03–11 keep exactly the acceptance states recorded in
+`docs/FINDINGS_CHECKLIST.md`, and anything the pilot plan did not verify
+stays explicitly open. Implementation ran on the user-selected branch
+`openchamber/tomorrow-pilot`; evidence is recorded under "Tomorrow-pilot
+implementation evidence" in `docs/FINDINGS_CHECKLIST.md`.
