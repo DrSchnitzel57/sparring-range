@@ -94,11 +94,22 @@ def build_overlay(*, repo_root: pathlib.Path, run_dir: pathlib.Path,
     base = qemu_guest.ensure_verified_base(cache_dir / "base")
     if cached.exists() and cached_meta.exists():
         meta = json.loads(cached_meta.read_text())
+        # Recreate the sized base (deterministic) and rebase the copied
+        # overlay onto it: backing paths are absolute per-run, so a raw copy
+        # would dangle at the deleted original run dir.
+        qemu_guest.sized_base_copy(base, run_dir, "guest", 16)
         overlay = run_dir / "guest.qcow2"
         shutil.copyfile(cached, overlay)
+        r = subprocess.run(["qemu-img", "rebase", "-u", "-F", "qcow2",
+                            "-b", str(run_dir / "guest-base.qcow2"),
+                            str(overlay)],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            raise RuntimeError(f"qemu-img rebase failed: {(r.stderr or r.stdout)[:200]}")
         return {"overlay": str(overlay), "cached": True,
                 "inputs_hash": key, **meta}
-    overlay = qemu_guest.make_overlay(base, run_dir, "guest")
+    # Production-sized test disk (superset serves the 16 GiB web-db role).
+    overlay = qemu_guest.fresh_role_overlay(base, run_dir, "guest", 16)
     seeds = json.loads((pathlib.Path(repo_root) / "scenarios/mojang-seeds.json"
                         ).read_text())
     payload = guest_userdata.payload_from_repo(str(repo_root), role, seeds)

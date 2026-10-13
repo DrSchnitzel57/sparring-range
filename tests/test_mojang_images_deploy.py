@@ -121,7 +121,8 @@ def test_images_ubuntu_verify_attacker():
     run = qemu_guest.make_run_dir()
     try:
         base = qemu_guest.ensure_verified_base(GUEST_CACHE / "base")
-        overlay = qemu_guest.make_overlay(base, run, "attacker")
+        # Attacker boots a FRESH production-sized overlay (16 GiB budget).
+        overlay = qemu_guest.fresh_role_overlay(base, run, "attacker", 16)
         rec = guest_build.verify_overlay(
             overlay=overlay, run_dir=run, name="attacker",
             user_data=guest_userdata.attacker_verify_user_data(),

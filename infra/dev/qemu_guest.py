@@ -95,6 +95,36 @@ def make_overlay(base_img: pathlib.Path, run_dir: pathlib.Path, name: str) -> pa
     return overlay
 
 
+def sized_base_copy(base_img: pathlib.Path, run_dir: pathlib.Path, name: str,
+                    size_gb: int) -> pathlib.Path:
+    """Run-owned resized COPY of the verified base (qcow2 resize is sparse
+    and instant). The stock cloud disk is 3.5 GiB — too small once real
+    packages + MySQL initialize; production guest budgets are 12–16 GiB, so
+    test disks match the budgeted sizes instead of an undersized default."""
+    if size_gb < 4 or size_gb > 16:
+        raise ValueError(f"test disk {size_gb}GiB outside 4..16 bound")
+    copy = run_dir / f"{name}-base.qcow2"
+    shutil.copyfile(base_img, copy)
+    r = subprocess.run(["qemu-img", "resize", str(copy), f"{size_gb}G"],
+                       capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise RuntimeError(f"qemu-img resize failed: {(r.stderr or r.stdout)[:300]}")
+    return copy
+
+
+def fresh_role_overlay(base_img: pathlib.Path, run_dir: pathlib.Path, name: str,
+                       disk_gb: int) -> pathlib.Path:
+    """Sized base copy + empty overlay: the standard per-boot test disk."""
+    sized = sized_base_copy(base_img, run_dir, name, disk_gb)
+    overlay = run_dir / f"{name}.qcow2"
+    r = subprocess.run(["qemu-img", "create", "-f", "qcow2",
+                        "-b", str(sized), "-F", "qcow2", str(overlay)],
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(f"qemu-img overlay failed: {(r.stderr or r.stdout)[:300]}")
+    return overlay
+
+
 def boot_full_guest(*, disk: pathlib.Path, seed_iso: pathlib.Path,
                     memory_mb: int = 2048, smp: int = 2,
                     net: str = "none", host_api_port: int | None = None,
