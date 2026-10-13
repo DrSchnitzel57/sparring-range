@@ -41,6 +41,21 @@ chk() {
   if "$@" >/tmp/sr-chk.log 2>&1; then say "$name-PASS";
   else say "$name-FAIL:$(tr '\n' ';' </tmp/sr-chk.log | tail -c 200)"; fails=$((fails+1)); fi
 }
+wchk() {
+  # Wait-then-check (bounded): TCG service starts are slow; poll the probe
+  # up to budget*2s before calling it a failure — never a fixed sleep race.
+  local name=$1 budget=$2; shift 2
+  local t=0
+  while ! "$@" >/tmp/sr-chk.log 2>&1; do
+    t=$((t+1))
+    if [ $t -ge $budget ]; then
+      say "$name-FAIL:$(tr '\n' ';' </tmp/sr-chk.log | tail -c 200)"
+      fails=$((fails+1)); return 0
+    fi
+    sleep 2
+  done
+  say "$name-PASS"
+}
 say BOOT
 """
 
@@ -159,16 +174,27 @@ def _build_runcmd(role: str, packages: list[str]) -> list[str]:
             r"printf '%s' \"$PW\" > /etc/mojang-web/reader-pw",
             "chmod 0640 /etc/mojang-web/reader-pw",
             r"printf 'MOJANG_MYSQL_PASSWORD=%s\n' \"$PW\" >> /etc/mojang-web/config.env",
+            # mysqld first-start initialization under TCG is SLOW: wait
+            # (bounded) for readiness BEFORE loading schema/seeds — the old
+            # race silently skipped seeding and poisoned later boots.
+            r"for i in $(seq 1 90); do mysqladmin --silent ping >/dev/null 2>&1 && break; sleep 2; done",
+            "mysqladmin --silent ping",
             "mysql < /etc/mysql/mojang/schema.sql",
             "mysql < /etc/mysql/mojang/seed.sql",
             r"mysql -e \"ALTER USER 'mojang_reader'@'127.0.0.1' IDENTIFIED BY '$PW'\"",
         ]
-    # Record resolved package versions, report, power off.
+    # Record resolved package versions, report, power off. The PASS marker
+    # is gated on the role's data check (db: seeded row count) — a silent
+    # seeding skip can never report success.
     want = " ".join(p.split("=")[0] + "*" for p in packages)
+    gate = ("test \"$(mysql --batch --skip-column-names -e "
+            "'SELECT COUNT(*) FROM purchases' mojang)\" = 12"
+            if role == "mojang-web-db" else "true")
     cmds += [
         f"dpkg-query -W -f='${{Package}}=${{Version}}\\n' {want} > /srv/sr-build/versions.txt 2>/dev/null || true",
         "sed 's/^/SR-GUEST-PKG:/' /srv/sr-build/versions.txt > /dev/ttyS0 || true",
-        f"echo SR-GUEST-BUILD-PASS > {SERIAL}",
+        f"bash -c '{gate} && echo SR-GUEST-BUILD-PASS > /dev/ttyS0 || "
+        "echo SR-GUEST-BUILD-FAIL > /dev/ttyS0'",
         "poweroff",
     ]
     return cmds
@@ -182,17 +208,19 @@ def _verify_checks(role: str) -> str:
     if role == "mojang-web-db":
         # NOTE: --protocol=TCP is load-bearing: the reader grant is
         # 'mojang_reader'@'127.0.0.1' (TCP); the CLI would otherwise use the
-        # local socket as 'localhost' and be refused.
+        # local socket as 'localhost' and be refused. Mysqld is waited on
+        # (bounded) since verify boots start it fresh under slow TCG.
         mysql_checks = """
+wchk MYSQL-READY 45 mysqladmin --silent ping
 chk MYSQL-COUNT bash -c 'test "$(mysql --protocol=TCP --host=127.0.0.1 --batch --skip-column-names --user=mojang_reader --password="$(cat /etc/mojang-web/reader-pw)" -e "SELECT COUNT(*) FROM purchases" mojang)" = 12'
 chk MYSQL-ROW bash -c 'mysql --protocol=TCP --host=127.0.0.1 --batch --skip-column-names --user=mojang_reader --password="$(cat /etc/mojang-web/reader-pw)" -e "SELECT purchase_id FROM purchases" mojang | grep -q buy-001'
 """
     return _HARNESS_HEADER + f"""
 chk UNITS-ACTIVE bash -c 'systemctl is-active --quiet {units}'
-chk CATALOGUE bash -c "curl -sf http://127.0.0.1/ | grep -q 'Minecraft Legends'"
+wchk CATALOGUE 30 bash -c "curl -sf http://127.0.0.1/ | grep -q 'Minecraft Legends'"
 chk CATALOGUE-COUNT bash -c "curl -sf http://127.0.0.1/ | grep -c buy- | grep -qx 12"
 chk DIAG-FLAW bash -c "curl -sf 'http://127.0.0.1:8080/diagnostic?cmd=whoami' && grep -q 'DIAG{{web-user}}' /tmp/mojang-diag-proof.txt"
-chk DIAG-FIX bash -c 'printf MOJANG_DIAG_ENABLED=off >> /etc/mojang-web/config.env && systemctl restart mojang-web && sleep 2 && curl -sf http://127.0.0.1/ | grep -q Legends && ! curl -sf "http://127.0.0.1:8080/diagnostic?cmd=whoami"'
+chk DIAG-FIX bash -c 'printf MOJANG_DIAG_ENABLED=off >> /etc/mojang-web/config.env && systemctl restart mojang-web && for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/ >/dev/null 2>&1 && break; sleep 2; done && curl -sf http://127.0.0.1/ | grep -q Legends && ! curl -sf "http://127.0.0.1:8080/diagnostic?cmd=whoami"'
 chk MAINT-HELPER bash -c 'test -u /usr/local/bin/mojang-maintenance'
 chk AUDITD-RULES bash -c 'auditctl -l | grep -q sparring_cmd'
 chk SHIPPER-UNIT bash -c 'grep -q "^User=srshipper" /etc/systemd/system/sparring-shipper.service && grep -q adm /etc/systemd/system/sparring-shipper.service'
