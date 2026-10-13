@@ -182,6 +182,37 @@ def bootstrap_cmd(
                    "recreate the bastion — docker compose up -d bastion")
 
 
+@app.command("user-add")
+def user_add_cmd(
+    username: str,
+    role: str = typer.Option("member", help="member|operator"),
+    password: str = typer.Option(None, help="else prompt (10+ chars)"),
+):
+    """Operator OFFLINE onboarding (control-plane only — the documented CLI
+    administration exception): create a take-turns member (or operator)
+    account with a scrypt-hashed password. Teammates log in with these;
+    per-session bastion capabilities stay server-issued."""
+    from sqlalchemy import select
+    from srplatform.api.auth import hash_password
+    from srplatform.db.models import User
+    from srplatform.db.session import db as db_ctx
+    if role not in ("member", "operator"):
+        typer.echo("role must be member|operator", err=True)
+        raise typer.Exit(2)
+    password = password or getpass.getpass(f"password for {username} (10+ chars): ")
+    if len(password) < 10:
+        typer.echo("password too short (10+ chars)", err=True)
+        raise typer.Exit(2)
+    with db_ctx() as s:
+        if s.execute(select(User).where(User.username == username)).first():
+            typer.echo(f"user {username!r} already exists", err=True)
+            raise typer.Exit(1)
+        s.add(User(username=username, role=role,
+                   password_hash=hash_password(password)))
+        s.commit()
+    typer.echo(f"ok: {role} account {username!r} created")
+
+
 # --- auth ------------------------------------------------------------------------
 @app.command("login")
 def login(username: str | None = None):

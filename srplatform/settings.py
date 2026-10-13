@@ -171,6 +171,13 @@ class Settings(BaseSettings):
     bastion_listen_port: int = 2222
     bastion_authorized_keys_file: str = ""  # member public keys, provisioned by operator
     bastion_targets_known_hosts: str = ""   # pinned range host keys (F08)
+    # Guest-side identity for recorded dials (pilot step 7): DEFENDER, not
+    # root — the bastion never needs guest root. The bastion authenticates
+    # with its own keypair (BASTION_CLIENT_KEY_PATH); the PUBLIC half is
+    # baked into the guest templates at build time, rotated per template
+    # generation (rebuild + reimport = new key).
+    bastion_target_user: str = "defender"
+    bastion_client_key_path: str = ""
     recording_max_bytes: int = 32 * 1024 * 1024
 
     # --- Telemetry ingest (F09) ---

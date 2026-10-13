@@ -1,0 +1,21 @@
+[Unit]
+Description=sparring-range recording bastion (recorded SSH, port 2222)
+After=network-online.target sr-api.service
+
+[Service]
+Type=exec
+User=srbastion
+Group=srbastion
+EnvironmentFile=/etc/sparring-range/control-plane.env
+WorkingDirectory=/opt/sparring-range
+ExecStart=/opt/sparring-range/.venv/bin/python -m srplatform.bastion.proxy
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sparring-range
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

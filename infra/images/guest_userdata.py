@@ -490,17 +490,37 @@ write_files:
 """
 
 
-def finalize_user_data() -> str:
-    """Template finalize boot (pilot step 2): scrub per-clone identity from
-    the BUILT template so every PVE clone regenerates fresh SSH host keys and
-    machine-id via cloud-init, exactly the contract the broker's guest-agent
-    host-key pinning depends on. Offline (`-net none`)."""
+def finalize_user_data(pubkey: str | None = None) -> str:
+    """Template finalize boot (pilot steps 2+7): optionally bake the ONE
+    operator/bastion PUBLIC key into root/defender/attacker (never a private
+    key), then scrub per-clone identity from the BUILT template so every PVE
+    clone regenerates fresh SSH host keys and machine-id via cloud-init —
+    the contract the broker's guest-agent host-key pinning depends on.
+    Offline (`-net none`)."""
+    bake_files, bake_call = "", ""
+    if pubkey:
+        bake = f"""#!/bin/bash
+set -e
+id -u defender >/dev/null 2>&1 || useradd -m -s /bin/bash defender
+id -u attacker >/dev/null 2>&1 || useradd -m -s /bin/bash attacker
+for d in /root/.ssh /home/defender/.ssh /home/attacker/.ssh; do
+  mkdir -p "$d"
+  printf '%s\\n' {shlex.quote(pubkey)} >> "$d/authorized_keys"
+  chmod 0700 "$d"; chmod 0600 "$d/authorized_keys"
+done
+chown -R defender:defender /home/defender/.ssh
+chown -R attacker:attacker /home/attacker/.ssh
+usermod -aG sudo defender 2>/dev/null || true
+"""
+        bake_files = _write_file_entry("/srv/sr-bake-key.sh", bake, perms="0755")
+        bake_call = "chk BAKE /srv/sr-bake-key.sh\n"
     script = (_HARNESS_HEADER + f"""
-chk SCRUB bash -c 'rm -f /etc/ssh/ssh_host_*; truncate -s 0 /etc/machine-id; rm -f /var/lib/dbus/machine-id; cloud-init clean --logs --seed 2>/dev/null || rm -rf /var/lib/cloud/instances/seed; ! ls /etc/ssh/ssh_host_* 2>/dev/null | grep -q .'
+{bake_call}chk SCRUB bash -c 'rm -f /etc/ssh/ssh_host_*; truncate -s 0 /etc/machine-id; rm -f /var/lib/dbus/machine-id; cloud-init clean --logs --seed 2>/dev/null || rm -rf /var/lib/cloud/instances/seed; ! ls /etc/ssh/ssh_host_* 2>/dev/null | grep -q .'
 echo "SR-GUEST-DONE rc=$fails" > {SERIAL}
 poweroff
 """)
-    files = _write_file_entry("/srv/sr-verify-checks.sh", script, perms="0755")
+    files = (_write_file_entry("/srv/sr-verify-checks.sh", script, perms="0755")
+             + bake_files)
     return f"""#cloud-config
 hostname: sr-finalize
 manage_etc_hosts: true

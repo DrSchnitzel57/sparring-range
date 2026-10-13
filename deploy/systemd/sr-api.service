@@ -1,0 +1,22 @@
+[Unit]
+Description=sparring-range control-plane API
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=srrange
+Group=srrange
+EnvironmentFile=/etc/sparring-range/control-plane.env
+WorkingDirectory=/opt/sparring-range
+ExecStart=/opt/sparring-range/.venv/bin/uvicorn srplatform.api.app:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sparring-range
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

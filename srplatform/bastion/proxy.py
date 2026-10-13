@@ -177,9 +177,15 @@ class BastionProxy:
             if known is None and s.sr_env == "production":
                 raise RuntimeError("BASTION_TARGETS_KNOWN_HOSTS required in production — "
                                    "refusing TOFU to range hosts")
+            # PILOT STEP 7: dial guests as the DEFENDER identity with the
+            # bastion's own keypair (public half baked into the templates);
+            # never the implicit root default.
+            client_keys = ([s.bastion_client_key_path]
+                           if s.bastion_client_key_path else None)
             async with asyncssh.connect(
                 target["target_host"], target.get("target_port", 22),
-                username=os.environ.get("BASTION_TARGET_USER", "root"),
+                username=s.bastion_target_user,
+                client_keys=client_keys,
                 known_hosts=known,
             ) as real:
                 if process.command is not None:

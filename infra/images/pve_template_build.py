@@ -92,11 +92,13 @@ def sha256_file(p: pathlib.Path) -> str:
     return h.hexdigest()
 
 
-def finalize(overlay: pathlib.Path, run_dir: pathlib.Path, role: str) -> None:
-    """Offline boot that scrubs per-clone identity from the built overlay."""
+def finalize(overlay: pathlib.Path, run_dir: pathlib.Path, role: str,
+             pubkey: str | None = None) -> None:
+    """Offline boot that bakes the operator PUBLIC key (root/defender/
+    attacker) and scrubs per-clone identity from the built overlay."""
     seed = guest_seed.build_seed_iso(
         run_dir / f"finalize-{role}-seed.iso",
-        guest_userdata.finalize_user_data(),
+        guest_userdata.finalize_user_data(pubkey),
         guest_seed.meta_data(f"sr-finalize-{uuid.uuid4().hex[:8]}",
                              f"sr-finalize-{role}"))
     qemu_guest.boot_full_guest(disk=overlay, seed_iso=seed, memory_mb=1024,
@@ -151,7 +153,7 @@ def build_role(role: str, out: pathlib.Path, cache_dir: pathlib.Path,
                 role=role, memory_mb=2048, disk_gb=budget["disk_gb"],
                 base_dir=cache_dir)
         overlay = pathlib.Path(rec["overlay"])
-        finalize(overlay, run, role)
+        finalize(overlay, run, role, pub)
         out_qcow2 = out / f"template-{role}.qcow2"
         meta = flatten(overlay, out_qcow2,
                        specs.check_guest_budget(role)["disk_gb"])
