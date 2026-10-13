@@ -107,9 +107,11 @@ def build_user_data(role: str, payload: dict[str, str], packages: list[str]) -> 
                                "MOJANG_MYSQL_USER=mojang_reader\n"
                                "MOJANG_DIAG_ENABLED=on\n")
     pins = " ".join(_shlex_quote(p) for p in packages)
+    setup_script = _setup_script(role, [p.split('=')[0] for p in packages])
+    files += _write_file_entry("/srv/sr-build.sh", setup_script, perms="0755")
     setup = "\n".join(f"  - {line}" for line in
-                      [f"DEBIAN_FRONTEND=noninteractive apt-get install -y {pins}"]
-                      + _build_runcmd(role, [p.split('=')[0] for p in packages]))
+                      [f"timeout 1200 env DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold {pins} && echo SR-GUEST-BUILD-APT-OK > /dev/ttyS0 || {{ echo SR-GUEST-BUILD-APT-FAIL > /dev/ttyS0; poweroff; }}",
+                       "bash /srv/sr-build.sh"])
     return f"""#cloud-config
 hostname: sr-build-{role}
 manage_etc_hosts: true
@@ -130,74 +132,63 @@ def _shlex_quote(s: str) -> str:
     return shlex.quote(s)
 
 
-def _build_runcmd(role: str, packages: list[str]) -> list[str]:
-    cmds = [
-        "systemctl disable --now unattended-upgrades || true",
-        "install -d -m 0755 /srv/sr-build",
-        # nginx site (payload) replaces the default site.
-        "ln -sf /etc/nginx/sites-available/mojang /etc/nginx/sites-enabled/mojang",
-        "rm -f /etc/nginx/sites-enabled/default",
-        # shipper install (mirrors telemetry/install.sh contract): identity,
-        # spool dir, unit, auditd rules.
-        "install -d -m 0750 -o root -g srshipper /etc/sparring-range",
-        "install -d -m 2770 -o root -g adm /var/lib/sparring-range/shipper",
-        "install -m 0644 /srv/sr-build-input/sparring-shipper.service /etc/systemd/system/sparring-shipper.service",
-        "install -m 0644 /srv/sr-build-input/auditd.rules /etc/audit/rules.d/sparring.rules",
-        "install -m 0755 /srv/sr-build-input/shipper.py /usr/local/bin/sparring-shipper",
-        "systemctl daemon-reload",
-        "ufw --force enable",
-        "ufw allow 22/tcp",
-        "ufw allow 80/tcp",
-        # Synthetic build-time shipper env (dummy API: the unit must be
-        # ACTIVE at build; real capabilities arrive per-generation at deploy
-        # time, and capture seeds overwrite this file).
-        r"printf 'SR_API_URL=http://127.0.0.1:9\nSR_TELEMETRY_TOKEN=sr-build-dummy\nSR_HOST=build\nSR_SPOOL_DIR=/var/lib/sparring-range/shipper\n' > /etc/sparring-range/shipper.env",
-        "chown root:srshipper /etc/sparring-range/shipper.env",
-        "chmod 0640 /etc/sparring-range/shipper.env",
-        "systemctl enable --now auditd sparring-shipper nginx mojang-web ssh",
-        "systemctl enable --now mysql || true",
-        "systemctl restart auditd",
-        # Noble uses sshd SOCKET activation by default (service inactive until
-        # first connection). Built guests run persistent sshd instead, so the
-        # service posture is deterministic on every boot (the base-image
-        # attacker keeps socket activation and asserts the socket).
-        # Deliberate lab flaw: the helper is setuid-root with an unsafe PATH
-        # (write_files cannot set the setuid bit, so it is set here at build
-        # time; the documented fix removes it without breaking services).
-        "chown root:root /usr/local/bin/mojang-maintenance",
-        "chmod 4755 /usr/local/bin/mojang-maintenance",
-    ]
-    if role == "mojang-web-db":
-        cmds += [
-            # Per-run synthetic reader secret (never baked anywhere).
-            r"PW=$(python3 -c 'import secrets;print(secrets.token_hex(16))')",
-            r"printf '%s' \"$PW\" > /etc/mojang-web/reader-pw",
-            "chmod 0640 /etc/mojang-web/reader-pw",
-            r"printf 'MOJANG_MYSQL_PASSWORD=%s\n' \"$PW\" >> /etc/mojang-web/config.env",
-            # mysqld first-start initialization under TCG is SLOW: wait
-            # (bounded) for readiness BEFORE loading schema/seeds — the old
-            # race silently skipped seeding and poisoned later boots.
-            r"for i in $(seq 1 90); do mysqladmin --silent ping >/dev/null 2>&1 && break; sleep 2; done",
-            "mysqladmin --silent ping",
-            "mysql < /etc/mysql/mojang/schema.sql",
-            "mysql < /etc/mysql/mojang/seed.sql",
-            r"mysql -e \"ALTER USER 'mojang_reader'@'127.0.0.1' IDENTIFIED BY '$PW'\"",
-        ]
-    # Record resolved package versions, report, power off. The PASS marker
-    # is gated on the role's data check (db: seeded row count) — a silent
-    # seeding skip can never report success.
-    want = " ".join(p.split("=")[0] + "*" for p in packages)
+def _setup_script(role: str, packages: list[str]) -> str:
+    """The whole post-install setup as ONE script with per-stage serial
+    markers and `timeout` on every slow step: a stall names itself in the
+    serial tail instead of dying silently mid-list, and the total is bounded.
+    `packages` here are bare names (pins were installed by the apt item)."""
+    want = " ".join(p + "*" for p in packages)
     gate = ("test \"$(mysql --batch --skip-column-names -e "
             "'SELECT COUNT(*) FROM purchases' mojang)\" = 12"
             if role == "mojang-web-db" else "true")
-    cmds += [
-        f"dpkg-query -W -f='${{Package}}=${{Version}}\\n' {want} > /srv/sr-build/versions.txt 2>/dev/null || true",
-        "sed 's/^/SR-GUEST-PKG:/' /srv/sr-build/versions.txt > /dev/ttyS0 || true",
-        f"bash -c '{gate} && echo SR-GUEST-BUILD-PASS > /dev/ttyS0 || "
-        "echo SR-GUEST-BUILD-FAIL > /dev/ttyS0'",
-        "poweroff",
-    ]
-    return cmds
+    db_setup = ""
+    if role == "mojang-web-db":
+        db_setup = """PW=$(python3 -c 'import secrets;print(secrets.token_hex(16))')
+printf '%s' "$PW" > /etc/mojang-web/reader-pw
+chmod 0640 /etc/mojang-web/reader-pw
+printf 'MOJANG_MYSQL_PASSWORD=%s\\n' "$PW" >> /etc/mojang-web/config.env
+for i in $(seq 1 120); do mysqladmin --silent ping >/dev/null 2>&1 && break; sleep 2; done
+timeout 120 mysqladmin --silent ping && mark MYSQL-READY || { mark MYSQL-FAIL; poweroff; }
+timeout 300 mysql < /etc/mysql/mojang/schema.sql || { mark SCHEMA-FAIL; poweroff; }
+timeout 300 mysql < /etc/mysql/mojang/seed.sql || { mark SEED-FAIL; poweroff; }
+timeout 120 mysql -e "ALTER USER 'mojang_reader'@'127.0.0.1' IDENTIFIED BY '$PW'" || { mark GRANT-FAIL; poweroff; }
+"""
+    script = f"""#!/bin/bash
+S=/dev/ttyS0
+mark() {{ echo "SR-GUEST-BUILD-$1" > $S; }}
+systemctl disable --now unattended-upgrades || true
+install -d -m 0755 /srv/sr-build
+ln -sf /etc/nginx/sites-available/mojang /etc/nginx/sites-enabled/mojang
+rm -f /etc/nginx/sites-enabled/default
+install -d -m 0750 -o root -g srshipper /etc/sparring-range
+install -d -m 2770 -o root -g adm /var/lib/sparring-range/shipper
+install -m 0644 /srv/sr-build-input/sparring-shipper.service /etc/systemd/system/sparring-shipper.service
+install -m 0644 /srv/sr-build-input/auditd.rules /etc/audit/rules.d/sparring.rules
+install -m 0755 /srv/sr-build-input/shipper.py /usr/local/bin/sparring-shipper
+systemctl daemon-reload
+ufw --force enable
+ufw allow 22/tcp
+ufw allow 80/tcp
+printf 'SR_API_URL=http://127.0.0.1:9\\nSR_TELEMETRY_TOKEN=sr-build-dummy\\nSR_HOST=build\\nSR_SPOOL_DIR=/var/lib/sparring-range/shipper\\n' > /etc/sparring-range/shipper.env
+chown root:srshipper /etc/sparring-range/shipper.env
+chmod 0640 /etc/sparring-range/shipper.env
+timeout 120 systemctl enable --now auditd sparring-shipper nginx mojang-web ssh || {{ mark UNITS-FAIL; poweroff; }}
+timeout 120 systemctl enable --now mysql || true
+timeout 60 systemctl restart auditd || true
+chown root:root /usr/local/bin/mojang-maintenance
+chmod 4755 /usr/local/bin/mojang-maintenance
+{db_setup}mark SETUP-OK
+dpkg-query -W -f='${{Package}}=${{Version}}\\n' {want} > /srv/sr-build/versions.txt 2>/dev/null || true
+sed 's/^/SR-GUEST-PKG:/' /srv/sr-build/versions.txt > /dev/ttyS0 || true
+if {gate}; then mark PASS; else mark FAIL; fi
+poweroff
+"""
+    lines = script.splitlines()
+    return "bash -c " + _shlex_quote("\n".join(lines))
+
+
+def _build_runcmd(role: str, packages: list[str]) -> list[str]:  # pragma: no cover
+    raise AssertionError("retired: setup now ships as one script item")
 
 
 def _verify_checks(role: str) -> str:
