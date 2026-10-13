@@ -36,7 +36,15 @@ SERIAL = "/dev/ttyS0"
 _HARNESS_HEADER = r"""#!/bin/bash
 # Generated guest check harness (03+04 rework). Reports over serial, powers off.
 S=/dev/ttyS0
-say() { echo "SR-GUEST-$1" > $S; }
+# Serial integrity (pilot): the Ubuntu image keeps the kernel console on
+# ttyS0, and under TCG load printk lines interleave into marker lines and
+# corrupt them (observed: a PASS marker lost with no FAIL and DONE rc=0 —
+# an impossible script outcome, proven to be line loss). Silence console
+# noise, stop the serial getty, and emit every marker TWICE: two
+# independent writes being corrupted alike is negligible.
+dmesg -n 1 2>/dev/null || true
+systemctl stop serial-getty@ttyS0 2>/dev/null || true
+say() { echo "SR-GUEST-$1" > $S; echo "SR-GUEST-$1" > $S; }
 fails=0
 chk() {
   local name=$1; shift
@@ -172,7 +180,9 @@ timeout 120 mysql -e "ALTER USER 'mojang_reader'@'127.0.0.1' IDENTIFIED BY '$PW'
 """
     script = f"""#!/bin/bash
 S=/dev/ttyS0
-mark() {{ echo "SR-GUEST-BUILD-$1" > $S; }}
+mark() {{ echo "SR-GUEST-BUILD-$1" > $S; echo "SR-GUEST-BUILD-$1" > $S; }}
+dmesg -n 1 2>/dev/null || true
+systemctl stop serial-getty@ttyS0 2>/dev/null || true
 systemctl disable --now unattended-upgrades || true
 install -d -m 0755 /srv/sr-build
 ln -sf /etc/nginx/sites-available/mojang /etc/nginx/sites-enabled/mojang
@@ -199,7 +209,7 @@ visudo -cf /etc/sudoers.d/mojang-maintenance || {{ mark SUDOERS-FAIL; poweroff; 
 install -d -o web-user -g web-user -m 0775 /srv/mojang-web/tools
 {db_setup}mark SETUP-OK
 dpkg-query -W -f='${{Package}}=${{Version}}\\n' {want} > /srv/sr-build/versions.txt 2>/dev/null || true
-sed 's/^/SR-GUEST-PKG:/' /srv/sr-build/versions.txt > /dev/ttyS0 || true
+while IFS= read -r l; do echo "SR-GUEST-PKG:$l" > $S; done < /srv/sr-build/versions.txt || true
 if {gate}; then mark PASS; else mark FAIL; fi
 poweroff
 """
@@ -242,7 +252,7 @@ chk SEEDS bash -c 'python3 -c "import json;d=json.load(open(\\"/srv/mojang-web/s
 chk USERS bash -c 'id -nG defender | grep -qw sudo && id web-user'
 chk FIREWALL bash -c 'ufw status | grep -qw active'
 {mysql_checks}
-echo "SR-GUEST-DONE rc=$fails" > {SERIAL}
+echo "SR-GUEST-DONE rc=$fails" > {SERIAL}; echo "SR-GUEST-DONE rc=$fails" > {SERIAL}
 poweroff
 """
 
@@ -357,7 +367,7 @@ chk SSH-SOCKET systemctl is-active --quiet ssh.socket
 chk HOSTKEYS bash -c 'test -s /etc/ssh/ssh_host_ed25519_key.pub && grep -q "^ssh-ed25519 " /etc/ssh/ssh_host_ed25519_key.pub'
 chk NO-MOJANG bash -c '! test -e /srv/mojang-web/app.py'
 chk NO-MYSQL bash -c '! systemctl list-unit-files mysql.service | grep -q enabled'
-echo "SR-GUEST-DONE rc=$fails" > {SERIAL}
+echo "SR-GUEST-DONE rc=$fails" > {SERIAL}; echo "SR-GUEST-DONE rc=$fails" > {SERIAL}
 poweroff
 """)
     files = _write_file_entry("/srv/sr-verify-checks.sh", script, perms="0755")
@@ -392,7 +402,7 @@ MARKER="SR-CAPTURE-negative$RANDOM"
 sleep 2
 chk AUDITD-CAPTURED bash -c 'ausearch -m EXECVE 2>/dev/null | grep -q "$MARKER" || grep -q "$MARKER" /var/log/audit/audit.log'
 chk NO-DELIVERY bash -c '! grep -q "$MARKER" /var/lib/sparring-range/shipper/delivered.log 2>/dev/null; true'
-echo "SR-GUEST-DONE rc=$fails" > {SERIAL}
+echo "SR-GUEST-DONE rc=$fails" > {SERIAL}; echo "SR-GUEST-DONE rc=$fails" > {SERIAL}
 poweroff
 """)
     _ = reader_pw_path_note
@@ -423,7 +433,7 @@ MARKER="SR-CAPTURE-{nonce[:12]}"
 sleep 10
 chk CURSOR-EXISTS bash -c 'test -s /var/lib/sparring-range/shipper/audit-cursor.json'
 chk AUDITD-CAPTURED bash -c 'grep -q "$MARKER" /var/log/audit/audit.log'
-echo "SR-GUEST-DONE rc=$fails" > {SERIAL}
+echo "SR-GUEST-DONE rc=$fails" > {SERIAL}; echo "SR-GUEST-DONE rc=$fails" > {SERIAL}
 poweroff
 """)
     files = _write_file_entry("/srv/sr-verify-checks.sh", script, perms="0755")
@@ -455,7 +465,9 @@ def attacker_build_user_data(payload: dict[str, str], packages: list[str],
     pins = " ".join(_shlex_quote(p) for p in packages)
     files += _write_file_entry("/srv/sr-attacker-build.sh", f"""#!/bin/bash
 S=/dev/ttyS0
-mark() {{ echo "SR-GUEST-BUILD-$1" > $S; }}
+mark() {{ echo "SR-GUEST-BUILD-$1" > $S; echo "SR-GUEST-BUILD-$1" > $S; }}
+dmesg -n 1 2>/dev/null || true
+systemctl stop serial-getty@ttyS0 2>/dev/null || true
 systemctl disable --now unattended-upgrades || true
 timeout 1200 env DEBIAN_FRONTEND=noninteractive apt-get install -y \\
   -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold {pins} \\
@@ -516,7 +528,7 @@ usermod -aG sudo defender 2>/dev/null || true
         bake_call = "chk BAKE /srv/sr-bake-key.sh\n"
     script = (_HARNESS_HEADER + f"""
 {bake_call}chk SCRUB bash -c 'rm -f /etc/ssh/ssh_host_*; truncate -s 0 /etc/machine-id; rm -f /var/lib/dbus/machine-id; cloud-init clean --logs --seed 2>/dev/null || rm -rf /var/lib/cloud/instances/seed; ! ls /etc/ssh/ssh_host_* 2>/dev/null | grep -q .'
-echo "SR-GUEST-DONE rc=$fails" > {SERIAL}
+echo "SR-GUEST-DONE rc=$fails" > {SERIAL}; echo "SR-GUEST-DONE rc=$fails" > {SERIAL}
 poweroff
 """)
     files = (_write_file_entry("/srv/sr-verify-checks.sh", script, perms="0755")
