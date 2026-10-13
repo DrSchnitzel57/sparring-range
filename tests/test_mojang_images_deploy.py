@@ -124,7 +124,7 @@ def test_images_ubuntu_verify_attacker():
             instance_id=f"sr-atk-{uuid.uuid4().hex[:8]}",
             hostname="sr-verify-attacker", memory_mb=1024, net="none",
             timeout_s=600)
-        _verify_markers(rec, "BOOT", "SSHD", "HOSTKEYS", "NO-MOJANG", "NO-MYSQL")
+        _verify_markers(rec, "BOOT", "SSH-SOCKET", "HOSTKEYS", "NO-MOJANG", "NO-MYSQL")
     finally:
         shutil.rmtree(run, ignore_errors=True)
 

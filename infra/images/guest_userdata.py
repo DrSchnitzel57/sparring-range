@@ -142,6 +142,10 @@ def _build_runcmd(role: str, packages: list[str]) -> list[str]:
         "systemctl enable --now auditd sparring-shipper nginx mojang-web ssh",
         "systemctl enable --now mysql || true",
         "systemctl restart auditd",
+        # Noble uses sshd SOCKET activation by default (service inactive until
+        # first connection). Built guests run persistent sshd instead, so the
+        # service posture is deterministic on every boot (the base-image
+        # attacker keeps socket activation and asserts the socket).
         # Deliberate lab flaw: the helper is setuid-root with an unsafe PATH
         # (write_files cannot set the setuid bit, so it is set here at build
         # time; the documented fix removes it without breaking services).
@@ -236,8 +240,10 @@ write_files:
 
 
 def attacker_verify_user_data() -> str:
+    # Base-image posture is sshd SOCKET activation (no persistent service):
+    # assert the listening socket, fresh host keys, and no target payload.
     script = (_HARNESS_HEADER + f"""
-chk SSHD systemctl is-active --quiet sshd
+chk SSH-SOCKET systemctl is-active --quiet ssh.socket
 chk HOSTKEYS bash -c 'test -s /etc/ssh/ssh_host_ed25519_key.pub && grep -q "^ssh-ed25519 " /etc/ssh/ssh_host_ed25519_key.pub'
 chk NO-MOJANG bash -c '! test -e /srv/mojang-web/app.py'
 chk NO-MYSQL bash -c '! systemctl list-unit-files mysql.service | grep -q enabled'
