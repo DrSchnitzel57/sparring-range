@@ -180,9 +180,12 @@ def _verify_checks(role: str) -> str:
         units += " mysql"
     mysql_checks = ""
     if role == "mojang-web-db":
+        # NOTE: --protocol=TCP is load-bearing: the reader grant is
+        # 'mojang_reader'@'127.0.0.1' (TCP); the CLI would otherwise use the
+        # local socket as 'localhost' and be refused.
         mysql_checks = """
-chk MYSQL-COUNT bash -c 'test "$(mysql --batch --skip-column-names --user=mojang_reader --password="$(cat /etc/mojang-web/reader-pw)" -e "SELECT COUNT(*) FROM purchases" mojang)" = 12'
-chk MYSQL-ROW bash -c 'mysql --batch --skip-column-names --user=mojang_reader --password="$(cat /etc/mojang-web/reader-pw)" -e "SELECT purchase_id FROM purchases" mojang | grep -q buy-001'
+chk MYSQL-COUNT bash -c 'test "$(mysql --protocol=TCP --host=127.0.0.1 --batch --skip-column-names --user=mojang_reader --password="$(cat /etc/mojang-web/reader-pw)" -e "SELECT COUNT(*) FROM purchases" mojang)" = 12'
+chk MYSQL-ROW bash -c 'mysql --protocol=TCP --host=127.0.0.1 --batch --skip-column-names --user=mojang_reader --password="$(cat /etc/mojang-web/reader-pw)" -e "SELECT purchase_id FROM purchases" mojang | grep -q buy-001'
 """
     return _HARNESS_HEADER + f"""
 chk UNITS-ACTIVE bash -c 'systemctl is-active --quiet {units}'
