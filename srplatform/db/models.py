@@ -336,6 +336,32 @@ class MatchModel(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class UptimeSample(Base):
+    """Web-uptime probe sample (pilot step 5): IDENTITY-BOUND (session +
+    deployment generation + host) and APPEND-ONLY (the app role holds only
+    SELECT+INSERT — history cannot be rewritten). 'unknown' is a first-class
+    state: unknown/missed checks never award anything and never count as
+    downtime."""
+
+    __tablename__ = "uptime_samples"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True),
+                                                  ForeignKey("sessions.session_id"),
+                                                  nullable=False)
+    deployment_id: Mapped[str] = mapped_column(Text, nullable=False)
+    host: Mapped[str] = mapped_column(Text, nullable=False)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True),
+                                         server_default=func.now(), nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False)  # up|down|unknown
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    detail: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        Index("ix_uptime_session_ts", "session_id", "ts"),
+    )
+
+
 class Recording(Base):
     """Opaque recording identities (F16): clients reference recording_ids,
     never filesystem paths. Paths live server-side only."""

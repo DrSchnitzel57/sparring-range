@@ -42,6 +42,8 @@ class Settings(BaseSettings):
     # --- match lifecycle (pilot step 4) ---
     match_default_duration_minutes: int = 30
     match_default_pace_seconds: int = 30   # 0 = no intentional delay
+    # web uptime scoring (pilot step 5): separate from the security score
+    uptime_scoring_enabled: bool = True
     # control-plane opt-in: background idle-expiry/deadline scheduler + startup
     # match reconcile. OFF by default so shared-database test processes never
     # run background cleanup; the deployment env file enables it.

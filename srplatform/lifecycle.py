@@ -141,6 +141,10 @@ def finalize_match(db, session_id, reason: str, *, broker, actor: str = "system"
     sess = db.get(SessionModel, session_id)
     if sess is None:
         raise MatchBlocked("no_session", str(session_id))
+    # the probe loop belongs to the match — stop it FIRST so no sample is
+    # recorded against a teardown in progress
+    from srplatform import uptime as _uptime
+    _uptime.stop_for_session(session_id)
     m = get_match(db, session_id)
     if m is not None and m.state == "completed":
         return {"ok": True, "status": "complete", "note": "already finalized",
@@ -259,6 +263,7 @@ def finalize_match(db, session_id, reason: str, *, broker, actor: str = "system"
             "outcome": sess.outcome,
             "scorecard_status": scorecard.get("status"),
             "earned": scorecard.get("earned"), "total": scorecard.get("total"),
+            "uptime": _uptime.summarize_for_session(db, session_id),
             "lease_released": complete,
             "end_reason": reason,
             "note": ("owned VMs destroyed, lease released" if complete

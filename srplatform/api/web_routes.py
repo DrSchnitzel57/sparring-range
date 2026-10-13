@@ -225,8 +225,10 @@ def live(session_id: uuid.UUID, p: Principal = Depends(any_member),
         "WHERE session_id=:sid ORDER BY event_id DESC LIMIT 12"),
         {"sid": str(session_id)}).fetchall()
     detections = [d for d in reversed(recent) if d.action_type in ("verifier", "detection")]
+    from srplatform import uptime as _uptime
     return {
         "session_id": str(session_id), "status": sess.status,
+        "uptime": _uptime.summarize_for_session(db, session_id),
         "started_at": sess.started_at.isoformat() if sess.started_at else None,
         "red_phase": state.current_phase if state else None,
         "recent": [{"event_id": e.event_id, "ts": e.ts.isoformat(), "actor": e.actor,

@@ -141,6 +141,28 @@ export default function LiveSession() {
             is recorded and replayable.</p>
         </div>
         <div className="panel">
+          <h3>web uptime</h3>
+          {live?.uptime?.scored ? (
+            <>
+              <p style={{ fontSize: 20 }}>
+                <span className={live.uptime.latest?.state === "up" ? "ok" : "bad"}>
+                  ●</span>{" "}
+                {live.uptime.pct_up}% up{" "}
+                <span className="dim">({live.uptime.up} up / {live.uptime.down} down ·{" "}
+                  {live.uptime.unknown} unknown · coverage {live.uptime.coverage_pct}%)</span>
+              </p>
+              <p className="dim">
+                latest: {live.uptime.latest?.state}
+                {live.uptime.latest?.latency_ms != null && ` ${live.uptime.latest.latency_ms}ms`}
+                {live.uptime.stale && " · STALE (probe not fresh — checks paused)"}
+                {" · scored only among valid checks; separate from the security score"}
+              </p>
+            </>
+          ) : (
+            <p className="dim">unscored — no valid checks yet (unknown/missed never count)</p>
+          )}
+        </div>
+        <div className="panel">
           <h3>detections</h3>
           {(!live || live.detections.length === 0) && <p className="dim">nothing verified yet</p>}
           <ul>{live?.detections.map(d => (

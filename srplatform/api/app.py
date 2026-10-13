@@ -839,6 +839,15 @@ def begin_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
     try:
         run = _start_red_run(db, p, sess.session_id, sess.scenario_id)
         m = lifecycle.start_clock(db, sess.session_id, actor=p.username)
+        # UPTIME SCORING (pilot step 5): Begin starts the probe loop TOGETHER
+        # with the clock + attack worker; samples are identity-bound to the
+        # ready deployment generation.
+        from srplatform import uptime
+        dep = db.execute(select(Deployment).where(
+            Deployment.session_id == sess.session_id,
+            Deployment.status == "ready")
+            .order_by(Deployment.created_at.desc())).scalars().first()
+        uptime.start_for_session(db, sess, dep)
         _ok = True
         return {"ok": True, "run_id": str(run.run_id), "status": "running",
                 "session_id": str(sess.session_id),

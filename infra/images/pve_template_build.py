@@ -128,10 +128,12 @@ def flatten(overlay: pathlib.Path, out_qcow2: pathlib.Path,
     if vsize_gb != expect_virtual_gb:
         raise RuntimeError(
             f"template virtual size {vsize_gb}G != budget {expect_virtual_gb}G")
-    check = subprocess.run(["qemu-img", "check", "-r", "no", str(out_qcow2)],
+    # plain `check` is repair-free (`-r` only accepts leaks|all here)
+    check = subprocess.run(["qemu-img", "check", str(out_qcow2)],
                            capture_output=True, text=True, timeout=600)
     if check.returncode != 0:
-        raise RuntimeError(f"qemu-img check failed: {check.stdout[:300]}")
+        raise RuntimeError(f"qemu-img check failed: "
+                           f"{(check.stdout or check.stderr)[:300]}")
     return meta
 
 

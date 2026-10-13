@@ -272,6 +272,9 @@ def env_dirs(migrated_db, tmp_path, monkeypatch):
     monkeypatch.setenv("API_BASE_URL", "http://127.0.0.1:1")  # nothing listens: accidental
     #                                              # outbound calls fail fast & loudly
     monkeypatch.setenv("MODEL_API_KEY", "")
+    # uptime prober OFF by default: background probe threads would race the
+    # deterministic db tests; the uptime tests enable it explicitly
+    monkeypatch.setenv("UPTIME_SCORING_ENABLED", "0")
     from srplatform import settings as s
     s.get_settings.cache_clear()
     yield tmp_path
