@@ -243,11 +243,13 @@ def verify_overlay(*, overlay: pathlib.Path, run_dir: pathlib.Path, name: str,
     seed_iso = guest_seed.build_seed_iso(
         run_dir / f"{name}-seed.iso", user_data,
         guest_seed.meta_data(instance_id, hostname))
+    serial_name = f"verify-{name}"
     rec = qemu_guest.boot_full_guest(disk=overlay, seed_iso=seed_iso,
                                      memory_mb=memory_mb, net=net,
                                      expect=("SR-GUEST-DONE rc=0",),
-                                     timeout_s=timeout_s)
-    serial = run_dir / f"{overlay.stem}.serial.log"
+                                     timeout_s=timeout_s,
+                                     serial_name=serial_name)
+    serial = run_dir / f"{serial_name}.serial.log"
     markers = serial_markers(serial)
     # ALWAYS preserve the serial for the run: a lost marker (no PASS, no
     # FAIL, DONE rc=0) is an evidence-level anomaly and must never be

@@ -129,7 +129,8 @@ def boot_full_guest(*, disk: pathlib.Path, seed_iso: pathlib.Path,
                     memory_mb: int = 2048, smp: int = 2,
                     net: str = "none", host_api_port: int | None = None,
                     expect: tuple[str, ...] = ("SR-GUEST-DONE rc=0",),
-                    timeout_s: int = 900) -> dict:
+                    timeout_s: int = 900,
+                    serial_name: str | None = None) -> dict:
     """Boot a REAL Ubuntu guest (disk + NoCloud seed) in isolated QEMU.
 
     - `net="none"`: no guest egress at all (verification/negative boots —
@@ -146,7 +147,14 @@ def boot_full_guest(*, disk: pathlib.Path, seed_iso: pathlib.Path,
         raise ValueError(f"guest RAM {memory_mb}MiB outside 512..{MAX_PER_VM_RAM_MB}")
     qemu = require_qemu()
     run_dir = disk.parent
-    serial = run_dir / f"{disk.stem}.serial.log"
+    # UNIQUE serial per boot (pilot fix): callers that boot the SAME disk
+    # repeatedly (web-local then web-db verify share one overlay + run dir)
+    # previously shared "<disk>.serial.log" — the poll loop could observe the
+    # PREVIOUS boot's DONE marker before QEMU opened the file and returned
+    # stale markers instantly (root cause of the images-gate web-db
+    # "MYSQL-COUNT" flake: the web-local serial, which has no MYSQL checks).
+    serial = run_dir / f"{serial_name or disk.stem}.serial.log"
+    serial.unlink(missing_ok=True)  # never judge a new boot on old evidence
     use_kvm = os.environ.get("SR_QEMU_KVM") == "1" and os.path.exists("/dev/kvm")
     accel = ["-accel", "kvm"] if use_kvm else ["-accel", "tcg,thread=multi"]
     if net == "none":
@@ -185,7 +193,7 @@ def boot_full_guest(*, disk: pathlib.Path, seed_iso: pathlib.Path,
         if missing:
             found = sorted({l for l in observed.splitlines()
                             if "SR-GUEST-" in l})
-            dbg = pathlib.Path(f"/tmp/opencode/sr-gate-debug/{disk.stem}.serial.log")
+            dbg = pathlib.Path(f"/tmp/opencode/sr-gate-debug/{serial.stem}.serial.log")
             try:
                 dbg.parent.mkdir(parents=True, exist_ok=True)
                 dbg.write_text(observed)
