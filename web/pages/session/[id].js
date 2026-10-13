@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/router";
 import Link from "next/link";
-import { api, getConnections, saveConnections } from "../../lib/api";
+import { api } from "../../lib/api";
 
 export default function LiveSession() {
   const router = useRouter();
@@ -21,8 +21,12 @@ export default function LiveSession() {
     api(`/sessions/${id}`).then(s => {
       if (stop) return;
       setSess(s);
-      setConns(getConnections(id));
     }).catch(e => setErr(String(e.message || e)));
+    // connection instructions are SERVED BY THE API (pilot step 4): they
+    // survive refreshes and other devices — no browser-session secret
+    api(`/sessions/${id}/connections`)
+      .then(c => { if (!stop) setConns(c.connections); })
+      .catch(() => { if (!stop) setConns(null); });
     const tick = async () => {
       try {
         const d = await api(`/sessions/${id}/live`);
@@ -44,6 +48,11 @@ export default function LiveSession() {
     setBusy(false);
     router.replace(router.asPath, undefined, { scroll: false });
   }
+  const beginMatch = () => act(async () => {
+    // BEGIN: server clock + attack worker start together (pilot step 4)
+    await api(`/sessions/${id}/begin`, { method: "POST" });
+    setSess(await api(`/sessions/${id}`));
+  }, "begin match");
   const startRed = () => act(async () => {
     await api(`/run/${sess.scenario_id}`, { method: "POST", body: { session_id: id } });
     setSess(await api(`/sessions/${id}`));
@@ -53,15 +62,17 @@ export default function LiveSession() {
     setSess(await api(`/sessions/${id}`));
   }, "stop red");
   const endSession = () => {
-    if (!confirm("End session? Stops red, takes a trusted final score, revokes tokens.")) return;
+    if (!confirm("End match? Stops red, takes a trusted final score, revokes tokens and destroys the owned lab.")) return;
     act(async () => {
       const r = await api(`/sessions/${id}/end`, { method: "POST" });
       setSess({ ...sess, status: r.status, outcome: r.outcome });
     }, "end");
   };
   const redeploy = () => act(async () => {
-    const out = await api(`/sessions/${id}/launch`, { method: "POST" });
-    saveConnections(id, out.connections); setConns(out.connections);
+    await api(`/sessions/${id}/launch`, { method: "POST" });
+    const c = await api(`/sessions/${id}/connections`);
+    setConns(c.connections);
+    setSess(await api(`/sessions/${id}`));
   }, "redeploy");
   const askHint = () => act(async () => {
     const r = await api(`/sessions/${id}/hint`, { method: "POST", body: { question: "" } });
@@ -72,6 +83,15 @@ export default function LiveSession() {
   if (!sess) return <p className="dim">loading…</p>;
   const mm = String(Math.floor(seconds / 60)).padStart(2, "0"), ss = String(seconds % 60).padStart(2, "0");
   const running = sess.status === "running" || sess.status === "stopping";
+  const match = sess.match;
+  // SERVER-clock countdown: the match ends at the server deadline, not on a
+  // client timer. Remaining time is derived from deadline_at on every render.
+  let remaining = null;
+  if (match && match.state === "running" && match.deadline_at) {
+    remaining = Math.max(0, Math.floor((new Date(match.deadline_at).getTime() - Date.now()) / 1000));
+  }
+  const rmm = remaining === null ? null : String(Math.floor(remaining / 60)).padStart(2, "0");
+  const rss = remaining === null ? null : String(remaining % 60).padStart(2, "0");
 
   return (
     <div className="grid">
@@ -79,13 +99,27 @@ export default function LiveSession() {
         <div className="panel">
           <div style={{ display: "flex", justifyContent: "space-between" }}>
             <h2>{sess.scenario_id} — <span className="phase">{live?.red_phase || sess.status}</span></h2>
-            {running && <span style={{ fontSize: 24 }}>{mm}:{ss}</span>}
+            {remaining !== null && <span style={{ fontSize: 24 }} title="server match clock — ends at the deadline">{rmm}:{rss}</span>}
+            {remaining === null && running && <span style={{ fontSize: 24 }}>{mm}:{ss}</span>}
           </div>
           <p className="dim">status: {sess.status} {sess.outcome && `(${sess.outcome})`}
             {sess.active_run && ` · red run ${sess.active_run.slice(0, 8)}`} ·
             phases advance only when verifiers pass</p>
+          {match && match.state === "ready" && (
+            <p className="dim">lab ready — <b>begins idle-expiry</b>
+              {match.ready_expires_at && ` at ${new Date(match.ready_expires_at).toLocaleTimeString()}`}
+              {" "}if not begun; match runs {match.duration_minutes} min from Begin
+              (attack pace {match.pace_seconds}s/action).</p>
+          )}
+          {match && (match.state === "finalizing" || match.state === "interrupted") && (
+            <p className="bad">match cleanup {match.state} ({match.expiry_reason || "recovery"}) —
+              {" "}range stays reserved until teardown completes; retry with “end session”.</p>
+          )}
           <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-            {!running && sess.status !== "complete" && sess.status !== "failed" &&
+            {match && match.state === "ready" && !running &&
+              <button onClick={beginMatch} disabled={busy}>▶ begin match ({match.duration_minutes} min)</button>}
+            {(!match || match.state !== "ready") && !running &&
+              sess.status !== "complete" && sess.status !== "failed" &&
               <button onClick={startRed} disabled={busy}>▶ start red</button>}
             {sess.active_run && <button onClick={stopRed} disabled={busy}>■ stop red</button>}
             {sess.status !== "complete" && <button className="danger" onClick={endSession} disabled={busy}>end session</button>}
@@ -94,13 +128,14 @@ export default function LiveSession() {
         </div>
         <div className="panel">
           <h3>connections</h3>
-          {conns ? (
+          {conns && conns.length ? (
             <ul>{conns.map(c => (
               <li key={c.host}><code>{c.ssh}</code></li>))}</ul>
+          ) : conns ? (
+            <p className="dim">no active connection capability — launch/redeploy to
+              {" "}<a href="#" onClick={e => { e.preventDefault(); redeploy(); }}>re-issue</a></p>
           ) : (
-            <p className="dim">instructions not in this browser tab —{" "}
-              <a href="#" onClick={e => { e.preventDefault(); redeploy(); }}>re-issue</a>
-            </p>
+            <p className="dim">loading…</p>
           )}
           <p className="dim">Defend: SSH through the bastion with the token login; every keystroke
             is recorded and replayable.</p>

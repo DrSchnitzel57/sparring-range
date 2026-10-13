@@ -280,7 +280,11 @@ def get_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
                  "pace_seconds": m.pace_seconds,
                  "ready_at": _iso(m.ready_at), "started_at": _iso(m.started_at),
                  "deadline_at": _iso(m.deadline_at), "ended_at": _iso(m.ended_at),
-                 "expiry_reason": m.expiry_reason}
+                 "expiry_reason": m.expiry_reason,
+                 "ready_expires_at": (
+                     (m.ready_at + timedelta(
+                         minutes=lifecycle.READY_IDLE_EXPIRY_MINUTES)).isoformat()
+                     if m.ready_at else None)}
     return {"session_id": str(sess.session_id), "scenario_id": sess.scenario_id,
             "status": sess.status, "outcome": sess.outcome,
             "started_at": sess.started_at.isoformat() if sess.started_at else None,

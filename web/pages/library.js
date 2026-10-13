@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/router";
 import Link from "next/link";
-import { api, saveConnections } from "../lib/api";
+import { api } from "../lib/api";
 
 export default function Library() {
   const [rows, setRows] = useState([]);
@@ -24,8 +24,9 @@ export default function Library() {
     setBusy(id); setErr(null);
     try {
       const s = await api("/sessions", { method: "POST", body: { scenario_id: id } });
-      const out = await api(`/sessions/${s.session_id}/launch`, { method: "POST" });
-      saveConnections(s.session_id, out.connections);
+      await api(`/sessions/${s.session_id}/launch`, { method: "POST" });
+      // connection instructions are fetched from the API on the session page
+      // (pilot step 4) — nothing secret is kept in browser storage
       router.push(`/session/${s.session_id}`);
     } catch (e) {
       setErr(e.status === 409

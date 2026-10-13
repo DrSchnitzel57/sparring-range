@@ -50,10 +50,5 @@ export const logout = () => {
   ["sr_token", "sr_user", "sr_role"].forEach((k) => localStorage.removeItem(k));
 };
 
-// connection instructions from launch live in sessionStorage keyed by session
-export const saveConnections = (sid, conns) =>
-  sessionStorage.setItem(`sr_conns_${sid}`, JSON.stringify(conns));
-export const getConnections = (sid) => {
-  const v = sessionStorage.getItem(`sr_conns_${sid}`);
-  return v ? JSON.parse(v) : null;
-};
+// (pilot step 4) connection instructions are SERVED BY THE API
+// (GET /sessions/{id}/connections) — the browser keeps no session secrets.
