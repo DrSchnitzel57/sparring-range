@@ -33,6 +33,10 @@ from infra.images import guest_seed, guest_userdata
 SUPERSET_PACKAGES = ["nginx", "mysql-server", "auditd", "openssh-server",
                      "python3-pymysql", "ufw", "curl", "qemu-guest-agent"]
 
+#: Pinned subset the attacker template installs (tooling VM: ssh + supervisor
+#: + guest agent + firewall; no target services, no MySQL, no shipper).
+ATTACKER_PACKAGES = ["openssh-server", "curl", "qemu-guest-agent", "ufw"]
+
 
 def manifest_packages(repo_root: pathlib.Path) -> list[str]:
     """Exact pinned `name=version` install set from the manifest (single
@@ -84,20 +88,22 @@ def recorded_packages(serial: pathlib.Path) -> dict[str, str]:
 
 def build_overlay(*, repo_root: pathlib.Path, run_dir: pathlib.Path,
                   cache_dir: pathlib.Path, role: str = "mojang-web-db",
-                  memory_mb: int = 2048, timeout_s: int = 1500) -> dict:
+                  memory_mb: int = 2048, timeout_s: int = 1500,
+                  disk_gb: int = 16,
+                  base_dir: pathlib.Path | None = None) -> dict:
     """Build (or reuse) the superset overlay. Returns the build record with
     resolved package versions parsed from the guest's own serial report."""
     key = inputs_hash(repo_root)
     cache_dir.mkdir(parents=True, exist_ok=True)
     cached = cache_dir / f"overlay-{key}.qcow2"
     cached_meta = cache_dir / f"overlay-{key}.json"
-    base = qemu_guest.ensure_verified_base(cache_dir / "base")
+    base = qemu_guest.ensure_verified_base((base_dir or cache_dir) / "base")
     if cached.exists() and cached_meta.exists():
         meta = json.loads(cached_meta.read_text())
         # Recreate the sized base (deterministic) and rebase the copied
         # overlay onto it: backing paths are absolute per-run, so a raw copy
         # would dangle at the deleted original run dir.
-        qemu_guest.sized_base_copy(base, run_dir, "guest", 16)
+        qemu_guest.sized_base_copy(base, run_dir, "guest", disk_gb)
         overlay = run_dir / "guest.qcow2"
         shutil.copyfile(cached, overlay)
         r = subprocess.run(["qemu-img", "rebase", "-u", "-F", "qcow2",
@@ -108,8 +114,9 @@ def build_overlay(*, repo_root: pathlib.Path, run_dir: pathlib.Path,
             raise RuntimeError(f"qemu-img rebase failed: {(r.stderr or r.stdout)[:200]}")
         return {"overlay": str(overlay), "cached": True,
                 "inputs_hash": key, **meta}
-    # Production-sized test disk (superset serves the 16 GiB web-db role).
-    overlay = qemu_guest.fresh_role_overlay(base, run_dir, "guest", 16)
+    # Production-sized test disk (superset serves the 16 GiB web-db role;
+    # template builds pass their role budget).
+    overlay = qemu_guest.fresh_role_overlay(base, run_dir, "guest", disk_gb)
     seeds = json.loads((pathlib.Path(repo_root) / "scenarios/mojang-seeds.json"
                         ).read_text())
     payload = guest_userdata.payload_from_repo(str(repo_root), role, seeds)
@@ -152,6 +159,79 @@ def build_overlay(*, repo_root: pathlib.Path, run_dir: pathlib.Path,
         if stale != cached_meta:
             stale.unlink(missing_ok=True)
     return {"overlay": str(overlay), "cached": False, **meta}
+
+
+def attacker_inputs_hash(repo_root: pathlib.Path, pubkey: str) -> str:
+    """Cache key for the attacker overlay: base SHA + attacker payload +
+    supervisor script + pinned subset + the operator PUBLIC key baked in."""
+    h = hashlib.sha256()
+    repo = pathlib.Path(repo_root)
+    manifest = json.loads((repo / "infra/images/manifest.json").read_text())
+    h.update(manifest["base_image"]["sha256"].encode())
+    h.update(pubkey.encode())
+    for rel in sorted((repo / "infra/images/payloads/attacker").rglob("*")):
+        if rel.is_file() and ".ssh" not in rel.parts:
+            h.update(str(rel.relative_to(repo)).encode())
+            h.update(rel.read_bytes())
+    h.update((repo / "infra/runner/runner_supervise.sh").read_bytes())
+    pins = {p.split("=")[0]: p for p in manifest_packages(repo)}
+    for name in ATTACKER_PACKAGES:
+        h.update(pins[name].encode())
+    return h.hexdigest()[:16]
+
+
+def build_attacker_overlay(*, repo_root: pathlib.Path, run_dir: pathlib.Path,
+                           cache_dir: pathlib.Path, pubkey: str,
+                           memory_mb: int = 1024,
+                           timeout_s: int = 1500,
+                           base_dir: pathlib.Path | None = None) -> dict:
+    """Build (or reuse) the attacker template overlay (pilot step 2): pinned
+    base + attacker role + runner-supervisor + public key. Fresh per-input,
+    cached by every build input, same discipline as the target overlay."""
+    key = attacker_inputs_hash(repo_root, pubkey)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cached = cache_dir / f"attacker-{key}.qcow2"
+    if cached.exists():
+        base = qemu_guest.ensure_verified_base((base_dir or cache_dir) / "base")
+        qemu_guest.sized_base_copy(base, run_dir, "attacker", 16)
+        overlay = run_dir / "attacker.qcow2"
+        shutil.copyfile(cached, overlay)
+        r = subprocess.run(["qemu-img", "rebase", "-u", "-F", "qcow2",
+                            "-b", str(run_dir / "attacker-base.qcow2"),
+                            str(overlay)],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            raise RuntimeError(f"qemu-img rebase failed: {(r.stderr or r.stdout)[:200]}")
+        return {"overlay": str(overlay), "cached": True, "inputs_hash": key}
+    base = qemu_guest.ensure_verified_base((base_dir or cache_dir) / "base")
+    overlay = qemu_guest.fresh_role_overlay(base, run_dir, "attacker", 16)
+    from infra.images import guest_userdata
+    manifest = json.loads((pathlib.Path(repo_root)
+                           / "infra/images/manifest.json").read_text())
+    pins = {p.split("=")[0]: p for p in manifest["packages"]}
+    packages = [pins[n] for n in ATTACKER_PACKAGES]
+    # The attacker payload is just the role marker (SSH keys arrive as the
+    # baked public key below; `payload_from_repo` deliberately ships nothing
+    # for the attacker role).
+    payload = {"/etc/sparring-range/role":
+               (pathlib.Path(repo_root)
+                / "infra/images/payloads/attacker/etc/sparring-range/role")
+               .read_text()}
+    user_data = guest_userdata.attacker_build_user_data(payload, packages, pubkey)
+    seed_iso = guest_seed.build_seed_iso(
+        run_dir / "attacker-build-seed.iso", user_data,
+        guest_seed.meta_data(f"sr-atk-build-{key[:8]}", "sr-build-attacker"))
+    rec = qemu_guest.boot_full_guest(disk=overlay, seed_iso=seed_iso,
+                                     memory_mb=memory_mb, net="user",
+                                     expect=("SR-GUEST-BUILD-APT-OK",
+                                             "SR-GUEST-BUILD-SETUP-OK"),
+                                     timeout_s=timeout_s)
+    shutil.copyfile(overlay, cached)
+    for stale in cache_dir.glob("attacker-*.qcow2"):
+        if stale != cached:
+            stale.unlink(missing_ok=True)
+    return {"overlay": str(overlay), "cached": False, "inputs_hash": key,
+            "qemu": rec["qemu"], "kvm": rec["kvm"]}
 
 
 def verify_overlay(*, overlay: pathlib.Path, run_dir: pathlib.Path, name: str,

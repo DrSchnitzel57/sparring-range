@@ -25,6 +25,8 @@ No credential is baked into the repo or the seed.
 from __future__ import annotations
 
 import json
+import pathlib
+import shlex
 
 SERIAL = "/dev/ttyS0"
 
@@ -148,6 +150,11 @@ def _setup_script(role: str, packages: list[str]) -> str:
     serial tail instead of dying silently mid-list, and the total is bounded.
     `packages` here are bare names (pins were installed by the apt item)."""
     want = " ".join(p + "*" for p in packages)
+    # Role-level config difference (documented superset build): the DB role
+    # runs MySQL; the web-local template must NOT enable it.
+    mysql_state = ("timeout 120 systemctl enable --now mysql || true"
+                   if role == "mojang-web-db" else
+                   "timeout 120 systemctl disable --now mysql >/dev/null 2>&1 || true")
     gate = ("test \"$(mysql --batch --skip-column-names -e "
             "'SELECT COUNT(*) FROM purchases' mojang)\" = 12"
             if role == "mojang-web-db" else "true")
@@ -183,7 +190,7 @@ printf 'SR_API_URL=http://127.0.0.1:9\\nSR_TELEMETRY_TOKEN=sr-build-dummy\\nSR_H
 chown root:srshipper /etc/sparring-range/shipper.env
 chmod 0640 /etc/sparring-range/shipper.env
 timeout 120 systemctl enable --now auditd sparring-shipper nginx mojang-web ssh || {{ mark UNITS-FAIL; poweroff; }}
-timeout 120 systemctl enable --now mysql || true
+{mysql_state}
 timeout 60 systemctl restart auditd || true
 chown root:root /usr/local/bin/mojang-maintenance /etc/sudoers.d/mojang-maintenance
 chmod 0755 /usr/local/bin/mojang-maintenance
@@ -426,6 +433,79 @@ manage_etc_hosts: true
 package_update: false
 package_upgrade: false
 {_common_users()}
+write_files:
+{files}runcmd:
+  - /bin/bash /srv/sr-verify-checks.sh
+"""
+
+
+def attacker_build_user_data(payload: dict[str, str], packages: list[str],
+                             pubkey: str) -> str:
+    """Build seed for the ATTACKER template (pilot step 2): the pinned base
+    + attacker role file + runner-supervisor + operator PUBLIC key only.
+    No target payload, no MySQL, no shipper/auditd (the attacker is tooling,
+    not a telemetry target). Host keys/machine-id are scrubbed by the
+    template finalize boot so every PVE clone regenerates fresh identity."""
+    files = "".join(_write_file_entry(p, c, perms=_payload_perms(p))
+                    for p, c in sorted(payload.items()))
+    files += _write_file_entry(
+        "/usr/local/bin/runner-supervisor",
+        (pathlib.Path(__file__).resolve().parents[2]
+         / "infra/runner/runner_supervise.sh").read_text(), perms="0755")
+    pins = " ".join(_shlex_quote(p) for p in packages)
+    files += _write_file_entry("/srv/sr-attacker-build.sh", f"""#!/bin/bash
+S=/dev/ttyS0
+mark() {{ echo "SR-GUEST-BUILD-$1" > $S; }}
+systemctl disable --now unattended-upgrades || true
+timeout 1200 env DEBIAN_FRONTEND=noninteractive apt-get install -y \\
+  -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold {pins} \\
+  && mark APT-OK || {{ mark APT-FAIL; poweroff; }}
+install -d -m 0750 -o root -g srshipper /etc/sparring-range 2>/dev/null \\
+  || install -d -m 0750 /etc/sparring-range
+mkdir -p /home/attacker/.ssh
+printf '%s\\n' {shlex.quote(pubkey)} > /home/attacker/.ssh/authorized_keys
+chmod 0700 /home/attacker/.ssh; chmod 0600 /home/attacker/.ssh/authorized_keys
+chown -R attacker:attacker /home/attacker/.ssh
+ufw --force enable; ufw allow 22/tcp
+systemctl enable --now ssh qemu-guest-agent || true
+mark SETUP-OK
+poweroff
+""", perms="0755")
+    return f"""#cloud-config
+hostname: sr-build-attacker
+manage_etc_hosts: true
+package_update: true
+package_upgrade: false
+users:
+  - name: attacker
+    groups: [sudo]
+    shell: /bin/bash
+  - name: srshipper
+    system: true
+    groups: [adm]
+    shell: /usr/sbin/nologin
+write_files:
+{files}runcmd:
+  - bash /srv/sr-attacker-build.sh
+"""
+
+
+def finalize_user_data() -> str:
+    """Template finalize boot (pilot step 2): scrub per-clone identity from
+    the BUILT template so every PVE clone regenerates fresh SSH host keys and
+    machine-id via cloud-init, exactly the contract the broker's guest-agent
+    host-key pinning depends on. Offline (`-net none`)."""
+    script = (_HARNESS_HEADER + f"""
+chk SCRUB bash -c 'rm -f /etc/ssh/ssh_host_*; truncate -s 0 /etc/machine-id; rm -f /var/lib/dbus/machine-id; cloud-init clean --logs --seed 2>/dev/null || rm -rf /var/lib/cloud/instances/seed; ! ls /etc/ssh/ssh_host_* 2>/dev/null | grep -q .'
+echo "SR-GUEST-DONE rc=$fails" > {SERIAL}
+poweroff
+""")
+    files = _write_file_entry("/srv/sr-verify-checks.sh", script, perms="0755")
+    return f"""#cloud-config
+hostname: sr-finalize
+manage_etc_hosts: true
+package_update: false
+package_upgrade: false
 write_files:
 {files}runcmd:
   - /bin/bash /srv/sr-verify-checks.sh
