@@ -282,7 +282,9 @@ def start_run(db: Session, session_id, scenario_id: str) -> Run:
 
     from srplatform.settings import get_settings
     s = get_settings()
-    env = _worker_env(s, token, session_id, scenario_id, run)
+    from srplatform.db.models import MatchModel
+    env = _worker_env(s, token, session_id, scenario_id, run,
+                      match=db.get(MatchModel, session_id))
     try:
         proc = subprocess.Popen([sys.executable, "-m", "srplatform.red_agent.worker"],
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -396,7 +398,8 @@ _WORKER_SETTING_KEYS = {
 }
 
 
-def _worker_env(s, token: str, session_id, scenario_id: str, run: Run) -> dict:
+def _worker_env(s, token: str, session_id, scenario_id: str, run: Run,
+                match=None) -> dict:
     import os as _os
     env = {k: _os.environ.get(k, "") for k in ("PATH", "HOME", "LANG", "LC_ALL", "TZ")}
     env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
@@ -410,6 +413,14 @@ def _worker_env(s, token: str, session_id, scenario_id: str, run: Run) -> dict:
         "SR_RUN_ID": str(run.run_id),
         "SR_WORKER_TOKEN": token,
     })
+    # SUSTAINED MATCH (pilot steps 3+4): the per-action throttle and the
+    # SERVER match deadline come from the session's SNAPSHOT row (never
+    # re-read live mid-match). Harmless operational values — no credential
+    # ever rides the worker environment.
+    env["SR_ATTACK_PACE_S"] = str(
+        match.pace_seconds if match is not None else s.match_default_pace_seconds)
+    if match is not None and match.deadline_at is not None:
+        env["SR_MATCH_DEADLINE_UTC"] = match.deadline_at.isoformat()
     return env
 
 

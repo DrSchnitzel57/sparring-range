@@ -73,8 +73,9 @@ def test_m1_reset_replaces_owned_resources_and_teardown_leaves_no_orphans(
 
 
 def test_m1_end_releases_lease_revokes_tokens_and_scores(client, users, fake_pve, migrated_db):
-    """Audit R07 invariant: END keeps the reservation while owned machines
-    still exist; only a COMPLETE teardown frees the range for the next launch."""
+    """Pilot step 4 contract: END finalizes AND destroys the owned machines,
+    freeing the range when teardown completes. The R07 invariant stays: a
+    machine that still EXISTS (failed destroy) keeps the reservation."""
     import sqlalchemy as sa
     from sqlalchemy import create_engine
 
@@ -87,18 +88,13 @@ def test_m1_end_releases_lease_revokes_tokens_and_scores(client, users, fake_pve
     assert body["status"] == "complete"
     # end runs the TRUSTED scorecard; hosts unreachable here -> visible honesty
     assert body["scorecard_status"] in ("partial", "unscored", "scored")
-    # VMs are retained => the range stays RESERVED (audit R07)
-    assert body["lease_released"] is False
+    # end DESTROYS the owned VMs and releases the range (pilot step 4)
+    assert body["lease_released"] is True
+    assert set(fake_pve.api.vms) == {9001, 9002, 9003, 9004}
 
-    # while machines remain, another member's launch must CONFLICT, not collide
+    # the range is free: another member can launch immediately
     sid2 = client.post("/sessions", json={"scenario_id": "db-exfil-01"},
                        headers=users["op"]).json()["session_id"]
-    conflict = client.post(f"/sessions/{sid2}/launch", headers=users["op"])
-    assert conflict.status_code == 409, conflict.text
-
-    # complete teardown frees the reservation: another member can now launch
-    t = client.post(f"/sessions/{sid}/teardown", headers=users["member"])
-    assert t.status_code == 200 and t.json().get("complete", True)
     assert client.post(f"/sessions/{sid2}/launch", headers=users["op"]).status_code == 200
 
     # session bastion tokens revoked at end

@@ -170,7 +170,9 @@ def test_m6_full_practice_loop_over_cli_and_http(live_api, tmp_path, monkeypatch
     assert "After-Action Review" in res.output
 
     res = runner.invoke(cli, ["teardown", sid])
-    assert res.exit_code == 0 and "destroyed" in res.output
+    # pilot step 4: END already destroyed the owned VMs and freed the range —
+    # teardown afterwards is a no-op (idempotent), not a second destruction
+    assert res.exit_code == 0
 
     res = runner.invoke(cli, ["readyz"])
     assert res.exit_code == 0

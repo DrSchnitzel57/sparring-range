@@ -1017,13 +1017,15 @@ def test_r07_reset_requires_the_lease(client, users, fake_pve):
     sid_a = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                         headers=users["member"]).json()["session_id"]
     client.post(f"/sessions/{sid_a}/launch", headers=users["member"])
-    # a completed session holding no lease cannot reset over an active range
+    # PILOT STEP 4: end destroys the owned machines and frees the range, so
+    # B CAN launch after A ends. The R07 invariant this test guards remains:
+    # a completed session's reset must not proceed over a range B now holds.
     client.post(f"/sessions/{sid_a}/end", headers=users["member"])
     sid_b = client.post("/sessions", json={"scenario_id": "db-exfil-01"},
                         headers=users["op"]).json()["session_id"]
-    # B holds nothing yet; A ended but still owns machines -> B launch conflicts,
-    # and A's reset must not proceed while B could hold the range either.
-    assert client.post(f"/sessions/{sid_b}/launch", headers=users["op"]).status_code == 409
+    assert client.post(f"/sessions/{sid_b}/launch", headers=users["op"]).status_code == 200
+    # A holds no lease -> A's reset conflicts with B's active range
+    assert client.post(f"/sessions/{sid_a}/reset", headers=users["member"]).status_code == 409
 
 
 @pytest.mark.db

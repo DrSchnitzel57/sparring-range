@@ -194,6 +194,10 @@ def create_user(body: UserIn, p: Principal = Depends(operator), db: DbSession = 
 class SessionCreate(BaseModel):
     scenario_id: str
     players: dict | None = None
+    # match parameters are SNAPSHOTTED at creation (pilot step 4); defaults
+    # come from settings (30-minute match, 30 s attack pace, 0 = no delay)
+    duration_minutes: int | None = None
+    pace_seconds: int | None = None
 
 
 def _scenario_snapshot(scenario_id: str) -> tuple[str, str]:
@@ -215,6 +219,16 @@ def create_session(body: SessionCreate, p: Principal = Depends(any_member),
                         status="preparing")
     db.add(sess)
     db.flush()
+    # MATCH SNAPSHOT (pilot step 4): effective preset/duration/pace are
+    # frozen NOW — never re-read live mid-match.
+    from srplatform import lifecycle
+    s = get_settings()
+    lifecycle.create_match(
+        db, sess.session_id, body.scenario_id,
+        duration_minutes=body.duration_minutes or s.match_default_duration_minutes,
+        pace_seconds=(s.match_default_pace_seconds if body.pace_seconds is None
+                      else body.pace_seconds),
+        actor=p.username)
     db.add(Event(session_id=sess.session_id, ts=_now(), actor="system",
                  action_type="session_start",
                  payload={"scenario_id": body.scenario_id,
@@ -255,11 +269,54 @@ def get_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
     dep = db.execute(select(Deployment).where(Deployment.session_id == session_id)
                      .order_by(Deployment.created_at.desc())).scalars().first()
     active = runs_svc.active_run_for_session(db, session_id)
+    from srplatform import lifecycle
+    m = lifecycle.get_match(db, session_id)
+    match = None
+    if m is not None:
+        def _iso(dt):
+            return dt.isoformat() if dt else None
+        match = {"state": m.state, "preset": m.preset,
+                 "duration_minutes": m.duration_minutes,
+                 "pace_seconds": m.pace_seconds,
+                 "ready_at": _iso(m.ready_at), "started_at": _iso(m.started_at),
+                 "deadline_at": _iso(m.deadline_at), "ended_at": _iso(m.ended_at),
+                 "expiry_reason": m.expiry_reason}
     return {"session_id": str(sess.session_id), "scenario_id": sess.scenario_id,
             "status": sess.status, "outcome": sess.outcome,
             "started_at": sess.started_at.isoformat() if sess.started_at else None,
             "deployment_status": dep.status if dep else None,
-            "active_run": str(active.run_id) if active else None}
+            "active_run": str(active.run_id) if active else None,
+            "match": match}
+
+
+@app.get("/sessions/{session_id}/connections")
+def get_connections(session_id: uuid.UUID, p: Principal = Depends(any_member),
+                    db: DbSession = None):
+    """Connection instructions SERVED BY THE API (pilot step 4): members
+    re-fetch their SSH instructions any time (refresh, another device) —
+    never a browser sessionStorage secret that vanishes on reload. Only the
+    caller's OWN unexpired, unrevoked login capabilities are returned."""
+    sess = _get_session(db, p, session_id)
+    s = get_settings()
+    dep = db.execute(select(Deployment).where(Deployment.session_id == session_id,
+                                              Deployment.status == "ready")
+                     .order_by(Deployment.created_at.desc())).scalars().first()
+    name_by_ip = {}
+    if dep:
+        for r in (dep.resources or []):
+            if r.get("ip"):
+                name_by_ip[r["ip"]] = r.get("host")
+    out = []
+    for lt in db.execute(select(LoginToken).where(
+            LoginToken.session_id == session_id,
+            LoginToken.user_id == p.user_id,
+            LoginToken.revoked_at.is_(None),
+            LoginToken.expires_at > _now())).scalars():
+        out.append({"host": name_by_ip.get(lt.target_host, lt.target_host),
+                    "ip": lt.target_host, "login_token": lt.token,
+                    "ssh": f"ssh {s.bastion_address} -p {s.bastion_listen_port} -l {lt.token}",
+                    "expires_at": lt.expires_at.isoformat() if lt.expires_at else None})
+    return {"session_id": str(session_id), "connections": out}
 
 
 # --- launch / end / reset / teardown (F08/F13) ----------------------------------
@@ -443,6 +500,10 @@ def _finalize_ready(db, sess, p, result, verification_service):
     db.add(Event(session_id=sess.session_id, ts=_now(), actor="system",
                  action_type="session_ready",
                  payload={"hosts": [i["host"] for i in instructions]}))
+    # MATCH: the idle-expiry clock starts now (ready-but-unstarted labs
+    # expire after 15 minutes — pilot step 4)
+    from srplatform import lifecycle
+    lifecycle.mark_ready(db, sess.session_id)
     db.flush()
     return instructions, readiness
 
@@ -450,106 +511,39 @@ def _finalize_ready(db, sess, p, result, verification_service):
 @app.post("/sessions/{session_id}/end")
 def end_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
                 db: DbSession = None):
-    """Idempotent finalize (F11/F13): stop worker, collect TRUSTED final score,
-    append snapshot + end evidence, revoke session capabilities. The lease is
-    released ONLY when no owned machine remains (audit R07): VMs are retained
-    unless teardown is explicitly requested, and while they hold the range's
-    static addresses the reservation must stay with this session."""
-    from srplatform import verification_service
+    """Idempotent durable finalize (F11/F13 + pilot step 4): stop the worker
+    and CONFIRM, capture final evidence, revoke capabilities, DESTROY the
+    owned VMs and release the lease when teardown completes. A blocked stop,
+    unresolved operation or failed destroy is a conflict — everything stays
+    reserved and visible, and the scheduler retries; a repeat end retries
+    the cleanup. The lease is released ONLY on a complete teardown (R07)."""
+    from srplatform import lifecycle
+    from srplatform.api.deps import get_broker
     from srplatform.scenario_engine import orchestrator
 
     sess = _get_session(db, p, session_id)
-    if sess.status == "complete":
+    m = lifecycle.get_match(db, sess.session_id)
+    if sess.status == "complete" and (m is None or m.state == "completed"):
         return {"ok": True, "status": "complete", "note": "already ended (idempotent)",
-                "outcome": sess.outcome}
+                "outcome": sess.outcome, "lease_released": True}
     try:
         _claim_owner = orchestrator.claim_operation(db, sess.session_id, "end")
     except orchestrator.OperationInProgress as e:
         raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
     _ok = False
     try:
-        out = _end_session_inner(db, sess, p, verification_service, orchestrator)
+        out = lifecycle.finalize_match(db, sess.session_id, "user_end",
+                                       broker=get_broker(), username=p.username)
+        db.commit()
         _ok = True
         return out
+    except lifecycle.MatchBlocked as e:
+        raise HTTPException(409, {"error": e.reason, "detail": e.detail,
+                                  "note": "session NOT fully ended; range stays "
+                                          "reserved, cleanup retried automatically"})
     finally:
         _release_claim_safely(db, sess.session_id, _ok, _claim_owner)
 
-
-def _end_session_inner(db, sess, p, verification_service, orchestrator):
-    active = runs_svc.active_run_for_session(db, sess.session_id)
-    if active:
-        stopped = runs_svc.stop_run(db, active.run_id)
-        if not stopped.get("ok"):
-            # cancellation FAILED — do not finalize as safely stopped (R07)
-            raise HTTPException(409, {"error": "worker_stop_failed",
-                                      "detail": stopped.get("detail"),
-                                      "note": "session NOT ended; retry or engage killswitch"})
-    # AUDIT F2: durable obligations are checked independently of run status —
-    # a terminal row with an unresolved operation blocks the end until the
-    # cessation is genuinely confirmed.
-    _require_session_operations_resolved(db, sess.session_id)
-
-    try:
-        scorecard = verification_service.build_scorecard(db, sess.session_id)
-    except Exception as e:  # noqa: BLE001 — scoring unavailable is visible, never fatal
-        db.add(Event(session_id=sess.session_id, ts=_now(), actor="system",
-                     action_type="score_unavailable", payload={"error": str(e)[:500]}))
-        scorecard = {"status": "unscored", "error": str(e)[:300]}
-
-    # red_verified_complete is RECONSTRUCTED from trusted verifier events —
-    # every objective of the session's snapshot must have a passed verifier
-    # result. The worker's self-reported `complete` flag is never trusted (R07).
-    red_complete = False
-    try:
-        spec = verification_service.scenario_spec(db, sess.session_id)
-        objective_ids = {o["id"] for o in spec.get("red", {}).get("objectives", [])}
-        passed = set()
-        for ev in db.execute(select(Event).where(
-                Event.session_id == sess.session_id,
-                Event.action_type == "verifier")).scalars():
-            pl = ev.payload or {}
-            if pl.get("passed") and pl.get("objective"):
-                passed.add(pl["objective"])
-        red_complete = bool(objective_ids) and objective_ids.issubset(passed)
-    except Exception:  # noqa: BLE001 — spec unreadable => cannot claim complete
-        red_complete = False
-
-    sess.status = "complete"
-    sess.outcome = "red_complete" if red_complete else "incomplete"
-    sess.ended_at = sess.finalized_at = _now()
-    db.add(Event(session_id=sess.session_id, ts=_now(), actor="system",
-                 action_type="session_end",
-                 payload={"score_status": scorecard.get("status"),
-                          "earned": scorecard.get("earned"), "total": scorecard.get("total"),
-                          "red_verified_complete": red_complete,
-                          "ended_by": p.username}))
-
-    # revoke session capabilities (F04/F08)
-    for lt in db.execute(select(LoginToken).where(LoginToken.session_id == sess.session_id,
-                                                  LoginToken.revoked_at.is_(None))).scalars():
-        lt.revoked_at = _now()
-    for st in db.execute(select(ServiceToken).where(ServiceToken.session_id == sess.session_id,
-                                                    ServiceToken.revoked_at.is_(None))).scalars():
-        st.revoked_at = _now()
-
-    # release the reservation ONLY when nothing owned remains (audit R07):
-    # retained VMs keep the range reserved so the next launch cannot collide
-    # with their static addresses.
-    residual = orchestrator._residual_resources(db, sess.session_id)
-    if residual:
-        note = (f"{len(residual)} owned machine(s) still exist — range reservation "
-                "RETAINED until teardown removes them")
-    else:
-        orchestrator.release_lease(db, sess.session_id)
-        note = "lease released (no residual resources)"
-    # COMMIT the finalize (status/outcome/evidence/revocations): the claim
-    # release in the route's finally must never roll this back, and durable
-    # end evidence must survive independently of the request transaction.
-    db.commit()
-    return {"ok": True, "status": sess.status, "outcome": sess.outcome,
-            "scorecard_status": scorecard.get("status"),
-            "earned": scorecard.get("earned"), "total": scorecard.get("total"),
-            "lease_released": not residual, "note": note}
 
 
 @app.post("/sessions/{session_id}/score")
@@ -598,6 +592,17 @@ def _teardown_common(db, sess, p):
             # documented terminal transition: torn-down sessions must go
             # through launch (a fresh deploy) before they can run again
             sess.status = "torn_down"
+    # MATCH: an explicit teardown ends the match lifecycle too (the machines
+    # it referred to are gone); incomplete cleanup stays retryable.
+    from srplatform import lifecycle
+    m = lifecycle.get_match(db, sess.session_id)
+    if m is not None and m.state != "completed":
+        m.state = "completed" if t.get("complete", True) else "interrupted"
+        m.expiry_reason = m.expiry_reason or "teardown"
+        m.ended_at = m.ended_at or _now()
+        db.add(Event(session_id=sess.session_id, ts=_now(), actor="system",
+                     action_type="match_end",
+                     payload={"reason": "teardown", "complete": t.get("complete", True)}))
     db.flush()
     return t
 
@@ -720,78 +725,123 @@ class RunIn(BaseModel):
     session_id: uuid.UUID
 
 
+def _start_red_run(db, p, session_id, scenario_id: str):
+    """Shared attack-start workflow (the durable claim must be HELD by the
+    caller — audit T02). Every precondition is re-read AFTER the claim:
+    what was true before the claim says nothing about now. Used by /run and
+    /begin so both enforce the identical lease/deployment/enrollment gate."""
+    from srplatform.scenario_engine import orchestrator
+    db.expire_all()
+    sess = _get_session(db, p, session_id)
+    if sess.scenario_id != scenario_id:
+        raise HTTPException(422, f"session runs scenario '{sess.scenario_id}'")
+    if sess.status not in ("ready", "running"):
+        raise HTTPException(409, f"session is {sess.status} — launch it first")
+    # DEPLOYMENT/RESERVATION checks come BEFORE the safety gate so clients see
+    # the actionable 409 ("not launched / no reservation") rather than a
+    # confusing 423 that mixes in dev-mode evidence relaxations (audit N03).
+    lease = orchestrator.current_lease(db)
+    if not lease or lease["session_id"] != str(sess.session_id):
+        raise HTTPException(409, {"error": "no_current_reservation",
+                                  "note": "the range lease is not held by this session — "
+                                          "launch it again before starting a run"})
+    dep = db.execute(select(Deployment).where(Deployment.session_id == sess.session_id,
+                                              Deployment.scenario_id == sess.scenario_id,
+                                              Deployment.status == "ready")
+                     .order_by(Deployment.created_at.desc())).scalars().first()
+    if dep is None:
+        raise HTTPException(409, {"error": "no_ready_deployment",
+                                  "note": "no ready owned deployment for this session — "
+                                          "launch it first"})
+    # ENROLLMENT EVIDENCE GATE (audit F3): an already-`ready` session must
+    # not let /run bypass the current enrollment requirements — readiness
+    # derives from valid CURRENT-generation enrollment evidence, not from
+    # a stale JSON phase alone.
+    from srplatform.scenario_engine import orchestrator as _orch
+    if _orch.enrollment_channel_available():
+        stale = [r.get("host") for r in (dep.resources or [])
+                 if r.get("state") == "created"
+                 and not _orch.enrollment_evidence_current(db, sess.session_id,
+                                                           r.get("host"),
+                                                           dep.deployment_id)]
+        if stale:
+            raise HTTPException(409, {
+                "error": "enrollment_evidence_missing", "hosts": stale,
+                "note": "current-deployment enrollment evidence (authenticated "
+                        "delivery + capture) is missing for these hosts — "
+                        "relaunch/reset to re-enroll; /run cannot bypass "
+                        "enrollment requirements"})
+    try:
+        run = runs_svc.start_run(db, sess.session_id, scenario_id)
+    except runs_svc.GateRefused as e:
+        raise HTTPException(423, {"error": "safety_gate", "reasons": e.reasons})
+    except runs_svc.RunConflict as e:
+        raise HTTPException(409, str(e))
+    sess.status = "running"
+    db.flush()
+    return run
+
+
 @app.post("/run/{scenario_id}", status_code=202)
 def run_scenario(scenario_id: str, body: RunIn, p: Principal = Depends(any_member),
                  db: DbSession = None):
+    """Start the attack worker. LIFECYCLE COORDINATION (audit T02): /run
+    participates in the SAME durable operation claim as end/reset/teardown/
+    begin — a run can never slip past teardown's "no active worker" check.
+    A ready match's SERVER CLOCK starts with it (pilot step 4)."""
+    from srplatform import lifecycle
     from srplatform.scenario_engine import orchestrator
     sess = _get_session(db, p, body.session_id)
     if sess.scenario_id != scenario_id:
         raise HTTPException(422, f"session runs scenario '{sess.scenario_id}'")
-    # LIFECYCLE COORDINATION (audit T02): /run participates in the SAME
-    # durable operation claim as end/reset/teardown. Without it a run could
-    # pass the lease/deployment checks, pause, and spawn its worker AFTER
-    # teardown's "no active worker" check while the machines and lease are
-    # being released.
     try:
         _claim_owner = orchestrator.claim_operation(db, sess.session_id, "run")
     except orchestrator.OperationInProgress as e:
         raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
     _ok = False
     try:
-        # REJECT STALE OBSERVATIONS (audit T02): every precondition is
-        # re-read AFTER the claim is held — what was true before the claim
-        # says nothing about now.
-        db.expire_all()
-        sess = _get_session(db, p, body.session_id)
-        if sess.scenario_id != scenario_id:
-            raise HTTPException(422, f"session runs scenario '{sess.scenario_id}'")
-        if sess.status not in ("ready", "running"):
-            raise HTTPException(409, f"session is {sess.status} — launch it first")
-        # DEPLOYMENT/RESERVATION checks come BEFORE the safety gate so clients see
-        # the actionable 409 ("not launched / no reservation") rather than a
-        # confusing 423 that mixes in dev-mode evidence relaxations (audit N03).
-        lease = orchestrator.current_lease(db)
-        if not lease or lease["session_id"] != str(sess.session_id):
-            raise HTTPException(409, {"error": "no_current_reservation",
-                                      "note": "the range lease is not held by this session — "
-                                              "launch it again before starting a run"})
-        dep = db.execute(select(Deployment).where(Deployment.session_id == sess.session_id,
-                                                  Deployment.scenario_id == sess.scenario_id,
-                                                  Deployment.status == "ready")
-                         .order_by(Deployment.created_at.desc())).scalars().first()
-        if dep is None:
-            raise HTTPException(409, {"error": "no_ready_deployment",
-                                      "note": "no ready owned deployment for this session — "
-                                              "launch it first"})
-        # ENROLLMENT EVIDENCE GATE (audit F3): an already-`ready` session must
-        # not let /run bypass the current enrollment requirements — readiness
-        # derives from valid CURRENT-generation enrollment evidence, not from
-        # a stale JSON phase alone.
-        from srplatform.scenario_engine import orchestrator as _orch
-        if _orch.enrollment_channel_available():
-            stale = [r.get("host") for r in (dep.resources or [])
-                     if r.get("state") == "created"
-                     and not _orch.enrollment_evidence_current(db, sess.session_id,
-                                                               r.get("host"),
-                                                               dep.deployment_id)]
-            if stale:
-                raise HTTPException(409, {
-                    "error": "enrollment_evidence_missing", "hosts": stale,
-                    "note": "current-deployment enrollment evidence (authenticated "
-                            "delivery + capture) is missing for these hosts — "
-                            "relaunch/reset to re-enroll; /run cannot bypass "
-                            "enrollment requirements"})
-        try:
-            run = runs_svc.start_run(db, sess.session_id, scenario_id)
-        except runs_svc.GateRefused as e:
-            raise HTTPException(423, {"error": "safety_gate", "reasons": e.reasons})
-        except runs_svc.RunConflict as e:
-            raise HTTPException(409, str(e))
-        sess.status = "running"
-        db.flush()
+        run = _start_red_run(db, p, body.session_id, scenario_id)
+        lifecycle.start_clock(db, sess.session_id, actor=p.username)
         _ok = True
         return {"ok": True, "run_id": str(run.run_id), "status": run.status,
                 "session_id": str(body.session_id)}
+    finally:
+        _release_claim_safely(db, sess.session_id, _ok, _claim_owner)
+
+
+@app.post("/sessions/{session_id}/begin", status_code=202)
+def begin_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
+                  db: DbSession = None):
+    """BEGIN (pilot step 4): start the SERVER match clock and the attack
+    schedule together, from the snapshot taken at session creation. The
+    deadline ends the match; a duplicate Begin is idempotent and can never
+    extend the ORIGINAL deadline."""
+    from srplatform import lifecycle
+    from srplatform.scenario_engine import orchestrator
+    sess = _get_session(db, p, session_id)
+    m = lifecycle.get_match(db, sess.session_id)
+    if m is not None and m.state == "running":
+        active = runs_svc.active_run_for_session(db, sess.session_id)
+        return {"ok": True, "status": "running", "note": "already begun (idempotent)",
+                "run_id": str(active.run_id) if active else None,
+                "started_at": m.started_at.isoformat() if m.started_at else None,
+                "deadline_at": m.deadline_at.isoformat() if m.deadline_at else None,
+                "duration_minutes": m.duration_minutes, "pace_seconds": m.pace_seconds}
+    try:
+        _claim_owner = orchestrator.claim_operation(db, sess.session_id, "begin")
+    except orchestrator.OperationInProgress as e:
+        raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
+    _ok = False
+    try:
+        run = _start_red_run(db, p, sess.session_id, sess.scenario_id)
+        m = lifecycle.start_clock(db, sess.session_id, actor=p.username)
+        _ok = True
+        return {"ok": True, "run_id": str(run.run_id), "status": "running",
+                "session_id": str(sess.session_id),
+                "started_at": m.started_at.isoformat() if m and m.started_at else None,
+                "deadline_at": m.deadline_at.isoformat() if m and m.deadline_at else None,
+                "duration_minutes": m.duration_minutes if m else None,
+                "pace_seconds": m.pace_seconds if m else None}
     finally:
         _release_claim_safely(db, sess.session_id, _ok, _claim_owner)
 
@@ -1519,3 +1569,21 @@ def _startup():
             app.state.control_heartbeat = hb
     except Exception:
         pass
+    # PILOT STEP 4: match lifecycle — an API restart INTERRUPTS running
+    # matches (never resumes them) and retries interrupted cleanup; the
+    # scheduler enforces idle expiry + deadlines. Opt-in
+    # (SR_MATCH_SCHEDULER_ENABLED=1) so shared-database test processes never
+    # run background cleanup; tests drive lifecycle.tick directly.
+    try:
+        from srplatform.settings import get_settings as _gs4
+        s4 = _gs4()
+        if s4.match_scheduler_enabled:
+            from srplatform import lifecycle
+            from srplatform.api import deps as _deps4
+            from srplatform.db.session import db as _db4
+            broker4 = _deps4.get_broker()
+            with _db4() as s:
+                lifecycle.reconcile_on_startup(s, broker=broker4)
+            lifecycle.start_scheduler(interval_s=s4.match_scheduler_interval_s)
+    except Exception:
+        pass  # the scheduler retries every tick; startup must not crash

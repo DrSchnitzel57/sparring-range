@@ -14,6 +14,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     SmallInteger,
     Text,
     UniqueConstraint,
@@ -298,6 +299,41 @@ class SafetyRecord(Base):
     config_identity: Mapped[str | None] = mapped_column(Text)
     detail: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class MatchModel(Base):
+    """Minimal durable match lifecycle (pilot step 4). One row per session,
+    created AT SESSION CREATION: the effective preset, match duration and
+    attack pace are SNAPSHOT then (never re-read live mid-match).
+
+    Server clock is the only authority: Begin binds started_at/deadline_at;
+    the scheduler ends the match at the deadline, expires ready-but-unstarted
+    labs after READY_IDLE_EXPIRY, and an API restart INTERRUPTS (never
+    resumes). Mutable by design — this is operational lifecycle state (like
+    the range lease), not history; every transition also appends an event.
+
+    States: provisioning -> ready -> running -> finalizing -> completed,
+    with `interrupted` for idle expiry / API restart / blocked cleanup.
+    'finalizing' is the DURABLE INTENT marker: a crash mid-cleanup leaves it,
+    and the scheduler (or startup reconcile) retries — unknown cleanup is
+    never treated as success."""
+
+    __tablename__ = "matches"
+
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.session_id"), primary_key=True)
+    preset: Mapped[str] = mapped_column(Text, nullable=False)
+    duration_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    pace_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    state: Mapped[str] = mapped_column(Text, nullable=False, default="provisioning")
+    snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expiry_reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class Recording(Base):

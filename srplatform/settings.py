@@ -38,6 +38,15 @@ class Settings(BaseSettings):
 
     # --- Auth (F04) ---
     web_token_ttl_hours: int = 12
+
+    # --- match lifecycle (pilot step 4) ---
+    match_default_duration_minutes: int = 30
+    match_default_pace_seconds: int = 30   # 0 = no intentional delay
+    # control-plane opt-in: background idle-expiry/deadline scheduler + startup
+    # match reconcile. OFF by default so shared-database test processes never
+    # run background cleanup; the deployment env file enables it.
+    match_scheduler_enabled: bool = False
+    match_scheduler_interval_s: int = 15
     # A brand-new operator account (empty users table) may bootstrap itself.
     bootstrap_operator_username: str = "drew"
 
