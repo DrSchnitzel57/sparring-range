@@ -32,10 +32,14 @@ def _qemu_available() -> bool:
     return bool(shutil.which("qemu-system-x86_64") or shutil.which("qemu-system-x86"))
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture()
 def superset_overlay():
-    """Build-once superset overlay for this gate run (real Ubuntu boot with
-    package install). Run-owned; removed with the run dir afterwards."""
+    """Build-once (cache) superset overlay, but a FRESH COPY per test: the
+    chain battery is state-mutating BY DESIGN (MAINT-FIX removes the sudoers
+    rule, DIAG-FIX disables the endpoint), and those writes land in the
+    overlay a boot runs on. Sharing one copy across verify tests would make
+    the second boot start in the already-fixed state (flaw checks then
+    correctly fail). A cache-hit build_overlay is copy+rebase — no boot."""
     from infra.dev import qemu_guest
     from infra.images import guest_build
     qemu_guest.require_qemu()  # fail closed here, not inside the build
