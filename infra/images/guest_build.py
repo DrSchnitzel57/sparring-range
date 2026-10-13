@@ -170,8 +170,14 @@ def verify_overlay(*, overlay: pathlib.Path, run_dir: pathlib.Path, name: str,
     serial = run_dir / f"{overlay.stem}.serial.log"
     markers = serial_markers(serial)
     failures = [m for m in markers if "-FAIL:" in m]
-    if failures:
-        raise RuntimeError(f"guest {name} reported check failures: {failures[:5]}")
-    if "SR-GUEST-DONE rc=0" not in markers:
-        raise RuntimeError(f"guest {name} never reached DONE rc=0")
+    if failures or "SR-GUEST-DONE rc=0" not in markers:
+        dbg = pathlib.Path(f"/tmp/opencode/sr-gate-debug/{name}.serial.log")
+        try:
+            dbg.parent.mkdir(parents=True, exist_ok=True)
+            dbg.write_text(serial.read_text(errors="replace"))
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"guest {name} reported check failures: {failures[:8]} "
+            f"(serial preserved at {dbg})")
     return {"name": name, "markers": markers, "packages": {}, **rec}
