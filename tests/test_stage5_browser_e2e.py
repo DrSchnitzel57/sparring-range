@@ -324,9 +324,15 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
         # proved nothing and the immediate assert raced the first poll.
         _body_has(pw, "command", timeout=20)
 
-        # ---- start red: REAL worker subprocess through the UI button ---------
-        pw("click", 'button:has-text("start red")')
+        # ---- begin match: SERVER clock + REAL worker subprocess via the UI ----
+        pw("click", 'button:has-text("begin match")')
         _body_has(pw, "red run")
+        # the match clock is SERVER-owned: begun, with a real deadline
+        s = httpx.get(f"{API}/sessions/{sid}", headers=mem).json()
+        assert s["match"]["state"] == "running" and s["match"]["deadline_at"], s["match"]
+        # SUSTAINED match (pilot step 3): the run does NOT end on objective
+        # completion — it runs to the deadline. Stop it through the UI.
+        pw("click", 'button:has-text("stop red")')
         deadline = time.time() + 120
         while time.time() < deadline:
             s = httpx.get(f"{API}/sessions/{sid}", headers=mem).json()
@@ -334,7 +340,7 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
                 break
             time.sleep(1)
         else:
-            pytest.fail("the red run never completed through the shared model path")
+            pytest.fail("the red run never stopped through the shared model path")
 
         # ---- end session (confirm dialog) -> trusted final score -------------
         pw("eval", "window.confirm = () => true")
