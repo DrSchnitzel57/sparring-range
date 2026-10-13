@@ -134,7 +134,7 @@ class Settings(BaseSettings):
     llm_api_key: str = "dummy"
     llm_model_red: str = "qwen2.5-14b-instruct"
     llm_model_coach: str = "qwen2.5-32b-instruct"
-    llm_timeout_s: int = 120
+    llm_timeout_s: int = 60   # per-call timeout (gateway policy, pilot step 3)
     # bounded model gateway (F18)
     model_queue_max: int = 32
     model_hint_max_wait_s: int = 150     # declared bound for interactive hints

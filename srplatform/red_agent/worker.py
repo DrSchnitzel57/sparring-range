@@ -55,7 +55,9 @@ def main() -> int:
             r.raise_for_status()
             return r.json()["text"]
 
-    loop = RedAgentLoop(session_id, scenario_id, transport, ApiModel(), runner)
+    loop = RedAgentLoop(session_id, scenario_id, transport, ApiModel(), runner,
+                        throttle_s=_pace_seconds(),
+                        deadline_utc=_match_deadline())
     try:
         result = loop.run()
     except Exception as e:  # noqa: BLE001 — the API needs a truthful failure
@@ -71,6 +73,31 @@ def main() -> int:
         # status so "stopped cleanly" is never confused with "unknown"
         return 4
     return 0
+
+
+def _pace_seconds() -> float:
+    """Per-action dispatch throttle from the SESSION SNAPSHOT (start_run
+    exports SR_ATTACK_PACE_S at worker spawn): 30 s default, 0 = no
+    intentional delay. Never re-read live mid-match."""
+    raw = os.environ.get("SR_ATTACK_PACE_S", "30")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 30.0
+
+
+def _match_deadline():
+    """Server-clock match deadline (SR_MATCH_DEADLINE_UTC, ISO) set at Begin;
+    absent = no server deadline (legacy CLI practice ends via stop/budget)."""
+    from datetime import datetime, timezone
+    raw = os.environ.get("SR_MATCH_DEADLINE_UTC")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
 
 
 def _report(api: str, run_id: str, token: str, result: dict) -> None:

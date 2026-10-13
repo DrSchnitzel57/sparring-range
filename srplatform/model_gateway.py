@@ -8,6 +8,11 @@ through ONE priority gateway per process.
     accounts for one in-flight request (documented, not claimed preemption).
   * Bounded queue (max_queue): overflow raises QueueFull — visible failure,
     not silent memory growth.
+  * RETRY POLICY (pilot step 3 / architecture): every model call gets at
+    most THREE attempts with 5/15-second delays between them; the per-call
+    timeout is LLM_TIMEOUT_S (60 s default). Exhausted recovery FAILS the
+    task truthfully (the red loop then interrupts the match honestly) —
+    attempts are never unlimited and failures are never swallowed.
   * Every failure is recorded (metrics) and surfaced; a model outage does not
     poison the gateway — the next attempt may succeed (recovery). No DB
     transactions are held here: callers pass plain data.
@@ -17,6 +22,7 @@ from __future__ import annotations
 import heapq
 import itertools
 import threading
+import time
 from concurrent.futures import CancelledError, Future, InvalidStateError
 
 
@@ -27,6 +33,13 @@ class QueueFull(RuntimeError):
 PRIORITY_HINT = 0
 PRIORITY_RED = 5
 PRIORITY_AAR = 9
+
+#: bounded retry policy (architecture: at most three attempts, 5/15 s delays)
+MODEL_ATTEMPTS = 3
+MODEL_RETRY_DELAYS_S = (5.0, 15.0)
+
+#: seam for tests (never sleep for real in unit tests)
+_sleep = time.sleep
 
 
 class ModelGateway:
@@ -82,7 +95,7 @@ class ModelGateway:
                 if not fut.set_running_or_notify_cancel():
                     continue
                 try:
-                    result = fn(*args, **kwargs)
+                    result = self._execute(name, fn, args, kwargs)
                 except BaseException as e:  # noqa: BLE001 — task failure is data
                     self.metrics["failed"] += 1
                     self.metrics["last_error"] = str(e)[:200]
@@ -100,6 +113,27 @@ class ModelGateway:
                 self.metrics["failed"] += 1
                 self.metrics["last_error"] = "gateway loop internal error"
                 continue
+
+    def _execute(self, name: str, fn, args, kwargs):
+        """Run one task with the bounded retry policy: at most MODEL_ATTEMPTS
+        attempts, MODEL_RETRY_DELAYS_S between them. A cancelled Future stops
+        retrying immediately (nobody is waiting). Exhaustion raises the LAST
+        error — the caller sees the real failure, truthfully."""
+        last: BaseException | None = None
+        for attempt in range(MODEL_ATTEMPTS):
+            try:
+                return fn(*args, **kwargs)
+            except BaseException as e:  # noqa: BLE001 — retried or re-raised
+                last = e
+                if attempt + 1 >= MODEL_ATTEMPTS:
+                    break
+                delay = MODEL_RETRY_DELAYS_S[min(attempt, len(MODEL_RETRY_DELAYS_S) - 1)]
+                self.metrics["last_error"] = (
+                    f"{name} attempt {attempt + 1}/{MODEL_ATTEMPTS} failed: "
+                    f"{str(e)[:160]}")
+                _sleep(delay)
+        assert last is not None
+        raise last
 
 
 _gateway: ModelGateway | None = None

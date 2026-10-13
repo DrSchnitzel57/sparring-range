@@ -66,19 +66,26 @@ def test_m3_loop_completes_only_via_backend_verifiers(client, users):
         "nmap": (0, "Nmap report: 80/tcp open http"),
         "exploit.py": _plant_pwn(state),
         "persist.sh": _persist(state),
+        "maintain": (0, "still in"),
     })
+    # SUSTAINED MATCH (pilot step 3): objective completion does NOT end the
+    # loop — the 4th action is dispatched AFTER everything is confirmed.
     result = RedAgentLoop(sid, "web-foothold-01", tr, FakeLLM([
         tool("recon", "nmap -sV 10.66.0.10"),
         tool("pwn", "python3 exploit.py --target 10.66.0.10"),
         tool("persist", "bash persist.sh"),
-    ]), sandbox, max_steps=10, compress_after=50).run()
+        tool("maintain", "bash maintain.sh"),
+    ]), sandbox, max_steps=4, compress_after=50).run()
 
-    assert result["complete"] is True and result["outcome"] == "complete"
+    assert result["complete"] is True and result["outcome"] == "incomplete"
     events = client.get("/events", params={"session_id": sid, "tail": 200},
                         headers=users["member"]).json()
     types = [e["action_type"] for e in events]
     # every step paired intent→result BEFORE/AFTER execution, phase-tagged
-    assert types.count("action_intent") >= 3 and types.count("action_result") >= 3
+    assert types.count("action_intent") >= 4 and types.count("action_result") >= 4
+    assert any(e["payload"].get("command", "").startswith("bash maintain")
+               for e in events if e["action_type"] == "action_intent"), \
+        "sustained match must keep acting after all objectives are confirmed"
     for e in events:
         if e["action_type"] in ("action_intent", "action_result"):
             assert e["phase"], "red steps must carry the phase tag"
@@ -153,7 +160,7 @@ def test_m3_agent_state_checkpoint_and_summary_carries_forward(client, users):
                    tool("pwn", "python3 exploit.py --target 10.66.0.10"),
                    tool("persist", "bash persist.sh")])
     result = RedAgentLoop(sid, "web-foothold-01", tr, llm, sandbox,
-                          max_steps=10, compress_after=4, keep_recent=2).run()
+                          max_steps=5, compress_after=4, keep_recent=2).run()
     assert result["complete"] is True
     st = tr.get_agent_state(sid)
     assert st["summary"], "compression must have persisted a summary"

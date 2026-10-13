@@ -12,11 +12,23 @@ objectives. Crash safety (F14): intents are appended before dispatch, results
 after — on restart, unresolved intents are marked unknown, never blindly
 replayed. DONE is only success when ALL objectives are verifier-confirmed
 (F15); false claims get bounded retries and end as explicit no-progress.
+
+SUSTAINED MATCH (pilot step 3, replaces the 20-step/objective-complete exit):
+the match runs to the SERVER-CLOCK deadline (`deadline_utc`), not to a step
+budget or to objective completion. Objectives being confirmed mid-match no
+longer ends the run — the agent keeps pressing (maintain/deepen access,
+re-establish after defender remediation) until the deadline. Actions are
+strictly sequential with a per-action dispatch throttle (`throttle_s`,
+snapshotted at session creation: 30 s default or 0 = no intentional delay);
+there is never more than one live action. Intent-before-dispatch,
+verifier-only truth, bounded command/output/time limits and the
+cancellation/containment guarantees are unchanged.
 """
 from __future__ import annotations
 
 import hashlib
 import inspect
+import time
 import uuid as uuidlib
 from datetime import datetime, timezone
 
@@ -33,13 +45,16 @@ Target inventory (scenario hostnames/IPs on the range network):
 Objectives (verifier-confirmed — never self-declare):
 {objectives}
 Current phase: {phase}
+Match state: {match_state}
 SITUATION REPORT (compressed memory):
 {summary}
 RECENT EVENTS:
 {recent}
 
-Command targets via their scenario hostnames/IPs. When you believe EVERY
-objective is verifier-confirmed, send {{"tool":"shell","args":{{"command":"DONE"}}}}."""
+Command targets via their scenario hostnames/IPs. This is a SUSTAINED match:
+keep working until the server deadline — confirmed objectives do NOT end it.
+If everything is confirmed, maintain and deepen your access and re-establish
+it if the defender remediates. Only send {{"tool":"shell","args":{{"command":"DONE"}}}} if you are truly stuck with no further action worth taking; the match continues until the deadline regardless."""
 
 SUMMARIZER_PROMPT = """You maintain a rolling situation report for a red-agent session.
 
@@ -61,7 +76,10 @@ class RedAgentKilled(Exception):
 
 class RedAgentLoop:
     def __init__(self, session_id: str, scenario_id: str, transport, llm, runner,
-                 max_steps: int = 20, compress_after: int = 8, keep_recent: int = 6):
+                 max_steps: int | None = None, compress_after: int = 8,
+                 keep_recent: int = 6, throttle_s: float = 0.0,
+                 deadline_utc: datetime | None = None,
+                 sleep_fn=time.sleep):
         self.session_id = session_id
         # audit N10: objectives/targets resolve from the session's IMMUTABLE
         # snapshot via the API capability — never from the mutable YAML.
@@ -78,9 +96,19 @@ class RedAgentLoop:
             self._runner_has_op_id = "op_id" in inspect.signature(runner.run).parameters
         except (TypeError, ValueError):
             self._runner_has_op_id = False
+        # Sustained match (pilot step 3): no step budget by default — the
+        # server deadline terminates the run. `max_steps` remains an explicit
+        # cap for tests/CLI bounded practice.
         self.max_steps = max_steps
         self.compress_after = compress_after
         self.keep_recent = keep_recent
+        # Per-action dispatch throttle (seconds between dispatches), read
+        # from the SESSION SNAPSHOT at worker start (30 s default, 0 = no
+        # intentional delay). Actions are strictly sequential: one dispatch
+        # at a time, never overlapping.
+        self.throttle_s = max(0.0, float(throttle_s))
+        self.deadline_utc = deadline_utc
+        self._sleep = sleep_fn
         self.achieved: set[str] = set()
         self._op_seq = 0
 
@@ -154,6 +182,23 @@ class RedAgentLoop:
         return summary, upto_event_id
 
     # --------------------------------------------------------------------- run
+    def _deadline_passed(self) -> bool:
+        return (self.deadline_utc is not None
+                and datetime.now(timezone.utc) >= self.deadline_utc)
+
+    def _throttle_before_next(self) -> bool:
+        """Wait out the configured per-action dispatch throttle in bounded
+        slices, stopping early if the match deadline lands. Returns False
+        when the deadline has passed (caller must stop dispatching)."""
+        remaining = self.throttle_s
+        while remaining > 0:
+            if self._deadline_passed():
+                return False
+            slice_s = min(1.0, remaining)
+            self._sleep(slice_s)
+            remaining -= slice_s
+        return not self._deadline_passed()
+
     def run(self, stop_after_steps: int | None = None) -> dict:
         objectives_desc = "\n".join(f"- {o['id']}: {o.get('description', o['verifier'])} "
                                     f"(phase {o.get('phase', 'any')})"
@@ -192,12 +237,16 @@ class RedAgentLoop:
         outcome = "incomplete"
 
         while True:
-            if all_ids and self.achieved >= all_ids:
-                outcome = "complete"
+            # SUSTAINED MATCH (pilot step 3): the SERVER deadline is the
+            # terminator. Objective completion no longer exits the loop —
+            # confirmed access must be MAINTAINED against the defender until
+            # the clock ends the match.
+            if self._deadline_passed():
+                outcome = "deadline"
                 break
             limit = stop_after_steps if stop_after_steps is not None else self.max_steps
-            if steps_run >= limit:
-                outcome = "incomplete"  # budget exhausted, explicitly not complete
+            if limit is not None and steps_run >= limit:
+                outcome = "incomplete"  # explicit budget exhausted, not complete
                 break
 
             recent = self.transport.events_since(self.session_id, summary_upto)
@@ -206,10 +255,19 @@ class RedAgentLoop:
                 f"[{e['event_id']}] {e['actor']}/{e['action_type']} {str(e['payload'])[:200]}"
                 for e in recent_tail) or "(none yet)"
 
+            if all_ids and self.achieved >= all_ids:
+                match_state = ("ALL objectives are currently verifier-confirmed. "
+                               "The match is NOT over: maintain and deepen access, "
+                               "and re-establish anything the defender remediates.")
+            else:
+                match_state = ("Sustained match until the server deadline; confirmed: "
+                               f"{sorted(self.achieved) or 'none'}")
+
             prompt = SYSTEM_PROMPT.format(
                 schema=TOOL_SCHEMA_DOC, name=self.scenario.get("name", "?"),
                 topology=self._topology_text(),
                 objectives=objectives_desc, phase=pm.phase,
+                match_state=match_state,
                 summary=summary or "(no summary yet)", recent=recent_txt)
 
             # ONE model call; strict parse with a single retry (Part 6.4 tuning)
@@ -232,12 +290,26 @@ class RedAgentLoop:
                     steps_run += 1
                     continue
 
-            # DONE is only true if the VERIFIERS say ALL objectives hold (F15)
+            # DONE never ENDS a sustained match (pilot step 3). A confirmed-
+            # all DONE is recorded and the agent keeps pressing; a false DONE
+            # is called out. Three CONSECUTIVE false DONEs with no objective
+            # progress in between is a stall guard (no_progress), not an
+            # objective-completion exit.
             if tc.command.strip() == "DONE":
+                before = set(self.achieved)
                 self._check_objectives(pm.phase)
+                if self.achieved != before:
+                    done_claims = 0  # real progress since the last claim
                 if all_ids and self.achieved >= all_ids:
-                    outcome = "complete"
-                    break
+                    self._log("red", "agent_note", {
+                        "note": "all objectives verifier-confirmed — sustained match "
+                                "continues until the server deadline (maintain access)"},
+                        phase=pm.phase)
+                    steps_run += 1
+                    if not self._throttle_before_next():
+                        outcome = "deadline"
+                        break
+                    continue
                 done_claims += 1
                 self._log("red", "agent_note", {
                     "note": "red agent claimed completion but verifiers did not confirm ALL objectives",
@@ -301,6 +373,7 @@ class RedAgentLoop:
             # trusted verification after every action; results come from the
             # backend (actor system) and drive phase advancement
             if self._check_objectives(pm.phase):
+                done_claims = 0  # real progress since the last DONE claim
                 newly_achieved = [o for o in self._red_objectives() if o["id"] in self.achieved]
                 for o in newly_achieved:
                     if o.get("phase"):  # phase is a SCENARIO fact (F15)
@@ -318,10 +391,15 @@ class RedAgentLoop:
             self.transport.save_agent_state(self.session_id, summary, summary_upto, pm.phase)
             steps_run += 1
 
+            # per-action dispatch throttle (sequential by construction: this
+            # happens AFTER the action fully resolves and BEFORE the next
+            # model call/dispatch)
+            if not self._throttle_before_next():
+                outcome = "deadline"
+                break
+
         self.transport.save_agent_state(self.session_id, summary, summary_upto, pm.phase)
         complete = bool(all_ids) and self.achieved >= all_ids
-        if complete:
-            outcome = "complete"
         return {"steps": steps_run, "phase": pm.phase, "achieved": sorted(self.achieved),
                 "complete": complete, "outcome": outcome}
 

@@ -58,8 +58,14 @@ def test_r10_timeout_during_execution_keeps_worker_and_queue_alive():
     assert gw._worker.is_alive()
 
 
-def test_r10_task_exception_does_not_kill_worker():
+def test_r10_task_exception_does_not_kill_worker(monkeypatch):
     from srplatform.model_gateway import PRIORITY_RED, ModelGateway
+    import srplatform.model_gateway as mg
+    # Pilot step 3 added the bounded retry policy (3 attempts, 5/15 s); this
+    # test is about the GATEWAY WORKER surviving an exhausted task — patch
+    # the retry sleep so the attempts land immediately (the retry policy
+    # itself has its own tests in tests/test_pilot_sustained_attacker.py).
+    monkeypatch.setattr(mg, "_sleep", lambda s: None)
 
     gw = ModelGateway()
 
