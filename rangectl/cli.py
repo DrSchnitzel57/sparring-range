@@ -161,6 +161,7 @@ def bootstrap_cmd(
 ):
     """Fresh-stack bootstrap: operator account + service capabilities + key
     material check + recordings dir. Idempotent — safe to re-run."""
+    from srplatform.settings import get_settings
     s = get_settings()
     username = username or s.bootstrap_operator_username
     password = (password or os.environ.get("BOOTSTRAP_OPERATOR_PASSWORD")
