@@ -249,14 +249,17 @@ def verify_overlay(*, overlay: pathlib.Path, run_dir: pathlib.Path, name: str,
                                      timeout_s=timeout_s)
     serial = run_dir / f"{overlay.stem}.serial.log"
     markers = serial_markers(serial)
+    # ALWAYS preserve the serial for the run: a lost marker (no PASS, no
+    # FAIL, DONE rc=0) is an evidence-level anomaly and must never be
+    # deleted by fixture cleanup (pilot: serial-loss flake root-cause).
+    dbg = pathlib.Path(f"/tmp/opencode/sr-gate-debug/{name}.serial.log")
+    try:
+        dbg.parent.mkdir(parents=True, exist_ok=True)
+        dbg.write_text(serial.read_text(errors="replace"))
+    except OSError:
+        pass
     failures = [m for m in markers if "-FAIL:" in m]
     if failures or "SR-GUEST-DONE rc=0" not in markers:
-        dbg = pathlib.Path(f"/tmp/opencode/sr-gate-debug/{name}.serial.log")
-        try:
-            dbg.parent.mkdir(parents=True, exist_ok=True)
-            dbg.write_text(serial.read_text(errors="replace"))
-        except OSError:
-            pass
         raise RuntimeError(
             f"guest {name} reported check failures: {failures[:8]} "
             f"(serial preserved at {dbg})")
