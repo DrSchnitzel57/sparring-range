@@ -153,10 +153,19 @@ def boot_full_guest(*, disk: pathlib.Path, seed_iso: pathlib.Path,
             time.sleep(2)
         missing = [m for m in expect if m not in observed]
         if missing:
+            found = sorted({l for l in observed.splitlines()
+                            if "SR-GUEST-" in l})
+            dbg = pathlib.Path(f"/tmp/opencode/sr-gate-debug/{disk.stem}.serial.log")
+            try:
+                dbg.parent.mkdir(parents=True, exist_ok=True)
+                dbg.write_text(observed)
+            except OSError:
+                pass
             raise RuntimeError(
                 f"guest {disk.name} missing serial markers {missing} within "
-                f"{timeout_s}s (qemu exit={proc.poll()}); "
-                f"serial tail: {observed[-1500:]!r}")
+                f"{timeout_s}s (qemu exit={proc.poll()}); found markers: "
+                f"{found[:20]!r}; full serial preserved at {dbg}; "
+                f"tail: {observed[-800:]!r}")
         return {"disk": str(disk), "qemu": qemu, "memory_mb": memory_mb,
                 "kvm": use_kvm, "net": net,
                 "serial_bytes": len(observed)}
