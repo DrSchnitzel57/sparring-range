@@ -508,10 +508,53 @@ def _pin_host_key(broker, db: Session, session_id, dep: Deployment,
     key = read(node, int(res["vmid"]), session_id=session_id,
                generation=str(dep.deployment_id))
     res["host_key_ref"] = f"{key[:24]}…{key[-8:]}"
+    ip = res.get("ip")
+    if ip:
+        err = _publish_pinned_host_key(ip, key)
+        if err:
+            # visible, never silent: the pin exists but clients cannot use
+            # it yet — runtime SSH will fail loudly until this is repaired
+            res["host_key_publish_error"] = err
+            _log(db, session_id, "host_key_publish_failed", res.get("host"),
+                 {"vmid": res["vmid"], "error": err})
     dep.resources = resources
     flag_modified(dep, "resources")
     _log(db, session_id, "host_key_pinned", res.get("host"),
          {"vmid": res["vmid"], "key_ref": res["host_key_ref"]})
+
+
+def _publish_pinned_host_key(ip: str, key: str) -> str | None:
+    """Publish the pinned generation host key to the SSH clients' known_hosts
+    files (runner / verifier / bastion). The pin is the truth; the files are
+    how the clients learn it. Returns None on success or an error string —
+    the caller records it as an event and in the deployment resource, so a
+    client that can never connect is loud, not silent (StrictHostKeyChecking
+    has no TOFU fallback).
+    """
+    import os
+    from pathlib import Path
+
+    from srplatform.settings import get_settings
+    s = get_settings()
+    line = f"{ip} {key.strip()}"
+    problems = []
+    for path in (s.runner_ssh_known_hosts, s.verifier_ssh_known_hosts,
+                 s.bastion_targets_known_hosts):
+        if not path:
+            continue  # role without that client (or test settings)
+        p = Path(path)
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            keep = [l for l in (p.read_text().splitlines() if p.exists() else [])
+                    if l.strip() and l.split()[0] != ip]
+            keep.append(line)  # newest pin replaces any prior entry for this IP
+            tmp = p.with_name(p.name + ".tmp")
+            tmp.write_text("\n".join(keep) + "\n")
+            os.replace(tmp, p)
+            os.chmod(p, 0o644)  # public host keys; every service user reads
+        except OSError as e:
+            problems.append(f"{path}: {e}")
+    return "; ".join(problems) or None
 
 
 def _reserve_guest_budgets(scenario_id: str, spec: dict) -> dict:
