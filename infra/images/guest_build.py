@@ -31,7 +31,7 @@ from infra.dev import qemu_guest
 from infra.images import guest_seed, guest_userdata
 
 SUPERSET_PACKAGES = ["nginx", "mysql-server", "auditd", "openssh-server",
-                     "python3-pymysql", "ufw", "curl"]
+                     "python3-pymysql", "ufw", "curl", "qemu-guest-agent"]
 
 
 def manifest_packages(repo_root: pathlib.Path) -> list[str]:

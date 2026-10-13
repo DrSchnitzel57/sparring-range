@@ -12,7 +12,7 @@ difficulty: 3
 focus: [web, data, lateral, priv-esc]
 est_minutes: 90
 techniques: [T1190, T1068, T1005, T1505.003]
-version: 2
+version: 3
 seed_version: 1
 image_version: noble-20261012
 topology:
@@ -43,7 +43,7 @@ red:
               expected_content: "DIAG{web-user}" }
     - id: priv-esc
       phase: priv-esc
-      description: "Escalate to guest root through the maintenance helper"
+      description: "Escalate to guest root through the maintenance helper; as root write FLAG{web01-root} into /root/flag_priv_esc.txt to prove it"
       verifier: flag_file_present
       args: { host: web01, path: /root/flag_priv_esc.txt,
               expected_content: "FLAG{web01-root}" }

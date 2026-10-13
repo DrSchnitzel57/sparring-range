@@ -90,7 +90,8 @@ def test_images_ubuntu_verify_web_local(superset_overlay):
         hostname="sr-verify-weblocal", memory_mb=2048, net="none",
         timeout_s=600)
     _verify_markers(rec, "BOOT", "UNITS-ACTIVE", "CATALOGUE", "CATALOGUE-COUNT",
-                    "DIAG-FLAW", "DIAG-FIX", "MAINT-HELPER", "AUDITD-RULES",
+                    "DIAG-FLAW", "ROOT-FLAW", "MAINT-HELPER", "MAINT-FIX",
+                    "DIAG-FIX", "AUDITD-RULES",
                     "SHIPPER-UNIT", "SHIPPER-SPOOL", "SEEDS", "USERS", "FIREWALL")
 
 
@@ -108,8 +109,8 @@ def test_images_ubuntu_verify_web_db(superset_overlay):
         hostname="sr-verify-webdb", memory_mb=2048, net="none",
         timeout_s=600)
     _verify_markers(rec, "BOOT", "UNITS-ACTIVE", "CATALOGUE", "MYSQL-COUNT",
-                    "MYSQL-ROW", "DIAG-FLAW", "DIAG-FIX", "AUDITD-RULES",
-                    "SEEDS")
+                    "MYSQL-ROW", "DIAG-FLAW", "ROOT-FLAW", "MAINT-HELPER",
+                    "MAINT-FIX", "DIAG-FIX", "AUDITD-RULES", "SEEDS")
 
 
 def test_images_ubuntu_verify_attacker():

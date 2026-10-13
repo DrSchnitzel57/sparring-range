@@ -110,17 +110,40 @@ def test_images_mysql_seed_is_logical_not_disk_hash():
 def test_images_flaws_documented_with_service_preserving_fixes():
     app = (REPO / "infra/images/payloads/mojang-web-local/srv/mojang-web"
            / "app.py").read_text()
-    # Diagnostic flaw: constrained command as limited web-user.
-    assert "DIAG_ALLOW" in app and "web-user" in app
-    assert "DIAG" in app and "diag-proof" in app
+    # Diagnostic flaw: GENUINE web-user command execution (shell), bounded,
+    # documented, and switchable off while the catalogue keeps serving.
+    assert "shell=True" in app and "web-user" in app
+    assert "DIAG{{web-user}}" in app and "mojang-diag-proof.txt" in app
+    assert "MOJANG_DIAG_ENABLED" in app and "403" in app
     helper = (REPO / "infra/images/payloads/mojang-web-local/usr/local/bin"
               / "mojang-maintenance").read_text()
-    assert "unsafe PATH" in helper or 'PATH="$PATH"' in helper
+    # Working guest-root path: root-owned helper behind a scoped sudo rule
+    # that trusts the web-user-writable tools dir (setuid-on-a-script is
+    # ignored by Linux and must not come back).
+    assert "/srv/mojang-web/tools" in helper and "backup-tool" in helper
+    assert "setuid" in helper.lower(), "helper must document why not setuid"
+    sudoers = (REPO / "infra/images/payloads/mojang-web-local/etc/sudoers.d"
+               / "mojang-maintenance").read_text()
+    assert ("web-user ALL=(root) NOPASSWD: /usr/local/bin/mojang-maintenance"
+            in sudoers)
+    unit = (REPO / "infra/images/payloads/mojang-web-local/etc/systemd/system"
+            / "mojang-web.service").read_text()
+    # The chain needs a privilege transition; NoNewPrivileges is reconciled
+    # (NOT an active directive in the vulnerable unit, documented as a
+    # hardening fix). Check directive lines, not prose.
+    assert not [l for l in unit.splitlines()
+                if l.strip().startswith("NoNewPrivileges")]
+    assert "NoNewPrivileges" in unit, "unit must document the reconciliation"
     fixes = (REPO / "infra/images/payloads/mojang-web-local/srv/mojang-web"
              / "FIXES.md").read_text()
     assert "MOJANG_DIAG_ENABLED=off" in fixes
-    assert "chmod u-s" in fixes
-    assert "still active" in fixes or "keeps serving" in fixes or "stays" in fixes
+    assert "rm -f /etc/sudoers.d/mojang-maintenance" in fixes
+    assert "still active" in fixes or "still serves" in fixes or "stays ready" in fixes
+    # Both role trees carry the identical chain (shared build path).
+    for rel in ("srv/mojang-web/app.py", "usr/local/bin/mojang-maintenance",
+                "etc/sudoers.d/mojang-maintenance", "srv/mojang-web/FIXES.md"):
+        assert (REPO / f"infra/images/payloads/mojang-web-db/{rel}").read_text() \
+            == (REPO / f"infra/images/payloads/mojang-web-local/{rel}").read_text(), rel
 
 
 def test_images_builder_deterministic_scrubbed_public_keys_only(tmp_path):

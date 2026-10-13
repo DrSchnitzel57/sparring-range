@@ -6,12 +6,17 @@
 # records from `scenarios/mojang-seeds.json` (seed_version 1).
 #
 # Documented lab vulnerabilities (reproducible, defender-repairable):
-# - Diagnostic flaw: the `/diagnostic?cmd=` endpoint runs a constrained
-#   command as the limited `web-user` account (network-entry foothold).
-#   Fix: disable the endpoint (`mojang_diag_enabled=off`) — service stays up.
-# - Maintenance helper: `/usr/local/bin/mojang-maintenance` is misconfigured
-#   (setuid web-user + unsafe PATH) and yields guest-root escalation.
-#   Fix: remove setuid + pin PATH (`chmod u-s`, `PATH=/usr/bin:/bin`) — service stays up.
+# - Diagnostic flaw: the `/diagnostic?cmd=` endpoint passes the parameter to
+#   a shell — GENUINE command execution as the limited `web-user` account
+#   (network-entry foothold). Fix: disable the endpoint
+#   (`MOJANG_DIAG_ENABLED=off` in /etc/mojang-web/config.env + restart) —
+#   service stays up and the catalogue keeps serving.
+# - Maintenance helper: root-owned `/usr/local/bin/mojang-maintenance`,
+#   invokable by `web-user` through the scoped sudo rule
+#   `/etc/sudoers.d/mojang-maintenance`, prepends the web-user-writable
+#   `/srv/mojang-web/tools` to PATH — a planted `backup-tool` runs as root
+#   (guest-root escalation). Fix: revoke the sudo rule
+#   (`rm -f /etc/sudoers.d/mojang-maintenance`) — service stays up.
 #
 # Start conditions: network-entry starts with NO target credentials;
 # assumed-breach starts with the disclosed limited `web-user` foothold only.
@@ -28,7 +33,7 @@ difficulty: 2
 focus: [web, initial-access, priv-esc]
 est_minutes: 60
 techniques: [T1190, T1068, T1505.003]
-version: 2
+version: 3
 seed_version: 1
 image_version: noble-20261012
 topology:
@@ -54,7 +59,7 @@ red:
               expected_content: "DIAG{web-user}" }
     - id: priv-esc
       phase: priv-esc
-      description: "Escalate to guest root through the maintenance helper"
+      description: "Escalate to guest root through the maintenance helper; as root write FLAG{web01-root} into /root/flag_priv_esc.txt to prove it"
       verifier: flag_file_present
       args: { host: web01, path: /root/flag_priv_esc.txt,
               expected_content: "FLAG{web01-root}" }

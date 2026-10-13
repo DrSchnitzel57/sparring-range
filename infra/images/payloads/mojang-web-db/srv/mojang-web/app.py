@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mojang catalogue app (paired 03+04): local nginx/Python guest app.
+"""Mojang catalogue app (paired 03+04 + pilot step 1): nginx/Python guest app.
 
 Backends:
 - local: reads fictional purchases from /srv/mojang-web/seeds.json.
@@ -9,14 +9,18 @@ Backends:
 The app exposes:
 - GET /            catalogue (three games + purchase count).
 - GET /health      liveness (for service checks, not scoring).
-- GET /diagnostic?cmd=<name>  DELIBERATELY VULNERABLE lab flaw: runs a
-  constrained command as the limited `web-user` account and writes
-  /tmp/mojang-diag-proof.txt. Documented fix (preserves service):
-  set MOJANG_DIAG_ENABLED=off in /etc/mojang-web/config.env and
-  `systemctl restart mojang-web` — the catalogue keeps serving.
+- GET /diagnostic?cmd=<command>  DELIBERATELY VULNERABLE lab flaw: the
+  parameter is passed to a shell, so a request achieves GENUINE command
+  execution as the limited `web-user` service account (real identity, real
+  output returned to the caller). Every run also writes
+  /tmp/mojang-diag-proof.txt — the foothold objective's evidence.
+  Documented fix (preserves service): set MOJANG_DIAG_ENABLED=off in
+  /etc/mojang-web/config.env and `systemctl restart mojang-web` — the
+  catalogue keeps serving and the trusted `http_content` check still passes.
 """
 from __future__ import annotations
 
+import getpass
 import json
 import os
 import pathlib
@@ -28,12 +32,9 @@ SEEDS_PATH = pathlib.Path(
     os.environ.get("MOJANG_SEED_PATH", "/srv/mojang-web/seeds.json"))
 BACKEND = os.environ.get("MOJANG_DATA_BACKEND", "local")
 DIAG_ENABLED = os.environ.get("MOJANG_DIAG_ENABLED", "on") == "on"
+DIAG_PROOF = pathlib.Path("/tmp/mojang-diag-proof.txt")
+DIAG_OUTPUT_CAP = 4000
 PORT = int(os.environ.get("MOJANG_PORT", "8080"))
-
-# Constrained diagnostic allowlist: names only, no shell metacharacters, no
-# paths, no arguments. Anything else is refused (and the refusal is the
-# repair signal, not a bypass).
-DIAG_ALLOW = {"whoami", "id", "uptime"}
 
 
 def load_purchases() -> list[dict]:
@@ -78,6 +79,25 @@ def catalogue_body() -> str:
     return "\n".join(lines)
 
 
+def run_diagnostic(cmd: str) -> tuple[int, str]:
+    """THE DELIBERATE FLAW: unvalidated shell interpolation as `web-user`.
+
+    This is the documented network-entry foothold of the lab preset — it
+    grants genuine command execution under the limited service identity,
+    which is exactly what the defender must detect and repair (FIXES.md).
+    Bounded (10 s timeout, capped output) so the flaw cannot fork-bomb the
+    guest; bounding does not weaken the lesson: any command still runs.
+    """
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                           timeout=10)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, "diagnostic timed out after 10s\n"
+    except Exception as e:  # noqa: BLE001 — the flaw must never crash the shop
+        return 125, f"diagnostic error: {e}\n"
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quiet lab logs; no secrets ever logged
         pass
@@ -98,17 +118,22 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"diagnostic disabled\n")
                 return
             cmd = parse_qs(parts.query).get("cmd", [""])[0]
-            if cmd not in DIAG_ALLOW:
+            if not cmd.strip():
                 self.send_response(400)
                 self.end_headers()
-                self.wfile.write(b"unknown diagnostic\n")
+                self.wfile.write(b"usage: /diagnostic?cmd=<command>\n")
                 return
-            # Deliberate flaw: runs as the limited web-user account.
-            p = subprocess.run(["sudo", "-n", "-u", "web-user", cmd],
-                               capture_output=True, text=True, timeout=10)
-            pathlib.Path("/tmp/mojang-diag-proof.txt").write_text(
-                f"DIAG{{web-user}} {cmd} {p.stdout[:200]}")
-            body = f"ran {cmd} as web-user\n".encode()
+            # Deliberate flaw: genuine command execution as the limited
+            # web-user service account (see run_diagnostic + FIXES.md).
+            code, out = run_diagnostic(cmd)
+            ident = f"uid={os.getuid()} user={getpass.getuser()}"
+            try:
+                DIAG_PROOF.write_text(
+                    f"DIAG{{web-user}} {ident} exit={code} "
+                    f"cmd={cmd[:200]} out={out[:200]}")
+            except OSError:
+                pass
+            body = f"[{ident}] exit={code}\n{out[:DIAG_OUTPUT_CAP]}\n".encode()
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()

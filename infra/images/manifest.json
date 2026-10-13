@@ -83,6 +83,7 @@
     "openssh-server=1:9.6p1-3ubuntu13.19",
     "python3-pymysql=1.0.2-2ubuntu1.1",
     "ufw=0.36.2-6",
-    "curl=8.5.0-2ubuntu10.15"
+    "curl=8.5.0-2ubuntu10.15",
+    "qemu-guest-agent=1:8.2.2+ds-0ubuntu1.18"
   ]
 }

@@ -1,5 +1,5 @@
 [Unit]
-Description=Mojang fictional shop (local data)
+Description=Mojang fictional shop (web+DB data)
 After=network.target
 
 [Service]
@@ -8,7 +8,11 @@ Group=web-user
 EnvironmentFile=/etc/mojang-web/config.env
 ExecStart=/usr/bin/python3 /srv/mojang-web/app.py
 Restart=always
-NoNewPrivileges=true
+# LAB FLAW CONTEXT (pilot step 1): NoNewPrivileges is deliberately NOT set
+# here because the documented maintenance-helper escalation needs a privilege
+# transition from the web-user service. Re-adding `NoNewPrivileges=true` is a
+# hardening fix that blocks the escalation while the service stays ready —
+# see /srv/mojang-web/FIXES.md.
 
 [Install]
 WantedBy=multi-user.target
