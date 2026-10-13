@@ -67,8 +67,12 @@ def test_images_ubuntu_build_superset_overlay(superset_overlay):
 def _verify_markers(record: dict, *required: str) -> None:
     markers = record["markers"]
     for name in required:
-        assert f"SR-GUEST-{name}-PASS" in markers, markers
+        # BOOT / DONE are bare lifecycle markers; checks carry -PASS.
+        want = f"SR-GUEST-{name}" if name in ("BOOT", "DONE rc=0") \
+            else f"SR-GUEST-{name}-PASS"
+        assert want in markers, markers
     assert not [m for m in markers if "-FAIL:" in m], markers
+    assert "SR-GUEST-DONE rc=0" in markers, markers
 
 
 def test_images_ubuntu_verify_web_local(superset_overlay):
