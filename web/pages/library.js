@@ -9,6 +9,8 @@ export default function Library() {
   const [err, setErr] = useState(null);
   const [fDiff, setFDiff] = useState("");
   const [fFocus, setFFocus] = useState("");
+  // attack pace is SNAPSHOTTED into the match at creation (pilot step 4)
+  const [pace, setPace] = useState(30);
   const router = useRouter();
 
   useEffect(() => { api("/scenarios").then(setRows).catch(e => setErr(String(e.message || e))); }, []);
@@ -23,7 +25,8 @@ export default function Library() {
   async function launch(id) {
     setBusy(id); setErr(null);
     try {
-      const s = await api("/sessions", { method: "POST", body: { scenario_id: id } });
+      const s = await api("/sessions", { method: "POST",
+                                         body: { scenario_id: id, pace_seconds: pace } });
       await api(`/sessions/${s.session_id}/launch`, { method: "POST" });
       // connection instructions are fetched from the API on the session page
       // (pilot step 4) — nothing secret is kept in browser storage
