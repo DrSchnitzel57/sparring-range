@@ -53,7 +53,7 @@ For each template file below (example: 9011 / mojang-web-local; repeat for
     qm create 9011 --name tpl-mojang-web-local --ostype l26 \\
         --cores 2 --sockets 1 --memory 2048 \\
         --net0 virtio,bridge=<BRIDGE> \\
-        --agent enabled=1,file-read=1 \\
+        --agent enabled=1 \\
         --scsihw virtio-scsi-single
 
     # 2. Import the flattened qcow2 and attach it as the boot disk:
@@ -63,7 +63,9 @@ For each template file below (example: 9011 / mojang-web-local; repeat for
 
     # 3. Cloud-Init (drives per-clone identity regeneration: fresh SSH host
     #    keys + machine-id on every clone; the broker pins the fresh ed25519
-    #    host key via the guest-agent FileRead channel):
+    #    host key via the guest-agent FileRead channel — that requires the
+    #    VM.AgentFileRead ACL privilege on the CLONE path /vms, it is NOT a
+    #    VM creation flag):
     qm set 9011 --ide2 <STORAGE>:cloudinit --ciuser attacker \\
         --ipconfig0 ip=dhcp
     # (range guests get static IPs from the broker's ipconfig0 at clone time;
