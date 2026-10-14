@@ -1106,6 +1106,99 @@ def _assert_no_owned_qemu_leftovers() -> None:
 
 # -------------------------------------------------------------------------- #
 
+def check_install() -> None:
+    """Plan 13 phase 8 — installer gate.
+
+    Sandbox-provable here: manifest validation fails CLOSED before any
+    effect; the dry-run is idempotent (byte-identical twice); existing key
+    material is preserved. The MANAGED-SERVICE half (clean VM install,
+    idempotent rerun, reboot, populated upgrade, failure recovery) needs a
+    disposable service VM — the CI/VM job sets SR_INSTALL_VM_EVIDENCE=1
+    only after running the full sequence; without it this gate FAILS,
+    because a sandbox pass never accepts the VM contract."""
+    import subprocess
+    import tempfile
+    import shutil as _sh
+
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="sr-install-gate-"))
+    try:
+        manifest = tmp / "manifest.json"
+        shutil.copyfile(REPO / "deploy/manifest.example.json", manifest)
+        prefix = tmp / "prefix"
+        prefix.mkdir()
+        cmd = ["bash", str(REPO / "deploy/install.sh"), "--manifest",
+               str(manifest), "--prefix", str(prefix), "--dry-run"]
+        env = {**os.environ, "SR_PYTHON": sys.executable}
+        r1 = subprocess.run(cmd, capture_output=True, text=True,
+                            cwd=REPO, env=env, timeout=120)
+        if r1.returncode != 0:
+            fail("installer dry-run (example manifest)",
+                 f"exit {r1.returncode}:\n{(r1.stdout + r1.stderr)[-1500:]}")
+        r2 = subprocess.run(cmd, capture_output=True, text=True,
+                            cwd=REPO, env=env, timeout=120)
+        if r2.returncode != 0 or r2.stdout != r1.stdout:
+            fail("installer idempotent rerun (dry-run)",
+                 f"exit {r2.returncode} or output drift:\n"
+                 f"{(r2.stdout + r2.stderr)[-1500:]}")
+        ok("installer dry-run + idempotent rerun (example manifest)")
+
+        # existing key material must be preserved, never regenerated
+        (prefix / "etc/sparring-range/tls").mkdir(parents=True)
+        key = prefix / "etc/sparring-range/tls/bastion_ed25519"
+        key.write_text("EXISTING-KEY\n")
+        r3 = subprocess.run(cmd, capture_output=True, text=True,
+                            cwd=REPO, env=env, timeout=120)
+        if "keeping existing bastion_ed25519" not in r3.stdout \
+                or not key.read_text().startswith("EXISTING"):
+            fail("installer preserves existing private keys",
+                 r3.stdout[-800:])
+        ok("installer preserves existing private keys (dry-run)")
+
+        # invalid manifest fails BEFORE any effect
+        bad = tmp / "bad.json"
+        bad.write_text(json.dumps({"schema_version": 99}))
+        r4 = subprocess.run(
+            ["bash", str(REPO / "deploy/install.sh"), "--manifest", str(bad),
+             "--prefix", str(tmp / "p2"), "--dry-run"],
+            capture_output=True, text=True, cwd=REPO, env=env, timeout=120)
+        if r4.returncode == 0 or (tmp / "p2/var").exists():
+            fail("invalid manifest refused before any effect",
+                 f"exit {r4.returncode}")
+        ok("invalid manifest refused before any effect")
+
+        if os.environ.get("SR_INSTALL_VM_EVIDENCE") != "1":
+            fail("managed-service installation (clean VM, rerun, reboot, "
+                 "upgrade, recovery)",
+                 "requires the disposable service-VM job; set "
+                 "SR_INSTALL_VM_EVIDENCE=1 only after that job passed its "
+                 "full sequence — a sandbox never accepts this contract")
+        ok("managed-service installation evidence (VM job)")
+    finally:
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
+def check_release() -> None:
+    """Plan 13 phase 8 — release-level workflow gate (both presets, start
+    conditions, snapshots, duplicate/crash/timeout recovery, injects,
+    scorer/model failures, competition filtering, reports, reuse). This is
+    the LIVE layer: it drives the deployed lab through the API and refuses
+    to run without an explicitly configured live fixture — there is no
+    fake or skipped acceptance here."""
+    if not os.environ.get("SR_LIVE_BASE_URL"):
+        fail("release workflow gate",
+             "requires SR_LIVE_BASE_URL (deployed lab) — operator/CI live "
+             "job; nothing about a release is accepted from a sandbox")
+    env = {"SR_REQUIRE_LIVE": "1",
+           "SR_LIVE_BASE_URL": os.environ["SR_LIVE_BASE_URL"]}
+    r, counts = pytest_run(["-m", "live"], env=env, timeout=3600)
+    require_selection(counts, "live")
+    if r.returncode != 0:
+        fail("live release regressions in required mode",
+             f"exit {r.returncode}, counts {counts}:\n{r.stdout[-6000:]}")
+    ok("release workflows pass against the deployed lab",
+       f"{counts.get('passed', 0)} passed, {counts.get('skipped', 0)} skipped")
+
+
 CHECKS = {
     "selection": check_selection,
     "python": check_python,
@@ -1119,6 +1212,8 @@ CHECKS = {
     "browser": check_browser,
     "images": check_images,
     "capture": check_capture,
+    "install": check_install,
+    "release": check_release,
 }
 
 
