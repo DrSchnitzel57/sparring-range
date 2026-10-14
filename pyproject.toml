@@ -16,6 +16,9 @@ dependencies = [
     "alembic>=1.13",
     "asyncssh>=2.14",
     "proxmoxer>=2.0",
+    # proxmoxer's default https backend imports requests at runtime; without
+    # it the real PVE client cannot be constructed (live deploy, 2026-10-13).
+    "requests>=2.32",
     "pycdlib>=1.22",
     "openai>=1.40",
     "typer>=0.12",
