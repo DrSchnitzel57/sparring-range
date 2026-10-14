@@ -1,0 +1,33 @@
+# Plan 13 phase 3 — SCOPED AppArmor profile for the runner's trusted
+# launcher (attacker guest). Ubuntu 24.04 restricts unprivileged user
+# namespaces to AppArmor-confined transitions; instead of relaxing that
+# globally (kernel.apparmor_restrict_unprivileged_userns=0), the runner's
+# boundary launcher /usr/bin/unshare is confined by this narrow profile,
+# which grants ONLY the namespace/mount permissions the supervisor's
+# documented boundary needs. Loaded at boot by apparmor.service from
+# /etc/apparmor.d — reboot-persistent. Nothing else changes.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile unshare /usr/bin/unshare flags=(attach_disconnected) {
+  include <abstractions/base>
+
+  # the supervisor invokes unshare with --user --map-root-user --mount
+  # --cgroup --pid --fork --mount-proc and then bind-mounts the operation's
+  # own cgroup directory over /sys/fs/cgroup inside the mount namespace.
+  capability sys_admin,
+  capability setuid,
+  capability setgid,
+  capability sys_chroot,
+
+  mount options=(rw bind) /sys/fs/cgroup/** -> /sys/fs/cgroup/,
+  mount options=(rw) fstype=tmpfs tmpfs -> /**,
+  umount,
+
+  # the operation command itself executes within the namespaces
+  /** rix,
+
+  change_profile unshare,
+  signal (receive) peer=unconfined,
+}

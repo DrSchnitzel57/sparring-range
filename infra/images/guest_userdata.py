@@ -118,14 +118,16 @@ def build_user_data(role: str, payload: dict[str, str], packages: list[str]) -> 
     RECORDED into the overlay at build time)."""
     files = "".join(_write_file_entry(p, c, perms=_payload_perms(p))
                     for p, c in sorted(payload.items()))
-    backend = "mysql" if role == "mojang-web-db" else "local"
-    files += _write_file_entry("/etc/mojang-web/config.env",
-                               f"MOJANG_DATA_BACKEND={backend}\n"
-                               "MOJANG_SEED_PATH=/srv/mojang-web/seeds.json\n"
-                               "MOJANG_MYSQL_HOST=127.0.0.1\n"
-                               "MOJANG_MYSQL_DB=mojang\n"
-                               "MOJANG_MYSQL_USER=mojang_reader\n"
-                               "MOJANG_DIAG_ENABLED=on\n")
+    if role != "mojang-web-db":
+        backend = "local"
+        files += _write_file_entry(
+            "/etc/mojang-web/config.env",
+            f"MOJANG_DATA_BACKEND={backend}\n"
+            "MOJANG_SEED_PATH=/srv/mojang-web/seeds.json\n"
+            "MOJANG_MYSQL_HOST=127.0.0.1\n"
+            "MOJANG_MYSQL_DB=mojang\n"
+            "MOJANG_MYSQL_USER=mojang_reader\n"
+            "MOJANG_DIAG_ENABLED=on\n")
     pins = " ".join(_shlex_quote(p) for p in packages)
     setup_script = _setup_script(role, [p.split('=')[0] for p in packages])
     files += _write_file_entry("/srv/sr-build.sh", setup_script, perms="0755")
@@ -156,22 +158,48 @@ def _setup_script(role: str, packages: list[str]) -> str:
     """The whole post-install setup as ONE script with per-stage serial
     markers and `timeout` on every slow step: a stall names itself in the
     serial tail instead of dying silently mid-list, and the total is bounded.
-    `packages` here are bare names (pins were installed by the apt item)."""
+    `packages` here are bare names (pins were installed by the apt item).
+
+    Plan 13 phase 3 — the DB tier is a DATABASE, not a second all-in-one
+    app: only web roles enable nginx/mojang-web; only the DB role enables
+    MySQL and opens 3306 (reachable only from the range — guests have no
+    default route). The capture path (auditd + shipper) is identical on
+    every role."""
     want = " ".join(p + "*" for p in packages)
-    # Role-level config difference (documented superset build): the DB role
-    # runs MySQL; the web-local template must NOT enable it.
-    mysql_state = ("timeout 120 systemctl enable --now mysql || true"
-                   if role == "mojang-web-db" else
-                   "timeout 120 systemctl disable --now mysql >/dev/null 2>&1 || true")
-    gate = ("test \"$(mysql --batch --skip-column-names -e "
-            "'SELECT COUNT(*) FROM purchases' mojang)\" = 12"
-            if role == "mojang-web-db" else "true")
+    if role == "mojang-web-db":
+        service_units = "auditd sparring-shipper ssh mysql"
+        mysql_state = "timeout 120 systemctl enable --now mysql || true"
+        web_lines = ""
+        ufw_lines = ("ufw --force enable\nufw allow 22/tcp\nufw allow 3306/tcp\n")
+        gate = ("test \"$(mysql --batch --skip-column-names -e "
+                "'SELECT COUNT(*) FROM purchases' mojang)\" = 12")
+    else:
+        service_units = "auditd sparring-shipper nginx mojang-web ssh"
+        mysql_state = ("timeout 120 systemctl disable --now mysql "
+                       ">/dev/null 2>&1 || true")
+        web_lines = (
+            "ln -sf /etc/nginx/sites-available/mojang "
+            "/etc/nginx/sites-enabled/mojang\n"
+            "rm -f /etc/nginx/sites-enabled/default\n"
+            "chown root:root /usr/local/bin/mojang-maintenance "
+            "/etc/sudoers.d/mojang-maintenance\n"
+            "chmod 0755 /usr/local/bin/mojang-maintenance\n"
+            "chmod 0440 /etc/sudoers.d/mojang-maintenance\n"
+            "visudo -cf /etc/sudoers.d/mojang-maintenance "
+            "|| { mark SUDOERS-FAIL; poweroff; }\n"
+            "install -d -o web-user -g web-user -m 0775 "
+            "/srv/mojang-web/tools\n")
+        ufw_lines = ("ufw --force enable\nufw allow 22/tcp\nufw allow 80/tcp\n")
+        gate = "true"
     db_setup = ""
     if role == "mojang-web-db":
-        db_setup = """PW=$(python3 -c 'import secrets;print(secrets.token_hex(16))')
+        # Fresh per-build synthetic reader credential — synthetic lab data,
+        # never a live credential; deploy-time provisioning replaces it with
+        # per-deployment scoped grants for the owned web/probe sources.
+        db_setup = """install -d -m 0750 /etc/mojang-web
+PW=$(python3 -c 'import secrets;print(secrets.token_hex(16))')
 printf '%s' "$PW" > /etc/mojang-web/reader-pw
 chmod 0640 /etc/mojang-web/reader-pw
-printf 'MOJANG_MYSQL_PASSWORD=%s\\n' "$PW" >> /etc/mojang-web/config.env
 for i in $(seq 1 120); do mysqladmin --silent ping >/dev/null 2>&1 && break; sleep 2; done
 timeout 120 mysqladmin --silent ping && mark MYSQL-READY || { mark MYSQL-FAIL; poweroff; }
 timeout 300 mysql < /etc/mysql/mojang/schema.sql || { mark SCHEMA-FAIL; poweroff; }
@@ -185,29 +213,19 @@ dmesg -n 1 2>/dev/null || true
 systemctl stop serial-getty@ttyS0 2>/dev/null || true
 systemctl disable --now unattended-upgrades || true
 install -d -m 0755 /srv/sr-build
-ln -sf /etc/nginx/sites-available/mojang /etc/nginx/sites-enabled/mojang
-rm -f /etc/nginx/sites-enabled/default
 install -d -m 0750 -o root -g srshipper /etc/sparring-range
 install -d -m 2770 -o root -g adm /var/lib/sparring-range/shipper
 install -m 0644 /srv/sr-build-input/sparring-shipper.service /etc/systemd/system/sparring-shipper.service
 install -m 0644 /srv/sr-build-input/auditd.rules /etc/audit/rules.d/sparring.rules
 install -m 0755 /srv/sr-build-input/shipper.py /usr/local/bin/sparring-shipper
 systemctl daemon-reload
-ufw --force enable
-ufw allow 22/tcp
-ufw allow 80/tcp
-printf 'SR_API_URL=http://127.0.0.1:9\\nSR_TELEMETRY_TOKEN=sr-build-dummy\\nSR_HOST=build\\nSR_SPOOL_DIR=/var/lib/sparring-range/shipper\\n' > /etc/sparring-range/shipper.env
+{ufw_lines}printf 'SR_API_URL=http://127.0.0.1:9\\nSR_TELEMETRY_TOKEN=sr-build-dummy\\nSR_HOST=build\\nSR_SPOOL_DIR=/var/lib/sparring-range/shipper\\n' > /etc/sparring-range/shipper.env
 chown root:srshipper /etc/sparring-range/shipper.env
 chmod 0640 /etc/sparring-range/shipper.env
-timeout 120 systemctl enable --now auditd sparring-shipper nginx mojang-web ssh || {{ mark UNITS-FAIL; poweroff; }}
+timeout 120 systemctl enable --now {service_units} || {{ mark UNITS-FAIL; poweroff; }}
 {mysql_state}
 timeout 60 systemctl restart auditd || true
-chown root:root /usr/local/bin/mojang-maintenance /etc/sudoers.d/mojang-maintenance
-chmod 0755 /usr/local/bin/mojang-maintenance
-chmod 0440 /etc/sudoers.d/mojang-maintenance
-visudo -cf /etc/sudoers.d/mojang-maintenance || {{ mark SUDOERS-FAIL; poweroff; }}
-install -d -o web-user -g web-user -m 0775 /srv/mojang-web/tools
-{db_setup}mark SETUP-OK
+{web_lines}{db_setup}mark SETUP-OK
 dpkg-query -W -f='${{Package}}=${{Version}}\\n' {want} > /srv/sr-build/versions.txt 2>/dev/null || true
 while IFS= read -r l; do echo "SR-GUEST-PKG:$l" > $S; done < /srv/sr-build/versions.txt || true
 if {gate}; then mark PASS; else mark FAIL; fi
@@ -222,11 +240,15 @@ def _build_runcmd(role: str, packages: list[str]) -> list[str]:  # pragma: no co
 
 
 def _verify_checks(role: str) -> str:
-    units = "mojang-web nginx sshd auditd sparring-shipper"
+    # Plan 13 phase 3: role-separated verification. The DB tier proves the
+    # DATABASE contract (mysql data + capture + firewall), never the web
+    # app; web roles prove the app/chain and must NOT have mysql enabled.
     if role == "mojang-web-db":
-        units += " mysql"
-    mysql_checks = ""
-    if role == "mojang-web-db":
+        units = "sshd auditd sparring-shipper mysql"
+        web_checks = (
+            "chk NO-WEB-APP bash -c '! systemctl is-enabled --quiet "
+            "nginx mojang-web 2>/dev/null; ! test -e "
+            "/srv/mojang-web/app.py'\n")
         # NOTE: --protocol=TCP is load-bearing: the reader grant is
         # 'mojang_reader'@'127.0.0.1' (TCP); the CLI would otherwise use the
         # local socket as 'localhost' and be refused. Mysqld is waited on
@@ -236,19 +258,25 @@ wchk MYSQL-READY 45 mysqladmin --silent ping
 wchk MYSQL-COUNT 30 bash -c 'test "$(mysql --protocol=TCP --host=127.0.0.1 --batch --skip-column-names --user=mojang_reader --password="$(cat /etc/mojang-web/reader-pw)" -e "SELECT COUNT(*) FROM purchases" mojang)" = 12'
 wchk MYSQL-ROW 30 bash -c 'mysql --protocol=TCP --host=127.0.0.1 --batch --skip-column-names --user=mojang_reader --password="$(cat /etc/mojang-web/reader-pw)" -e "SELECT purchase_id FROM purchases" mojang | grep -q buy-001'
 """
-    return _HARNESS_HEADER + f"""
-chk UNITS-ACTIVE bash -c 'systemctl is-active --quiet {units}'
-wchk CATALOGUE 30 bash -c "curl -sf http://127.0.0.1/ | grep -q 'Minecraft Legends'"
+    else:
+        units = "mojang-web nginx sshd auditd sparring-shipper"
+        web_checks = """wchk CATALOGUE 30 bash -c "curl -sf http://127.0.0.1/ | grep -q 'Minecraft Legends'"
 chk CATALOGUE-COUNT bash -c "curl -sf http://127.0.0.1/ | grep -c buy- | grep -qx 12"
 chk DIAG-FLAW /srv/sr-chain-checks.sh diag-flaw
 chk ROOT-FLAW /srv/sr-chain-checks.sh root-flaw
 chk MAINT-HELPER bash -c 'test -x /usr/local/bin/mojang-maintenance && ! test -u /usr/local/bin/mojang-maintenance && test -e /etc/sudoers.d/mojang-maintenance && [ "$(stat -c %U /srv/mojang-web/tools)" = web-user ]'
 chk MAINT-FIX /srv/sr-chain-checks.sh maint-fix
 chk DIAG-FIX /srv/sr-chain-checks.sh diag-fix
-chk AUDITD-RULES bash -c 'auditctl -l | grep -q sparring_cmd'
+chk SEEDS bash -c 'python3 -c "import json;d=json.load(open(\\"/srv/mojang-web/seeds.json\\"));assert len(d[\\"purchases\\"])==12"'
+"""
+        mysql_checks = (
+            "chk NO-MYSQL-ENABLED bash -c '! systemctl is-enabled --quiet "
+            "mysql 2>/dev/null'\n")
+    return _HARNESS_HEADER + f"""
+chk UNITS-ACTIVE bash -c 'systemctl is-active --quiet {units}'
+{web_checks}chk AUDITD-RULES bash -c 'auditctl -l | grep -q sparring_cmd'
 chk SHIPPER-UNIT bash -c 'grep -q "^User=srshipper" /etc/systemd/system/sparring-shipper.service && grep -q adm /etc/systemd/system/sparring-shipper.service'
 chk SHIPPER-SPOOL bash -c 'test -d /var/lib/sparring-range/shipper'
-chk SEEDS bash -c 'python3 -c "import json;d=json.load(open(\\"/srv/mojang-web/seeds.json\\"));assert len(d[\\"purchases\\"])==12"'
 chk USERS bash -c 'id -nG defender | grep -qw sudo && id web-user'
 chk FIREWALL bash -c 'ufw status | grep -qw active'
 {mysql_checks}
@@ -325,29 +353,26 @@ def verify_user_data(role: str, payload: dict[str, str],
                      backend: str = "local") -> str:
     """Verify seed: NO packages (offline `-net none` boot proves no runtime
     fetching is needed). Payload is re-asserted from the overlay; the seed
-    only selects the data backend + carries the check harness."""
-    config = (f"MOJANG_DATA_BACKEND={backend}\n"
-              f"MOJANG_SEED_PATH=/srv/mojang-web/seeds.json\n"
-              "MOJANG_MYSQL_HOST=127.0.0.1\n"
-              "MOJANG_MYSQL_DB=mojang\n"
-              "MOJANG_MYSQL_USER=mojang_reader\n"
-              "MOJANG_DIAG_ENABLED=on\n")
-    files = (_write_file_entry("/etc/mojang-web/config.env", config) +
-             _write_file_entry("/srv/sr-chain-checks.sh", _chain_script(),
+    only selects the data backend + carries the check harness. The DB tier
+    has no web app, so it gets no app config at all."""
+    files = (_write_file_entry("/srv/sr-chain-checks.sh", _chain_script(),
                                perms="0755") +
              _write_file_entry("/srv/sr-verify-checks.sh",
                                _verify_checks(role), perms="0755"))
+    if role != "mojang-web-db":
+        config = (f"MOJANG_DATA_BACKEND={backend}\n"
+                  f"MOJANG_SEED_PATH=/srv/mojang-web/seeds.json\n"
+                  "MOJANG_MYSQL_HOST=127.0.0.1\n"
+                  "MOJANG_MYSQL_DB=mojang\n"
+                  "MOJANG_MYSQL_USER=mojang_reader\n"
+                  "MOJANG_DIAG_ENABLED=on\n")
+        files = (_write_file_entry("/etc/mojang-web/config.env", config)
+                 + files)
     runcmd = ["  - systemctl restart mojang-web",
               "  - sleep 2",
               "  - /bin/bash /srv/sr-verify-checks.sh"]
     if role == "mojang-web-db":
-        # The overlay's per-run reader secret persists on disk, but this
-        # boot's fresh config.env needs it re-injected (proves the secret
-        # never lives in the seed — only on the built disk).
-        runcmd.insert(
-            0, "  - bash -c 'printf \"MOJANG_MYSQL_PASSWORD=%s\\n\" "
-               "\"$(cat /etc/mojang-web/reader-pw)\" "
-               ">> /etc/mojang-web/config.env'")
+        runcmd = ["  - /bin/bash /srv/sr-verify-checks.sh"]
     return f"""#cloud-config
 hostname: sr-verify-{role}
 manage_etc_hosts: true
@@ -362,11 +387,21 @@ write_files:
 def attacker_verify_user_data() -> str:
     # Base-image posture is sshd SOCKET activation (no persistent service):
     # assert the listening socket, fresh host keys, and no target payload.
+    # Plan 13 phase 3: the attacker ALSO carries the capture path (auditd +
+    # shipper) and the runner boundary (cgroup delegation unit + scoped
+    # AppArmor profile) — deployment requires every guest's evidence.
     script = (_HARNESS_HEADER + f"""
 chk SSH-SOCKET systemctl is-active --quiet ssh.socket
 chk HOSTKEYS bash -c 'test -s /etc/ssh/ssh_host_ed25519_key.pub && grep -q "^ssh-ed25519 " /etc/ssh/ssh_host_ed25519_key.pub'
 chk NO-MOJANG bash -c '! test -e /srv/mojang-web/app.py'
 chk NO-MYSQL bash -c '! systemctl list-unit-files mysql.service | grep -q enabled'
+chk AUDITD-ACTIVE systemctl is-active --quiet auditd
+chk SHIPPER-UNIT bash -c 'systemctl is-active --quiet sparring-shipper && grep -q "^User=srshipper" /etc/systemd/system/sparring-shipper.service'
+chk SHIPPER-SPOOL bash -c 'test -d /var/lib/sparring-range/shipper && test -s /etc/sparring-range/shipper.env'
+chk AUDITD-RULES bash -c 'auditctl -l | grep -q sparring_cmd'
+chk CGROUP-DELEGATION bash -c 'systemctl is-enabled --quiet sr-runner-cgroup.service && test -d /sys/fs/cgroup/sr-runner && grep -q RUNNER_CGROUP_ROOT /etc/environment'
+chk APPARMOR-PROFILE bash -c 'test -s /etc/apparmor.d/usr.bin.unshare && systemctl is-enabled --quiet apparmor'
+chk RUNNER-BOUNDARY bash -c 'test -x /usr/local/bin/runner-supervisor'
 echo "SR-GUEST-DONE rc=$fails" > {SERIAL}; echo "SR-GUEST-DONE rc=$fails" > {SERIAL}
 poweroff
 """)
@@ -450,19 +485,44 @@ write_files:
 
 
 def attacker_build_user_data(payload: dict[str, str], packages: list[str],
-                             pubkey: str) -> str:
-    """Build seed for the ATTACKER template (pilot step 2): the pinned base
-    + attacker role file + runner-supervisor + operator PUBLIC key only.
-    No target payload, no MySQL, no shipper/auditd (the attacker is tooling,
-    not a telemetry target). Host keys/machine-id are scrubbed by the
-    template finalize boot so every PVE clone regenerates fresh identity."""
+                             key_manifest: dict[str, str]) -> str:
+    """Build seed for the ATTACKER template (plan 13 phase 3): pinned base +
+    attacker role file + runner-supervisor + **auditd/shipper** (deployment
+    requires EVERY guest's delivery/capture evidence — the attacker is not
+    exempt) + reboot-persistent runner cgroup delegation + the scoped
+    AppArmor profile for the trusted launcher. Keys land per role_keys
+    policy: the runner key authenticates ONLY to `attacker`, mgmt/emergency
+    separately — never one key everywhere, never a private key. Host
+    keys/machine-id are scrubbed by the finalize boot so every PVE clone
+    regenerates fresh identity."""
+    from infra.images.role_keys import bake_script
     files = "".join(_write_file_entry(p, c, perms=_payload_perms(p))
                     for p, c in sorted(payload.items()))
     files += _write_file_entry(
         "/usr/local/bin/runner-supervisor",
         (pathlib.Path(__file__).resolve().parents[2]
          / "infra/runner/runner_supervise.sh").read_text(), perms="0755")
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    files += _write_file_entry(
+        "/srv/sr-build-input/sr-runner-cgroup.service",
+        (repo / "infra/runner/sr-runner-cgroup.service").read_text())
+    files += _write_file_entry(
+        "/srv/sr-build-input/usr.bin.unshare",
+        (repo / "infra/runner/apparmor/usr.bin.unshare").read_text())
+    tel = repo / "telemetry"
+    files += _write_file_entry("/srv/sr-build-input/shipper.py",
+                               (tel / "shipper.py").read_text())
+    files += _write_file_entry(
+        "/srv/sr-build-input/sparring-shipper.service",
+        (tel / "sparring-shipper.service").read_text())
+    files += _write_file_entry("/srv/sr-build-input/auditd.rules",
+                               (tel / "auditd.rules").read_text())
     pins = " ".join(_shlex_quote(p) for p in packages)
+    # Presence of an emergency key in the manifest IS the explicit operator
+    # decision (the template CLI only accepts it via --emergency-key).
+    bake = bake_script("attacker", key_manifest,
+                       include_emergency="emergency" in key_manifest)
+    files += _write_file_entry("/srv/sr-bake-keys.sh", bake, perms="0755")
     files += _write_file_entry("/srv/sr-attacker-build.sh", f"""#!/bin/bash
 S=/dev/ttyS0
 mark() {{ echo "SR-GUEST-BUILD-$1" > $S; echo "SR-GUEST-BUILD-$1" > $S; }}
@@ -472,15 +532,29 @@ systemctl disable --now unattended-upgrades || true
 timeout 1200 env DEBIAN_FRONTEND=noninteractive apt-get install -y \\
   -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold {pins} \\
   && mark APT-OK || {{ mark APT-FAIL; poweroff; }}
-install -d -m 0750 -o root -g srshipper /etc/sparring-range 2>/dev/null \\
-  || install -d -m 0750 /etc/sparring-range
-mkdir -p /home/attacker/.ssh
-printf '%s\\n' {shlex.quote(pubkey)} > /home/attacker/.ssh/authorized_keys
-chmod 0700 /home/attacker/.ssh; chmod 0600 /home/attacker/.ssh/authorized_keys
-chown -R attacker:attacker /home/attacker/.ssh
+# capture path IDENTICAL to defender guests (canonical telemetry inputs)
+install -d -m 0750 -o root -g srshipper /etc/sparring-range
+install -d -m 2770 -o root -g adm /var/lib/sparring-range/shipper
+install -m 0644 /srv/sr-build-input/sparring-shipper.service /etc/systemd/system/sparring-shipper.service
+install -m 0644 /srv/sr-build-input/auditd.rules /etc/audit/rules.d/sparring.rules
+install -m 0755 /srv/sr-build-input/shipper.py /usr/local/bin/sparring-shipper
+printf 'SR_API_URL=http://127.0.0.1:9\\nSR_TELEMETRY_TOKEN=sr-build-dummy\\nSR_HOST=build\\nSR_SPOOL_DIR=/var/lib/sparring-range/shipper\\n' > /etc/sparring-range/shipper.env
+chown root:srshipper /etc/sparring-range/shipper.env
+chmod 0640 /etc/sparring-range/shipper.env
+# runner boundary: reboot-persistent cgroup delegation + scoped AppArmor
+install -m 0644 /srv/sr-build-input/sr-runner-cgroup.service /etc/systemd/system/sr-runner-cgroup.service
+install -m 0644 /srv/sr-build-input/usr.bin.unshare /etc/apparmor.d/usr.bin.unshare
+echo 'RUNNER_CGROUP_ROOT=/sys/fs/cgroup/sr-runner' >> /etc/environment
+command -v apparmor_parser >/dev/null || {{ mark APPARMOR-MISSING; poweroff; }}
+systemctl enable sr-runner-cgroup.service apparmor || mark APPARMOR-EN-FAIL
+bash -c 'apparmor_parser -r /etc/apparmor.d/usr.bin.unshare' || true
+timeout 120 systemctl enable --now auditd sparring-shipper || {{ mark UNITS-FAIL; poweroff; }}
+timeout 60 systemctl restart auditd || true
+bash /srv/sr-bake-keys.sh || {{ mark KEYS-FAIL; poweroff; }}
 ufw --force enable; ufw allow 22/tcp
 systemctl enable --now ssh qemu-guest-agent || true
 mark SETUP-OK
+for p in {pins}; do n=${{p%%=*}}; v=$(dpkg-query -W -f='${{Version}}' "$n" 2>/dev/null || echo unknown); echo "SR-GUEST-PKG:$n=$v" > $S; done
 poweroff
 """, perms="0755")
     return f"""#cloud-config
@@ -502,32 +576,28 @@ write_files:
 """
 
 
-def finalize_user_data(pubkey: str | None = None) -> str:
-    """Template finalize boot (pilot steps 2+7): optionally bake the ONE
-    operator/bastion PUBLIC key into root/defender/attacker (never a private
-    key), then scrub per-clone identity from the BUILT template so every PVE
-    clone regenerates fresh SSH host keys and machine-id via cloud-init —
-    the contract the broker's guest-agent host-key pinning depends on.
-    Offline (`-net none`)."""
+def finalize_user_data(role: str = "mojang-web-local",
+                       key_manifest: dict[str, str] | None = None,
+                       *, include_emergency: bool = False) -> str:
+    """Template finalize boot (plan 13 phase 3): bake ONLY the role-appropriate
+    PUBLIC keys per the role_keys policy (runner→attacker only, bastion→
+    defender, mgmt→approved management account, emergency only when
+    explicitly included; deduplicated; private keys refused), then scrub
+    per-clone identity from the BUILT template so every PVE clone regenerates
+    fresh SSH host keys and machine-id via cloud-init — the contract the
+    broker's guest-agent host-key pinning depends on. Offline (`-net none`)."""
     bake_files, bake_call = "", ""
-    if pubkey:
-        bake = f"""#!/bin/bash
-set -e
-id -u defender >/dev/null 2>&1 || useradd -m -s /bin/bash defender
-id -u attacker >/dev/null 2>&1 || useradd -m -s /bin/bash attacker
-for d in /root/.ssh /home/defender/.ssh /home/attacker/.ssh; do
-  mkdir -p "$d"
-  printf '%s\\n' {shlex.quote(pubkey)} >> "$d/authorized_keys"
-  chmod 0700 "$d"; chmod 0600 "$d/authorized_keys"
-done
-chown -R defender:defender /home/defender/.ssh
-chown -R attacker:attacker /home/attacker/.ssh
-usermod -aG sudo defender 2>/dev/null || true
-"""
-        bake_files = _write_file_entry("/srv/sr-bake-key.sh", bake, perms="0755")
-        bake_call = "chk BAKE /srv/sr-bake-key.sh\n"
+    if key_manifest:
+        from infra.images.role_keys import bake_script
+        bake = bake_script(role, key_manifest,
+                           include_emergency=include_emergency
+                           or "emergency" in key_manifest)
+        bake_files = _write_file_entry("/srv/sr-bake-keys.sh", bake,
+                                       perms="0755")
+        bake_call = "chk BAKE /srv/sr-bake-keys.sh\n"
     script = (_HARNESS_HEADER + f"""
 {bake_call}chk SCRUB bash -c 'rm -f /etc/ssh/ssh_host_*; truncate -s 0 /etc/machine-id; rm -f /var/lib/dbus/machine-id; cloud-init clean --logs --seed 2>/dev/null || rm -rf /var/lib/cloud/instances/seed; ! ls /etc/ssh/ssh_host_* 2>/dev/null | grep -q .'
+chk NO-BUILD-LOGS bash -c '! test -s /root/.bash_history; rm -rf /srv/sr-build; true'
 echo "SR-GUEST-DONE rc=$fails" > {SERIAL}; echo "SR-GUEST-DONE rc=$fails" > {SERIAL}
 poweroff
 """)

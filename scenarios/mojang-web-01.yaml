@@ -23,7 +23,7 @@
 # The defender account (`defender`, full guest sudo) is separate from the
 # trusted verifier/provisioning identity (separate keys, pinned management).
 #
-# Baselines (versioned): image_version noble-20261012, seed_version 1,
+# Baselines (versioned): image_version noble-20260926, seed_version 1,
 # known_users, cron/static file lists. HTTP content checks observe served
 # behavior; raw MySQL disk hashes are never evidence (this preset has no DB).
 # Repairs must keep services ready (readiness re-proves nginx+mojang-web).
@@ -35,7 +35,7 @@ est_minutes: 60
 techniques: [T1190, T1068, T1505.003]
 version: 3
 seed_version: 1
-image_version: noble-20261012
+image_version: noble-20260926
 topology:
   hosts:
     - name: attacker

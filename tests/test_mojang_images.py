@@ -77,7 +77,7 @@ def test_images_mojang_scenarios_load_with_attacker_and_budgets():
                               ("mojang-web-db-01", {"attacker", "web01", "db01"})):
         spec = load_scenario(sid)
         assert spec["seed_version"] == 1
-        assert spec["image_version"] == "noble-20261012"
+        assert spec["image_version"] == "noble-20260926"
         hosts = {h["name"]: h for h in spec["topology"]["hosts"]}
         assert set(hosts) == expect_hosts, hosts
         assert hosts["attacker"]["template_vmid"] == 9005

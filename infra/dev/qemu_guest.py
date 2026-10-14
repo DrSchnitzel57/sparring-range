@@ -63,9 +63,12 @@ def ensure_verified_base(cache_dir: pathlib.Path) -> pathlib.Path:
     import urllib.request
     base = manifest_base_image()
     cache_dir.mkdir(parents=True, exist_ok=True)
-    img = cache_dir / "noble-server-cloudimg-amd64.img"
+    img = cache_dir / f"{base['image_version']}-server-cloudimg-amd64.img"
     if not img.exists():
-        # Build-phase fetch of the single pinned input (plan step 1).
+        # Build-phase fetch of the single pinned input (plan step 1). The
+        # URL is the DATED, retained release directory (immutable), never the
+        # moving `current` alias; a missing pin fails closed here rather than
+        # silently substituting a different image.
         with urllib.request.urlopen(base["source_url"], timeout=120) as r, \
                 open(img, "wb") as f:
             shutil.copyfileobj(r, f, 8 * 1024 * 1024)

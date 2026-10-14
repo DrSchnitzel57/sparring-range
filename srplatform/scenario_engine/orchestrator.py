@@ -315,6 +315,64 @@ def _provision_command(host: str, token: str, nonce: str, s) -> str:
             "systemctl restart sparring-shipper")
 
 
+def _provision_guest_configs(db: Session, dep: Deployment, spec: dict,
+                             resources: list, session_id) -> None:
+    """Deploy-time DB-tier wiring (plan 13 phase 3): web hosts with a
+    ``db_ref`` get config targeting the OWNED DB IP with a fresh scoped
+    reader credential; the DB host binds, grants and firewalls ONLY the
+    owned web sources plus the loopback probe. Idempotent (resume-safe);
+    a missing channel is a VISIBLE skip (event + readiness gate), a
+    channel that answers with failure fails the deployment loudly."""
+    from srplatform.scenario_engine import guest_config
+    plan = guest_config.plan_db_provisioning(spec)
+    if not plan:
+        return
+    chan = _enrollment_channel()
+    if chan is None:
+        # Same contract as telemetry enrollment: skipping is a VISIBLE
+        # dev-mode relaxation (event + resource flag), never silent —
+        # enforced readiness refuses a db_ref deployment whose tier was
+        # never configured (phase 4 gate).
+        _log(db, session_id, "guest_config_skipped", None,
+             {"reason": "management channel not configured — dev-mode "
+                        "relaxation, visible in readiness"})
+        db.commit()
+        return
+    s = get_settings()
+    by_host = {r.get("host"): r for r in resources}
+    for step in plan:
+        res = by_host.get(step["host"])
+        ip = (res or {}).get("ip")
+        if not ip:
+            raise RuntimeError(
+                f"cannot provision {step['host']}: no owned IP in the "
+                "deployment inventory")
+        if step["kind"] == "db":
+            pw = guest_config.reader_password(resources, step["host"])
+            cmd = guest_config.db_provision_command(step, pw)
+        else:
+            pw = (by_host.get(step["db_ref"]) or {}).get("db_reader_password")
+            if not pw:
+                raise RuntimeError(
+                    f"web host {step['host']} must be provisioned AFTER its "
+                    f"DB tier {step['db_ref']}")
+            cmd = guest_config.web_provision_command(step, pw)
+        code, out = _provision_with_boot_wait(
+            chan, ip, cmd, s.management_ready_wait_s)
+        if code != 0:
+            raise RuntimeError(
+                f"guest config provisioning failed on {step['host']} "
+                f"(exit {code}): {str(out)[:300]}")
+        if step["kind"] == "db":
+            res["db_reader_password"] = pw
+        res["db_configured"] = True
+        dep.resources = resources
+        flag_modified(dep, "resources")
+        _log(db, session_id, "guest_config_provisioned", step["host"],
+             {"kind": step["kind"], "db_ref": step.get("db_ref")})
+        db.commit()
+
+
 def _enrollment_evidence(db: Session, session_id, host: str, attr: str,
                          deployment_id=None):
     """Evidence timestamp of the capability bound to the CURRENT deployment
@@ -839,6 +897,11 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
             # OWNERSHIP COMMITTED PER RESOURCE: if a later host fails (or the
             # process dies), everything already created remains accounted for
             db.commit()
+        # DB-tier wiring (plan 13 phase 3): owned-IP web config + fresh
+        # scoped reader credentials + restricted listener/grants/firewall.
+        # Runs for EVERY host once (DB steps first), so resume re-applies
+        # idempotently before readiness is judged.
+        _provision_guest_configs(db, dep, spec, resources, session_id)
         dep.status = "ready"
         dep.updated_at = _now()
         db.commit()

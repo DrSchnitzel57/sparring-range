@@ -40,17 +40,21 @@ The source-of-truth map and per-role renderings live in
 ```bash
 python infra/images/pve_template_build.py \
     --out /tmp/sr-templates \
-    --pubkey /etc/sparring-range/ssh/bastion_ed25519.pub \
-    --roles attacker,mojang-web-local
+    --runner-key /etc/sparring-range/ssh/runner_ed25519.pub \
+    --bastion-key /etc/sparring-range/ssh/bastion_ed25519.pub \
+    --mgmt-key /etc/sparring-range/ssh/mgmt_ed25519.pub \
+    --roles attacker,mojang-web-local,mojang-web-db
 ```
 
-`--pubkey` is the bastion's PUBLIC dial key (see §4) — baked into
-root/defender/attacker at the finalize boot; the private half never leaves
-the bastion. Output: flattened qcow2 + `SHA256SUMS` + `TEMPLATE-INFO.json`
-+ `IMPORT-STEPS.md` (the `qm importdisk` → `qm template` procedure, VMIDs
-9005 attacker / 9011 mojang-web-local). Verify `sha256sum -c SHA256SUMS`
-before import. Rotating the bastion key = rebuild + reimport (per
-generation).
+Each `--*-key` is a PUBLIC key baked ONLY where its role belongs (plan 13
+phase 3): the runner key lands solely on the attacker's `attacker` account,
+the bastion key solely on defender guests, the mgmt key on the management
+account; `--emergency-key` is separate and explicit. Private halves never
+leave their consuming service VMs. Output: flattened qcow2 + `SHA256SUMS` +
+`TEMPLATE-INFO.json` + `IMPORT-STEPS.md` (the `qm importdisk` →
+`qm template` procedure, VMIDs 9005 attacker / 9011 mojang-web-local /
+9012 mojang-web-db). Verify `sha256sum -c SHA256SUMS` before import.
+Rotating any key = rebuild + reimport (per generation).
 
 ## 2. Control-plane VM (fresh Ubuntu 24.04)
 

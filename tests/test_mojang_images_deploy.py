@@ -32,14 +32,17 @@ def _qemu_available() -> bool:
     return bool(shutil.which("qemu-system-x86_64") or shutil.which("qemu-system-x86"))
 
 
-@pytest.fixture()
-def superset_overlay():
-    """Build-once (cache) superset overlay, but a FRESH COPY per test: the
-    chain battery is state-mutating BY DESIGN (MAINT-FIX removes the sudoers
-    rule, DIAG-FIX disables the endpoint), and those writes land in the
-    overlay a boot runs on. Sharing one copy across verify tests would make
-    the second boot start in the already-fixed state (flaw checks then
-    correctly fail). A cache-hit build_overlay is copy+rebase — no boot."""
+#: Synthetic (never secret) role key manifest for template boots — the
+#: gate proves the ROLE-KEY CONTRACT (runner only on attacker, bastion only
+#: on defenders), and no live key ever touches a test artifact.
+TEST_KEYS = {
+    "runner": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISyntheticRunnerKey00 runner@synthetic",
+    "bastion": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIiSyntheticBastionKey0 bastion@synthetic",
+    "mgmt": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISyntheticMgmtKey000 mgmt@synthetic",
+}
+
+
+def _role_overlay(role: str, memory_mb: int = 2048):
     from infra.dev import qemu_guest
     from infra.images import guest_build
     qemu_guest.require_qemu()  # fail closed here, not inside the build
@@ -47,25 +50,41 @@ def superset_overlay():
     try:
         rec = guest_build.build_overlay(
             repo_root=REPO, run_dir=run, cache_dir=GUEST_CACHE,
-            role="mojang-web-db", memory_mb=2048, timeout_s=1500)
+            role=role, memory_mb=memory_mb, timeout_s=1500)
         yield {"run": run, "overlay": pathlib.Path(rec["overlay"]), "record": rec}
     finally:
         shutil.rmtree(run, ignore_errors=True)
 
 
-def test_images_ubuntu_build_superset_overlay(superset_overlay):
-    """The build boot installs the pinned families on real Ubuntu and records
-    resolved versions from the guest itself (no host-side guessing)."""
-    rec = superset_overlay["record"]
-    pkgs = rec["packages"]
-    assert any(n == "nginx" or n.startswith("nginx-") for n in pkgs), pkgs
-    assert any("mysql" in n for n in pkgs), pkgs
-    assert any(n == "auditd" or n.startswith("audit") for n in pkgs), pkgs
-    overlay = superset_overlay["overlay"]
-    assert overlay.exists() and overlay.stat().st_size > 0
-    r = subprocess.run(["qemu-img", "info", str(overlay)], capture_output=True,
-                       text=True, timeout=60)
-    assert r.returncode == 0 and "qcow2" in r.stdout, r.stdout[:300]
+@pytest.fixture()
+def web_local_overlay():
+    """Build-once (cache) WEB overlay (app + nginx, mysql disabled), fresh
+    copy per test (the chain battery is state-mutating by design)."""
+    yield from _role_overlay("mojang-web-local")
+
+
+@pytest.fixture()
+def db_overlay():
+    """Build-once (cache) DB-tier overlay: MySQL + capture, NO web app —
+    plan 13 phase 3 separates the tiers into production shapes."""
+    yield from _role_overlay("mojang-web-db")
+
+
+def test_images_ubuntu_build_role_overlays(web_local_overlay, db_overlay):
+    """The build boots install the pinned families on real Ubuntu and record
+    resolved versions from the guest itself (no host-side guessing); each
+    role records its own artifact."""
+    for rec_ in (web_local_overlay, db_overlay):
+        rec = rec_["record"]
+        pkgs = rec["packages"]
+        assert any(n == "nginx" or n.startswith("nginx-") for n in pkgs), pkgs
+        assert any("mysql" in n for n in pkgs), pkgs
+        assert any(n == "auditd" or n.startswith("audit") for n in pkgs), pkgs
+        overlay = rec_["overlay"]
+        assert overlay.exists() and overlay.stat().st_size > 0
+        r = subprocess.run(["qemu-img", "info", str(overlay)],
+                           capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0 and "qcow2" in r.stdout, r.stdout[:300]
 
 
 def _verify_markers(record: dict, *required: str) -> None:
@@ -79,13 +98,13 @@ def _verify_markers(record: dict, *required: str) -> None:
     assert "SR-GUEST-DONE rc=0" in markers, markers
 
 
-def test_images_ubuntu_verify_web_local(superset_overlay):
-    """Real offline boot (`-net none`): local-data catalogue, live diagnostic
-    flaw + service-preserving fix, auditd/shipper/users/firewall — all on the
-    installed guest, reported over serial."""
+def test_images_ubuntu_verify_web_local(web_local_overlay):
+    """Real offline boot (`-net none`) of the WEB artifact: local-data
+    catalogue, live diagnostic flaw + service-preserving fix, auditd/shipper/
+    users/firewall, and MySQL NOT enabled — all on the installed guest."""
     from infra.dev import qemu_guest
     from infra.images import guest_build, guest_userdata
-    run, overlay = superset_overlay["run"], superset_overlay["overlay"]
+    run, overlay = web_local_overlay["run"], web_local_overlay["overlay"]
     rec = guest_build.verify_overlay(
         overlay=overlay, run_dir=run, name="web-local",
         user_data=guest_userdata.verify_user_data("mojang-web-local", {},
@@ -96,15 +115,17 @@ def test_images_ubuntu_verify_web_local(superset_overlay):
     _verify_markers(rec, "BOOT", "UNITS-ACTIVE", "CATALOGUE", "CATALOGUE-COUNT",
                     "DIAG-FLAW", "ROOT-FLAW", "MAINT-HELPER", "MAINT-FIX",
                     "DIAG-FIX", "AUDITD-RULES",
-                    "SHIPPER-UNIT", "SHIPPER-SPOOL", "SEEDS", "USERS", "FIREWALL")
+                    "SHIPPER-UNIT", "SHIPPER-SPOOL", "SEEDS", "USERS",
+                    "FIREWALL", "NO-MYSQL-ENABLED")
 
 
-def test_images_ubuntu_verify_web_db(superset_overlay):
-    """Real offline boot with the MySQL backend: 12 seeded rows through the
-    read-only role, plus the full local-behavior battery."""
+def test_images_ubuntu_verify_web_db(db_overlay):
+    """Real offline boot of the DB-tier artifact: 12 seeded rows through the
+    read-only role + capture, and NO web app enabled or present — the DB
+    tier is a database, not a second all-in-one app (plan 13 phase 3)."""
     from infra.dev import qemu_guest
     from infra.images import guest_build, guest_userdata
-    run, overlay = superset_overlay["run"], superset_overlay["overlay"]
+    run, overlay = db_overlay["run"], db_overlay["overlay"]
     rec = guest_build.verify_overlay(
         overlay=overlay, run_dir=run, name="web-db",
         user_data=guest_userdata.verify_user_data("mojang-web-db", {},
@@ -112,29 +133,40 @@ def test_images_ubuntu_verify_web_db(superset_overlay):
         instance_id=f"sr-vdb-{uuid.uuid4().hex[:8]}",
         hostname="sr-verify-webdb", memory_mb=2048, net="none",
         timeout_s=600)
-    _verify_markers(rec, "BOOT", "UNITS-ACTIVE", "CATALOGUE", "MYSQL-COUNT",
-                    "MYSQL-ROW", "DIAG-FLAW", "ROOT-FLAW", "MAINT-HELPER",
-                    "MAINT-FIX", "DIAG-FIX", "AUDITD-RULES", "SEEDS")
+    _verify_markers(rec, "BOOT", "UNITS-ACTIVE", "MYSQL-READY", "MYSQL-COUNT",
+                    "MYSQL-ROW", "AUDITD-RULES", "SHIPPER-UNIT",
+                    "SHIPPER-SPOOL", "USERS", "FIREWALL", "NO-WEB-APP")
 
 
 def test_images_ubuntu_verify_attacker():
-    """Attacker boots from a FRESH overlay of the verified base (never the
-    payload overlay): sshd up, fresh host keys, none of the target payload."""
+    """Attacker boots the ACTUAL BUILT attacker artifact (plan 13 phase 3:
+    acceptance boots what gets imported): runner-supervisor, capture path
+    (auditd + shipper), cgroup delegation, scoped AppArmor profile, role
+    keys — plus the base posture (sshd socket, fresh host keys, no target
+    payload)."""
     from infra.dev import qemu_guest
-    from infra.images import guest_build, guest_seed, guest_userdata
+    from infra.images import guest_build, guest_userdata
     qemu_guest.require_qemu()
     run = qemu_guest.make_run_dir()
     try:
-        base = qemu_guest.ensure_verified_base(GUEST_CACHE / "base")
-        # Attacker boots a FRESH production-sized overlay (16 GiB budget).
-        overlay = qemu_guest.fresh_role_overlay(base, run, "attacker", 16)
+        rec_build = guest_build.build_attacker_overlay(
+            repo_root=REPO, run_dir=run, cache_dir=GUEST_CACHE / "attacker",
+            key_manifest=TEST_KEYS, memory_mb=1024, base_dir=GUEST_CACHE)
+        overlay = pathlib.Path(rec_build["overlay"])
+        assert rec_build.get("packages"), \
+            "attacker build must record resolved packages"
+        assert any(n == "auditd" or n.startswith("audit")
+                   for n in rec_build["packages"]), rec_build["packages"]
         rec = guest_build.verify_overlay(
             overlay=overlay, run_dir=run, name="attacker",
             user_data=guest_userdata.attacker_verify_user_data(),
             instance_id=f"sr-atk-{uuid.uuid4().hex[:8]}",
             hostname="sr-verify-attacker", memory_mb=1024, net="none",
             timeout_s=600)
-        _verify_markers(rec, "BOOT", "SSH-SOCKET", "HOSTKEYS", "NO-MOJANG", "NO-MYSQL")
+        _verify_markers(rec, "BOOT", "SSH-SOCKET", "HOSTKEYS", "NO-MOJANG",
+                        "NO-MYSQL", "AUDITD-ACTIVE", "SHIPPER-UNIT",
+                        "SHIPPER-SPOOL", "AUDITD-RULES", "CGROUP-DELEGATION",
+                        "APPARMOR-PROFILE", "RUNNER-BOUNDARY")
     finally:
         shutil.rmtree(run, ignore_errors=True)
 

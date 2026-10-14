@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
-"""PVE template build (pilot plan step 2): import-ready qcow2 templates.
+"""PVE template build (plan 13 phase 3): import-ready qcow2 templates.
 
-Produces standalone (flattened) qcow2 templates for the pilot presets —
-9005 attacker and 9011 mojang-web-local — from the pinned, checksum-verified
-noble base plus the payload, using the SAME QEMU overlay machinery as the
-images gate (`infra/images/guest_build.py`). Every artifact is built by
-booting a real guest: build boot (packages + payload), then a finalize boot
-that scrubs per-clone identity (SSH host keys, machine-id, cloud-init state)
-so every PVE clone regenerates fresh identity — the contract the broker's
+Produces standalone (flattened) qcow2 templates for the release presets —
+9005 attacker, 9011 mojang-web-local and 9012 mojang-web-db — from the
+pinned, checksum-verified noble base plus the payload, using the SAME QEMU
+overlay machinery as the images gate (`infra/images/guest_build.py`). Every
+artifact is built by booting a real guest: build boot (packages + payload),
+then a finalize boot that bakes ONLY the role-appropriate public keys and
+scrubs per-clone identity (SSH host keys, machine-id, cloud-init state) so
+every PVE clone regenerates fresh identity — the contract the broker's
 guest-agent host-key pinning depends on.
 
-Only the operator PUBLIC access key is baked (refuses private material).
-The output directory carries SHA256SUMS, TEMPLATE-INFO.json (inputs hash,
+Keys arrive as per-principal PUBLIC key files (--runner-key/--bastion-key/
+--mgmt-key/--emergency-key); private material is refused. The output
+directory carries SHA256SUMS, TEMPLATE-INFO.json (inputs hash,
 guest-resolved package versions, QEMU record) and IMPORT-STEPS.md with the
 documented `qm importdisk` → template-convert procedure the operator runs.
 
 Usage:
-    python infra/images/pve_template_build.py --out /tmp/sr-templates \
-        --pubkey /secure/operator_access.pub [--roles attacker,mojang-web-local]
+    python infra/images/pve_template_build.py --out /tmp/sr-templates \\
+        --runner-key /secure/runner.pub --bastion-key /secure/bastion.pub \\
+        --mgmt-key /secure/mgmt.pub [--roles attacker,mojang-web-local,...]
 
 This never contacts Proxmox; importing is the operator's documented step.
 """
@@ -44,7 +47,7 @@ ROLE_VMID = {"attacker": 9005, "mojang-web-local": 9011, "mojang-web-db": 9012}
 IMPORT_STEPS = """# Operator import steps (run on the Proxmox node as root)
 
 For each template file below (example: 9011 / mojang-web-local; repeat for
-9005 / attacker with its file and budget):
+9005 / attacker and 9012 / mojang-web-db with their files and budgets):
 
     # 0. Verify the artifact BEFORE import:
     sha256sum -c SHA256SUMS
@@ -65,8 +68,10 @@ For each template file below (example: 9011 / mojang-web-local; repeat for
     #    keys + machine-id on every clone; the broker pins the fresh ed25519
     #    host key via the guest-agent FileRead channel — that requires the
     #    VM.GuestAgent.FileRead ACL privilege on the CLONE path /vms (PVE 9
-    #    privilege name; PVE 8 called this VM.AgentFileRead), NOT a VM flag:
-    qm set 9011 --ide2 <STORAGE>:cloudinit --ciuser attacker \\
+    #    privilege name; PVE 8 called this VM.AgentFileRead), NOT a VM flag.
+    #    --ciuser is the ROLE's own login: attacker for 9005, defender for
+    #    the web/DB guests):
+    qm set 9011 --ide2 <STORAGE>:cloudinit --ciuser defender \\
         --ipconfig0 ip=dhcp
     # (range guests get static IPs from the broker's ipconfig0 at clone time;
     #  the template itself only needs Cloud-Init enabled)
@@ -79,10 +84,15 @@ Never boot these templates directly — they are clone sources. The broker
 policy must allowlist exactly these VMIDs; nothing else may be cloned.
 
 Attacker guest note: the runner-supervisor's kernel-enforced command boundary
-needs unprivileged user namespaces. On the ATTACKER guest only, either load
-the scoped AppArmor profile used by CI or set
-`kernel.apparmor_restrict_unprivileged_userns=0` (a disposable guest, never
-the control plane or the host).
+needs unprivileged user namespaces. The template SHIPS the scoped AppArmor
+profile (/etc/apparmor.d/usr.bin.unshare, loaded at boot) — do NOT relax the
+restriction globally; if the profile ever fails to load, fix the profile
+rather than setting kernel.apparmor_restrict_unprivileged_userns=0.
+
+DB guest (9012) note: it is a DATABASE tier — no web app. Deploy-time
+provisioning binds MySQL to its owned range address and grants the per-
+deployment reader ONLY for the owned web guest and the loopback probe;
+3306 is reachable only from the range (guests have no default route).
 """
 
 
@@ -95,12 +105,18 @@ def sha256_file(p: pathlib.Path) -> str:
 
 
 def finalize(overlay: pathlib.Path, run_dir: pathlib.Path, role: str,
-             pubkey: str | None = None) -> None:
-    """Offline boot that bakes the operator PUBLIC key (root/defender/
-    attacker) and scrubs per-clone identity from the built overlay."""
+             key_manifest: dict[str, str] | None = None, *,
+             include_emergency: bool = False) -> None:
+    """Offline boot that bakes the ROLE-APPROPRIATE public keys per the
+    role_keys policy (runner→attacker only, bastion→defender, mgmt→mgmt
+    account; emergency only when explicitly included) and scrubs per-clone
+    identity from the built overlay."""
     seed = guest_seed.build_seed_iso(
         run_dir / f"finalize-{role}-seed.iso",
-        guest_userdata.finalize_user_data(pubkey),
+        guest_userdata.finalize_user_data(
+            role, key_manifest,
+            include_emergency=include_emergency
+            or bool(key_manifest and "emergency" in key_manifest)),
         guest_seed.meta_data(f"sr-finalize-{uuid.uuid4().hex[:8]}",
                              f"sr-finalize-{role}"))
     qemu_guest.boot_full_guest(disk=overlay, seed_iso=seed, memory_mb=1024,
@@ -140,16 +156,13 @@ def flatten(overlay: pathlib.Path, out_qcow2: pathlib.Path,
 
 
 def build_role(role: str, out: pathlib.Path, cache_dir: pathlib.Path,
-               pubkey: str) -> dict:
-    from infra.images.build import check_pubkey  # reuse the public-key gate
-    check_pubkey(pathlib.Path(pubkey))
-    pub = pathlib.Path(pubkey).read_text().strip()
+               key_manifest: dict[str, str]) -> dict:
     run = qemu_guest.make_run_dir()
     try:
         if role == "attacker":
             rec = guest_build.build_attacker_overlay(
                 repo_root=REPO, run_dir=run, cache_dir=cache_dir / role,
-                pubkey=pub, memory_mb=1024, base_dir=cache_dir)
+                key_manifest=key_manifest, memory_mb=1024, base_dir=cache_dir)
         else:
             budget = specs.check_guest_budget(role)
             rec = guest_build.build_overlay(
@@ -157,7 +170,7 @@ def build_role(role: str, out: pathlib.Path, cache_dir: pathlib.Path,
                 role=role, memory_mb=2048, disk_gb=budget["disk_gb"],
                 base_dir=cache_dir)
         overlay = pathlib.Path(rec["overlay"])
-        finalize(overlay, run, role, pub)
+        finalize(overlay, run, role, key_manifest)
         out_qcow2 = out / f"template-{role}.qcow2"
         meta = flatten(overlay, out_qcow2,
                        specs.check_guest_budget(role)["disk_gb"])
@@ -174,13 +187,35 @@ def build_role(role: str, out: pathlib.Path, cache_dir: pathlib.Path,
 
 
 def main(argv: list[str] | None = None) -> int:
+    from infra.images.build import check_pubkey  # public-key gate
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
-    ap.add_argument("--pubkey", required=True,
-                    help="Operator PUBLIC access key (bare key file)")
+    ap.add_argument("--runner-key",
+                    help="runner PUBLIC key (authenticates ONLY to attacker)")
+    ap.add_argument("--bastion-key",
+                    help="bastion PUBLIC key (defender guests ONLY)")
+    ap.add_argument("--mgmt-key",
+                    help="provisioning/verifier PUBLIC key (mgmt account)")
+    ap.add_argument("--emergency-key",
+                    help="break-glass PUBLIC key (explicit, separate)")
     ap.add_argument("--cache-dir", default="/tmp/sr-guest-cache")
-    ap.add_argument("--roles", default="attacker,mojang-web-local")
+    ap.add_argument("--roles",
+                    default="attacker,mojang-web-local,mojang-web-db")
     args = ap.parse_args(argv)
+    key_manifest: dict[str, str] = {}
+    for principal, path in (("runner", args.runner_key),
+                            ("bastion", args.bastion_key),
+                            ("mgmt", args.mgmt_key),
+                            ("emergency", args.emergency_key)):
+        if not path:
+            continue
+        check_pubkey(pathlib.Path(path))  # refuses private material
+        key_manifest[principal] = pathlib.Path(path).read_text().strip()
+    if not key_manifest:
+        print("template-build: at least one --*-key PUBLIC key is required "
+              "(templates without any key cannot be administered)",
+              file=sys.stderr)
+        return 2
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     cache = pathlib.Path(args.cache_dir)
@@ -191,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"template-build: unknown role {role!r}", file=sys.stderr)
             return 2
         print(f"template-build: building {role} (QEMU boots; TCG is slow)...")
-        built.append(build_role(role, out, cache, args.pubkey))
+        built.append(build_role(role, out, cache, key_manifest))
     sums = "".join(f"{b['sha256']}  {b['file']}\n" for b in built)
     (out / "SHA256SUMS").write_text(sums)
     info = {"built_by": "infra/images/pve_template_build.py",

@@ -104,12 +104,15 @@ class MysqlRows(Verifier):
                 expected_text: str | None = None):
         # SELECT-only by construction: the query is built here from a bare
         # identifier + COUNT; scenario args can never smuggle writes.
-        # --protocol=TCP --host=127.0.0.1 is load-bearing: the reader grant is
-        # a TCP grant; the CLI would otherwise use the local socket as
-        # 'localhost' and be refused.
+        # --protocol=TCP --host=127.0.0.1 is load-bearing: the reader grant
+        # is a TCP grant; the CLI would otherwise use the local socket as
+        # 'localhost' and be refused. The password is read INSIDE the guest
+        # from the per-deployment provisioning file (plan 13 phase 3) — it
+        # never travels through the controller or the scenario args.
         q = f"SELECT COUNT(*) FROM `{table}`"
         cmd = ("mysql --protocol=TCP --host=127.0.0.1 --batch --skip-column-names "
                "--user=mojang_reader "
+               '--password="$(cat /etc/mojang-web/reader-pw)" '
                f"--execute={shlex.quote(q)} mojang")
         code, out = _run(ctx, host, cmd)
         if code is None or code != 0:
@@ -125,6 +128,7 @@ class MysqlRows(Verifier):
             q2 = f"SELECT purchase_id, game_id, buyer FROM `{table}`"
             cmd2 = ("mysql --protocol=TCP --host=127.0.0.1 --batch --skip-column-names "
                     "--user=mojang_reader "
+                    '--password="$(cat /etc/mojang-web/reader-pw)" '
                     f"--execute={shlex.quote(q2)} mojang")
             code2, out2 = _run(ctx, host, cmd2)
             if code2 is None or code2 != 0:

@@ -14,7 +14,7 @@ est_minutes: 90
 techniques: [T1190, T1068, T1005, T1505.003]
 version: 3
 seed_version: 1
-image_version: noble-20261012
+image_version: noble-20260926
 topology:
   hosts:
     - name: attacker
@@ -27,6 +27,10 @@ topology:
       ip: 10.66.0.10
       services: [http, mojang-web, ssh]
       os: linux
+      # plan 13 phase 3: deploy-time provisioning rewrites the app config
+      # to target the OWNED DB IP with a fresh per-deployment reader
+      # credential (never baked into the template).
+      db_ref: db01
     - name: db01
       template_vmid: 9012
       ip: 10.66.0.11

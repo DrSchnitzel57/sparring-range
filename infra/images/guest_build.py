@@ -33,9 +33,13 @@ from infra.images import guest_seed, guest_userdata
 SUPERSET_PACKAGES = ["nginx", "mysql-server", "auditd", "openssh-server",
                      "python3-pymysql", "ufw", "curl", "qemu-guest-agent"]
 
-#: Pinned subset the attacker template installs (tooling VM: ssh + supervisor
-#: + guest agent + firewall; no target services, no MySQL, no shipper).
-ATTACKER_PACKAGES = ["openssh-server", "curl", "qemu-guest-agent", "ufw"]
+#: Pinned subset the attacker template installs. Plan 13 phase 3: the
+#: attacker ALSO carries the capture path (auditd; shipper is installed from
+#: the canonical telemetry inputs) and the runner boundary; no target
+#: services, no MySQL. AppArmor userspace ships with the Ubuntu cloud image
+#: (the build fails loudly if `apparmor_parser` is somehow absent).
+ATTACKER_PACKAGES = ["openssh-server", "curl", "qemu-guest-agent", "ufw",
+                     "auditd"]
 
 
 def manifest_packages(repo_root: pathlib.Path) -> list[str]:
@@ -49,9 +53,13 @@ def manifest_packages(repo_root: pathlib.Path) -> list[str]:
     return list(pins)
 
 
-def inputs_hash(repo_root: pathlib.Path) -> str:
+def inputs_hash(repo_root: pathlib.Path, role: str = "mojang-web-db") -> str:
+    """Per-role cache key: base SHA + the ROLE's payload subtree + seeds +
+    generators. Plan 13 phase 3: web and DB tiers are separate artifacts,
+    so they cache separately and each boots its own production shape."""
     h = hashlib.sha256()
     repo = pathlib.Path(repo_root)
+    h.update(f"role={role}\n".encode())
     manifest = json.loads((repo / "infra/images/manifest.json").read_text())
     h.update(manifest["base_image"]["sha256"].encode())
     h.update((repo / "infra/images/packages-24.04.txt").read_bytes())
@@ -93,10 +101,10 @@ def build_overlay(*, repo_root: pathlib.Path, run_dir: pathlib.Path,
                   base_dir: pathlib.Path | None = None) -> dict:
     """Build (or reuse) the superset overlay. Returns the build record with
     resolved package versions parsed from the guest's own serial report."""
-    key = inputs_hash(repo_root)
+    key = inputs_hash(repo_root, role)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cached = cache_dir / f"overlay-{key}.qcow2"
-    cached_meta = cache_dir / f"overlay-{key}.json"
+    cached = cache_dir / f"overlay-{role}-{key}.qcow2"
+    cached_meta = cache_dir / f"overlay-{role}-{key}.json"
     base = qemu_guest.ensure_verified_base((base_dir or cache_dir) / "base")
     if cached.exists() and cached_meta.exists():
         meta = json.loads(cached_meta.read_text())
@@ -152,28 +160,37 @@ def build_overlay(*, repo_root: pathlib.Path, run_dir: pathlib.Path,
     (cached_meta).write_text(json.dumps(meta, indent=2, sort_keys=True))
     # Bound the cache: only the current key's overlay survives (plus the
     # verified base); stale overlays are removed, never accumulated.
-    for stale in cache_dir.glob("overlay-*.qcow2"):
+    for stale in cache_dir.glob(f"overlay-{role}-*.qcow2"):
         if stale != cached:
             stale.unlink(missing_ok=True)
-    for stale in cache_dir.glob("overlay-*.json"):
+    for stale in cache_dir.glob(f"overlay-{role}-*.json"):
         if stale != cached_meta:
             stale.unlink(missing_ok=True)
     return {"overlay": str(overlay), "cached": False, **meta}
 
 
-def attacker_inputs_hash(repo_root: pathlib.Path, pubkey: str) -> str:
+def attacker_inputs_hash(repo_root: pathlib.Path,
+                         key_manifest: dict[str, str]) -> str:
     """Cache key for the attacker overlay: base SHA + attacker payload +
-    supervisor script + pinned subset + the operator PUBLIC key baked in."""
+    supervisor script + cgroup delegation unit + AppArmor profile + capture
+    inputs + pinned subset + the role key manifest (public keys only)."""
     h = hashlib.sha256()
     repo = pathlib.Path(repo_root)
     manifest = json.loads((repo / "infra/images/manifest.json").read_text())
     h.update(manifest["base_image"]["sha256"].encode())
-    h.update(pubkey.encode())
+    h.update(json.dumps(key_manifest, sort_keys=True).encode())
     for rel in sorted((repo / "infra/images/payloads/attacker").rglob("*")):
         if rel.is_file() and ".ssh" not in rel.parts:
             h.update(str(rel.relative_to(repo)).encode())
             h.update(rel.read_bytes())
-    h.update((repo / "infra/runner/runner_supervise.sh").read_bytes())
+    for mod in ("infra/runner/runner_supervise.sh",
+                "infra/runner/sr-runner-cgroup.service",
+                "infra/runner/apparmor/usr.bin.unshare",
+                "infra/images/guest_userdata.py",
+                "telemetry/shipper.py",
+                "telemetry/sparring-shipper.service",
+                "telemetry/auditd.rules"):
+        h.update((repo / mod).read_bytes())
     pins = {p.split("=")[0]: p for p in manifest_packages(repo)}
     for name in ATTACKER_PACKAGES:
         h.update(pins[name].encode())
@@ -181,17 +198,21 @@ def attacker_inputs_hash(repo_root: pathlib.Path, pubkey: str) -> str:
 
 
 def build_attacker_overlay(*, repo_root: pathlib.Path, run_dir: pathlib.Path,
-                           cache_dir: pathlib.Path, pubkey: str,
+                           cache_dir: pathlib.Path,
+                           key_manifest: dict[str, str],
                            memory_mb: int = 1024,
                            timeout_s: int = 1500,
                            base_dir: pathlib.Path | None = None) -> dict:
-    """Build (or reuse) the attacker template overlay (pilot step 2): pinned
-    base + attacker role + runner-supervisor + public key. Fresh per-input,
-    cached by every build input, same discipline as the target overlay."""
-    key = attacker_inputs_hash(repo_root, pubkey)
+    """Build (or reuse) the attacker template overlay (plan 13 phase 3):
+    pinned base + attacker role + runner-supervisor + capture path + runner
+    boundary + role-appropriate public keys. Fresh per-input, cached by
+    every build input, same discipline as the target overlay; resolved
+    package versions are RECORDED like every other artifact."""
+    key = attacker_inputs_hash(repo_root, key_manifest)
     cache_dir.mkdir(parents=True, exist_ok=True)
     cached = cache_dir / f"attacker-{key}.qcow2"
-    if cached.exists():
+    cached_meta = cache_dir / f"attacker-{key}.json"
+    if cached.exists() and cached_meta.exists():
         base = qemu_guest.ensure_verified_base((base_dir or cache_dir) / "base")
         qemu_guest.sized_base_copy(base, run_dir, "attacker", 16)
         overlay = run_dir / "attacker.qcow2"
@@ -202,7 +223,8 @@ def build_attacker_overlay(*, repo_root: pathlib.Path, run_dir: pathlib.Path,
                            capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
             raise RuntimeError(f"qemu-img rebase failed: {(r.stderr or r.stdout)[:200]}")
-        return {"overlay": str(overlay), "cached": True, "inputs_hash": key}
+        return {"overlay": str(overlay), "cached": True, "inputs_hash": key,
+                **json.loads(cached_meta.read_text())}
     base = qemu_guest.ensure_verified_base((base_dir or cache_dir) / "base")
     overlay = qemu_guest.fresh_role_overlay(base, run_dir, "attacker", 16)
     from infra.images import guest_userdata
@@ -210,14 +232,15 @@ def build_attacker_overlay(*, repo_root: pathlib.Path, run_dir: pathlib.Path,
                            / "infra/images/manifest.json").read_text())
     pins = {p.split("=")[0]: p for p in manifest["packages"]}
     packages = [pins[n] for n in ATTACKER_PACKAGES]
-    # The attacker payload is just the role marker (SSH keys arrive as the
-    # baked public key below; `payload_from_repo` deliberately ships nothing
-    # for the attacker role).
+    # The attacker payload is just the role marker (keys arrive per the
+    # role_keys policy below; `payload_from_repo` deliberately ships nothing
+    # else for the attacker role).
     payload = {"/etc/sparring-range/role":
                (pathlib.Path(repo_root)
                 / "infra/images/payloads/attacker/etc/sparring-range/role")
                .read_text()}
-    user_data = guest_userdata.attacker_build_user_data(payload, packages, pubkey)
+    user_data = guest_userdata.attacker_build_user_data(payload, packages,
+                                                        key_manifest)
     seed_iso = guest_seed.build_seed_iso(
         run_dir / "attacker-build-seed.iso", user_data,
         guest_seed.meta_data(f"sr-atk-build-{key[:8]}", "sr-build-attacker"))
@@ -226,12 +249,20 @@ def build_attacker_overlay(*, repo_root: pathlib.Path, run_dir: pathlib.Path,
                                      expect=("SR-GUEST-BUILD-APT-OK",
                                              "SR-GUEST-BUILD-SETUP-OK"),
                                      timeout_s=timeout_s)
+    serial = run_dir / "attacker.serial.log"
+    meta = {"packages": recorded_packages(serial), "inputs_hash": key,
+            "qemu": rec["qemu"], "kvm": rec["kvm"]}
+    (run_dir / "attacker-build-meta.json").write_text(
+        json.dumps(meta, indent=2, sort_keys=True))
     shutil.copyfile(overlay, cached)
+    cached_meta.write_text(json.dumps(meta, indent=2, sort_keys=True))
     for stale in cache_dir.glob("attacker-*.qcow2"):
         if stale != cached:
             stale.unlink(missing_ok=True)
-    return {"overlay": str(overlay), "cached": False, "inputs_hash": key,
-            "qemu": rec["qemu"], "kvm": rec["kvm"]}
+    for stale in cache_dir.glob("attacker-*.json"):
+        if stale != cached_meta:
+            stale.unlink(missing_ok=True)
+    return {"overlay": str(overlay), "cached": False, **meta}
 
 
 def verify_overlay(*, overlay: pathlib.Path, run_dir: pathlib.Path, name: str,

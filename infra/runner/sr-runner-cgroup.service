@@ -1,0 +1,19 @@
+# Plan 13 phase 3 — reboot-persistent runner cgroup delegation (attacker).
+# Creates a cgroup v2 subtree owned by the `attacker` user so the runner
+# supervisor can create per-operation containment groups WITHOUT root and
+# WITHOUT any global security relaxation. The runner writes its group
+# leader into <child>/cgroup.procs and kills via cgroup.kill — both require
+# the delegated ownership this unit establishes on every boot.
+[Unit]
+Description=sparring-range runner cgroup delegation
+Documentation=file:/usr/local/bin/runner-supervisor
+After=local-fs.target
+Before=sshd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'set -e; d=/sys/fs/cgroup/sr-runner; mkdir -p "$d"; for c in cpu io memory; do [ -f /sys/fs/cgroup/cgroup.controllers ] && grep -qw $c /sys/fs/cgroup/cgroup.controllers && echo +$c > "$d/cgroup.subtree_control" 2>/dev/null || true; done; chown attacker:attacker "$d" "$d/cgroup.procs" "$d/cgroup.subtree_control" 2>/dev/null || true; chmod 0700 "$d"'
+
+[Install]
+WantedBy=multi-user.target
