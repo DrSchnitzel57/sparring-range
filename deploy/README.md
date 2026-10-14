@@ -91,10 +91,12 @@ systemctl daemon-reload && systemctl enable --now sr-brokerd
 PVE side (operator, on the host UI or `pveum`): create realm user
 `sr-broker@pve` with API token `range`, ACLs ONLY for the policy's node,
 template VMIDs, VMID range and storages (`VM.Audit, VM.Clone, VM.Allocate,
-VM.Config.Network, VM.PowerMgmt, VM.GuestAgent.FileRead,
-Datastore.Allocate, Datastore.AllocateSpace` — on PVE 9 the guest-agent
-privileges are `VM.GuestAgent.*` (PVE 8: `VM.AgentFileRead`) and spawning
-new VMIDs needs `VM.Allocate` (PVE 8 called it `VM.Create`). `VM.Clone`
+VM.Config.Network, VM.Config.Cloudinit, VM.Config.Options, VM.PowerMgmt,
+VM.GuestAgent.FileRead, Datastore.Allocate, Datastore.AllocateSpace` — on
+PVE 9 the guest-agent privileges are `VM.GuestAgent.*` (PVE 8:
+`VM.AgentFileRead`) and spawning new VMIDs needs `VM.Allocate` (PVE 8
+called it `VM.Create`); `VM.Config.Cloudinit` covers the per-clone
+`ipconfig0`, `VM.Config.Options` the ownership `tags`. `VM.Clone`
 only on the two template VMIDs;
 `VM.GuestAgent.FileRead` is what lets the broker pin each fresh clone's
 SSH host key (no TOFU). Never `Admin.*`. The broker refuses any operation
