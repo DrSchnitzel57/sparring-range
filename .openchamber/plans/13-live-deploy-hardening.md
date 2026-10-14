@@ -1,125 +1,192 @@
-# 13 — Live-deploy hardening (running plan)
+# Plan 13 (full update, 2026-10-14 ~04:00 UTC) — live deploy hardening
 
-Status: RUNNING — append findings as they occur; tick items when fixed.
+Companion docs: `docs/HANDOFF-2026-10-14-live-deploy.md` (night-of state),
+`deploy/README.md` (runbook, corrected all night),
+`docs/audits/pve92-alignment.md` (PVE 9.2 audit — started, unfinished).
+This plan supersedes its earlier versions. The `openchamber/tomorrow-pilot`
+branch was deleted after the demo night (content identical to master);
+work continues fresh from `master`.
 
 ## Goal
-Close the quality gaps the first real Proxmox deployment (2026-10-13/14)
-exposed: dev defaults that fail closed at the broker, test fixtures that
-don't match production policy, and operator-facing UX that made every
-refusal a journal-dig.
 
-## Context
-The pilot deployed end-to-end on real hardware caught nine issues the
-compose rehearsal could not, because the rehearsal used a permissive
-policy fixture and dev-value defaults. Each item below records what the
-fence caught and what layer should have caught it earlier.
+Get one rehearsal match genuinely green on the real LAN: launch →
+readiness → isolation gates → begin match → red run → flag verified →
+teardown. Everything below is what the live PVE 9.2 host taught us and
+what still stands between "deployed" and "ready".
 
-## Done during the live deploy (verified fixes, in master)
-- [x] `requests` added — proxmoxer https backend needs it at runtime (`0494ca4`).
-- [x] `bootstrap_tls.sh`: iPAddress SAN when `BROKER_HOST` is an address (`71cb483`).
-- [x] Runbook PVE 9 privileges: `VM.Allocate`, `VM.GuestAgent.FileRead`,
-      `VM.Config.Cloudinit`, `VM.Config.Options` (`e58187a`, `c75e712`, `4c840e7`).
-- [x] IMPORT-STEPS: agent file-read is an ACL privilege, not a VM flag (`e58187a`).
-- [x] Control-plane env example pins `PROXMOX_NODE`, `DEPLOY_VMID_BASE`,
-      `RANGE_BRIDGE`, `DEPLOY_CLONE_MODE` (`455a840`, `30144ce`, `b03a889`).
-- [x] Heartbeat disarms idle broker lease — dead-man lifecycle fix + tests (`6c42160`).
-- [x] PVE 500 "no such file" classified as confirmed absence + tests (`e41c156`).
-- [x] Clone names carry `sr-` prefix; fixture policy enforces it (`b63e0af`).
-- [x] Broker token needs `Sys.Audit` on `/nodes/<node>` — documented (`4f7bb4d`).
-- [x] **ROOT CAUSE**: proxmoxer path adapter — leading-slash paths lost the
-      `/api2/json` prefix (posixpath.join replaces on absolute segments), so
-      every real PVE call answered "no such file" while 158 fake-boundary
-      tests stayed green (`db01932`).
-- [x] Dead-man switch demonstrated live: lease expiry latched, honest
-      release with empty ledger (audit trail #1–#5).
-- [x] 401 wall resolved: running `sr-brokerd` held a stale/placeholder
-      `PROXMOX_TOKEN_ID` (example shipped `sr-broker@pve` with a stray
-      hyphen); live probe proved file+client+token healthy after restart
-      (`version()` 200 on PVE 9.2.21). Example placeholder defused (`12e22fa`).
-- [x] PVE's SECOND absence dialect — 500 "Configuration file
-      'nodes/<n>/qemu-server/<vmid>.conf' does not exist" — classified as
-      confirmed absence + tests (`d45f8f7`); this unblocked `next_vmid`
-      against the real host.
-- [x] PVE 9 SDN bridge check: cloning a NIC onto a bridge requires
-      `SDN.Use` on `/sdn/zones/localnetwork/<bridge>` — clone task starts
-      then dies 403 without it (live find 2026-10-14; runbook documents
-      `SRBrokerSdn` role + ACL line).
-- [x] Management-channel first-boot race: enrollment/readiness SSH into a
-      just-started clone exits 255 while sshd boots (live: both clones
-      `provision_failed` one second after deploy). Provisioning now retries
-      ONLY ssh-255 ("command never ran") within
-      `MANAGEMENT_READY_WAIT_S=90`; every other rc still fails fast.
-      4 tests.
-- [x] Guest-agent first-boot race: after `start_and_wait` returns, PVE
-      answers agent reads with 500 "QEMU guest agent is not running" for
-      tens of seconds — the host-key pin failed there on the FIRST real
-      clone. And there is NO `/agent/status` endpoint (a probe for it
-      answered 501 "Not Implemented" — my invented path, caught live).
-      `read_guest_file_when_ready` now retries the REAL allowlisted read,
-      bounded (`PROXMOX_AGENT_READY_TIMEOUT_S=120`), only that signature,
-      timeout stays uncertain; client gives `read_host_key` a 150 s
-      per-op timeout. 6 tests.
+## Where we actually are (verified live, 2026-10-14)
 
-## Remaining improvements
-- [ ] Launch is a synchronous HTTP request held for the whole deploy
-      (minutes with agent waits) — nginx 504s the browser at 60s while the
-      deploy keeps running. Run deploys as a background task and let the
-      session page poll status; until then the runbook pins nginx
-      `proxy_read_timeout 900s`.
-- [ ] Production settings validation: refuse to start `sr-api` with
-      dev-default `proxmox_node=r740`, `deploy_vmid_base=210`,
-      `range_bridge=vmbr1`, `deploy_clone_mode=linked` when `SR_ENV=production`.
-- [ ] Compose rehearsal: generate the policy with production shape
-      (`name_prefix sr-`, `clone_mode full`, real bridge name) and run the
-      production config validator, so fixtures can't diverge again.
-- [ ] `FakePVEHttp`: option to answer per-guest paths with PVE's real
-      500 "no such file" quirk (keep 404 mode too).
-- [ ] Add one integration smoke that drives the REAL proxmoxer client
-      against a local HTTP mock, so URL joining (the `/api2/json` prefix
-      bug class) is covered end to end, not just the fake boundary.
-- [ ] Web UI: session list reachable from library (active + failed);
-      failed sessions currently URL-only.
-- [ ] Web UI: session page surfaces the latest deploy refusal reason
-      (broker 403/423 text) from events, not just journalctl.
-- [ ] Web UI: safety panel — latch state + reason; for a broker latch,
-      print the exact broker-local release command (operator-only host).
-- [ ] `deploy/pve_broker_acl.sh`: idempotent `pveum` role/ACL/token setup
-      for PVE 9 (replaces tonight's hand-pasted blocks).
-- [ ] Provisioning: create empty `known_hosts.runner|bastion|verifier`
-      files so `readyz` is clean before first deploy.
-- [ ] `rangectl sessions` (list + lease holder) for operators without DB access.
-- [ ] DEMO-DAY.md one-pager: launch → isolation gate checks → teardown →
-    latch-release runbook, printable.
-- [ ] **Full PVE 9.2 alignment audit** — scope in
-      `docs/HANDOFF-2026-10-14-live-deploy.md` §6 (API surface, error
-      taxonomy, privilege model, proxmoxer call audit, cloud-init,
-      zfs/storage, docs sweep). Read-only against the live host.
-- [ ] Settle broker ledger residue from the aborted attempts: VMID 9100
-      reserved claim + possible `clone-outcome-unknown` obligation
-      (verify absent in PVE, settle via tools/teardown, never by
-      hand-editing the ledger).
-- [ ] Live carry-over: first green Launch still pending — after pulling
-      `d45f8f7` on the broker VM, next attempt reaches the real clone
-      path (new-error territory: storage/ACL/boot, not auth).
+PROVEN WORKING end to end against real PVE 9.2.21 (`pve.internal`):
+
+- broker mTLS control plane → broker → PVE token auth (after the 401/
+  hyphen and path-adapter fixes below)
+- VMID claim (`next_vmid`), full clone from 9005/9011, `set_config`
+  (ipconfig0/net0/tags), NIC attach on SDN bridge `srrange` (SDN.Use),
+  start, boot
+- guest-agent host-key read (agent boot wait + cloud-init key
+  regeneration wait + `root@hostname` comment stripped) and pinning;
+  pinned keys published to `known_hosts.runner` AND `known_hosts.verifier`
+- manual SSH from the control plane into both clones as `attacker` and as
+  `root` with the pinned known_hosts (prints `ok`)
+- dead-man latch lifecycle (armed/disarmed/latched/released, live twice)
+- teardown destroys clones on end session
+
+STILL FAILING — the readiness gate (`readiness_failed`, last seen
+03:58 session `d2baa057…`):
+
+- service checks (`sshd`/`nginx`/`mojang-web`) + telemetry enrollment
+  returned exit 255 / `provision_failed`
+- the sshd boot-race fix (`c952831`, retries provisioning ONLY on ssh
+  exit 255 for `MANAGEMENT_READY_WAIT_S=90`) was pushed but its
+  deployment on the control-plane VM is UNCONFIRMED — the last failure
+  came 2 s after deploy, which means either the fix was not running or
+  the failure was not the 255 dialect. First morning task is to know
+  which.
+
+## Morning procedure (fresh start, in order)
+
+1. House-clean the night: on the control-plane VM, end session
+   `d2baa057-7114-4165-bd05-5dd5352a6fda` (or restart `sr-api` if it
+   wedges with `operation_in_progress`), then
+   `sudo -u postgres psql -d sparring_range -c "delete from sessions where status in ('failed');" `
+   is NOT allowed (append-only discipline) — leave failed rows; they're
+   history. Just end anything still holding the range lease.
+2. Confirm both VMs run current master and services were restarted:
+   `sudo git -C /opt/sparring-range log --oneline -1` → must be ≥
+   `c952831` on BOTH VMs; `sudo systemctl restart sr-api sr-brokerd`
+   (each VM restarts its own service). Rule from tonight: BOTH VMs run
+   code — pull and restart both.
+3. Launch `mojang-web-01`. If readiness passes → isolation gates (§
+   below) → demo flow. If it fails again, read the exact payload before
+   touching anything:
+   `sudo -u postgres psql -d sparring_range -c "select payload from events where session_id='<sid>' and action_type='readiness_failed' order by event_id desc limit 1;"`
+   (column is `action_type`, not `event_type`).
+4. Interpret the payload:
+   - `exit 255` on web01 only, seconds after its boot → boot race again
+     → confirm step 2 actually happened (the fix retries up to 90 s, so
+     a 2-second failure means the fix was NOT running).
+   - `confirm_failed / delivery_confirmed` stage → the shipper inside
+     the clone never called back. Suspects, in order: (a) the API URL
+     baked by `_provision_command` must be reachable FROM the range
+     (`https://10.66.0.1/...`, not `10.10.10.132` — the range is
+     isolated); (b) TLS: `https.crt` SAN is `10.10.10.132`, so a
+     shipper validating certs against `10.66.0.1` fails — check what
+     the shipper pins/skips and what `_provision_command` actually
+     writes; (c) shipper unit state via
+     `sudo ssh -i /var/lib/sparring-range/ssh/verifier_ed25519 -o UserKnownHostsFile=/var/lib/sparring-range/known_hosts.verifier root@10.66.0.9 'systemctl status sparring-shipper'`.
+   - `unknown` service checks with rc≠255 → run the failing command
+     manually through the verifier channel and read stderr.
+5. Isolation gates from the attacker VM before any attack traffic:
+   `ping -c1 -W2 1.1.1.1` FAIL · `getent hosts example.com` FAIL ·
+   `ip route` only `10.66.0.0/24` · `ip -6 route` no default. Also
+   `ip forward` off on the control-plane VM.
+
+## Everything master gained tonight (all pushed, all with tests)
+
+| Fix | Commits |
+|---|---|
+| `requests` for proxmoxer https backend | `0494ca4` |
+| broker-server cert IP SAN | `71cb483` |
+| PVE 9 privilege docs (`VM.Allocate`, `VM.GuestAgent.FileRead`, `VM.Config.Cloudinit/Options`, `Sys.Audit` on `/nodes/<n>`) | `e58187a` `c75e712` `4c840e7` `4f7bb4d` |
+| env examples pin node/vmid-base/bridge/clone-mode; TOKEN_ID exact-match warning | `455a840` `30144ce` `b03a889` `12e22fa` |
+| heartbeat disarms idle broker lease (dead-man lifecycle) | `6c42160` |
+| absence dialect 1: 500 "no such file" | `e41c156` |
+| absence dialect 2: 500 "Configuration file '…<vmid>.conf' does not exist" | `d45f8f7` |
+| clone names carry `sr-` prefix (fixture enforces) | `b63e0af` |
+| ROOT CAUSE: `_ProxmoxerPathAdapter` — leading-slash paths lost `/api2/json` (posixpath.join replaces on absolute segments); 158 fake tests stayed green while every real call 404'd | `db01932` |
+| SDN.Use on `/sdn/zones/localnetwork/<bridge>` documented (clone 403 without it) | `cc68f69` |
+| guest-agent first-boot wait; NO `/agent/status` endpoint exists (501) — retry the real read instead; cloud-init regeneration wait (empty key); `root@host` comment accepted and stripped from the pin | `fc04050` `a6fb74d` `1a14ba1` `f19ab36` |
+| sshd boot race: provisioning retries ONLY ssh-255 within `MANAGEMENT_READY_WAIT_S=90` | `c952831` |
+| runbook: nginx proxy timeouts; handoff doc; plan/handoff bookkeeping | `15b1539` `8698af2` others |
+
+Suite at `c952831`: **176 passed, 206 deselected** (fast, infra-free).
+
+## Ops lessons (burned into the runbook or belonging there)
+
+- BOTH VMs run code: pull + restart `sr-api` AND `sr-brokerd` after any
+  push. Tonight's "still broken" moments were each a half-update.
+- Never paste key material between machines (the 23:47 runner+verifier
+  private keys were corrupt from a bad paste — `error in libcrypto`);
+  generate with `ssh-keygen` on the target VM.
+- `https://` not `http://` (no port 80); `set +H` before pasting token
+  headers; `<placeholder>` text gets pasted literally; `sudo` needed on
+  640 cert files; PVE 9.2 `pveum` has no `node list` (`ls /etc/pve/nodes/`).
+- The web UI keeps showing a failed session's stored error until a NEW
+  launch; "end session" is refused while an operation is in progress
+  (correct — wait for the bounded operation to finish).
+- One operator key currently serves operator+bastion+runner+verifier
+  (the templates bake `bastion_ed25519.pub` into root/defender/attacker).
+  Works; split after the demo (below).
+
+## Remaining improvements (post-demo, roughly prioritized)
+
+- [ ] Finish the readiness gate live (morning procedure above) — the
+      only thing between here and a demo-able range.
+- [ ] Async launch: POST returns 202 immediately, deploy runs as a
+      background operation, session page polls (kills the 504 class and
+      the stale `operation_in_progress` on restart). nginx
+      `proxy_read_timeout 900s` meanwhile (runbook documents it; the
+      live VM still has the 60 s default).
+- [ ] Session page surfaces the latest `readiness_failed`/refusal
+      payload (it's in `events` already; the UI just doesn't show it —
+      tonight cost 30 min/round-trip without it).
+- [ ] Web UI: session list from library (failed sessions are URL-only);
+      safety panel with latch state + release command; `rangectl
+      sessions` for lease holder.
+- [ ] Key separation: dedicated runner/verifier/bastion keypairs, all
+      pubkeys baked into templates at build; `readyz` parse-checks each
+      private key (`ssh-keygen -y`) and warns when its pubkey is not in
+      the template bake list.
+- [ ] Broker ledger settle from the aborted attempts: VMID 9100-era
+      claims + `host-key-read-uncertain` obligations — verify via
+      `python -m infra.broker.tools status`, settle via teardown/
+      reconcile paths, never by hand-editing sqlite.
+- [ ] Template finalize appends the operator pubkey twice (harmless;
+      dedupe) and the images should bake the SEPARATED keys.
+- [ ] `deploy/pve_broker_acl.sh`: idempotent pveum setup incl. the
+      SRBrokerSdn line (replaces hand-pasted blocks).
+- [ ] Full PVE 9.2 alignment audit — scope in HANDOFF §6; report file
+      started at `docs/audits/pve92-alignment.md` (unfinished; the
+      session that began it was stopped). Every finding tonight was an
+      instance of the fake PVE agreeing with our assumptions — the
+      audit's highest-value item is the real-proxmoxer-vs-HTTP-mock
+      smoke and a fake that replays PVE's real error dialects
+      (both already listed below and in HANDOFF §6).
+- [ ] `FakePVEHttp` modes: per-guest 500 absence dialects, agent
+      not-running/empty-key windows (partially done:
+      `agent_not_ready_polls`, `empty_key_polls`), plus one integration
+      smoke driving the REAL proxmoxer client against a local HTTP mock
+      (the `/api2/json` prefix bug class must be impossible to
+      reintroduce silently).
+- [ ] Production settings validation (refuse dev-default node/vmid
+      base/bridge/clone-mode under `SR_ENV=production`); compose
+      rehearsal with production-shaped policy.
+- [ ] DEMO-DAY.md one-pager: launch → isolation gates → begin match →
+      red run → flag → teardown → latch release runbook, printable.
+- [ ] Rotate the DB passwords and the broker token secret pasted into
+      chat during the live night (operator action; nothing else leaked).
 
 ## Out of scope
-Re-architecting the lease/latch model; relaxing any policy check;
-UI framework changes beyond linking existing data.
 
-## Acceptance criteria
-1. `pytest -q` fast suite green including new validator/fixture tests.
-2. `SR_ENV=production` with any dev default node/vmid/bridge/clone-mode
-   makes `sr-api` refuse startup with a message naming the variable.
-3. Compose rehearsal policy contains `"name_prefix": "sr-"` and
-   `"clone_mode": "full"` and still passes.
-4. `FakePVEHttp(pve_no_such_file=True)` returns PVE-shaped 500s and the
-   deploy path treats them as absence (test).
-5. Library page links every non-complete session for the user.
-6. Session page shows the last refusal reason within 5s of the event.
-7. `bash deploy/pve_broker_acl.sh --help` documents roles/ACLs and is
-   idempotent (run twice → same `pveum acl list`).
-8. Fresh provision → `readyz` has no host-key-file complaints.
+Real competition multi-tenant hardening, scoring changes, new scenarios,
+anything requiring the inference LXC or NAS. The existing inference LXC
+stays outside the attack network.
+
+## Acceptance criteria (this plan is done when all pass)
+
+1. `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -ra -p no:cacheprovider` → 0 failed.
+2. Launch `mojang-web-01` from the web UI reaches **ready** without manual DB/ledger surgery.
+3. From the attacker clone: `ping -c1 -W2 1.1.1.1` fails, `getent hosts example.com` fails, `ip route` shows only `10.66.0.0/24`, `ip -6 route` has no default.
+4. Begin match → start red → one objective verified → end session → `qm list` shows no `sr-*` VMs and `python -m infra.broker.tools status` shows no open obligations.
+5. `journalctl -u sr-api` and `-u sr-brokerd` contain no unexplained ERROR after the full flow.
+6. Both VMs at the same master commit, services restarted once after pull (documented in FINDINGS with the commit hash).
 
 ## Manual checks (operator)
-- Run `pve_broker_acl.sh` against a disposable PVE test host.
-- Browser walkthrough of session list with a failed deploy.
+
+- Confirm `pveum user permissions srbroker@pve` still lists exactly the
+  SRBroker* roles (no drift from debugging).
+- Confirm OPNsense rule 10.10.10.141→192.168.86.83:8006 is the ONLY
+  broker→LAN path, and nothing on VLAN 66 ever reaches WAN (spot-check
+  OPNsense live view during the isolation gates).
+- Decide on rotating the pasted secrets (listed above) before teammates
+  get accounts.
