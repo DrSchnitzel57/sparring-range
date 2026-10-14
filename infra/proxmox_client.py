@@ -71,6 +71,13 @@ def classify_pve_error(exc: Exception) -> ProxmoxError:
             return PveUnavailable(f"unparseable PVE status {status!r}: {exc}")
         if status == 404:
             return PveNotFound(str(exc))
+        if status == 500 and "no such file" in str(exc):
+            # Real PVE answers per-guest paths for a NONEXISTENT VMID with
+            # 500 "no such file" (long-standing API quirk; the fake answers
+            # 404). This is PVE itself deterministically confirming absence,
+            # not a transport failure — treating it as uncertain made the
+            # first real next_vmid probe fail (live deploy, 2026-10-14).
+            return PveNotFound(str(exc))
         return PveUnavailable(f"PVE status {status}: {exc}")
     if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
         return PveUnavailable(f"transport failure: {exc}")
