@@ -254,12 +254,19 @@ class Prober:
             try:
                 self.run_once()
             except Exception as e:  # noqa: BLE001 — DB hiccup is unknown, not fatal
-                for host, _ in self.targets:
+                for target in self.targets:
                     try:
-                        self._record(host, "unknown", None, f"prober error: {e}"[:160])
-                    except Exception:  # noqa: BLE001
-                        break
+                        self._record(target[0], "unknown", None,
+                                     f"prober error: {e}"[:160])
+                    except Exception:  # noqa: BLE001 — DB fully down: keep
+                        break            # looping; the schedule gap shows
             self._stop.wait(self.interval_s)
+
+    def alive(self) -> bool:
+        """Is the probe thread actually running? A dead prober must never
+        masquerade as coverage: gaps stay visible as `missed`, and the
+        staleness flag tells the viewer the probe itself stopped."""
+        return bool(self._thread and self._thread.is_alive())
 
     def start(self) -> "Prober":
         self._thread = threading.Thread(

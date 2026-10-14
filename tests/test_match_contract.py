@@ -199,3 +199,61 @@ def test_disabled_inject_set_releases_nothing():
     assert schedule(db, "sid", match, {"topology": {"hosts": []}}) == []
     db.add.assert_not_called()
     db.commit.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# probe infrastructure failure (plan 13 phase 6: DB failure + dead threads)
+# --------------------------------------------------------------------------- #
+
+def test_prober_survives_db_failure_and_records_unknown_truth():
+    from srplatform.uptime import Prober
+    recorded = []
+    p = Prober("s1", [("web01", "http://x/"), ("db01", "mysql",
+                                                 lambda: ("up", 1, ""))],
+               record=lambda h, s, l, d: recorded.append((h, s, d)),
+               interrupt=lambda r: None)
+
+    def record_then_stop(host, state, latency, detail):
+        recorded.append((host, state, detail))
+        p._stop.set()          # end the loop after the first fallback record
+
+    p.run_once = lambda: (_ for _ in ()).throw(
+        RuntimeError("db connection lost"))
+    p._record = record_then_stop
+    p.interval_s = 0.01
+    p.loop()                    # must NOT raise: a DB hiccup is survivable
+    assert recorded[0][0] == "web01"
+    assert recorded[0][1] == "unknown"      # never fabricated downtime
+    assert "prober error" in recorded[0][2]
+
+    # DB FULLY down: the loop keeps running (no crash), samples just stop —
+    # the schedule gap shows the truth instead.
+    p2 = Prober("s2", [("web01", "http://x/")],
+                record=lambda *a: None, interrupt=lambda r: None)
+
+    def dead_record(*a):
+        p2._stop.set()
+        raise RuntimeError("db gone")
+
+    p2.run_once = lambda: (_ for _ in ()).throw(RuntimeError("db gone"))
+    p2._record = dead_record
+    p2.interval_s = 0.01
+    p2.loop()                   # one full failing iteration, no exception
+
+
+def test_dead_prober_is_detectable_never_fakes_coverage():
+    from srplatform.uptime import Prober, coverage
+    p = Prober("s1", [("web01", "http://x/")],
+               record=lambda *a: None, interrupt=lambda r: None)
+    assert p.alive() is False          # never started: NOT alive
+    p._get = lambda url, timeout: type("R", (), {"status_code": 200,
+                                                 "text": "Minecraft Legends"})()
+    p.start()
+    assert p.alive() is True
+    p.stop()
+    assert p.alive() is False          # dead thread is detectable
+    # and a dead prober shows as schedule GAPS, never as downtime:
+    now = datetime.now(timezone.utc)
+    c = coverage(["up"] * 3, started_at=now - timedelta(seconds=100),
+                 ended_at=now)
+    assert c["missed"] == 7 and c["down"] == 0
