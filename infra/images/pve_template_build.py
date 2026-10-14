@@ -64,8 +64,8 @@ For each template file below (example: 9011 / mojang-web-local; repeat for
     # 3. Cloud-Init (drives per-clone identity regeneration: fresh SSH host
     #    keys + machine-id on every clone; the broker pins the fresh ed25519
     #    host key via the guest-agent FileRead channel — that requires the
-    #    VM.AgentFileRead ACL privilege on the CLONE path /vms, it is NOT a
-    #    VM creation flag):
+    #    VM.GuestAgent.FileRead ACL privilege on the CLONE path /vms (PVE 9
+    #    privilege name; PVE 8 called this VM.AgentFileRead), NOT a VM flag:
     qm set 9011 --ide2 <STORAGE>:cloudinit --ciuser attacker \\
         --ipconfig0 ip=dhcp
     # (range guests get static IPs from the broker's ipconfig0 at clone time;
