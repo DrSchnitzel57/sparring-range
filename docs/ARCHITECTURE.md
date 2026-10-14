@@ -449,6 +449,19 @@ over older prose in this document and the runbook.
 | Automatic backups plus a documented restore procedure, with unconfigured/unverified backups reported conspicuously; backup setup and restore verification are **not release-blocking** | Dropping backup tooling, or reporting unverified backups as protected recovery | User retained the tooling but waived it as a gate; honesty about recovery state is still mandatory |
 | One versioned non-secret release manifest (`deploy/manifest.example.json`, validated by `infra/release_manifest.py`) as the single deployment input; every consumer (env, broker policy, services, templates, installer) is derived from it; secrets referenced as local protected paths only | Drifting hand-edited env/policy/script copies | Derivation plus validation makes manifest/consumer mismatch structurally impossible and keeps secrets out of Git and rendered artifacts |
 
+### Plan 13 implementation decisions (2026-10-14, branch `plan-13-implementation`)
+
+| Chosen | Rejected / deferred | Why |
+|---|---|---|
+| Range guests are **on-link only**: the typed broker policy refuses any `gw=` in `ipconfig0`; every legitimate target (controller range address, bastion, peers) is on-link | Keeping an operator-configurable gateway on clones (a default route is a WAN/management egress path by construction) | Isolation must be impossible to defeat from guest configuration; the plan demands default-route removal via typed policy, not firewall hope |
+| Role-scoped template keys (runner→attacker only, bastion→defender guests, mgmt account, separate explicit emergency), deduplicated, private material refused at build time | One operator key baked into every account on every guest | Lateral compromise of one principal must not authenticate to every guest; break-glass stays an explicit decision |
+| Web and DB are **separate production-shaped artifacts** (DB payload ships no web app; role-conditional units/firewall/verify; per-role overlay cache keys), wired at deploy time to owned IPs with fresh per-deployment reader credentials | The documented superset overlay running one all-in-one app on both tiers | The plan forbids a second all-in-one app as the "DB tier"; deploy-time grants/listener/firewall narrow to owned sources only |
+| Base image pinned to the **dated retained** cloud-image directory with checksum+size enforced; missing pin fails closed | The moving `noble/current` alias | Reproducibility: the artifact a build used is fetchable byte-identically later |
+| Settings accept both the bare field name and the documented `SR_*` name; every shipped example key is proven effective with non-default values | Silently ignored example settings (the plan-13 baseline showed `SR_MATCH_*` ignored) | A setting that looks configured but is ignored defeats every downstream gate |
+| Telemetry HTTPS with an explicit verified SSL context and the public CA provisioned into guests; production refuses http/localhost/missing-anchor APIs | Disabling TLS checks or trusting a system store nobody provisioned | Enrollment capabilities and audit evidence cross the range; verified trust is the authentication |
+| Durable `deploy_operations` rows (identity, fence, phase, deadline committed before effects) + startup reconcile to `interrupted` before claims clear; redacted polling endpoint | Fire-and-forget synchronous launches whose evidence dies with the response | A lost response or restart must never duplicate a deployment or erase the first attempt |
+| `install`/`release` gates FAIL without their real fixtures (service VM / deployed lab); sandbox passes are reported as sandbox passes | Accepting a sandbox or a skip as release acceptance | Green must mean the contract ran; prerequisite absence is a loud failure, never a pass |
+
 ## Risks and explicitly unverified inputs
 
 - Same physical host retains hypervisor/resource-contention risk even with no

@@ -16,6 +16,15 @@ a claim that the current code or any live deployment has passed acceptance.
 - [ ] 8. Deliver and rehearse the operator installer and optional backups.
 - [ ] 9. Collect authorized live evidence and reconcile release documents.
 
+Status (2026-10-14, implementation session): steps 1–2 complete and gated.
+Steps 3–6 and 8 implemented with fast/gate evidence recorded in
+`docs/FINDINGS_CHECKLIST.md` ("Phases 3–8"); step 3 awaits the images/capture
+gate rerun, step 5's db-layer tests await the db gate, and steps 6 (inject
+subsystem + control matrix) and 7 (new browser surfaces: control builder,
+inject inbox, AAR UI) remain explicitly open. Step 9 is operator live
+evidence and stays open by design. Checkboxes are ticked only when the
+step's own gate passes — never on implementation presence alone.
+
 Finish phases in order; each has a stop condition below. Independent tests
 may run in parallel, but unresolved safety or ownership defects block later
 live work. No application implementation or live operation is authorized

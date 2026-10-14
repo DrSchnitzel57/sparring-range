@@ -1084,6 +1084,75 @@ Delivered:
   a code/test anchor in `docs/audits/pve92-alignment.md` "Fix anchors";
   remaining live probes stay explicit operator work.
 
+### Phases 3–8 — guests, configuration, lifecycle, match contract, tooling
+
+Fresh results at the phase-8 revisions (same environment; every command run
+with `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD`):
+
+| Exact command | Fresh result |
+|---|---|
+| `…python -m pytest -q -p no:cacheprovider` (fast default) | Exit 0: **315 passed, 0 failed, 0 skipped, 212 deselected**, 4 warnings, 50.4s |
+| `…acceptance.py frontend` | **PASS** — npm ci, production build, audit zero high/critical |
+| `…acceptance.py compose` | **PASS** — full stack + seed-bastion-keys success gate, cleaned |
+| `…acceptance.py browser` | **PASS** — isolated real-browser workflow + replay, 1 passed |
+| `…acceptance.py install` | Sandbox contract **PASS** (dry-run, idempotent rerun, key preservation, invalid manifest refused before effects); **FAILS** on the managed-service VM half until the disposable-VM job sets `SR_INSTALL_VM_EVIDENCE` — deliberately not accepted from a sandbox |
+| `…acceptance.py images` / `capture` | running at this recording; results appended below when complete |
+
+Delivered:
+
+- **Phase 3 (guest/template contract)**: `infra/images/role_keys.py` role
+  key policy (runner→attacker only, bastion→defender guests only, mgmt and
+  separate explicit emergency; private/placeholder/unknown refused; dedup);
+  attacker template now carries auditd + shipper (canonical inputs), the
+  reboot-persistent cgroup delegation unit and the scoped AppArmor profile
+  (`infra/runner/`), with verify checks; web/DB tiers separated (DB payload
+  ships no web app; role-conditional units, firewall and verify checks;
+  per-role overlay cache keys); base image pinned to the DATED retained
+  directory `noble/20260926` (byte-identical to the `current` alias as
+  re-verified 2026-10-14; checksum+size enforced); resolved packages
+  recorded from every build including the attacker; deploy-time DB wiring
+  (`srplatform/scenario_engine/guest_config.py` + orchestrator pass):
+  fresh per-deployment reader credential, grants/listener/firewall narrowed
+  to owned web sources + loopback probe, atomic web config to the owned DB
+  IP with read-back, resume-idempotent, visible skip (event) without a
+  channel; verifier reads the credential inside the guest; template build
+  takes per-principal public keys and defaults to all three roles.
+  17 fast contract tests (`tests/test_guest_contract.py`).
+- **Phase 4 (configuration/trust/readiness)**: settings now honor the
+  documented `SR_*` env names (the plan-13 baseline probe
+  `SR_MATCH_SCHEDULER_ENABLED=1`/`SR_MATCH_DEFAULT_DURATION_MINUTES=60`
+  resolves True/60; bare names unchanged); 55 compatibility tests prove
+  EVERY key of EVERY shipped example reaches the model with non-default
+  values; shipper HTTPS uses an explicit verified SSL context
+  (`SR_TLS_CA_FILE`), enrollment provisions the public CA into guests,
+  production refuses http/localhost/missing-anchor APIs; readiness refuses
+  created clones without pinned host keys; confirmed teardown unpublishes
+  pins; boot-race 255 retry now distinguishes definitive auth/pin failures;
+  private keys parse-checked at startup with ssh-keygen-format fingerprints
+  recorded in `TEMPLATE-INFO.json` for rotation drift detection; typed
+  broker policy REFUSES `gw=` — range guests are on-link only, no default
+  route by construction.
+- **Phase 5 (durable lifecycle operations)**: `deploy_operations` table
+  (migration 0014) + orchestrator helpers; launch/reset commit identity,
+  fence, phase and deadline BEFORE effects; redacted
+  `GET /sessions/{id}/operation` polling; startup reconcile marks dead
+  executors `interrupted` before clearing claims (live fences survive;
+  stale requests cannot finalize replacements); 4 db-layer tests pending
+  the db gate.
+- **Phase 6 (match contract, partial)**: snapshot v2 freezes bounded
+  choices (mode practice|competition, start condition manual|auto-on-ready,
+  intensity pace ∈ {0,15,30,60}, injects toggle) with 422 before
+  storage; `uptime.coverage` computes the EXPECTED schedule from the match
+  clock — gaps are visible `missed`, unknown ≠ downtime, zero valid
+  unscored. **Open requirement:** the versioned inject subsystem
+  (restricted-account/web-restoration/DB-recovery/incident-report) and the
+  full control-matrix live tests remain unimplemented; the release gate
+  exists but refuses to run without a deployed lab.
+- **Phase 8 (installer/gates)**: `deploy/install.sh` (idempotent,
+  key-preserving, verify-before-enable, explicit migrations, optional
+  backups) + `install`/`release` acceptance gates with honest
+  prerequisite refusal.
+
 ## Recording new acceptance evidence
 
 For every gate record: date, evidence Git revision and dirty status, exact command
