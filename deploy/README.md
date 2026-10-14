@@ -89,7 +89,10 @@ systemctl daemon-reload && systemctl enable --now sr-brokerd
 ```
 
 PVE side (operator, on the host UI or `pveum`): create realm user
-`sr-broker@pve` with API token `range`, ACLs ONLY for the policy's node,
+`sr-broker@pve` with API token `range` — the user name in
+`PROXMOX_TOKEN_ID` must match the realm user EXACTLY (a stray hyphen
+answers 401 "Authentication failed!", not 403) — ACLs ONLY for the
+policy's node,
 template VMIDs, VMID range and storages (`VM.Audit, VM.Clone, VM.Allocate,
 VM.Config.Network, VM.Config.Cloudinit, VM.Config.Options, VM.PowerMgmt,
 VM.GuestAgent.FileRead, Datastore.Allocate, Datastore.AllocateSpace` — on
@@ -99,7 +102,13 @@ called it `VM.Create`); `VM.Config.Cloudinit` covers the per-clone
 `ipconfig0`, `VM.Config.Options` the ownership `tags`. `VM.Clone`
 only on the two template VMIDs; plus `Sys.Audit` on `/nodes/<node>` —
 without it PVE hides the whole `/nodes/<node>/...` API subtree from the
-token ("no such file" on every call despite full `/vms` rights).
+token ("no such file" on every call despite full `/vms` rights); plus
+`SDN.Use` on the range bridge object `/sdn/zones/localnetwork/<bridge>`
+(PVE 8+ treats every bridge as an SDN object — without it the clone
+task itself starts and then dies with `403 Permission check failed
+(/sdn/zones/localnetwork/<bridge>, SDN.Use)`; live find 2026-10-14:
+`pveum role add SRBrokerSdn --privs "SDN.Use" && pveum acl modify
+/sdn/zones/localnetwork/srrange --users srbroker@pve --roles SRBrokerSdn`).
 `VM.GuestAgent.FileRead` is what lets the broker pin each fresh clone's
 SSH host key (no TOFU). Never `Admin.*`. The broker refuses any operation
 the policy file does not fully determine (fail closed).

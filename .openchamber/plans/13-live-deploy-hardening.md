@@ -40,6 +40,10 @@ fence caught and what layer should have caught it earlier.
       'nodes/<n>/qemu-server/<vmid>.conf' does not exist" — classified as
       confirmed absence + tests (`d45f8f7`); this unblocked `next_vmid`
       against the real host.
+- [x] PVE 9 SDN bridge check: cloning a NIC onto a bridge requires
+      `SDN.Use` on `/sdn/zones/localnetwork/<bridge>` — clone task starts
+      then dies 403 without it (live find 2026-10-14; runbook documents
+      `SRBrokerSdn` role + ACL line).
 
 ## Remaining improvements
 - [ ] Production settings validation: refuse to start `sr-api` with
