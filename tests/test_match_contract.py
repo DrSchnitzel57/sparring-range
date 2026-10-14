@@ -51,6 +51,22 @@ def test_snapshot_freezes_versioned_choices():
     assert snap["pace_seconds"] == 15 and snap["duration_minutes"] == 45
 
 
+def test_snapshot_freezes_scenario_and_effective_versions():
+    """History can never be re-scored against a later library state."""
+    from unittest.mock import MagicMock
+
+    from srplatform.lifecycle import create_match
+    db = MagicMock()
+    m = create_match(db, "sid", "mojang-web-db-01",
+                     scenario_versions={"scenario_version": 3,
+                                        "image_version": "noble-20260926",
+                                        "scenario_sha256": "ab" * 32},
+                     effective_settings={"uptime_scoring_enabled": True})
+    assert m.snapshot["scenario_versions"]["image_version"] == "noble-20260926"
+    assert m.snapshot["scenario_versions"]["scenario_sha256"] == "ab" * 32
+    assert m.snapshot["effective_settings"]["uptime_scoring_enabled"] is True
+
+
 # --------------------------------------------------------------------------- #
 # schedule-aware coverage
 # --------------------------------------------------------------------------- #
@@ -85,3 +101,63 @@ def test_coverage_open_clock_and_empty_window():
     c = coverage([], started_at=now - timedelta(seconds=100), ended_at=None)
     assert c["expected_checks"] == 10 and c["missed"] == 10
     assert not c["scored"] and c["received"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# MySQL business probe (plan 13 phase 6)
+# --------------------------------------------------------------------------- #
+
+def test_mysql_probe_command_is_select_only_with_in_guest_password():
+    from srplatform.uptime import mysql_probe_command
+    cmd = mysql_probe_command()
+    assert "SELECT COUNT(*)" in cmd and "INSERT" not in cmd.upper().replace(
+        "SELECT", "")
+    # credential never crosses the channel: read INSIDE the guest
+    assert "--password=\"$(cat /etc/mojang-web/reader-pw)\"" in cmd
+    assert "--host=127.0.0.1" in cmd
+
+
+def test_mysql_probe_three_truths_separate():
+    from srplatform.uptime import ProbeInfraError, probe_mysql
+
+    def runner(rc, out):
+        return lambda ip, cmd: (rc, out)
+
+    assert probe_mysql(runner(0, "12\n"), "10.0.0.5")[0] == "up"
+    # reachable DB, WRONG business answer => down (not up, not unknown)
+    assert probe_mysql(runner(0, "9\n"), "10.0.0.5")[0] == "down"
+    # session never established => cannot tell whether the query ran
+    assert probe_mysql(runner(255, "ssh: connect"), "10.0.0.5")[0] == "unknown"
+    # refused connection => target down
+    assert probe_mysql(runner(1, "ERROR 2002: Can't connect to "
+                                 "local MySQL server (111)"),
+                       "10.0.0.5")[0] == "down"
+    # OUR credential broken => probe infrastructure, never target downtime
+    try:
+        probe_mysql(runner(1, "ERROR 1045: Access denied for user"),
+                    "10.0.0.5")
+        raise AssertionError("expected ProbeInfraError")
+    except ProbeInfraError:
+        pass
+    # channel machinery itself failing => infrastructure too
+    def broken(ip, cmd):
+        raise OSError("ssh binary vanished")
+    try:
+        probe_mysql(broken, "10.0.0.5")
+        raise AssertionError("expected ProbeInfraError")
+    except ProbeInfraError:
+        pass
+
+
+def test_prober_dispatches_http_and_mysql_targets():
+    from srplatform.uptime import Prober
+    seen = []
+    p = Prober("s1", [("web01", "http://x/"), ("db01", "mysql",
+                                                 lambda: ("up", 5, "rows"))],
+               record=lambda h, s, l, d: seen.append((h, s)),
+               interrupt=lambda r: seen.append(("interrupt", r)))
+    p._get = lambda url, timeout: type("R", (), {"status_code": 200,
+                                                 "text": "Minecraft Legends"})()
+    p.run_once()
+    assert ("web01", "up") in seen and ("db01", "up") in seen
+    assert len(seen) == 2

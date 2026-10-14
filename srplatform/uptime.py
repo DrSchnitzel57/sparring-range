@@ -16,6 +16,7 @@ This score stays SEPARATE from the security scorecard — no combined grade.
 """
 from __future__ import annotations
 
+import functools
 import threading
 import time
 from datetime import datetime, timezone
@@ -149,17 +150,77 @@ def coverage_for_session(db, session_id, *, started_at, ended_at=None,
                     interval_s=interval_s)
 
 
+# ------------------------------------------------- MySQL business probe ------
+#: Pinned seed facts (paired 03+04): the seeded catalogue has exactly this
+#: many purchase rows; a business transaction that answers anything else is
+#: NOT healthy, however bright the process looks.
+MYSQL_TABLE = "purchases"
+MYSQL_EXPECTED_ROWS = 12
+
+
+def mysql_probe_command(table: str = MYSQL_TABLE) -> str:
+    """SELECT-only by construction; the reader password is read INSIDE the
+    guest (never crosses the channel), and the connection is loopback on the
+    owned DB guest — the same authenticated path the mysql_rows verifier
+    uses (plan 13 phase 6: business transactions, not target-local claims
+    of health)."""
+    return ("mysql --protocol=TCP --host=127.0.0.1 --batch --skip-column-names "
+            '-u mojang_reader --password="$(cat /etc/mojang-web/reader-pw)" '
+            f"mojang -e 'SELECT COUNT(*) FROM `{table}`'")
+
+
+def probe_mysql(runner, ip: str, *, table: str = MYSQL_TABLE,
+                expected: int = MYSQL_EXPECTED_ROWS):
+    """One authenticated read-only business transaction through the
+    management channel. Classification keeps the three truths separate:
+    wrong answer from a reachable DB is DOWN; an unestablished session is
+    UNKNOWN (cannot tell whether the query ran); broken probe credentials
+    are a PROBE INFRASTRUCTURE failure, never target downtime."""
+    t0 = time.monotonic()
+    try:
+        code, out = runner(ip, mysql_probe_command(table))
+    except ProbeInfraError:
+        raise
+    except Exception as e:  # noqa: BLE001 — channel itself unhealthy
+        raise ProbeInfraError(f"management channel call failed: {e}") from e
+    latency = int((time.monotonic() - t0) * 1000)
+    text = str(out or "").strip()
+    if code == 255:
+        return ("unknown", latency,
+                "ssh session not established — cannot tell whether the "
+                "query ran")
+    if code == 0:
+        last = text.splitlines()[-1].strip() if text else ""
+        if last == str(expected):
+            return "up", latency, f"{table}={expected}"
+        return "down", latency, f"{table} count wrong: {last[:60]!r}"
+    low = text.lower()
+    if "access denied" in low or "unknown user" in low:
+        # OUR credential is broken — scoring truth is compromised, this is
+        # not the target's downtime.
+        raise ProbeInfraError(f"probe credential refused by target: {text[:120]}")
+    if "refused" in low or "can't connect" in low or "unknown host" in low:
+        return "down", latency, text[:120]
+    return "unknown", latency, f"exit {code}: {text[:120]}"
+
+
 # ------------------------------------------------------------------ prober ---
 class Prober:
     """One thread per running match: probes every 10 s, appends samples,
     and on a CONFIRMED infrastructure failure records the truth and
-    interrupts the match (via the injected `interrupt` callback)."""
+    interrupts the match (via the injected `interrupt` callback).
 
-    def __init__(self, session_id, targets: list[tuple[str, str]], *,
+    Targets are ``(host, url)`` for HTTP/content checks or
+    ``(host, "mysql", callable)`` where the callable performs one
+    authenticated business transaction and returns
+    ``(state, latency_ms, detail)`` (plan 13 phase 6: availability is
+    proven by real transactions against owned targets, not by pings)."""
+
+    def __init__(self, session_id, targets: list[tuple], *,
                  interval_s: float = INTERVAL_S, timeout_s: float = TIMEOUT_S,
                  record, interrupt, get=None, marker: str = CONTENT_MARKER):
         self.session_id = session_id
-        self.targets = targets           # [(host, url)]
+        self.targets = targets           # [(host, url)] or [(host, "mysql", fn)]
         self.interval_s = interval_s
         self.timeout_s = timeout_s
         self._record = record            # (host, state, latency_ms, detail) -> None
@@ -170,11 +231,16 @@ class Prober:
         self._thread: threading.Thread | None = None
 
     def run_once(self) -> None:
-        for host, url in self.targets:
+        for target in self.targets:
+            host, kind, spec = (target[0], target[1], target[2]) \
+                if len(target) == 3 else (target[0], "http", target[1])
             try:
-                state, latency, detail = probe_once(
-                    url, timeout_s=self.timeout_s, marker=self._marker,
-                    _get=self._get)
+                if kind == "mysql":
+                    state, latency, detail = spec()
+                else:
+                    state, latency, detail = probe_once(
+                        spec, timeout_s=self.timeout_s, marker=self._marker,
+                        _get=self._get)
             except ProbeInfraError as e:
                 self._interrupt(f"probe infrastructure failure: {e}")
                 self._stop.set()
@@ -232,6 +298,21 @@ def start_for_session(db, sess, dep, *, get=None) -> bool:
     targets = [(r.get("host", "web"), f"http://{r['ip']}/")
                for r in (dep.resources or [])
                if r.get("ip") and r.get("host") in http_hosts]
+    # plan 13 phase 6: hosts whose DB tier was provisioned also get an
+    # authenticated read-only BUSINESS TRANSACTION probe every cycle —
+    # availability is proven by the seeded data answering correctly, not
+    # by the port being open. No channel => no mysql target (never a
+    # fabricated or claim-based probe).
+    db_hosts = [r for r in (dep.resources or [])
+                if r.get("ip") and r.get("db_configured")]
+    if db_hosts:
+        from srplatform.scenario_engine.orchestrator import management_runner
+        runner = management_runner()
+        if runner is not None:
+            for r in db_hosts:
+                targets.append((r.get("host", "db"), "mysql",
+                                functools.partial(probe_mysql, runner,
+                                                  r["ip"])))
     if not targets:
         return False
     deployment_id = str(dep.deployment_id)

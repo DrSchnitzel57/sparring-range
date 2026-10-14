@@ -303,6 +303,7 @@ def create_session(body: SessionCreate, p: Principal = Depends(any_member),
     from srplatform import lifecycle
     s = get_settings()
     try:
+        spec_v = load_scenario(body.scenario_id)
         lifecycle.create_match(
             db, sess.session_id, body.scenario_id,
             duration_minutes=body.duration_minutes or s.match_default_duration_minutes,
@@ -310,6 +311,14 @@ def create_session(body: SessionCreate, p: Principal = Depends(any_member),
                           else body.pace_seconds),
             mode=body.mode, start_condition=body.start_condition,
             injects_enabled=body.injects_enabled,
+            scenario_versions={"scenario_version": spec_v.get("version"),
+                               "rubric_version": spec_v.get("rubric_version"),
+                               "seed_version": spec_v.get("seed_version"),
+                               "image_version": spec_v.get("image_version"),
+                               "scenario_sha256": sha},
+            effective_settings={
+                "uptime_scoring_enabled": s.uptime_scoring_enabled,
+                "scheduler_enabled": s.match_scheduler_enabled},
             actor=p.username)
     except ValueError as e:
         raise HTTPException(422, {"error": "invalid_match_parameters",

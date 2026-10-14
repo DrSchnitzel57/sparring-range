@@ -71,10 +71,15 @@ def create_match(db, session_id, preset: str, *, duration_minutes: int = 30,
                  pace_seconds: int = 30, mode: str = "practice",
                  start_condition: str = "manual",
                  injects_enabled: bool = True,
+                 scenario_versions: dict | None = None,
+                 effective_settings: dict | None = None,
                  actor: str = "system") -> MatchModel:
     """Snapshot the effective match parameters AT SESSION CREATION.
     Every choice is BOUNDED (plan 13 phase 6): an unbounded cadence or an
-    unknown mode/start condition is refused before anything is stored."""
+    unknown mode/start condition is refused before anything is stored.
+    ``scenario_versions`` freezes the topology/template/rubric/seed versions
+    and scenario digest in force NOW, so history can never be re-scored
+    against a later library state."""
     if mode not in MATCH_MODES:
         raise ValueError(f"mode must be one of {MATCH_MODES}")
     if start_condition not in START_CONDITIONS:
@@ -93,6 +98,8 @@ def create_match(db, session_id, preset: str, *, duration_minutes: int = 30,
                   "pace_seconds": pace_seconds, "mode": mode,
                   "start_condition": start_condition,
                   "injects_enabled": bool(injects_enabled),
+                  "scenario_versions": dict(scenario_versions or {}),
+                  "effective_settings": dict(effective_settings or {}),
                   "ready_idle_expiry_minutes": READY_IDLE_EXPIRY_MINUTES,
                   "snapshot_at": _now().isoformat(), "snapshotted_by": actor})
     db.add(m)

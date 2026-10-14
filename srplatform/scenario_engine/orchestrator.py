@@ -336,6 +336,15 @@ def _enrollment_channel():
     return None
 
 
+def management_runner():
+    """Public bounded management-channel runner (plan 13 phase 6): returns
+    a callable ``(ip, command) -> (exit_code, output)`` or None when no
+    channel is configured. The uptime MySQL business probe reads through
+    the SAME authenticated path the verifier uses — one read-only command
+    per call, no boot-race replay (the target is long booted)."""
+    return _enrollment_channel()
+
+
 def _recover_telemetry_token(db: Session, session_id, host: str,
                              deployment_id=None) -> tuple[str, str] | None:
     """Recover the issued plaintext + nonce after a lost deployment response:
