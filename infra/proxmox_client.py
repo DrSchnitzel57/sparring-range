@@ -362,10 +362,17 @@ class ProxmoxClient:
                 f"{resp!r}")
         content = resp["content"].strip()
         parts = content.split()
-        if len(parts) != 2 or parts[0] != "ssh-ed25519" or len(parts[1]) < 32:
+        # Live find 2026-10-14: cloud-init's ssh module appends a
+        # `root@hostname` COMMENT to generated host keys — a perfectly
+        # valid 3-field .pub line. The key material is parts[:2]; the
+        # comment is dropped, because the pin feeds known_hosts lines,
+        # which carry no comment and must match what sshd presents.
+        if len(parts) not in (2, 3) or parts[0] != "ssh-ed25519" \
+                or len(parts[1]) < 32:
             raise PveUnavailable(
                 f"guest-agent host-key response for vmid {vmid} is not a "
                 "bounded ssh-ed25519 public key")
+        content = " ".join(parts[:2])
         if len(content) > 1024 or "\n" in content:
             raise PveUnavailable(
                 f"guest-agent host-key response for vmid {vmid} exceeds bounds")

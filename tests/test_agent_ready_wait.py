@@ -81,6 +81,26 @@ def test_read_when_ready_retries_empty_key_until_cloud_init_regenerates():
                if "/agent/file-read" in p) == 3
 
 
+def test_read_guest_file_accepts_and_strips_hostname_comment():
+    # Live find 2026-10-14: cloud-init writes `ssh-ed25519 <b64>
+    # root@hostname` — valid, but the pin/known_hosts format carries no
+    # comment, so the comment must be stripped from the returned key.
+    c, http = _client_with_vm()
+    http.vms[9100]["guest_host_key"] = (
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF5/Yr9SC+IM2Q04FRm7jVdxbaK0"
+        "9b+3DPZ+wEARcfzI root@sr-mojang-web-01-attacker-9233821e")
+    key = c.read_guest_file("r740", 9100, HOSTKEY)
+    assert key.startswith("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF5")
+    assert len(key.split()) == 2 and "root@" not in key
+
+
+def test_read_guest_file_rejects_four_field_garbage():
+    c, http = _client_with_vm()
+    http.vms[9100]["guest_host_key"] = "ssh-ed25519 " + "A" * 40 + " a b"
+    with pytest.raises(PveUnavailable):
+        c.read_guest_file("r740", 9100, HOSTKEY)
+
+
 def test_host_key_read_survives_first_boot_window():
     """The broker's read_host_key rides out the live 500 dialect and pins
     the key; the fake never saw a separate status endpoint (501 lesson)."""
