@@ -116,13 +116,90 @@ def release_operation(db: Session, session_id, owner: str | None = None) -> bool
 
 def clear_operation_claims(db: Session) -> int:
     """API startup reconciliation: claims only have meaning while the single
-    API process is alive; anything left over belongs to a dead request."""
+    API process is alive; anything left over belongs to a dead request.
+
+    Deploy-operation rows are reconciled FIRST (plan 13 phase 5): an
+    accepted/running operation whose executor died becomes `interrupted`
+    with loud evidence, so clearing its claim can never make a dead
+    attempt look like one that is still in flight."""
+    reconcile_deploy_operations(db)
     n = 0
     for row in db.execute(select(OperationClaim)).scalars().all():
         db.delete(row)
         n += 1
     db.commit()
     return n
+
+
+# ------------------------------------------------- durable deploy operations --
+def begin_deploy_operation(db: Session, session_id, operation: str, *,
+                           fence: str, deadline_s: int):
+    """DURABLE ACCEPTANCE (plan 13 phase 5): identity, owner fence, phase and
+    deadline are committed BEFORE the first side effect. A caller that loses
+    the response can still find this row; a duplicate request finds the live
+    claim and is refused, so no second deployment exists."""
+    from srplatform.db.models import DeployOperation
+    row = DeployOperation(session_id=session_id, operation=operation,
+                          state="accepted", phase="queued", fence=fence,
+                          deadline_at=_now() + timedelta(seconds=deadline_s))
+    db.add(row)
+    db.commit()
+    return row
+
+
+def advance_deploy_operation(db: Session, row, phase: str) -> None:
+    """Phase/progress transitions commit immediately: a poller sees where the
+    attempt really is, and a crash leaves the LAST phase it reached."""
+    from srplatform.db.models import DeployOperation
+    row = db.get(DeployOperation, row.operation_id)
+    if row is None or row.state in ("succeeded", "failed", "interrupted"):
+        return
+    row.state = "running"
+    row.phase = phase
+    row.updated_at = _now()
+    db.commit()
+
+
+def finish_deploy_operation(db: Session, row, state: str, *,
+                            error: str | None = None) -> None:
+    """Terminal outcome, committed. `error` is redacted + bounded by the
+    caller; full provisioning commands and secrets never reach this row."""
+    from srplatform.db.models import DeployOperation
+    row = db.get(DeployOperation, row.operation_id)
+    if row is None:
+        return
+    row.state = state
+    row.error = (error or None) and str(error)[:500]
+    row.completed_at = _now()
+    row.updated_at = row.completed_at
+    db.commit()
+
+
+def reconcile_deploy_operations(db: Session) -> int:
+    """Startup: operations still accepted/running belong to an executor that
+    died with the process. Mark them `interrupted` — never silently resumed,
+    never deleted; the range stays owned and the next launch resumes through
+    the durable deployment inventory."""
+    from srplatform.db.models import DeployOperation
+    rows = db.execute(select(DeployOperation).where(
+        DeployOperation.state.in_(("accepted", "running")))).scalars().all()
+    for row in rows:
+        row.state = "interrupted"
+        row.error = "executor lost (API restart) — range stays owned; " \
+                    "next launch resumes"
+        row.completed_at = _now()
+        row.updated_at = row.completed_at
+    db.commit()
+    return len(rows)
+
+
+def latest_deploy_operation(db: Session, session_id):
+    from srplatform.db.models import DeployOperation
+    return db.execute(
+        select(DeployOperation)
+        .where(DeployOperation.session_id == session_id)
+        .order_by(DeployOperation.created_at.desc())
+    ).scalars().first()
 
 
 def _now():

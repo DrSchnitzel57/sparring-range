@@ -138,6 +138,10 @@ class Settings(BaseSettings):
     # a clone starts, ssh exits 255 ("session never established") until sshd
     # finishes booting; enrollment retries provisioning within this window.
     management_ready_wait_s: int = 90
+    # Durable lifecycle operations (plan 13 phase 5): the declared bound for
+    # one launch/reset attempt, recorded BEFORE dispatch so pollers and
+    # reconciliation see the same deadline the executor works against.
+    deploy_operation_deadline_s: int = 900
     enroll_capture_timeout_s: int = 30
     # local-dev command-group identity sidecar directory (audit F7): the
     # LocalDevRunner records each command group's identity here so the API's

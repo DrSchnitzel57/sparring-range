@@ -362,10 +362,43 @@ class UptimeSample(Base):
     )
 
 
+class DeployOperation(Base):
+    """Durable lifecycle-operation record (plan 13 phase 5): identity,
+    owner/fence, phase, deadline, progress and outcome are committed
+    BEFORE the first side effect, so a browser disconnect, a lost
+    response or an API restart can never duplicate a deployment or erase
+    the evidence of the first attempt. Mutable operational state (like
+    range_lease / operation_claims): transitions are also appended as
+    events; rows are never deleted.
+
+    States: accepted -> running -> succeeded | failed; accepted/running
+    rows found at startup are reconciled to interrupted (the executor died
+    with the process — the range stays owned, the next launch resumes)."""
+
+    __tablename__ = "deploy_operations"
+
+    operation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.session_id"), nullable=False)
+    operation: Mapped[str] = mapped_column(Text, nullable=False)  # launch|reset
+    state: Mapped[str] = mapped_column(Text, nullable=False, default="accepted")
+    phase: Mapped[str] = mapped_column(Text, nullable=False, default="queued")
+    fence: Mapped[str] = mapped_column(Text, nullable=False)  # owner token (T02)
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    progress: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    error: Mapped[str | None] = mapped_column(Text)  # redacted, bounded
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class Recording(Base):
     """Opaque recording identities (F16): clients reference recording_ids,
     never filesystem paths. Paths live server-side only."""
-
     __tablename__ = "recordings"
 
     recording_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

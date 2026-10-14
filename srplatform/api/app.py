@@ -396,6 +396,23 @@ def _require_session_operations_resolved(db, session_id) -> None:
                     "release blocked until cessation is genuinely confirmed"})
 
 
+def _fail_deploy_operation(session_id, fence: str | None, error: str) -> None:
+    """Record the failed outcome through a SEPARATE session (the request
+    transaction is discarded by the raise) and ONLY for the attempt this
+    request still fences — a stale request never finalizes a replacement."""
+    from srplatform.db.session import db as db_ctx
+    from srplatform.scenario_engine import orchestrator
+    try:
+        with db_ctx() as s2:
+            row = orchestrator.latest_deploy_operation(s2, session_id)
+            if row is not None and row.fence == fence and row.state in (
+                    "accepted", "running"):
+                orchestrator.finish_deploy_operation(s2, row, "failed",
+                                                     error=error)
+    except Exception:  # noqa: BLE001 — evidence is best-effort, the raise is not
+        pass
+
+
 def _release_claim_safely(db, session_id, succeeded: bool, owner: str | None = None) -> None:
     """Release the durable operation claim WITHOUT ever rolling back the
     request's own successful writes (the request transaction commits after
@@ -443,6 +460,14 @@ def launch_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
         _claim_owner = orchestrator.claim_operation(db, sess.session_id, "launch")
     except orchestrator.OperationInProgress as e:
         raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
+    # DURABLE ACCEPTANCE (plan 13 phase 5): the attempt's identity, fence,
+    # phase and deadline are committed BEFORE any side effect; a lost
+    # response never creates a second deployment, and a restart reconciles
+    # this row to `interrupted` instead of forgetting the attempt.
+    from srplatform.settings import get_settings as _gs_op
+    op_row = orchestrator.begin_deploy_operation(
+        db, sess.session_id, "launch", fence=_claim_owner,
+        deadline_s=_gs_op().deploy_operation_deadline_s)
     _ok = False
     try:
         try:
@@ -450,6 +475,7 @@ def launch_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
         except orchestrator.LeaseConflict as e:
             raise HTTPException(409, {"error": "range_busy", "holder_session": e.holder_session_id,
                                       "acquired_at": e.acquired_at})
+        orchestrator.advance_deploy_operation(db, op_row, "deploying")
         try:
             result = orchestrator.deploy(db, sess.session_id, sess.scenario_id, get_broker())
         except orchestrator.ForeignResourceError as e:
@@ -462,12 +488,23 @@ def launch_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
         # explicit — machines stay deployed for a documented retry, the
         # session does NOT pretend to be ready.
         from srplatform import verification_service
+        orchestrator.advance_deploy_operation(db, op_row, "readiness")
         instructions, readiness = _finalize_ready(db, sess, p, result,
                                                   verification_service)
         _ok = True
+        orchestrator.finish_deploy_operation(db, op_row, "succeeded")
         return {"session_id": str(sess.session_id), "status": sess.status,
+                "operation_id": str(op_row.operation_id),
                 "deployment": result, "connections": instructions,
                 "readiness": readiness}
+    except HTTPException as e:
+        _fail_deploy_operation(sess.session_id, _claim_owner,
+                               str(e.detail if isinstance(e.detail, (dict, str))
+                                   else e.status_code))
+        raise
+    except Exception as e:  # noqa: BLE001 — recorded, then stays loud
+        _fail_deploy_operation(sess.session_id, _claim_owner, str(e))
+        raise
     finally:
         _release_claim_safely(db, sess.session_id, _ok, _claim_owner)
 
@@ -639,12 +676,17 @@ def reset_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
         _claim_owner = orchestrator.claim_operation(db, sess.session_id, "reset")
     except orchestrator.OperationInProgress as e:
         raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
+    from srplatform.settings import get_settings as _gs_op
+    op_row = orchestrator.begin_deploy_operation(
+        db, sess.session_id, "reset", fence=_claim_owner,
+        deadline_s=_gs_op().deploy_operation_deadline_s)
     _ok = False
     try:
         # stop the worker BEFORE anything is destroyed (audit N03)
         _stop_active_run_or_conflict(db, sess)
         # old machines are about to die — their capabilities must die first
         _revoke_session_capabilities(db, sess.session_id, "reset")
+        orchestrator.advance_deploy_operation(db, op_row, "redeploy")
         try:
             # orchestrator.reset ACQUIRES/VERIFIES the global lease first (R07)
             out = orchestrator.reset(db, sess.session_id, sess.scenario_id, get_broker())
@@ -658,6 +700,7 @@ def reset_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
         # ready), never left claiming the pre-reset state.
         from srplatform import verification_service
         try:
+            orchestrator.advance_deploy_operation(db, op_row, "readiness")
             instructions, readiness = _finalize_ready(db, sess, p, out,
                                                       verification_service)
         except HTTPException as e:
@@ -674,11 +717,43 @@ def reset_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
                 s2.commit()
             raise
         _ok = True
+        orchestrator.finish_deploy_operation(db, op_row, "succeeded")
         out.update({"status": sess.status, "connections": instructions,
+                    "operation_id": str(op_row.operation_id),
                     "readiness": readiness})
         return out
+    except HTTPException as e:
+        _fail_deploy_operation(sess.session_id, _claim_owner,
+                               str(e.detail if isinstance(e.detail, (dict, str))
+                                   else e.status_code))
+        raise
+    except Exception as e:  # noqa: BLE001
+        _fail_deploy_operation(sess.session_id, _claim_owner, str(e))
+        raise
     finally:
         _release_claim_safely(db, sess.session_id, _ok, _claim_owner)
+
+
+@app.get("/sessions/{session_id}/operation")
+def get_session_operation(session_id: uuid.UUID,
+                          p: Principal = Depends(any_member), db: DbSession = None):
+    """Authorized, REDACTED polling of the session's latest lifecycle
+    operation (plan 13 phase 5): state/phase/deadline/outcome only — never
+    provisioning commands, tokens or full errors. A browser disconnect or a
+    504 can consult this to learn what actually happened; the answer can
+    never create a second deployment."""
+    from srplatform.scenario_engine import orchestrator
+    sess = _get_session(db, p, session_id)
+    row = orchestrator.latest_deploy_operation(db, sess.session_id)
+    if row is None:
+        raise HTTPException(404, {"error": "no_operation"})
+    return {"operation_id": str(row.operation_id), "operation": row.operation,
+            "state": row.state, "phase": row.phase,
+            "deadline_at": row.deadline_at.isoformat() if row.deadline_at else None,
+            "error": row.error,
+            "created_at": row.created_at.isoformat(),
+            "updated_at": row.updated_at.isoformat(),
+            "completed_at": row.completed_at.isoformat() if row.completed_at else None}
 
 
 # --- deploy (legacy wrapper — SAME invariants as /launch, audit N03) -------------
