@@ -27,7 +27,7 @@ DEFAULT_TEST_POLICY = {
     "clone_mode": "linked",
     "nic": {"bridge": "vmbr1", "vlan": 66},
     "provision": {"cidr": "10.66.0.0/24", "gateway": "10.66.0.1"},
-    "name_prefix": "",
+    "name_prefix": "sr-",
     "limits": {"max_vms": 12, "cores_per_vm": 4, "memory_mb_per_vm": 8192,
                "disk_gb_per_vm": 48, "max_total_cores": 48,
                "max_total_memory_mb": 98304, "max_total_disk_gb": 512},

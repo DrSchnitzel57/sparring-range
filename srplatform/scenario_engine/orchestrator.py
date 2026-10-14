@@ -843,11 +843,12 @@ def _ownership_tag(session_id) -> str:
 
 
 def _vm_name(scenario_id: str, host_name: str, session_id) -> str:
-    """Exact creation identity name: always ends with the full session id so
-    two sessions can never produce the same name; PVE names are <= 63 chars,
-    so the readable prefix is truncated, NEVER the identity suffix."""
+    """Exact creation identity name: always starts with the shipped broker
+    policy prefix ('sr-') and ends with the full session id so two sessions
+    can never produce the same name; PVE names are <= 63 chars, so the
+    readable middle is truncated, NEVER the identity suffix."""
     sid = _sid(session_id)
-    prefix = f"{scenario_id}-{host_name}"
+    prefix = f"sr-{scenario_id}-{host_name}"
     max_prefix = 63 - 1 - len(sid)
     return f"{prefix[:max_prefix].strip('-')}-{sid}"
 
