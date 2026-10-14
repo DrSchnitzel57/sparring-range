@@ -97,7 +97,9 @@ PVE 9 the guest-agent privileges are `VM.GuestAgent.*` (PVE 8:
 `VM.AgentFileRead`) and spawning new VMIDs needs `VM.Allocate` (PVE 8
 called it `VM.Create`); `VM.Config.Cloudinit` covers the per-clone
 `ipconfig0`, `VM.Config.Options` the ownership `tags`. `VM.Clone`
-only on the two template VMIDs;
+only on the two template VMIDs; plus `Sys.Audit` on `/nodes/<node>` —
+without it PVE hides the whole `/nodes/<node>/...` API subtree from the
+token ("no such file" on every call despite full `/vms` rights).
 `VM.GuestAgent.FileRead` is what lets the broker pin each fresh clone's
 SSH host key (no TOFU). Never `Admin.*`. The broker refuses any operation
 the policy file does not fully determine (fail closed).
