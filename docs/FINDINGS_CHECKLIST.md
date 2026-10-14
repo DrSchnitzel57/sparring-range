@@ -1165,6 +1165,15 @@ Delivered:
   no combined grade. **Open requirement:** the full control-matrix live
   tests and browser inject inbox (phase 7 UI) remain; the release gate
   exists but refuses to run without a deployed lab.
+- **Phase 7 (browser/visibility/reports, partial)**: the live session page
+  now carries the inject inbox (release windows, submissions, separate
+  score); Begin, uptime panel, detections, AAR/replay links, per-user
+  history and server-served SSH instructions already exist; competition
+  visibility is enforced at the API (own sessions only for members;
+  inject/readiness data per-session). Frontend gate PASS (npm ci,
+  production build, zero high/critical). **Open requirement:** the
+  operator safety-panel refinements and the attacker control builder
+  remain unbuilt UI scope.
 - **Phase 8 (installer/gates)**: `deploy/install.sh` (idempotent,
   key-preserving, verify-before-enable, explicit migrations, optional
   backups) + `install`/`release` acceptance gates with honest
