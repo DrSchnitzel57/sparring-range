@@ -10,6 +10,7 @@ truth); scores use only authenticated, generation-bound evidence.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import shutil
 import uuid as uuidlib
@@ -315,7 +316,8 @@ def test_capture_no_logged_secrets_and_forgeable_telemetry_note(client, users):
 
 
 #: Shared overlay cache with the images gate (same inputs key; cold in CI).
-GUEST_CACHE = pathlib.Path("/tmp/sr-guest-cache")
+GUEST_CACHE = pathlib.Path(os.environ.get("SR_GUEST_CACHE",
+                                          "/tmp/sr-guest-cache"))
 
 
 @pytest.fixture(scope="module")

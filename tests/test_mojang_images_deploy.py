@@ -24,7 +24,11 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 
 #: Shared overlay cache across gate runs on one machine (keyed by every
 #: build input; `qemu-img check` on hit). Cold in CI, warm on reruns.
-GUEST_CACHE = pathlib.Path("/tmp/sr-guest-cache")
+# /tmp may be tmpfs (RAM-backed): QEMU builds there compete with the VMs
+# for memory and OOM-kill the gate. Operators/CI set SR_GUEST_CACHE to a
+# disk-backed directory; the default keeps local dev unchanged.
+GUEST_CACHE = pathlib.Path(os.environ.get("SR_GUEST_CACHE",
+                                          "/tmp/sr-guest-cache"))
 
 
 def _qemu_available() -> bool:
