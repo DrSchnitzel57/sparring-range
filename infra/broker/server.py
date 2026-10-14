@@ -26,6 +26,10 @@ CONTROL_OPS = frozenset({
     "vm_status", "inventory", "latch_status", "next_vmid", "clone_and_wait",
     "set_config", "start_and_wait", "stop", "stop_and_confirm",
     "destroy_and_wait", "disown", "hard_stop_all", "renew_lease",
+    # Idle-range lifecycle: disarming is safe while latched (it can never
+    # resume a stopped range — only release_latch does that), and without it
+    # an armed-forever lease re-latches the broker after every session.
+    "disarm_lease",
 })
 
 

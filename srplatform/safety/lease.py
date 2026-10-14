@@ -38,6 +38,7 @@ class ControlHeartbeat:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.last_error: str | None = None
+        self._disarmed = False
 
     def tick(self) -> bool:
         """One renewal cycle. Returns True when a renewal was sent."""
@@ -47,7 +48,19 @@ class ControlHeartbeat:
             self.last_error = f"active check failed: {e}"
             active = True
         if not active:
+            # Range provably idle (DB says no lease holder): disarm the
+            # broker's watchdog lease so an inactive control plane is not
+            # mistaken for a dead one. A latched broker refuses nothing here
+            # — disarming can never resume a stopped range.
+            if not self._disarmed:
+                try:
+                    self.broker.disarm_lease()
+                    self._disarmed = True
+                    self.last_error = None
+                except Exception as e:  # noqa: BLE001 — retry next tick
+                    self.last_error = f"disarm failed: {e}"
             return False
+        self._disarmed = False
         try:
             self.broker.renew_lease(self.holder)
             self.last_error = None

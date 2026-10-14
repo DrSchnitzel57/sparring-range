@@ -165,3 +165,6 @@ class BrokerClient:
 
     def renew_lease(self, holder: str) -> dict:
         return self._call("renew_lease", holder=str(holder))
+
+    def disarm_lease(self) -> None:
+        self._call("disarm_lease")
