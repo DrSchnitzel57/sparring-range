@@ -18,6 +18,7 @@ two launches could collide and destroy each other's machines. Now:
 """
 from __future__ import annotations
 
+import time
 import uuid as uuidlib
 from datetime import datetime, timedelta, timezone
 
@@ -203,6 +204,30 @@ def enrollment_channel_available() -> bool:
                 and os.path.exists(s.verifier_ssh_known_hosts))
 
 
+# Poll interval for the first-boot management-channel retry (tests shorten it).
+_MANAGEMENT_READY_POLL_S = 5.0
+
+
+def _provision_with_boot_wait(chan, ip: str, command: str,
+                              wait_s: float) -> tuple[int, str]:
+    """Run a provisioning command, riding out ONLY the sshd boot race.
+
+    Live find 2026-10-14: right after a clone starts, ssh exits 255
+    ("session never established") until sshd finishes booting — the first
+    live deploy failed enrollment exactly there. 255 means the command
+    NEVER RAN, so retrying the same (idempotent) command is safe and is
+    bounded by `wait_s`. Any other rc is a real answer from the guest and
+    is returned immediately — broken channels still fail fast and visibly
+    (audit: a wrong API address or rejected token must not hide)."""
+    code, tail = chan(ip, command)
+    if code == 255 and wait_s > 0:
+        deadline = time.monotonic() + wait_s
+        while code == 255 and time.monotonic() < deadline:
+            time.sleep(_MANAGEMENT_READY_POLL_S)
+            code, tail = chan(ip, command)
+    return code, tail
+
+
 def _enrollment_channel():
     if _enrollment_exec is not None:
         return _enrollment_exec
@@ -381,7 +406,9 @@ def _enroll_host_telemetry(db: Session, dep: Deployment, res: dict, resources: l
         return persist(phase="unconfigured",
                        note="provisioning channel not configured — dev-mode "
                             "relaxation, visible in readiness")
-    code, tail = chan(ip, _provision_command(host_name, tok, nonce, s))
+    code, tail = _provision_with_boot_wait(
+        chan, ip, _provision_command(host_name, tok, nonce, s),
+        s.management_ready_wait_s)
     if code != 0:
         return persist(phase="provision_failed", error=str(tail)[:200])
     persist(phase="provisioned", provisioned_at=_now().isoformat())

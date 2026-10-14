@@ -113,6 +113,10 @@ class Settings(BaseSettings):
     # callback (delivery) and for the capture probe's audit event (capture).
     # A timeout is a visible enrollment failure, never an assumed pass.
     enroll_confirm_timeout_s: int = 30
+    # First-boot management-channel race (live find 2026-10-14): right after
+    # a clone starts, ssh exits 255 ("session never established") until sshd
+    # finishes booting; enrollment retries provisioning within this window.
+    management_ready_wait_s: int = 90
     enroll_capture_timeout_s: int = 30
     # local-dev command-group identity sidecar directory (audit F7): the
     # LocalDevRunner records each command group's identity here so the API's

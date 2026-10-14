@@ -44,6 +44,12 @@ fence caught and what layer should have caught it earlier.
       `SDN.Use` on `/sdn/zones/localnetwork/<bridge>` — clone task starts
       then dies 403 without it (live find 2026-10-14; runbook documents
       `SRBrokerSdn` role + ACL line).
+- [x] Management-channel first-boot race: enrollment/readiness SSH into a
+      just-started clone exits 255 while sshd boots (live: both clones
+      `provision_failed` one second after deploy). Provisioning now retries
+      ONLY ssh-255 ("command never ran") within
+      `MANAGEMENT_READY_WAIT_S=90`; every other rc still fails fast.
+      4 tests.
 - [x] Guest-agent first-boot race: after `start_and_wait` returns, PVE
       answers agent reads with 500 "QEMU guest agent is not running" for
       tens of seconds — the host-key pin failed there on the FIRST real
