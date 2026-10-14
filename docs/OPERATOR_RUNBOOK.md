@@ -156,6 +156,17 @@ visible. Record only synthetic lab activity, never real admin operations.
 
 ## 5. Production startup and match behavior — target, not shipped
 
+**Plan 13 status note (2026-10-14):** the release-stage ladder is now an
+API fact — `GET /stages` (operator) reports install-ready (config, schema
+at head, state writable; no clone/pin required), lab-ready (+ broker latch
+answers) and attack-authorized (+ explicit `SR_ATTACK_AUTHORIZED=1`, set
+only after §3 isolation and §6 emergency-stop verification). The guest-
+facing range listener serves ONLY the authenticated enrollment/ingest
+routes (`deploy/env.telemetry-listener.example`; deploy/README §2a). The
+member flow below is exercised end-to-end by the browser acceptance gate
+against the Compose stack; live-infrastructure claims remain operator
+gates (§9).
+
 Milestone 10 will supply executable managed guest-service packaging, same-origin
 HTTPS and exact startup/upgrade/recovery commands. Production is not simply dev
 Compose pointed at your real infrastructure. Preserve PostgreSQL 16+ UTF8,
@@ -263,12 +274,19 @@ This default selection is infrastructure-free (milestone 01): DB/containment/
 packet/browser/live are explicit layers, DB and containment membership derives
 from the fixture closure, and the default run has zero prerequisite skips.
 Per-gate acceptance runs through `python infra/dev/acceptance.py <check>`
-(`selection|python|db|containment|authority|packet|frontend|compose|browser`),
+(`selection|python|db|containment|authority|pve-contract|packet|frontend|
+compose|browser|images|capture|install|release`),
 which executes the real commands and fails on absent prerequisites, empty
 selections or cleanup problems. The `authority` gate (milestone 02) needs no
 external service: it exercises the real broker policy, SQLite ledger, mutual-TLS
 server and cessation read-back over loopback. `packet` and `browser` remain
 CI-only on hosts without root/nft or a launchable pinned chromium.
+`images`/`capture` build real Ubuntu artifacts under QEMU — set
+`SR_GUEST_CACHE` to a DISK-backed directory when `/tmp` is tmpfs (RAM), or
+the builds will be OOM-killed. `install` proves the installer contract in a
+sandbox and additionally requires the disposable service-VM job
+(`SR_INSTALL_VM_EVIDENCE=1`); `release` drives the deployed lab
+(`SR_LIVE_BASE_URL`). Both refuse to pass from a sandbox by design.
 
 ### Disposable database integration
 
