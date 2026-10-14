@@ -58,6 +58,17 @@ fence caught and what layer should have caught it earlier.
 - [ ] `rangectl sessions` (list + lease holder) for operators without DB access.
 - [ ] DEMO-DAY.md one-pager: launch → isolation gate checks → teardown →
     latch-release runbook, printable.
+- [ ] **Full PVE 9.2 alignment audit** — scope in
+      `docs/HANDOFF-2026-10-14-live-deploy.md` §6 (API surface, error
+      taxonomy, privilege model, proxmoxer call audit, cloud-init,
+      zfs/storage, docs sweep). Read-only against the live host.
+- [ ] Settle broker ledger residue from the aborted attempts: VMID 9100
+      reserved claim + possible `clone-outcome-unknown` obligation
+      (verify absent in PVE, settle via tools/teardown, never by
+      hand-editing the ledger).
+- [ ] Live blocker carry-over: 401 from `sr-brokerd` while curl with the
+      same token works — restart the service (stale env), retest, then
+      first green Launch (handoff §2).
 
 ## Out of scope
 Re-architecting the lease/latch model; relaxing any policy check;
