@@ -140,6 +140,26 @@ and an intermittent browser command wait; all three were repaired at
 migration restore, bounded event wait) and CI run 37855269245 passed all ten
 jobs on two attempts. Green gate results do not waive plan requirements.
 
+### Plan-13 implementation baseline (2026-10-14, revision `44a712a`)
+
+Fresh reproduction on this branch (`plan-13-implementation`, clean at start,
+fresh uv `.venv`, Python 3.13.5):
+
+- `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 \
+  .venv/bin/python -m pytest -q -ra -p no:cacheprovider` — exit 0:
+  **176 passed, 0 failed, 0 skipped, 206 deselected**, 4 warnings, 19.43s.
+- `.venv/bin/python infra/dev/acceptance.py authority` — **FAILED**:
+  **16 failed, 8 passed, 358 deselected**. All 16 failures are
+  `tests/test_authority_boundary.py` fixtures using the pre-policy name
+  `web01-deadbeef`, rejected by the current `sr-` name policy. Repair the
+  fixtures; never loosen the policy.
+- Settings probe: `SR_MATCH_SCHEDULER_ENABLED=1` /
+  `SR_MATCH_DEFAULT_DURATION_MINUTES=60` resolve to **False/30** — the
+  documented `SR_*` names are ignored by the current settings model.
+
+These are the plan-13 starting failures to repair; the fast default remains
+green and infrastructure-free.
+
 ## Validation commands and safety
 
 - Fast baseline: the pytest command above (infrastructure-free since `ac5a61b`:

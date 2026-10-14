@@ -15,7 +15,27 @@ Topology (three machines + one VLAN):
    inference LXC 10.10.10.197:8096 — model calls only, outside the range
 ```
 
-## 0. Build the templates (any machine with QEMU + network)
+## 0. Release manifest (single non-secret deployment input)
+
+One versioned manifest describes the intended release; every consumer
+(env files, broker policy, systemd services, template import verification,
+the installer) is derived from it. Validate before use:
+
+```bash
+.venv/bin/python -c 'from infra.release_manifest import load_manifest; \
+    m = load_manifest("deploy/manifest.example.json"); print(m.release_revision)'
+```
+
+`deploy/manifest.example.json` carries **candidate** values (node `pve`,
+bridge `srrange`, VLAN 66, storage `local-zfs`, VMIDs 9005/9011/9012,
+9100–9199) that fresh operator discovery must confirm — the installer never
+assumes them. Secrets never enter the manifest: `secret_inputs` maps each
+required secret to a locally protected file the operator installer reads.
+The source-of-truth map and per-role renderings live in
+`infra/release_manifest.py` (`SOURCE_OF_TRUTH_MAP`, `render_broker_policy`,
+`render_env`).
+
+## 1. Build the templates (any machine with QEMU + network)
 
 ```bash
 python infra/images/pve_template_build.py \
@@ -24,7 +44,7 @@ python infra/images/pve_template_build.py \
     --roles attacker,mojang-web-local
 ```
 
-`--pubkey` is the bastion's PUBLIC dial key (see §3) — baked into
+`--pubkey` is the bastion's PUBLIC dial key (see §4) — baked into
 root/defender/attacker at the finalize boot; the private half never leaves
 the bastion. Output: flattened qcow2 + `SHA256SUMS` + `TEMPLATE-INFO.json`
 + `IMPORT-STEPS.md` (the `qm importdisk` → `qm template` procedure, VMIDs
@@ -32,7 +52,7 @@ the bastion. Output: flattened qcow2 + `SHA256SUMS` + `TEMPLATE-INFO.json`
 before import. Rotating the bastion key = rebuild + reimport (per
 generation).
 
-## 1. Control-plane VM (fresh Ubuntu 24.04)
+## 2. Control-plane VM (fresh Ubuntu 24.04)
 
 PostgreSQL 16 (owner/app roles — the app role is DML-only, migrations run
 as owner):
@@ -76,7 +96,7 @@ verify it out-of-band once, then import `https.crt` into the browser/OS or
 accept the pin on first visit. The bastion banner shows the session token
 login; SSH instructions come from the web UI (server-served, re-fetchable).
 
-## 2. Broker VM (fresh Ubuntu 24.04)
+## 3. Broker VM (fresh Ubuntu 24.04)
 
 ```bash
 git clone <repo> /opt/sparring-range && cd /opt/sparring-range
@@ -117,7 +137,7 @@ task itself starts and then dies with `403 Permission check failed
 SSH host key (no TOFU). Never `Admin.*`. The broker refuses any operation
 the policy file does not fully determine (fail closed).
 
-## 3. TLS + keys
+## 4. TLS + keys
 
 ```bash
 BROKER_HOST=broker.range.internal HTTPS_IP=<LAN-IP> SR_TLS_DIR=/etc/sparring-range/tls \
@@ -126,12 +146,12 @@ BROKER_HOST=broker.range.internal HTTPS_IP=<LAN-IP> SR_TLS_DIR=/etc/sparring-ran
 
 Distribute per the script's closing note: CA + `api-client.*` → control
 plane; CA + `broker-server.*` → broker VM; `bastion_ed25519` stays on the
-bastion (its `.pub` goes into §0). The bastion dials guests as **defender**
+bastion (its `.pub` goes into §1). The bastion dials guests as **defender**
 with that key (`BASTION_TARGET_USER=defender`, `BASTION_CLIENT_KEY_PATH`) —
 the root default is replaced; guest root SSH stays reserved for the
 verifier/management key.
 
-## 4. Member onboarding (take-turns accounts)
+## 5. Member onboarding (take-turns accounts)
 
 On the control plane (offline administration exception):
 
@@ -142,9 +162,9 @@ On the control plane (offline administration exception):
 Passwords are scrypt-hashed; per-session bastion capabilities are
 server-issued login tokens (single-use, revoked at end/expiry) — member
 accounts carry no standing range access. Operator-provisioned public keys
-are baked at template build (§0) for emergency console access only.
+are baked at template build (§1) for emergency console access only.
 
-## 5. Match lifecycle the operator will see
+## 6. Match lifecycle the operator will see
 
 * **Launch** → lab `ready`; a ready, un-begun lab **expires after 15
   minutes** and is cleaned up automatically (VMs destroyed, lease freed).
@@ -162,7 +182,7 @@ are baked at template build (§0) for emergency console access only.
   reconciles cleanup on boot. `SR_MATCH_SCHEDULER_ENABLED=1` runs this
   automatically.
 
-## 6. Operator access matrix (operator configures; agent documents)
+## 7. Operator access matrix (operator configures; agent documents)
 
 | Source → Destination | Purpose | Verdict |
 |---|---|---|
@@ -176,7 +196,7 @@ are baked at template build (§0) for emergency console access only.
 | Range guests → telemetry ingest | Installed shipper | allow (narrow) |
 | Range → WAN/DNS/IPv6, Proxmox mgmt, NAS, VLAN 30, inference LXC | — | **deny** |
 
-## 7. Before any attack (Manual checks, plan §Manual checks)
+## 8. Before any attack (Manual checks, plan §Manual checks)
 
 VLAN default-deny verified with positive controls; emergency-stop drill
 (`hard_stop_all` + read-back + latch release); model smoke test through the

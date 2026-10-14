@@ -434,6 +434,21 @@ revisits them with evidence.
 | Bastion dials guests as `defender` with its own keypair (public half baked at template finalize, rotated per generation); SSH instructions served by `GET /sessions/{id}/connections` | Implicit root dial default; browser sessionStorage holding connection secrets | Least-privilege guest identity; instructions survive refresh/other devices without browser-resident secrets |
 | Scheduler thread + startup match reconcile opt-in (`SR_MATCH_SCHEDULER_ENABLED=1`, production env only) | Always-on background cleanup in every process | Shared-database test processes must never run destructive background cleanup against other sessions' fixtures |
 
+### Plan 13 release amendments (approved 2026-10-14)
+
+Plan: `.openchamber/plans/13-live-deploy-hardening.md`. The user explicitly
+amended the release contract as follows; these amendments are authoritative
+over older prose in this document and the runbook.
+
+| Chosen | Rejected / deferred | Why |
+|---|---|---|
+| One combined, phased full-release plan (plan 13); the 4,800-character and one-milestone limits are waived for it; its number is not the roadmap's Windows milestone number; existing acceptance states unchanged and 03/04 keep separate evidence gates | Rewriting the plan as ten separate milestone plans | The operator needs one coherent implementation contract for the end-to-end install/rehearsal goal; splitting would hide cross-phase dependencies |
+| Fresh installation only: the operator removed the old sparring-range installation; **only the network bridge remains**; no service-VM cutover or migration requirement; unexpectedly discovered resources/evidence are preserved and never assumed owned from a name or empty DB | Designing a cutover/migration path for the deleted installation | Reproducible setup replaces tribal knowledge; ownership must still be positively established before any mutation |
+| Scoped, deterministic **operator-run** PVE bootstrap tooling (dry-run, reviewed resource manifest, explicit confirmation, idempotent create/reuse of approved service VMs, templates, roles, ACLs); runtime authority stays restricted; agents never receive host/root credentials | Fully unattended host administration or ad-hoc ACL editing | Bootstrap needs PVE administration the operator must review and execute; improvising ACLs at runtime violates the boundary |
+| Storage suitability proven by **measured** capacity, I/O suitability, quotas and Proxmox/system headroom (installer pre-flight inventory: absent/matching/conflicting/unreadable, refusal before side effects) | Requiring dedicated non-boot disks, or trusting a storage label such as `local-zfs` as capacity proof | User amended the earlier boot-disk restriction; numbers measured at install time are the real safety property, and unrelated disks are never wiped/resized to meet them |
+| Automatic backups plus a documented restore procedure, with unconfigured/unverified backups reported conspicuously; backup setup and restore verification are **not release-blocking** | Dropping backup tooling, or reporting unverified backups as protected recovery | User retained the tooling but waived it as a gate; honesty about recovery state is still mandatory |
+| One versioned non-secret release manifest (`deploy/manifest.example.json`, validated by `infra/release_manifest.py`) as the single deployment input; every consumer (env, broker policy, services, templates, installer) is derived from it; secrets referenced as local protected paths only | Drifting hand-edited env/policy/script copies | Derivation plus validation makes manifest/consumer mismatch structurally impossible and keeps secrets out of Git and rendered artifacts |
+
 ## Risks and explicitly unverified inputs
 
 - Same physical host retains hypervisor/resource-contention risk even with no

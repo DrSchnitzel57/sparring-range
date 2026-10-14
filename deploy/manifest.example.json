@@ -1,0 +1,85 @@
+{
+  "manifest_version": 1,
+  "_comment": "CANDIDATE example (plan 13): node pve, bridge srrange, VLAN 66, storage local-zfs, VMIDs 9005/9011/9012 and 9100-9199 are values to VERIFY with fresh operator discovery, never silent assumptions. Copy, verify every value, then use. Contains no secrets.",
+  "release": {
+    "revision": "44a712a"
+  },
+  "pve": {
+    "node": "pve",
+    "clone_vmid_range": [9100, 9199]
+  },
+  "network": {
+    "bridge": "srrange",
+    "vlan": 66,
+    "range_cidr": "10.66.0.0/24",
+    "gateway": "10.66.0.1"
+  },
+  "storage": {
+    "name": "local-zfs",
+    "clone_mode": "full"
+  },
+  "templates": {
+    "attacker": {
+      "vmid": 9005,
+      "sha256": "a8c78964f1d6629df37176a188dc143a73b1867d44f651232b5f0f9d43a4032a"
+    },
+    "mojang-web-local": {
+      "vmid": 9011,
+      "sha256": "653259af19c1b6b0ea617830a16f2cfbb31796dd363a5948021652a94b87e17c"
+    },
+    "mojang-web-db": {
+      "vmid": 9012,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  "service_vms": {
+    "control_plane": {
+      "name": "sr-service-01",
+      "vmid": 9001,
+      "ip": "10.60.0.11"
+    },
+    "broker": {
+      "name": "sr-broker-01",
+      "vmid": 9002,
+      "ip": "10.60.0.12"
+    }
+  },
+  "budgets": {
+    "max_vms": 3,
+    "guest_vcpus": 2,
+    "guest_ram_mb": 2048,
+    "guest_disk_gb": 16,
+    "disk_gb_total": 44
+  },
+  "headroom": {
+    "min_free_gb": 60,
+    "min_reserve_gb": 40
+  },
+  "urls": {
+    "public_https": "https://10.60.0.11:8443",
+    "internal_api": "http://127.0.0.1:8000",
+    "ingest": "https://10.66.0.2:8444"
+  },
+  "trust": {
+    "san_ips": ["10.60.0.11", "10.66.0.2"],
+    "ca_identity": "sr-range-ca"
+  },
+  "model": {
+    "base_url": "http://10.60.0.20:8080/v1",
+    "alias": "qwen3.8-flash-next"
+  },
+  "state_paths": {
+    "data_dir": "/var/lib/sparring-range",
+    "recordings_dir": "/var/lib/sparring-range/recordings",
+    "safety_state_file": "/var/lib/sparring-range/safety_state.json"
+  },
+  "backup": {
+    "enabled": false
+  },
+  "secret_inputs": {
+    "owner_db_url": "/etc/sparring-range/secrets/owner_db_url",
+    "app_db_password": "/etc/sparring-range/secrets/app_db_password",
+    "pve_token_value": "/etc/sparring-range/secrets/pve_token_value",
+    "model_api_key": "/etc/sparring-range/secrets/model_api_key"
+  }
+}

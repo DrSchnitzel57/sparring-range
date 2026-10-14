@@ -349,3 +349,19 @@ milestone 12 (Windows/AD) below. It accepts and ticks NO milestone: milestones
 stays explicitly open. Implementation ran on the user-selected branch
 `openchamber/tomorrow-pilot`; evidence is recorded under "Tomorrow-pilot
 implementation evidence" in `docs/FINDINGS_CHECKLIST.md`.
+
+**Authorized cross-cutting exception (2026-10-14):** the user approved
+`.openchamber/plans/13-live-deploy-hardening.md` — one combined, phased
+full-release implementation plan (reproducible installation and deployment
+hardening). It is an explicit exception to one-plan-per-milestone and to the
+4,800-character plan-length limit, and its number does NOT refer to roadmap
+milestone 12 (Windows/AD). It accepts and ticks NO milestone by itself:
+milestones 01–11 keep exactly the acceptance states recorded in
+`docs/FINDINGS_CHECKLIST.md`, and its phase checkboxes track implementation
+progress only. The user's release amendments recorded with this plan (fresh
+installation with only the bridge surviving, operator-run scoped PVE
+bootstrap, measured storage suitability, optional non-blocking backups, one
+versioned release manifest) are authoritative over older prose; see
+"Plan 13 release amendments" in `docs/ARCHITECTURE.md`. Implementation runs
+on the user-selected branch `plan-13-implementation`; live/operator gates
+stay open and evidence is recorded in `docs/FINDINGS_CHECKLIST.md`.

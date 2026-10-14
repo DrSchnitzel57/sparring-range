@@ -984,6 +984,50 @@ fixed; contradictory single-boot outcomes must be reproduced before being
 believed. Browser/packet gates remain CI-required for acceptance; local
 chromium passing does not replace them.
 
+## Plan 13 implementation evidence (2026-10-14, plan 13-live-deploy-hardening)
+
+Cross-cutting authorized exception plan (see `docs/ROADMAP.md`). It accepts
+NO milestone; phase checkboxes in the plan track implementation only.
+Branch `plan-13-implementation`, base revision `44a712a`. Environment:
+fresh uv `.venv`, Python **3.13.5**; Docker daemon 29.8.2 / Compose 5.6.0;
+QEMU 10.0.13; Node 22.23.3. No Proxmox, live range, host firewall, NAS or
+unrelated-VM access; every fixture run-owned and synthetic.
+
+### Phase 1 — contract, fresh baseline, deployment manifest
+
+Fresh baseline reproduced at `44a712a` before any change (also recorded in
+`AGENTS.md`):
+
+| Exact command | Fresh result |
+|---|---|
+| `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -ra -p no:cacheprovider` | Exit 0: **176 passed, 0 failed, 0 skipped, 206 deselected**, 4 warnings, 19.43s — fast layer only |
+| `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 .venv/bin/python infra/dev/acceptance.py authority` | Exit 1: **16 failed, 8 passed, 358 deselected**, 3 warnings. Classification: every failure is `tests/test_authority_boundary.py` fixture name `web01-deadbeef` rejected by the current `sr-` name policy (`infra/broker/policy.py check_name`); production naming (`sr-<scenario>-<host>-<32hex>`) already satisfies the policy. Fixture repair is phase-2 work; the policy stays. |
+| `SR_MATCH_SCHEDULER_ENABLED=1 SR_MATCH_DEFAULT_DURATION_MINUTES=60` probe of `Settings(_env_file=None)` | `match_scheduler_enabled=False`, `match_default_duration_minutes=30` — documented `SR_*` names ignored (phase-4 repair target) |
+
+Delivered (fast tests `tests/test_release_manifest.py`, 22 passed):
+
+- User amendments recorded authoritatively: `docs/ARCHITECTURE.md`
+  "Plan 13 release amendments", `docs/ROADMAP.md` 2026-10-14 exception.
+- Versioned release manifest: `infra/release_manifest.py` (schema v1,
+  fail-closed validation: secret-material rejection, placeholder refusal,
+  VMID/address overlap refusal, mandatory template checksums, bounded clone
+  window, measured-capacity headroom, three distinct HTTPS/internal/ingest
+  listeners, absolute state paths, explicit backup status) +
+  `deploy/manifest.example.json` (candidate values clearly marked as
+  verify-first, per the plan).
+- Installer inventory classification: `classify_resource` (absent/matching/
+  conflicting/**unreadable — an error is never absence**),
+  `assess_capacity` (measured free capacity vs payload+headroom; unreadable
+  is unsafe; a storage label is never proof), `inventory_report` (refuses
+  before side effects on any conflict/unreadable/version/capacity problem).
+- Source-of-truth map (`SOURCE_OF_TRUTH_MAP` + `render_broker_policy` +
+  `render_env(role)`): manifest → broker policy (re-validated by the real
+  `BrokerPolicy.from_dict`), per-role env fragments (worker minimal, no PVE
+  credentials anywhere, absolute state paths), service/template consumers.
+
+No live installation was inferred or performed. DB/packet/browser/live gates
+were not rerun in phase 1; old totals are not claimed.
+
 ## Recording new acceptance evidence
 
 For every gate record: date, evidence Git revision and dirty status, exact command
