@@ -17,8 +17,19 @@ from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _sr_alias(name: str) -> str:
+    """Documented ``SR_``-prefixed env name for every field (plan 13 phase
+    4: shipped env examples use ``SR_MATCH_*`` etc.; an ignored setting
+    must not hide behind its default). With ``populate_by_name`` the bare
+    field name keeps resolving too, and matching stays case-insensitive,
+    so ``SR_ENV`` still resolves field ``sr_env``."""
+    return f"SR_{name.upper()}"
+
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore",
+        alias_generator=_sr_alias, populate_by_name=True)
 
     # --- Environment mode ------------------------------------------------------
     # dev: local shell fallback runner permitted (explicitly), TLS lab override OK
@@ -35,6 +46,11 @@ class Settings(BaseSettings):
     # Explicit LAN origins for the browser (F23: never default teammates to
     # their own localhost). Comma-separated list, e.g. http://gym.lan:3000.
     api_allowed_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+    # Public trust material for the telemetry/API HTTPS listener (plan 13
+    # phase 4): the CA whose certificate the guests must verify. Provisioned
+    # into every enrolled guest; the shipper uses an explicit verified SSL
+    # context — TLS checks are never disabled for readiness or delivery.
+    telemetry_ca_file: str | None = None
 
     # --- Auth (F04) ---
     web_token_ttl_hours: int = 12
@@ -272,6 +288,18 @@ def validate_production(s: Settings, role: str = "controller") -> None:
             problems.append(f"{name} missing (mutual TLS to the broker)")
     if s.runner_transport == "local-dev":
         problems.append("local-dev runner forbidden in production")
+    # Telemetry trust (plan 13 phase 4): enrollment capabilities and audit
+    # events cross the range — the API the guests dial is HTTPS with the
+    # provisioned public CA, on an address the guests can actually reach.
+    if not s.api_base_url.startswith("https://"):
+        problems.append("api_base_url must be https in production (guests "
+                        "ship authenticated telemetry across the range)")
+    if "localhost" in s.api_base_url or "127.0.0.1" in s.api_base_url:
+        problems.append("api_base_url must be the controller's range/LAN "
+                        "address — guests cannot reach localhost")
+    if not s.telemetry_ca_file:
+        problems.append("telemetry_ca_file missing (public trust material "
+                        "provisioned into guests; verified TLS is mandatory)")
     if s.datapath_controller == "nft":
         problems.append("runtime nft datapath removed — isolation is "
                         "operator-managed static (datapath_controller=static)")

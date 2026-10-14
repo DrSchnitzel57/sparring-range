@@ -300,14 +300,30 @@ def _provision_command(host: str, token: str, nonce: str, s) -> str:
     """The per-clone provisioning command the golden image's installer
     contract expects: write the REAL env file (no placeholders, including the
     enrollment nonce), restrict it to the service identity, and enable+
-    restart the enrolled service."""
+    restart the enrolled service. For an https API the PUBLIC range CA is
+    provisioned alongside (plan 13 phase 4) so the shipper verifies the
+    listener with an explicit trust anchor — never a disabled check."""
     import shlex
     env = (f"SR_API_URL={s.api_base_url}\n"
            f"SR_TELEMETRY_TOKEN={token}\n"
            f"SR_HOST={host}\n"
            f"SR_ENROLL_NONCE={nonce}\n"
            f"SR_SPOOL_DIR=/var/lib/sparring-range/shipper\n")
-    return ("install -d -m 0750 /etc/sparring-range && "
+    ca_pre, ca_env = "", ""
+    if s.api_base_url.startswith("https://") and s.telemetry_ca_file:
+        try:
+            ca_pem = open(s.telemetry_ca_file).read()
+        except OSError as e:
+            raise RuntimeError(
+                f"telemetry CA file {s.telemetry_ca_file!r} unreadable — "
+                f"refusing to enroll {host} without its trust anchor: {e}") from e
+        ca_pre = ("install -d -m 0755 /etc/sparring-range/tls && "
+                  f"printf '%s' {shlex.quote(ca_pem)} > "
+                  "/etc/sparring-range/tls/api-ca.crt && "
+                  "chmod 0644 /etc/sparring-range/tls/api-ca.crt && ")
+        env += "SR_TLS_CA_FILE=/etc/sparring-range/tls/api-ca.crt\n"
+    return (ca_pre +
+            "install -d -m 0750 /etc/sparring-range && "
             f"printf '%s' {shlex.quote(env)} > /etc/sparring-range/shipper.env && "
             "chown root:srshipper /etc/sparring-range/shipper.env && "
             "chmod 0640 /etc/sparring-range/shipper.env && "
@@ -606,6 +622,35 @@ def _pin_host_key(broker, db: Session, session_id, dep: Deployment,
     flag_modified(dep, "resources")
     _log(db, session_id, "host_key_pinned", res.get("host"),
          {"vmid": res["vmid"], "key_ref": res["host_key_ref"]})
+
+
+def _unpublish_pinned_host_key(ip: str) -> None:
+    """Invalidate the published pin for a DESTROYED generation (plan 13
+    phase 4): once the VM is gone its key is dead truth — a stale line
+    would MITM whatever answers that address next. Best-effort per client
+    file; the broker ledger keeps the historical pin evidence."""
+    import os
+    from pathlib import Path
+
+    from srplatform.settings import get_settings
+    s = get_settings()
+    for path in (s.runner_ssh_known_hosts, s.verifier_ssh_known_hosts,
+                 s.bastion_targets_known_hosts):
+        if not path:
+            continue
+        p = Path(path)
+        try:
+            if not p.exists():
+                continue
+            lines = p.read_text().splitlines()
+            keep = [l for l in lines if l.strip() and l.split()[0] != ip]
+            if len(keep) == len(lines):
+                continue
+            tmp = p.with_name(p.name + ".tmp")
+            tmp.write_text(("\n".join(keep) + "\n") if keep else "")
+            os.replace(tmp, p)
+        except OSError:
+            pass  # never blocks teardown; the destroyed VM is the authority
 
 
 def _publish_pinned_host_key(ip: str, key: str) -> str | None:
@@ -1023,6 +1068,8 @@ def _destroy_owned(db: Session, session_id, dep: Deployment, broker) -> dict:
         if verdict == "absent":
             r["state"] = "removed"
             removed.append(r.get("name"))
+            if r.get("ip"):
+                _unpublish_pinned_host_key(r["ip"])
             broker.disown(node, int(r["vmid"]), session_id=session_id,
                           reason="confirmed-absent before teardown")
             _log(db, session_id, "teardown_already_absent", r.get("host"),
@@ -1049,6 +1096,8 @@ def _destroy_owned(db: Session, session_id, dep: Deployment, broker) -> dict:
             else:
                 r["state"] = "removed"
                 removed.append(r.get("name"))
+                if r.get("ip"):
+                    _unpublish_pinned_host_key(r["ip"])
                 _log(db, session_id, "teardown_resource", r.get("host"),
                      {"vmid": r["vmid"], "outcome": outcome})
         dep.resources = resources

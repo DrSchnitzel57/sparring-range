@@ -32,6 +32,7 @@ see docs/ARCHITECTURE_NOTES.md.
 
 Configuration (env or /etc/sparring-range/shipper.env):
   SR_API_URL, SR_TELEMETRY_TOKEN, SR_HOST, SR_SPOOL_DIR, SR_SPOOL_MAX_BYTES,
+  SR_TLS_CA_FILE (public range CA for https ingest; checks never disabled),
   SR_ENROLL_NONCE (provisioned per enrollment; triggers the authenticated
   delivery confirmation from the host — audit T-05)
 """
@@ -601,6 +602,28 @@ class Spooler:
         self.ack(ids)
 
 
+def _ssl_context(api: str):
+    """Explicit VERIFIED TLS context for HTTPS ingest (plan 13 phase 4):
+    trust the provisioned range CA (SR_TLS_CA_FILE, public trust material
+    shipped by deployment) or the system store. Certificate checks are
+    NEVER disabled — a missing/broken CA fails closed, and plain http is
+    only ever what the operator explicitly configured (dev fixtures)."""
+    if not api.startswith("https://"):
+        return None
+    import ssl
+    ca = os.environ.get("SR_TLS_CA_FILE", "").strip()
+    if ca:
+        return ssl.create_default_context(cafile=ca)
+    return ssl.create_default_context()
+
+
+def _open(req, api: str):
+    ctx = _ssl_context(api)
+    if ctx is not None:
+        return urllib.request.urlopen(req, timeout=15, context=ctx)
+    return urllib.request.urlopen(req, timeout=15)
+
+
 def ship_events(api: str, token: str, events: list[dict]) -> bool:
     req = urllib.request.Request(
         f"{api}/ingest/auditd",
@@ -608,7 +631,7 @@ def ship_events(api: str, token: str, events: list[dict]) -> bool:
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
         method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with _open(req, api) as resp:
             return resp.status < 400
     except (urllib.error.URLError, OSError):
         return False
@@ -627,7 +650,7 @@ def confirm_enrollment(api: str, token: str, nonce: str, host: str,
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
         method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with _open(req, api) as resp:
             return resp.status < 400
     except (urllib.error.URLError, OSError, urllib.error.HTTPError):
         return False

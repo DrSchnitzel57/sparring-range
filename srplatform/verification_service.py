@@ -202,6 +202,21 @@ def readiness_checks(db: Session, session_id) -> dict:
                               "error": outcome.error})
     if enroll_enforced and not all(e["ok"] for e in enroll_items):
         ok = False
+    # HOST-KEY PINS (plan 13 phase 4): a created clone without a pinned
+    # generation host key cannot be honestly reached — StrictHostKeyChecking
+    # clients fail forever. Refuse readiness; resume must complete the pin
+    # (audit A6), never a waiver.
+    if dep is not None:
+        for r in (dep.resources or []):
+            if r.get("state") == "created" and not r.get("host_key_ref"):
+                ok = False
+                items.append({"host": r.get("host"), "service": "ssh",
+                              "unit": "host-key-pin", "status": "failed",
+                              "evidence": None,
+                              "error": "no pinned host key for this "
+                                       "generation — resume must complete it"})
+                reasons.append("unusable/missing host-key pin on "
+                               f"{r.get('host')}")
     if not ok:
         if declared and any(i["status"] != "passed" for i in items):
             reasons.append("declared services not ready on the owned inventory")

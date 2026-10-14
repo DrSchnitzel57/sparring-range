@@ -22,6 +22,9 @@ def _prod(**overrides):
         verifier_ssh_key_path="/etc/sr/verifier",
         verifier_ssh_known_hosts="/etc/sr/vkh",
         bastion_targets_known_hosts="/etc/sr/tkh",
+        # plan 13 phase 4: guests dial HTTPS with a provisioned trust anchor
+        api_base_url="https://api.range.internal",
+        telemetry_ca_file="/etc/sr/api-ca.crt",
     )
     base.update(overrides)
     return Settings(_env_file=None, **base)
@@ -60,6 +63,10 @@ def test_production_rejects_placeholders_and_insecurities():
         "local runner": dict(runner_transport="local-dev"),
         "runtime nft datapath": dict(datapath_controller="nft"),
         "unpinned runner keys": dict(runner_ssh_known_hosts=""),
+        # plan 13 phase 4: telemetry trust is mandatory in production
+        "plain-http guest API": dict(api_base_url="http://api.range.internal"),
+        "localhost guest API": dict(api_base_url="https://localhost"),
+        "no trust anchor": dict(telemetry_ca_file=None),
     }
     for label, over in bad.items():
         with pytest.raises(RuntimeError, match="production config invalid"):
