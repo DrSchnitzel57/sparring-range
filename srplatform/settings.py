@@ -61,6 +61,11 @@ class Settings(BaseSettings):
     proxmox_tls_ca_file: str | None = None   # path to PVE CA cert
     proxmox_insecure_lab_override: bool = False  # explicit, loud, dev-only
     proxmox_task_timeout_s: int = 300
+    # First-boot guest-agent readiness after a clone starts (paired 03+04
+    # host-key pin). Live find 2026-10-14: PVE answers agent reads with 500
+    # "QEMU guest agent is not running" for tens of seconds after the VM is
+    # running; the broker waits this long before declaring the read uncertain.
+    proxmox_agent_ready_timeout_s: int = 120
 
     # --- Broker (milestone 02): the ONLY component holding PVE authority ----
     # Controller (API) side: mutual-TLS client material + broker URL. The

@@ -38,10 +38,13 @@ MUTATING_OPS = frozenset({"next_vmid", "clone_and_wait", "set_config",
 
 class BrokerService:
     def __init__(self, policy: BrokerPolicy, pve, ledger: Ledger,
-                 now=time.time):
+                 now=time.time, agent_ready_timeout_s: float = 120.0,
+                 agent_ready_poll_s: float = 2.0):
         self.policy = policy
         self.pve = pve          # broker-private ProxmoxClient adapter
         self.ledger = ledger
+        self.agent_ready_timeout_s = agent_ready_timeout_s
+        self.agent_ready_poll_s = agent_ready_poll_s
         self._now = now
         self._op_lock = threading.RLock()
         self._watchdog: threading.Thread | None = None
@@ -120,6 +123,12 @@ class BrokerService:
                     "generation")
             # Ownership verified BEFORE the read (claim) — now read the key.
             try:
+                # First-boot reality (live find 2026-10-14): the agent needs
+                # time after start; waiting here keeps the read a single
+                # honest attempt instead of a certain-fail + obligation.
+                self.pve.wait_agent_ready(node, int(vmid),
+                                          timeout_s=self.agent_ready_timeout_s,
+                                          poll_s=self.agent_ready_poll_s)
                 key = self.pve.read_guest_file(node, int(vmid),
                                                _PC.GUEST_HOST_KEY_PATH)
             except Exception as e:  # noqa: BLE001 — uncertain, retain

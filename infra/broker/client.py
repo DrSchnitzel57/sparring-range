@@ -50,6 +50,11 @@ class HttpTransport:
     """Mutual-TLS HTTPS transport. A missing/foreign client certificate
     fails at the TLS handshake — before any request is even sent."""
 
+    # Ops whose SERVER-side work can legitimately outlast the default socket
+    # timeout (guest-agent readiness wait, live find 2026-10-14). The server
+    # bound (proxmox_agent_ready_timeout_s=120) stays below the client bound.
+    OP_TIMEOUTS = {"read_host_key": 150.0}
+
     def __init__(self, url: str, ca_file: str, cert_file: str, key_file: str,
                  timeout: float = 30.0):
         parts = urllib.parse.urlsplit(url)
@@ -66,8 +71,9 @@ class HttpTransport:
 
     def call(self, op: str, args: dict):
         body = json.dumps(args, default=str).encode()
-        conn = http.client.HTTPSConnection(self.host, self.port, timeout=self.timeout,
-                                           context=self._ctx)
+        conn = http.client.HTTPSConnection(
+            self.host, self.port,
+            timeout=self.OP_TIMEOUTS.get(op, self.timeout), context=self._ctx)
         try:
             conn.request("POST", f"/v1/{op}", body=body,
                          headers={"Content-Type": "application/json"})

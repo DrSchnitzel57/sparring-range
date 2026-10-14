@@ -44,6 +44,13 @@ fence caught and what layer should have caught it earlier.
       `SDN.Use` on `/sdn/zones/localnetwork/<bridge>` — clone task starts
       then dies 403 without it (live find 2026-10-14; runbook documents
       `SRBrokerSdn` role + ACL line).
+- [x] Guest-agent first-boot race: after `start_and_wait` returns, PVE
+      answers agent reads with 500 "QEMU guest agent is not running" for
+      tens of seconds — the host-key pin failed there on the FIRST real
+      clone. Broker now waits bounded (`wait_agent_ready`,
+      `PROXMOX_AGENT_READY_TIMEOUT_S=120`, only that signature retried,
+      timeout stays uncertain) before its single honest read; client
+      transport gives `read_host_key` a 150 s per-op timeout. 6 tests.
 
 ## Remaining improvements
 - [ ] Production settings validation: refuse to start `sr-api` with

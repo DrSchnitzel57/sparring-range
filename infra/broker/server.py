@@ -132,7 +132,9 @@ def build_service_from_settings() -> tuple[BrokerService, Ledger, BrokerPolicy]:
 
     pve = ProxmoxClient(host=s.proxmox_host, token_id=s.proxmox_token_id,
                         token_secret=s.proxmox_token_secret)
-    return BrokerService(policy, pve, ledger), ledger, policy
+    return BrokerService(policy, pve, ledger,
+                         agent_ready_timeout_s=s.proxmox_agent_ready_timeout_s), \
+        ledger, policy
 
 
 def main(argv=None) -> int:
