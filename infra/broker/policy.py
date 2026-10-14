@@ -178,11 +178,21 @@ class BrokerPolicy:
                                   f"{self.net0_expected!r}")
 
     def check_ipconfig(self, ipconfig0: str) -> None:
-        m = re.fullmatch(r"ip=([0-9.]+)/(\d+),gw=([0-9.]+)", ipconfig0 or "")
+        """Cloned guests are ON-LINK ONLY (plan 13 phase 4): the typed
+        config REFUSES a gateway, so no clone ever installs a default route
+        toward the host — WAN/management egress cannot even be attempted by
+        guest configuration. Everything a guest legitimately reaches (the
+        controller's range address, the bastion, peer range hosts) is
+        on-link within the range network."""
+        if "gw=" in (ipconfig0 or ""):
+            raise PolicyViolation(
+                "ipconfig0 must not carry gw= — range guests are on-link "
+                "only; a default route is refused by policy")
+        m = re.fullmatch(r"ip=([0-9.]+)/(\d+)", ipconfig0 or "")
         if not m:
-            raise PolicyViolation(f"ipconfig0 {ipconfig0!r} must be "
-                                  "'ip=<addr>/<prefix>,gw=<gateway>'")
-        addr, prefix, gw = m.group(1), int(m.group(2)), m.group(3)
+            raise PolicyViolation("ipconfig0 must be 'ip=<addr>/<prefix>' "
+                                  "(no gateway)")
+        addr, prefix = m.group(1), int(m.group(2))
         ip = ipaddress.ip_address(addr)
         if ip.version != 4 or ip not in self.network \
                 or ip == self.gateway or ip == self.network.network_address \
@@ -191,8 +201,6 @@ class BrokerPolicy:
         if prefix != self.network.prefixlen:
             raise PolicyViolation(f"prefix /{prefix} does not match range network "
                                   f"/{self.network.prefixlen}")
-        if gw != str(self.gateway):
-            raise PolicyViolation(f"gateway {gw} is not the policy gateway {self.gateway}")
 
     def check_tags(self, tags: str) -> None:
         rx = re.compile(self.tag_pattern)

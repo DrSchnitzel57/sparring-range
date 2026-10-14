@@ -36,7 +36,7 @@ NODE = "r740"
 # names because they model someone else's machine.
 NAME = "sr-web01-deadbeef"
 TAG = "srsess-" + "a" * 32
-IPC = "ip=10.66.0.10/24,gw=10.66.0.1"
+IPC = "ip=10.66.0.10/24"  # on-link only: a gw= is refused by policy
 NET0 = "virtio,bridge=vmbr1,tag=66"
 
 
@@ -94,9 +94,10 @@ def test_policy_rejects_every_out_of_boundary_operation(tmp_path):
         ({"mount0": "local:100,mp0=/etc"}, "keys not provisionable"),
         ({"net0": "virtio,bridge=vmbr0,tag=66"}, "exact policy NIC"),
         ({"net0": "virtio,bridge=vmbr1,tag=999"}, "exact policy NIC"),
-        ({"ipconfig0": "ip=10.99.0.10/24,gw=10.66.0.1"}, "outside range network"),
-        ({"ipconfig0": "ip=10.66.0.10/24,gw=10.66.0.2"}, "not the policy gateway"),
-        ({"ipconfig0": "ip=10.66.0.10/16,gw=10.66.0.1"}, "prefix"),
+        ({"ipconfig0": "ip=10.99.0.10/24"}, "outside range network"),
+        ({"ipconfig0": "ip=10.66.0.10/24,gw=10.66.0.1"},
+         "default route is refused by policy"),
+        ({"ipconfig0": "ip=10.66.0.10/16"}, "prefix"),
         ({"tags": "anything-goes"}, "must all match"),
         ({"tags": "srsess-" + "z" * 32}, "must all match"),
     ):
@@ -452,7 +453,7 @@ def test_hard_stop_all_stops_with_readback_and_retains_obligations(tmp_path):
         client.clone_and_wait(NODE, 9001, vmid, f"{NAME}-h{vmid}",
                               session_id="s", generation="g")
         client.set_config(NODE, vmid, session_id="s",
-                          ipconfig0=f"ip=10.66.0.{vmid-200}/24,gw=10.66.0.1",
+                          ipconfig0=f"ip=10.66.0.{vmid-200}/24",
                           net0=NET0, tags=TAG)
         client.start_and_wait(NODE, vmid)
     # 212 refuses to stop: task fails

@@ -913,7 +913,7 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
                             f"resume mutation aborted, intent retained: {e}") from e
                     # probe succeeded: finish placement (idempotent re-POST)
                     broker.set_config(node, vmid,
-                                      ipconfig0=f"ip={host['ip']}/24,gw={s.range_gateway}",
+                                      ipconfig0=f"ip={host['ip']}/24",
                                       net0=_net_spec(s), session_id=session_id)
                     cfg2 = broker.lookup_config(node, vmid)
                     net0 = (cfg2 or {}).get("net0", "") if isinstance(cfg2, dict) else ""
@@ -936,7 +936,7 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
                     continue
             # network placement on the range bridge/VLAN + ownership tag (F06)
             broker.set_config(node, vmid,
-                              ipconfig0=f"ip={host['ip']}/24,gw={s.range_gateway}",
+                              ipconfig0=f"ip={host['ip']}/24",
                               net0=_net_spec(s),
                               tags=_ownership_tag(session_id),
                               session_id=session_id)
