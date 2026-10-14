@@ -310,6 +310,12 @@ def _prod_env(monkeypatch):
     and the verifier key is missing. Milestone 02 contract: the controller
     presents broker mutual-TLS material and NO PVE credentials."""
     monkeypatch.setenv("SR_ENV", "production")
+    # plan 13 phase 4: production trust is mandatory — guests ship
+    # authenticated telemetry to the controller's range address over
+    # verified TLS (the file need not exist for validation; only that the
+    # anchor is configured).
+    monkeypatch.setenv("SR_API_BASE_URL", "https://10.66.0.1:8443")
+    monkeypatch.setenv("SR_TELEMETRY_CA_FILE", "/etc/sr/api-ca.crt")
     monkeypatch.setenv("BROKER_URL", "https://broker.lab:8443")
     monkeypatch.setenv("BROKER_CLIENT_CERT", "/etc/sr/broker-client.pem")
     monkeypatch.setenv("BROKER_CLIENT_KEY", "/etc/sr/broker-client.key")
@@ -325,7 +331,8 @@ def _prod_env(monkeypatch):
 
 
 def _clear_prod(monkeypatch):
-    for k in ("SR_ENV", "BROKER_URL", "BROKER_CLIENT_CERT", "BROKER_CLIENT_KEY",
+    for k in ("SR_ENV", "SR_API_BASE_URL", "SR_TELEMETRY_CA_FILE",
+              "BROKER_URL", "BROKER_CLIENT_CERT", "BROKER_CLIENT_KEY",
               "BROKER_TLS_CA_FILE",
               "RUNNER_TRANSPORT", "RUNNER_SSH_TARGET", "RUNNER_SSH_KNOWN_HOSTS",
               "BASTION_TARGETS_KNOWN_HOSTS", "VERIFIER_SSH_KNOWN_HOSTS",

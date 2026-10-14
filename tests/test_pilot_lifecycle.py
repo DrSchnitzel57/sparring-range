@@ -55,12 +55,12 @@ def _match_row(session_id):
 def test_match_snapshot_at_creation(client, users):
     sid = client.post("/sessions",
                       json={"scenario_id": "web-foothold-01",
-                            "duration_minutes": 45, "pace_seconds": 10},
+                            "duration_minutes": 45, "pace_seconds": 15},
                       headers=users["member"]).json()["session_id"]
     body = client.get(f"/sessions/{sid}", headers=users["member"]).json()
     m = body["match"]
     assert m["state"] == "provisioning"
-    assert m["duration_minutes"] == 45 and m["pace_seconds"] == 10
+    assert m["duration_minutes"] == 45 and m["pace_seconds"] == 15
     # defaults: 30-minute match, 30 s pace; pace 0 is the no-delay option
     sid2 = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
                        headers=users["member"]).json()["session_id"]
@@ -270,7 +270,7 @@ def test_worker_env_carries_snapshot_pace_and_deadline(client, users, fake_pve):
     import uuid as u
     from srplatform.api.runs import _worker_env
     from srplatform.settings import get_settings
-    sid, _ = _launch(client, users, duration_minutes=25, pace_seconds=7)
+    sid, _ = _launch(client, users, duration_minutes=25, pace_seconds=30)
     client.post(f"/sessions/{sid}/begin", headers=users["member"])
     with _db() as s:
         from srplatform.db.models import MatchModel
@@ -278,7 +278,7 @@ def test_worker_env_carries_snapshot_pace_and_deadline(client, users, fake_pve):
         run = type("R", (), {"run_id": u.uuid4()})()
         env = _worker_env(get_settings(), "tok", u.UUID(str(sid)),
                           "web-foothold-01", run, match=m)
-        assert env["SR_ATTACK_PACE_S"] == "7"
+        assert env["SR_ATTACK_PACE_S"] == "30"
         assert "SR_MATCH_DEADLINE_UTC" in env
         # no credential ever rides the worker env
         assert not any(k.startswith(("LLM_", "POSTGRES_", "PROXMOX_")) for k in env)

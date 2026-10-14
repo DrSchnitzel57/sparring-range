@@ -62,6 +62,10 @@ class Host(Strict):
     ip: IPvAnyAddress
     services: list[str] = []
     os: Literal["linux", "windows"] | None = None
+    # plan 13 phase 3: the DB-tier host this web tier's application is wired
+    # to at deploy time (guest_config provisions grants/listeners/firewall
+    # for exactly this owned host). Validated against the topology.
+    db_ref: str | None = None
 
     @field_validator("name")
     @classmethod
@@ -191,6 +195,11 @@ def validate_scenario(spec: Any, where: str = "<spec>") -> dict:
 
     data = model.model_dump(mode="json")
     hostnames = {h["name"] for h in data["topology"]["hosts"]}
+    for h in data["topology"]["hosts"]:
+        if h.get("db_ref"):
+            if h["db_ref"] not in hostnames:
+                issues.append(f"{where}: host '{h['name']}': db_ref "
+                              f"'{h['db_ref']}' not in topology")
 
     def check(prefix: str, verifier_id: str, args: dict, needs_host: bool = True) -> None:
         if verifier_id not in registry.REGISTRY:
