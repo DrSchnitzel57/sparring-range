@@ -1146,7 +1146,12 @@ Delivered:
   `GET /sessions/{id}/operation` polling; startup reconcile marks dead
   executors `interrupted` before clearing claims (live fences survive;
   stale requests cannot finalize replacements); 4 db-layer tests pass in the
-  db gate.
+  db gate. **Recorded deviation:** launch/reset still execute synchronously
+  inside the request (returning 200 with `operation_id`) rather than 202 +
+  background executor; the safety properties the plan asked for — durable
+  acceptance before effects, dedupe, restart reconcile, fenced outcomes —
+  are implemented and gated, and the non-blocking 202 executor remains a
+  client-experience refinement for a later milestone.
 - **Phase 6 (match contract)**: snapshot v2 freezes bounded
   choices (mode practice|competition, start condition manual|auto-on-ready,
   intensity pace ∈ {0,15,30,60}, injects toggle) plus scenario/rubric/seed/
