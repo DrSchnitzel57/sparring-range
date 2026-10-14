@@ -84,6 +84,32 @@ def classify_pve_error(exc: Exception) -> ProxmoxError:
     return exc
 
 
+class _ProxmoxerPathAdapter:
+    """proxmoxer joins path segments onto its /api2/json base with
+    posixpath.join — a segment with a LEADING SLASH replaces the base
+    entirely, so api.get("/nodes/x") silently requests "/nodes/x" and PVE
+    answers 500 "no such file" (live-deploy find, 2026-10-14: every real
+    proxmoxer call from this client lost its /api2/json prefix). The whole
+    codebase passes '/nodes/...' paths, so normalize here, at the single
+    boundary. Injected fakes (api=...) are NOT wrapped: they emulate this
+    boundary and receive exactly what the wrapper sends."""
+
+    def __init__(self, api):
+        self._api = api
+
+    def get(self, path, **kw):
+        return self._api.get(path.lstrip("/"), **kw)
+
+    def post(self, path, **kw):
+        return self._api.post(path.lstrip("/"), **kw)
+
+    def delete(self, path, **kw):
+        return self._api.delete(path.lstrip("/"), **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._api, name)
+
+
 class ProxmoxLike(Protocol):
     def version(self) -> dict: ...
     def get(self, path: str) -> dict | list: ...
@@ -116,8 +142,9 @@ class ProxmoxClient:
                 verify = False
                 print("WARNING: Proxmox TLS verification DISABLED by explicit lab override")
             user, _, name = token_id.partition("!")
-            api = ProxmoxAPI(host, user=user, token_name=name, token_value=token_secret,
-                             verify_ssl=verify, timeout=30)
+            api = _ProxmoxerPathAdapter(
+                ProxmoxAPI(host, user=user, token_name=name,
+                           token_value=token_secret, verify_ssl=verify, timeout=30))
         self.api = api
         self.task_timeout = s.proxmox_task_timeout_s
 
