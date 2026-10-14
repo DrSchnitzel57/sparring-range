@@ -68,6 +68,19 @@ def test_read_when_ready_other_error_raises_immediately():
                if "/agent/file-read" in p) == 1
 
 
+def test_read_when_ready_retries_empty_key_until_cloud_init_regenerates():
+    # Live find 2026-10-14: the agent answers BEFORE cloud-init's ssh
+    # module has regenerated the template-scrubbed host key — empty
+    # content. That is "not materialized yet", retried in the same window.
+    c, http = _client_with_vm()
+    http.empty_key_polls = 2
+    key = c.read_guest_file_when_ready("r740", 9100, HOSTKEY, timeout_s=5,
+                                       poll_s=0.01)
+    assert key.startswith("ssh-ed25519 ")
+    assert sum(1 for _, p, _ in http.requests
+               if "/agent/file-read" in p) == 3
+
+
 def test_host_key_read_survives_first_boot_window():
     """The broker's read_host_key rides out the live 500 dialect and pins
     the key; the fake never saw a separate status endpoint (501 lesson)."""
