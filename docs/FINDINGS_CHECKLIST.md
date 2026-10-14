@@ -1092,14 +1092,16 @@ with `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD`):
 | Exact command | Fresh result |
 |---|---|
 | `…python -m pytest -q -p no:cacheprovider` (fast default) | Exit 0: **328 passed, 0 failed, 0 skipped, 222 deselected**, 4 warnings, 50.4s |
-| `…acceptance.py frontend` | **PASS** — npm ci, production build, audit zero high/critical |
+| `…acceptance.py frontend` | **PASS** — npm ci, production build, audit zero high/critical (re-run PASS on the inbox-bearing revision) |
+| `bash -e …selection python authority pve-contract…` | **PASS** on the final revision — 102.4s / 5.1s / 16.6s / 26.4s, all four gates exit 0 |
 | `…acceptance.py compose` | **PASS** — full stack + seed-bastion-keys success gate, cleaned |
 | `…acceptance.py browser` | **PASS** — isolated real-browser workflow + replay, 1 passed |
 | `…acceptance.py db` | **PASS** after 155.7s — disposable fixture, fresh + forward migrations (incl. 0014/0015), **150 passed, 0 failed** (phase-3/6 regressions repaired; deploy-operation, network-plane and inject tests included) |
 | `…acceptance.py containment` | **PASS** after 11.6s — real namespace/cgroup fixtures created, positive-control process migration, 21 required-mode regressions 0 skipped, no leaked run cgroups |
 | `…acceptance.py packet` | **FAIL (prerequisite)** — needs root + nft (missing here); runs only in the approved disposable-netns CI packet job; never accepted from this host |
+| `…acceptance.py images` | **PASS** after 1784.8s — all three role overlays rebuilt from the fixed recipe (web-local `f1b5777d`, web-db `7ae761c9`, attacker `7552a591`), **18 passed, 0 skipped**: real Ubuntu builds, boot tests, services/seeds/flaws/fixes, readiness + clone-mode + host-key contracts, attacker records its 5 resolved packages (the PKG-before-SETUP-OK fix), no QEMU or DB leaks |
+| `…acceptance.py capture` | running at this recording; result appended below |
 | `…acceptance.py install` | Sandbox contract **PASS** (dry-run, idempotent rerun, key preservation, invalid manifest refused before effects); **FAILS** on the managed-service VM half until the disposable-VM job sets `SR_INSTALL_VM_EVIDENCE` — deliberately not accepted from a sandbox |
-| `…acceptance.py images` / `capture` | rerunning with the disk-backed cache (`SR_GUEST_CACHE`) after the tmpfs build was OOM-killed; results appended below when complete |
 
 Delivered:
 
