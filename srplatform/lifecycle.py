@@ -55,17 +55,44 @@ class MatchBlocked(RuntimeError):
 
 
 # ------------------------------------------------------------------ snapshot --
+#: Bounded, versioned match choices (plan 13 phase 6). Historical snapshots
+#: keep whatever they froze; new rows freeze these keys, and readers apply
+#: DOCUMENTED defaults to pre-upgrade rows (forward migration, never
+#: reinterpretation of history).
+MATCH_MODES = ("practice", "competition")
+START_CONDITIONS = ("manual", "auto-on-ready")
+#: attack dispatch cadence (intensity): 60/30/15 s maximum; 0 is the
+#: explicit no-delay fixture mode, never an operator default.
+PACE_CHOICES = (0, 15, 30, 60)
+SNAPSHOT_VERSION = 2
+
+
 def create_match(db, session_id, preset: str, *, duration_minutes: int = 30,
-                 pace_seconds: int = 30, actor: str = "system") -> MatchModel:
-    """Snapshot the effective match parameters AT SESSION CREATION."""
+                 pace_seconds: int = 30, mode: str = "practice",
+                 start_condition: str = "manual",
+                 injects_enabled: bool = True,
+                 actor: str = "system") -> MatchModel:
+    """Snapshot the effective match parameters AT SESSION CREATION.
+    Every choice is BOUNDED (plan 13 phase 6): an unbounded cadence or an
+    unknown mode/start condition is refused before anything is stored."""
+    if mode not in MATCH_MODES:
+        raise ValueError(f"mode must be one of {MATCH_MODES}")
+    if start_condition not in START_CONDITIONS:
+        raise ValueError(f"start_condition must be one of {START_CONDITIONS}")
+    if int(pace_seconds) not in PACE_CHOICES:
+        raise ValueError(f"pace_seconds (intensity) must be one of "
+                         f"{PACE_CHOICES} (0 = no-delay fixture mode)")
     duration_minutes = max(1, int(duration_minutes))
-    pace_seconds = max(0, int(pace_seconds))
+    pace_seconds = int(pace_seconds)
     m = MatchModel(
         session_id=session_id, preset=preset,
         duration_minutes=duration_minutes, pace_seconds=pace_seconds,
         state="provisioning",
-        snapshot={"preset": preset, "duration_minutes": duration_minutes,
-                  "pace_seconds": pace_seconds,
+        snapshot={"snapshot_version": SNAPSHOT_VERSION,
+                  "preset": preset, "duration_minutes": duration_minutes,
+                  "pace_seconds": pace_seconds, "mode": mode,
+                  "start_condition": start_condition,
+                  "injects_enabled": bool(injects_enabled),
                   "ready_idle_expiry_minutes": READY_IDLE_EXPIRY_MINUTES,
                   "snapshot_at": _now().isoformat(), "snapshotted_by": actor})
     db.add(m)

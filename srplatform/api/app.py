@@ -198,6 +198,10 @@ class SessionCreate(BaseModel):
     # come from settings (30-minute match, 30 s attack pace, 0 = no delay)
     duration_minutes: int | None = None
     pace_seconds: int | None = None
+    # plan 13 phase 6: bounded, versioned choices frozen into the snapshot
+    mode: str = "practice"
+    start_condition: str = "manual"
+    injects_enabled: bool = True
 
 
 def _scenario_snapshot(scenario_id: str) -> tuple[str, str]:
@@ -223,12 +227,18 @@ def create_session(body: SessionCreate, p: Principal = Depends(any_member),
     # frozen NOW — never re-read live mid-match.
     from srplatform import lifecycle
     s = get_settings()
-    lifecycle.create_match(
-        db, sess.session_id, body.scenario_id,
-        duration_minutes=body.duration_minutes or s.match_default_duration_minutes,
-        pace_seconds=(s.match_default_pace_seconds if body.pace_seconds is None
-                      else body.pace_seconds),
-        actor=p.username)
+    try:
+        lifecycle.create_match(
+            db, sess.session_id, body.scenario_id,
+            duration_minutes=body.duration_minutes or s.match_default_duration_minutes,
+            pace_seconds=(s.match_default_pace_seconds if body.pace_seconds is None
+                          else body.pace_seconds),
+            mode=body.mode, start_condition=body.start_condition,
+            injects_enabled=body.injects_enabled,
+            actor=p.username)
+    except ValueError as e:
+        raise HTTPException(422, {"error": "invalid_match_parameters",
+                                  "detail": str(e)})
     db.add(Event(session_id=sess.session_id, ts=_now(), actor="system",
                  action_type="session_start",
                  payload={"scenario_id": body.scenario_id,

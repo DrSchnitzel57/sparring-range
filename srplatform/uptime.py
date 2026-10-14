@@ -107,6 +107,48 @@ def summarize_for_session(db, session_id) -> dict:
                        "detail": r.detail, "host": r.host} for r in rows])
 
 
+def coverage(states: list[str], *, started_at: datetime,
+             ended_at: datetime | None, interval_s: float = INTERVAL_S) -> dict:
+    """Schedule-aware coverage (plan 13 phase 6): the EXPECTED schedule
+    comes from the match clock, so GAPS are visible evidence — received
+    samples alone can never look like full coverage. Nothing is fabricated:
+    a missing slot is `missed`, an ambiguous sample is `unknown`, and
+    neither counts as downtime. Zero valid checks => UNSCORED.
+
+    A scorer/prober that was itself down is therefore distinguishable from
+    a target that was down (separate `missed` vs `down` accounting)."""
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    end = ended_at or datetime.now(timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    span = max(0.0, (end - started_at).total_seconds())
+    expected = int(span // interval_s)
+    up = sum(1 for s in states if s == "up")
+    down = sum(1 for s in states if s == "down")
+    unknown = sum(1 for s in states if s not in ("up", "down"))
+    valid = up + down
+    missed = max(0, expected - len(states))
+    return {
+        "expected_checks": expected, "received": len(states),
+        "up": up, "down": down, "unknown": unknown, "missed": missed,
+        "valid_checks": valid,
+        "scored": valid > 0,
+        "coverage_pct": round(100.0 * len(states) / expected, 1) if expected else None,
+        "pct_up": round(100.0 * up / valid, 1) if valid else None,
+    }
+
+
+def coverage_for_session(db, session_id, *, started_at, ended_at=None,
+                         interval_s: float = INTERVAL_S) -> dict:
+    from sqlalchemy import select
+    from srplatform.db.models import UptimeSample
+    rows = db.execute(select(UptimeSample.state).where(
+        UptimeSample.session_id == session_id)).scalars().all()
+    return coverage(list(rows), started_at=started_at, ended_at=ended_at,
+                    interval_s=interval_s)
+
+
 # ------------------------------------------------------------------ prober ---
 class Prober:
     """One thread per running match: probes every 10 s, appends samples,
