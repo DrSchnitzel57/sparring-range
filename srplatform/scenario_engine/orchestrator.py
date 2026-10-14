@@ -208,6 +208,24 @@ def enrollment_channel_available() -> bool:
 _MANAGEMENT_READY_POLL_S = 5.0
 
 
+#: Signatures in ssh's 255 output that DEFINITIVELY explain the failure
+#: (plan 13 phase 4): bad key/auth and pin mismatches can never be ridden
+#: out by retrying, and must fail distinctly and immediately. A bare 255
+#: without one of these stays the ambiguous "session never established"
+#: boot race — the command provably never ran, so retry is safe.
+_SSH_DEFINITIVE_FAILURES = (
+    "Permission denied",               # bad key / auth method
+    "Host key verification failed",    # pinned key mismatch
+    "REMOTE HOST IDENTIFICATION HAS CHANGED",
+    "no matching host key type",       # transport negotiation refused
+)
+
+
+def ssh_failure_is_definitive(tail) -> bool:
+    t = str(tail)
+    return any(sig in t for sig in _SSH_DEFINITIVE_FAILURES)
+
+
 def _provision_with_boot_wait(chan, ip: str, command: str,
                               wait_s: float) -> tuple[int, str]:
     """Run a provisioning command, riding out ONLY the sshd boot race.
@@ -218,8 +236,12 @@ def _provision_with_boot_wait(chan, ip: str, command: str,
     NEVER RAN, so retrying the same (idempotent) command is safe and is
     bounded by `wait_s`. Any other rc is a real answer from the guest and
     is returned immediately — broken channels still fail fast and visibly
-    (audit: a wrong API address or rejected token must not hide)."""
+    (audit: a wrong API address or rejected token must not hide).
+    Definitive 255 causes (bad key/auth/pin, plan 13 phase 4) fail
+    distinctly WITHOUT burning the boot window."""
     code, tail = chan(ip, command)
+    if code == 255 and ssh_failure_is_definitive(tail):
+        return code, tail
     if code == 255 and wait_s > 0:
         deadline = time.monotonic() + wait_s
         while code == 255 and time.monotonic() < deadline:

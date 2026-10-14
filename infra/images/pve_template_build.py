@@ -35,6 +35,8 @@ import subprocess
 import sys
 import uuid
 
+from srplatform.settings import public_key_fingerprint
+
 REPO = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
@@ -232,6 +234,13 @@ def main(argv: list[str] | None = None) -> int:
     info = {"built_by": "infra/images/pve_template_build.py",
             "base_image": manifest["base_image"],
             "image_version": manifest["base_image"]["image_version"],
+            # SHA256 fingerprints of the PUBLIC keys baked into these
+            # templates (plan 13 phase 4): deployment compares them against
+            # the public halves of its configured private keys, so a key
+            # rotation that skipped a rebuild is caught before first dial.
+            "baked_key_fingerprints": {
+                principal: public_key_fingerprint(line)
+                for principal, line in sorted(key_manifest.items())},
             "templates": built}
     (out / "TEMPLATE-INFO.json").write_text(json.dumps(info, indent=2,
                                                        sort_keys=True) + "\n")

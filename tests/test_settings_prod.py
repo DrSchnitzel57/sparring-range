@@ -8,6 +8,26 @@ import pytest
 from srplatform.settings import Settings
 
 
+def _make_real_key() -> str:
+    """A REAL parseable OpenSSH private key: production validation
+    parse-checks configured keys (plan 13 phase 4), so the "correct
+    config" fixture must ship real material."""
+    import tempfile
+    from pathlib import Path
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    key = ed25519.Ed25519PrivateKey.generate()
+    f = Path(tempfile.mkdtemp()) / "verifier"
+    f.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH,
+        serialization.NoEncryption()))
+    return str(f)
+
+
+_REAL_KEY = _make_real_key()
+
+
 def _prod(**overrides):
     base = dict(
         sr_env="production",
@@ -19,7 +39,7 @@ def _prod(**overrides):
         broker_tls_ca_file="/etc/sr/broker-ca.pem",
         runner_transport="ssh", runner_ssh_target="runner@10.66.0.9",
         runner_ssh_key_path="/etc/sr/runner", runner_ssh_known_hosts="/etc/sr/kh",
-        verifier_ssh_key_path="/etc/sr/verifier",
+        verifier_ssh_key_path=_REAL_KEY,
         verifier_ssh_known_hosts="/etc/sr/vkh",
         bastion_targets_known_hosts="/etc/sr/tkh",
         # plan 13 phase 4: guests dial HTTPS with a provisioned trust anchor

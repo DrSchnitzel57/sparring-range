@@ -216,6 +216,46 @@ class Settings(BaseSettings):
     ingest_max_body_events: int = 500
 
 
+def check_private_key(path: str, label: str) -> str:
+    """Parse-check a configured SSH PRIVATE key (plan 13 phase 4) and
+    return the SHA256 fingerprint of its public half (ssh-keygen format).
+    A corrupt or missing key must fail at configuration time, not halfway
+    through a live enrollment; the fingerprint lets deployment compare the
+    private material against the PUBLIC fingerprints baked into the role
+    build manifest (TEMPLATE-INFO.json)."""
+    import base64
+    import hashlib
+
+    try:
+        from cryptography.hazmat.primitives import serialization
+        with open(path, "rb") as f:
+            key = serialization.load_ssh_private_key(f.read(), password=None)
+        pub = key.public_key().public_bytes(
+            serialization.Encoding.OpenSSH,
+            serialization.PublicFormat.OpenSSH)
+        blob = base64.b64decode(pub.split()[1])
+    except Exception as e:  # unreadable/unparseable/wrong format
+        raise ValueError(f"{label}: SSH private key {path!r} unusable: {e}") from e
+    digest = hashlib.sha256(blob).digest()
+    return "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
+
+
+def public_key_fingerprint(line: str) -> str:
+    """SHA256 fingerprint of an OpenSSH PUBLIC key line (same format), for
+    comparing baked template keys against configured private material."""
+    import base64
+    import hashlib
+    parts = line.split()
+    if len(parts) < 2:
+        raise ValueError("not an OpenSSH public key line")
+    try:
+        blob = base64.b64decode(parts[1])
+    except Exception as e:
+        raise ValueError(f"public key line undecodable: {e}") from e
+    digest = hashlib.sha256(blob).digest()
+    return "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
+
+
 def process_role() -> str:
     """Which component this process is (controller | worker | broker). The
     worker is spawned by the API with SR_PROCESS_ROLE=worker and a SERIALIZED,
@@ -241,6 +281,11 @@ def validate_production(s: Settings, role: str = "controller") -> None:
             problems.append("api_base_url missing (worker acts only via its "
                             "session-scoped API capability — including model "
                             "scheduling, audit Stage 5)")
+        if s.runner_ssh_key_path:
+            try:
+                check_private_key(s.runner_ssh_key_path, "runner key")
+            except ValueError as e:
+                problems.append(str(e))
         if problems:
             raise RuntimeError("production WORKER config invalid:\n  - "
                                + "\n  - ".join(problems))
@@ -312,6 +357,17 @@ def validate_production(s: Settings, role: str = "controller") -> None:
     if s.verifier_ssh_known_hosts == "":
         problems.append("verifier_ssh_known_hosts required (pinned management "
                         "host keys — no TOFU, audit N11)")
+    # Parse-check configured private keys BEFORE effects (plan 13 phase 4):
+    # a corrupt key must fail at startup, not mid-enrollment; the returned
+    # fingerprint is what deployment compares against the role build
+    # manifest's baked PUBLIC key fingerprints.
+    for label, path in (("verifier key", s.verifier_ssh_key_path),
+                        ("bastion client key", s.bastion_client_key_path)):
+        if path:
+            try:
+                check_private_key(path, label)
+            except ValueError as e:
+                problems.append(str(e))
     if problems:
         raise RuntimeError("production config invalid:\n  - " + "\n  - ".join(problems))
 
