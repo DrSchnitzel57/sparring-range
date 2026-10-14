@@ -61,6 +61,11 @@ class Settings(BaseSettings):
     proxmox_tls_ca_file: str | None = None   # path to PVE CA cert
     proxmox_insecure_lab_override: bool = False  # explicit, loud, dev-only
     proxmox_task_timeout_s: int = 300
+    # Per-REQUEST HTTP timeout of the proxmoxer session. Every PVE mutation
+    # returns a UPID quickly; long work is awaited via bounded task polling,
+    # so this stays short — but it must be an explicit, configurable deadline
+    # (plan 13 phase 2: client/server/task deadlines are checked together).
+    proxmox_http_timeout_s: int = 30
     # First-boot guest-agent readiness after a clone starts (paired 03+04
     # host-key pin). Live find 2026-10-14: PVE answers agent reads with 500
     # "QEMU guest agent is not running" for tens of seconds after the VM is

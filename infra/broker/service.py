@@ -236,7 +236,13 @@ class BrokerService:
                 if existing["state"] not in ("reserved", "creating"):
                     raise BrokerConflict(f"VMID {new_vmid} is already claimed "
                                          f"({existing['state']}) — reconcile first")
-            self.policy.check_capacity(len(self.ledger.active_claims()))
+            # Capacity counts OTHER VMs: a 'reserved' claim for this very
+            # VMID (from next_vmid) is this VM's own reservation, not an
+            # additional machine — counting it would double-charge the
+            # reservation (plan 13 phase 2 audit).
+            active_others = [c for c in self.ledger.active_claims()
+                             if int(c["vmid"]) != int(new_vmid)]
+            self.policy.check_capacity(len(active_others))
             state, _ = self.ledger.begin_intent(key, "clone", args)
             if state == "replay":
                 return

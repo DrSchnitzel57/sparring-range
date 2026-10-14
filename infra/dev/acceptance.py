@@ -996,6 +996,28 @@ def check_authority() -> None:
 
 
 # -------------------------------------------------------------------------- #
+# pve-contract (plan 13 phase 2): REAL pinned proxmoxer over synthetic HTTPS  #
+# -------------------------------------------------------------------------- #
+
+def check_pve_contract() -> None:
+    # The real ProxmoxAPI/requests stack against a local PVE dialect server:
+    # /api2/json prefix, PVEAPIToken header, form encoding, task/UPID
+    # lifecycle, malformed replies, and the source-checked PVE 9.2 error
+    # dialects (absence vs uncertainty) over real HTTP. Infrastructure-free
+    # (loopback HTTPS, ephemeral CA), so required mode pins the selection:
+    # an empty selection or any skip is a failure, never acceptance.
+    r, counts = pytest_run(["-m", "adapter"],
+                           env={"SR_REQUIRE_ADAPTER": "1"}, timeout=1200)
+    if r.returncode != 0:
+        fail("pve-contract regressions in required mode",
+             f"exit {r.returncode}, counts {counts}:\n{r.stdout[-6000:]}")
+    if not counts.get("passed"):
+        fail("pve-contract layer non-empty", f"selection counts {counts}")
+    ok("real-proxmoxer PVE contract regressions pass (required mode)",
+       f"{counts.get('passed', 0)} passed, {counts.get('skipped', 0)} skipped")
+
+
+# -------------------------------------------------------------------------- #
 # images (03): real builds/boots/services/seeds/flaws/fixes/readiness         #
 # capture (04): installed auditd/srshipper/negatives/recovery/access/replay   #
 # -------------------------------------------------------------------------- #
@@ -1090,6 +1112,7 @@ CHECKS = {
     "db": check_db,
     "containment": check_containment,
     "authority": check_authority,
+    "pve-contract": check_pve_contract,
     "packet": check_packet,
     "frontend": check_frontend,
     "compose": check_compose,

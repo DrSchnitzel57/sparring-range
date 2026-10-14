@@ -705,6 +705,13 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
             name = _vm_name(scenario_id, host["name"], session_id)
             res = by_host.get(host["name"])
             if res and res.get("state") == "created":
+                if not res.get("host_key_ref"):
+                    # Audit A6: a crash between the created-state commit and
+                    # the pin left the resource permanently un-SSH-able —
+                    # resume must COMPLETE the missing pin (read + publish),
+                    # never skip it. A failing read stays loud (uncertain is
+                    # not success); ownership and lease are retained.
+                    _pin_host_key(broker, db, session_id, dep, res, resources, node)
                 if (res.get("telemetry_enroll") or {}).get("phase") != "confirmed" \
                         or not enrollment_evidence_current(
                             db, session_id, host["name"], dep.deployment_id):

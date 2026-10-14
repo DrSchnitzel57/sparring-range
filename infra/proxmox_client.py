@@ -172,7 +172,8 @@ class ProxmoxClient:
                     " — the user part must match the realm user EXACTLY")
             api = _ProxmoxerPathAdapter(
                 ProxmoxAPI(host, user=user, token_name=name,
-                           token_value=token_secret, verify_ssl=verify, timeout=30))
+                           token_value=token_secret, verify_ssl=verify,
+                           timeout=s.proxmox_http_timeout_s))
         self.api = api
         self.task_timeout = s.proxmox_task_timeout_s
 

@@ -60,6 +60,7 @@ REQUIRED_LAYER_ENV = {
     "containment": "SR_REQUIRE_CONTAINMENT",
     "packet": "SR_REQUIRE_PACKET",
     "authority": "SR_REQUIRE_AUTHORITY",
+    "adapter": "SR_REQUIRE_ADAPTER",
     "browser": "SR_REQUIRE_BROWSER",
     "live": "SR_REQUIRE_LIVE",
     "images": "SR_REQUIRE_IMAGES",

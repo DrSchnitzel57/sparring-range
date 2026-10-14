@@ -99,3 +99,28 @@ Line numbers refer to `e370e95`.
   on 2026-10-13 (the script must be a superset-equivalent).
 - After the next Launch: `journalctl -u sr-brokerd` shows no `no such file`
   500s (they would now be loud `PveUnavailable` routing-bug errors — A1).
+
+## Fix anchors (plan 13 phase 2, 2026-10-14)
+
+Every finding now has code + an executed test anchor. `pve-contract` =
+`tests/test_pve_real_client_contract.py` (REAL pinned proxmoxer over local
+HTTPS replaying the source-checked dialects; gate
+`python infra/dev/acceptance.py pve-contract`).
+
+| # | Code anchor | Test anchor |
+|---|---|---|
+| A1 | `classify_pve_error` — router `no such file` never maps to absence | `test_router_no_such_file_500_is_NEVER_absence` (pve-contract, real HTTP), `tests/test_pve_error_classification.py` |
+| A2 | `_KEY_NOT_READY_SIGNATURES` removed; only agent-not-running signatures stay | `tests/test_pve_error_classification.py`, `test_guest_agent_read_encodes_query_and_strips_comment` |
+| A3 | `version()` → `GET /version` | `test_real_client_uses_api2_json_prefix_and_token_header` |
+| A4 | `next_vmid` — `?vmid=` assertion then permission-filtered scan fallback | `test_nextid_collision_asserts_then_scans` |
+| A5 | token-shape fail-fast in `ProxmoxClient.__init__` | `test_malformed_token_id_fails_before_any_request` |
+| A6 | resume re-pins when `state == created` but `host_key_ref` missing (`orchestrator.py` resume branch) | `tests/test_deploy_resume_repins_missing_host_key.py` |
+| A7/A14 | `deploy/pve_broker_acl.sh` (dry-run/`--apply`/`--verify` effective probes) | operator manual checks above (live host required) |
+| A8 | template build records net0 bridge; operator probe command above | images gate (phase 3) |
+| A9/A10 | `FakePVEHttp` `pve_no_such_file` mode + exact config-absent dialect | `test_pve92_config_absent_500_dialect_is_confirmed_absence`, `test_404_is_confirmed_absence` |
+| A11 | real proxmoxer HTTP contract suite exists | the whole pve-contract gate |
+| A12 | `deploy/env.broker.example` privilege comment → ACL script pointer | inspected (comment-only) |
+| A13 | `deploy/env.control-plane.example` node-discovery command fixed | inspected (comment-only) |
+
+Remaining live probes stay under "Needs operator probe" above — they need the
+real node and are NOT claimed as done.

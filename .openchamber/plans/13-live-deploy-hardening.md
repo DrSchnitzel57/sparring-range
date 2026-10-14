@@ -7,7 +7,7 @@ a claim that the current code or any live deployment has passed acceptance.
 ## Steps
 
 - [x] 1. Establish the release contract, fresh baseline, and deployment manifest.
-- [ ] 2. Repair and prove the Proxmox/broker boundary and recovery contracts.
+- [x] 2. Repair and prove the Proxmox/broker boundary and recovery contracts.
 - [ ] 3. Build complete, role-separated, boot-tested guest templates.
 - [ ] 4. Establish production configuration, TLS, telemetry, and readiness.
 - [ ] 5. Implement durable asynchronous deployment and lifecycle recovery.

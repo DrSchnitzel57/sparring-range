@@ -1028,6 +1028,62 @@ Delivered (fast tests `tests/test_release_manifest.py`, 22 passed):
 No live installation was inferred or performed. DB/packet/browser/live gates
 were not rerun in phase 1; old totals are not claimed.
 
+### Phase 2 — Proxmox/broker boundary and recovery contracts
+
+Fresh results at this revision (same environment; every gate run with
+`env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD`):
+
+| Exact command | Fresh result |
+|---|---|
+| `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -ra -p no:cacheprovider` | Exit 0: **223 passed, 0 failed, 0 skipped, 208 deselected**, 4 warnings, 40.27s (adds 22 pve-contract + 3 lease + 1 capacity tests to the 198) |
+| `.venv/bin/python infra/dev/acceptance.py authority` | **PASS**: 25 passed, 0 failed, 0 skipped (was 16 failed/8 passed at `44a712a`) — fixtures repaired to the `sr-` policy; the policy itself unchanged |
+| `.venv/bin/python infra/dev/acceptance.py pve-contract` (new gate) | **PASS**: 22 passed, 0 skipped — REAL pinned proxmoxer 2.3.0 over loopback HTTPS |
+| `.venv/bin/python infra/dev/acceptance.py selection` | **PASS** |
+| `.venv/bin/python infra/dev/acceptance.py python` | **PASS** (fresh locked install, Python 3.13.5) |
+
+Delivered:
+
+- **Authority fixtures repaired, policy untouched**: `web01-deadbeef` →
+  `sr-web01-deadbeef` (foreign-resource fixtures deliberately keep non-`sr-`
+  names); all latch/race/intent/uncertain-cleanup assertions preserved.
+- **`pve-contract` gate** (`tests/test_pve_real_client_contract.py`,
+  `adapter` marker — runs in the fast default AND required mode): real
+  `ProxmoxAPI`/requests stack against a synthetic PVE dialect server —
+  `/api2/json` prefix survival, `PVEAPIToken` header, query/form encoding,
+  nextid assertion→scan, clone/start/stop/delete UPID polling, task
+  exitstatus ERROR, malformed replies uncertain, 404 vs the exact
+  config-absent 500 dialect (confirmed absence) vs the router
+  `no such file` 500 (NEVER absence), 401/403/timeout/refused uncertain,
+  TLS trust enforced (no-CA/foreign-CA fail closed), agent file-read query
+  encoding + comment stripping + allowlist refusal before any HTTP.
+  `_Recorder` is never substituted for this boundary.
+- **Deadlines checked together**: `HttpTransport.OP_TIMEOUTS` per op exceed
+  the documented server bounds (static contract test); a task longer than
+  the old flat 30 s completes; a lost mutation response stays
+  `BrokerUnavailable` and is **never** transport-retried; lost reads get
+  exactly one safe retry; `proxmox_http_timeout_s` is an explicit setting.
+- **Reservation accounting fixed**: `clone_and_wait` no longer double-charges
+  the target VMID's own `reserved` claim against `max_vms`
+  (`test_reserved_claim_is_not_double_counted` — old code refused the third
+  guest of a three-VM range).
+- **Bounded DB/control-failure lease policy**: `control_is_active()` is
+  tri-state (active/provably-idle/**unverified**); renewals continue only
+  within `max_unverified_s` (default 60 s = 2× broker TTL), then go silent
+  so the broker watchdog latches and stops the range; unverified is never
+  provable idle; recovery resets the window (4 heartbeat tests).
+- **`deploy/pve_broker_acl.sh`**: dry-run default, `--apply` (idempotent,
+  only "already exists" tolerated), `--verify` probes EFFECTIVE token
+  permissions (allowed ops + denials on unrelated VM, ACL read/write,
+  foreign file-read/stop) — role names alone are never proof; no
+  broad-privilege fallback; token secret never on argv, never printed.
+- **Audit A6 repaired**: resume re-pins when `state == created` but
+  `host_key_ref` is missing; regression
+  `tests/test_deploy_resume_repins_missing_host_key.py` is **db-layer —
+  pending the db gate** (no disposable PostgreSQL in this environment; not
+  claimed as run). A12/A13 comment fixes landed; every audit finding now has
+  a code/test anchor in `docs/audits/pve92-alignment.md` "Fix anchors";
+  remaining live probes stay explicit operator work.
+
 ## Recording new acceptance evidence
 
 For every gate record: date, evidence Git revision and dirty status, exact command

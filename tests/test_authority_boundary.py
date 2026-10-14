@@ -29,7 +29,12 @@ from infra.broker.testing import DEFAULT_TEST_POLICY, make_fake_broker, make_tes
 pytestmark = pytest.mark.authority
 
 NODE = "r740"
-NAME = "web01-deadbeef"
+# Plan 13 phase 2: fixtures must satisfy the CURRENT name policy (prefix
+# "sr-", see infra/broker/policy.py check_name) — the pre-policy
+# "web01-deadbeef" was correctly refused. The policy stays; the fixtures
+# were stale. Foreign-resource fixtures below deliberately keep NON-sr
+# names because they model someone else's machine.
+NAME = "sr-web01-deadbeef"
 TAG = "srsess-" + "a" * 32
 IPC = "ip=10.66.0.10/24,gw=10.66.0.1"
 NET0 = "virtio,bridge=vmbr1,tag=66"
@@ -300,7 +305,7 @@ def test_latched_refuses_mutation_allows_cessation(tmp_path):
     with pytest.raises(BrokerLatched):
         _place(client)
     with pytest.raises(BrokerLatched):
-        client.clone_and_wait(NODE, 9001, 211, "x-" + NAME, session_id="s")
+        client.clone_and_wait(NODE, 9001, 211, NAME + "-2", session_id="s")
     with pytest.raises(BrokerLatched):
         client.destroy_and_wait(NODE, 210)
     with pytest.raises(BrokerLatched):
@@ -444,7 +449,7 @@ def test_healthy_renewals_prevent_stop(tmp_path):
 def test_hard_stop_all_stops_with_readback_and_retains_obligations(tmp_path):
     client, service, http = _mk(tmp_path)
     for vmid in (210, 211, 212):
-        client.clone_and_wait(NODE, 9001, vmid, f"h{vmid}-{NAME}",
+        client.clone_and_wait(NODE, 9001, vmid, f"{NAME}-h{vmid}",
                               session_id="s", generation="g")
         client.set_config(NODE, vmid, session_id="s",
                           ipconfig0=f"ip=10.66.0.{vmid-200}/24,gw=10.66.0.1",
@@ -506,6 +511,29 @@ def test_cross_session_and_unowned_mutation_refused(tmp_path):
 # --------------------------------------------------------------------------- #
 # 6. writer races                                                             #
 # --------------------------------------------------------------------------- #
+
+def test_reserved_claim_is_not_double_counted(tmp_path):
+    """Plan 13 phase 2 reservation accounting: next_vmid's 'reserved' claim
+    IS the future VM — clone_and_wait must not charge it AGAIN against
+    max_vms (the old code counted it twice and refused the third guest of a
+    three-VM range)."""
+    policy = make_test_policy(limits={**DEFAULT_TEST_POLICY["limits"],
+                                      "max_vms": 3})
+    client, service, http = make_fake_broker(
+        policy=policy, ledger_path=tmp_path / "l3.sqlite3")
+    vmids = []
+    for i in range(3):
+        vmid = client.next_vmid(NODE, 210 + i, session_id="s")
+        vmids.append(vmid)
+        assert service.ledger.get_claim(vmid)["state"] == "reserved"
+        client.clone_and_wait(NODE, 9001, vmid, f"{NAME}-{i}",
+                              session_id="s", generation=f"g{i}")
+        assert service.ledger.get_claim(vmid)["state"] == "created"
+    assert len(set(vmids)) == 3
+    # the FOURTH reservation is the first genuine capacity violation
+    with pytest.raises(PolicyViolation, match="max_vms"):
+        client.next_vmid(NODE, 220, session_id="s")
+
 
 def test_concurrent_same_clone_executes_exactly_once(tmp_path):
     client, service, http = _mk(tmp_path)

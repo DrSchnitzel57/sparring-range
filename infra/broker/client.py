@@ -48,12 +48,32 @@ class LocalTransport:
 
 class HttpTransport:
     """Mutual-TLS HTTPS transport. A missing/foreign client certificate
-    fails at the TLS handshake — before any request is even sent."""
+    fails at the TLS handshake — before any request is sent."""
 
-    # Ops whose SERVER-side work can legitimately outlast the default socket
-    # timeout (guest-agent readiness wait, live find 2026-10-14). The server
-    # bound (proxmox_agent_ready_timeout_s=120) stays below the client bound.
-    OP_TIMEOUTS = {"read_host_key": 150.0}
+    # Plan 13 phase 2: client/server/task deadlines are checked TOGETHER.
+    # Every bound below exceeds the documented SERVER-side bound of the op
+    # (task timeout 300 s, agent-readiness wait 120 s, start wait 90 s,
+    # stop/destroy waits 60 s each) so a legitimate long task is never cut
+    # off client-side at the old flat 30 s. When the client bound IS
+    # exceeded (or the response is otherwise lost) the call raises
+    # BrokerUnavailable — UNCERTAIN, never failure: the broker persisted its
+    # intent/claim before the effect, keeps stopping on the latch path, and
+    # reconciliation (never blind replay) resolves the outcome afterwards.
+    # Mutations are NEVER retried by this transport; only idempotent reads
+    # get one bounded retry, and only for a pure transport failure.
+    OP_TIMEOUTS = {
+        "read_host_key": 150.0,     # server bound: 120 s agent wait + margin
+        "clone_and_wait": 330.0,    # server bound: 300 s task timeout
+        "start_and_wait": 125.0,    # server bound: 90 s task wait + read-back
+        "stop_and_confirm": 95.0,   # server bound: 60 s task wait + read-back
+        "destroy_and_wait": 160.0,  # server bound: 60 s stop + 60 s delete
+        "hard_stop_all": 330.0,     # latch is durable FIRST; a lost response
+        # keeps stopping server-side and stays an explicit obligation
+    }
+    READ_OPS = frozenset({
+        "lookup_vm", "lookup_config", "try_lookup_config", "read_config",
+        "vm_status", "inventory", "latch_status",
+    })
 
     def __init__(self, url: str, ca_file: str, cert_file: str, key_file: str,
                  timeout: float = 30.0):
@@ -69,8 +89,7 @@ class HttpTransport:
         ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
         self._ctx = ctx
 
-    def call(self, op: str, args: dict):
-        body = json.dumps(args, default=str).encode()
+    def _call_once(self, op: str, body: bytes):
         conn = http.client.HTTPSConnection(
             self.host, self.port,
             timeout=self.OP_TIMEOUTS.get(op, self.timeout), context=self._ctx)
@@ -83,6 +102,19 @@ class HttpTransport:
             raise BrokerUnavailable(f"broker transport failure: {e}") from e
         finally:
             conn.close()
+        return resp, payload
+
+    def call(self, op: str, args: dict):
+        body = json.dumps(args, default=str).encode()
+        try:
+            resp, payload = self._call_once(op, body)
+        except BrokerUnavailable:
+            # Reads are side-effect-free: one retry is safe. Mutations are
+            # NOT replayed — their outcome is uncertain and must be
+            # reconciled (intent-before-effect ledger), never assumed away.
+            if op not in self.READ_OPS:
+                raise
+            resp, payload = self._call_once(op, body)
         if resp.status == 200:
             try:
                 return json.loads(payload or "null")["result"]
