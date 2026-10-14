@@ -8,7 +8,7 @@ a claim that the current code or any live deployment has passed acceptance.
 
 - [x] 1. Establish the release contract, fresh baseline, and deployment manifest.
 - [x] 2. Repair and prove the Proxmox/broker boundary and recovery contracts.
-- [ ] 3. Build complete, role-separated, boot-tested guest templates.
+- [x] 3. Build complete, role-separated, boot-tested guest templates.
 - [ ] 4. Establish production configuration, TLS, telemetry, and readiness.
 - [ ] 5. Implement durable asynchronous deployment and lifecycle recovery.
 - [ ] 6. Complete both presets, match controls, observations, and injects.
@@ -16,14 +16,14 @@ a claim that the current code or any live deployment has passed acceptance.
 - [ ] 8. Deliver and rehearse the operator installer and optional backups.
 - [ ] 9. Collect authorized live evidence and reconcile release documents.
 
-Status (2026-10-14, implementation session): steps 1–2 complete and gated.
-Steps 3–6 and 8 implemented with fast/gate evidence recorded in
-`docs/FINDINGS_CHECKLIST.md` ("Phases 3–8"); step 3 awaits the images/capture
-gate rerun, step 5's db-layer tests pass in the db gate, step 6's inject
-subsystem is implemented and gated at API level while its full control-
-matrix live tests remain, and step 7 (new browser surfaces: control builder,
-inject inbox UI, AAR UI) remains explicitly open. Step 9 is operator live
-evidence and stays open by design. Checkboxes are ticked only when the
+Status (2026-10-14, implementation session): steps 1–3 complete and gated
+(step 3 by `images` PASS 18/0 + `capture` PASS on the rebuilt role overlays).
+Steps 4–6 and 8 are implemented with fast/db/browser/gate evidence recorded
+in `docs/FINDINGS_CHECKLIST.md` ("Phases 3–8"); their remaining halves are
+live/operator gates (packet CI job, service-VM install evidence, deployed-
+lab release workflows), and step 7's new UI beyond the shipped inject inbox
+(control builder, safety-panel refinements) remains open. Step 9 is operator
+live evidence and stays open by design. Checkboxes are ticked only when the
 step's own gate passes — never on implementation presence alone.
 
 Finish phases in order; each has a stop condition below. Independent tests

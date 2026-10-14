@@ -1100,7 +1100,7 @@ with `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD`):
 | `…acceptance.py containment` | **PASS** after 11.6s — real namespace/cgroup fixtures created, positive-control process migration, 21 required-mode regressions 0 skipped, no leaked run cgroups |
 | `…acceptance.py packet` | **FAIL (prerequisite)** — needs root + nft (missing here); runs only in the approved disposable-netns CI packet job; never accepted from this host |
 | `…acceptance.py images` | **PASS** after 1784.8s — all three role overlays rebuilt from the fixed recipe (web-local `f1b5777d`, web-db `7ae761c9`, attacker `7552a591`), **18 passed, 0 skipped**: real Ubuntu builds, boot tests, services/seeds/flaws/fixes, readiness + clone-mode + host-key contracts, attacker records its 5 resolved packages (the PKG-before-SETUP-OK fix), no QEMU or DB leaks |
-| `…acceptance.py capture` | running at this recording; result appended below |
+| `…acceptance.py capture` | **PASS** after 202.4s — 10 passed, 0 skipped: installed auditd+shipper on the real DB overlay guest, EXECVE capture proven locally with NO delivery on the negative boot, end-to-end delivery to the synthetic API, cursor durability; two pre-existing test-expectation bugs fixed (the harness emits bare `BOOT` liveness, never `BOOT-PASS`; the DB payload check now asserts tier separation) |
 | `…acceptance.py install` | Sandbox contract **PASS** (dry-run, idempotent rerun, key preservation, invalid manifest refused before effects); **FAILS** on the managed-service VM half until the disposable-VM job sets `SR_INSTALL_VM_EVIDENCE` — deliberately not accepted from a sandbox |
 
 Delivered:

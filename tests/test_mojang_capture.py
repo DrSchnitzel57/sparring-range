@@ -41,10 +41,14 @@ def test_capture_installed_unit_rules_and_hardening():
     installer = (REPO / "telemetry/install.sh").read_text()
     assert "ENRICHED" in installer and "adm" in installer
     assert "srshipper" in installer and "spool" in installer.lower()
-    # Payloads carry the installed unit (web guests), attacker does not.
-    for guest in ("mojang-web-local", "mojang-web-db"):
-        tree = REPO / "infra/images/payloads" / guest
-        assert (tree / "etc/systemd/system/mojang-web.service").exists()
+    # Payloads carry the installed web unit (web guests ONLY — plan 13
+    # phase 3 tier separation: the DB tier ships no web app); the capture
+    # shipper unit is installed into every role by telemetry/install.sh,
+    # proven live by the boot tests below.
+    assert (REPO / "infra/images/payloads/mojang-web-local"
+            / "etc/systemd/system/mojang-web.service").exists()
+    assert not (REPO / "infra/images/payloads/mojang-web-db"
+                / "etc/systemd/system/mojang-web.service").exists()
     # Spool/cast bounds match the architecture decision.
     from telemetry.shipper import Spooler
     import inspect
@@ -351,7 +355,11 @@ def test_capture_installed_negatives_on_real_guest(capture_overlay):
         hostname="sr-capture-neg", memory_mb=2048, net="none",
         timeout_s=600)
     markers = rec["markers"]
-    for name in ("BOOT", "UNIT-ACTIVE", "AUDITD-CAPTURED", "NO-DELIVERY"):
+    # BOOT is the harness liveness marker (bare `say BOOT`, written twice
+    # for serial integrity); the three checks below are chk-based and
+    # therefore emit -PASS.
+    assert "SR-GUEST-BOOT" in markers, markers
+    for name in ("UNIT-ACTIVE", "AUDITD-CAPTURED", "NO-DELIVERY"):
         assert f"SR-GUEST-{name}-PASS" in markers, markers
     assert not [m for m in markers if "-FAIL:" in m], markers
 
