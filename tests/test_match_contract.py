@@ -161,3 +161,41 @@ def test_prober_dispatches_http_and_mysql_targets():
     p.run_once()
     assert ("web01", "up") in seen and ("db01", "up") in seen
     assert len(seen) == 2
+
+
+# --------------------------------------------------------------------------- #
+# injects (plan 13 phase 6)
+# --------------------------------------------------------------------------- #
+
+def test_inject_catalog_is_versioned_and_typed():
+    from srplatform.injects import CATALOG
+    assert all(k.endswith("@1") for k in CATALOG)
+    kinds = {k: v["kind"] for k, v in CATALOG.items()}
+    assert kinds["incident-report@1"] == "written"
+    assert sum(1 for v in CATALOG.values() if v["kind"] == "technical") == 3
+    # written work can never carry a verifier (advisory only)
+    assert CATALOG["incident-report@1"]["verifier"] is None
+
+
+def test_inject_schedule_derives_from_frozen_duration():
+    from datetime import datetime, timezone
+    from srplatform.injects import schedule_times
+    start = datetime(2026, 10, 14, 12, tzinfo=timezone.utc)
+    times = schedule_times(start, 60)
+    assert len(times) == 4
+    # 20/40/60/80% release, each open 20% of the clock
+    assert times[0][0] == start + timedelta(minutes=12)
+    assert times[0][1] == start + timedelta(minutes=24)
+    assert times[3][1] == start + timedelta(minutes=60)
+
+
+def test_disabled_inject_set_releases_nothing():
+    """injects_enabled=false: schedule returns [] BEFORE touching the db."""
+    from unittest.mock import MagicMock
+    from srplatform.injects import schedule
+    db = MagicMock()
+    match = MagicMock()
+    match.snapshot = {"injects_enabled": False}
+    assert schedule(db, "sid", match, {"topology": {"hosts": []}}) == []
+    db.add.assert_not_called()
+    db.commit.assert_not_called()

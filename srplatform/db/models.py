@@ -396,6 +396,36 @@ class DeployOperation(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class InjectRelease(Base):
+    """Versioned inject release (plan 13 phase 6): trusted server-side
+    schedule derived from the snapshotted duration; identity-bound,
+    idempotent submissions decide ONCE (pending|correct|incorrect|late),
+    written work is advisory. Mutable lifecycle state (like
+    deploy_operations); every transition is also appended as an event."""
+
+    __tablename__ = "inject_releases"
+
+    release_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.session_id"), nullable=False)
+    inject_id: Mapped[str] = mapped_column(Text, nullable=False)  # versioned
+    kind: Mapped[str] = mapped_column(Text, nullable=False)       # technical|written
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    submissions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    evidence: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+
+    __table_args__ = (
+        UniqueConstraint("session_id", "inject_id",
+                         name="uq_inject_releases_session_inject"),
+        Index("ix_inject_releases_session_status", "session_id", "status"),
+    )
+
+
 class Recording(Base):
     """Opaque recording identities (F16): clients reference recording_ids,
     never filesystem paths. Paths live server-side only."""

@@ -139,11 +139,13 @@ def test_images_flaws_documented_with_service_preserving_fixes():
     assert "MOJANG_DIAG_ENABLED=off" in fixes
     assert "rm -f /etc/sudoers.d/mojang-maintenance" in fixes
     assert "still active" in fixes or "still serves" in fixes or "stays ready" in fixes
-    # Both role trees carry the identical chain (shared build path).
+    # PLAN 13 PHASE 3 TIER SEPARATION: the DB tree must NOT carry the web
+    # app at all (the documented superset overlay is replaced by per-role
+    # artifacts); the chain above lives ONLY in the web tree.
     for rel in ("srv/mojang-web/app.py", "usr/local/bin/mojang-maintenance",
                 "etc/sudoers.d/mojang-maintenance", "srv/mojang-web/FIXES.md"):
-        assert (REPO / f"infra/images/payloads/mojang-web-db/{rel}").read_text() \
-            == (REPO / f"infra/images/payloads/mojang-web-local/{rel}").read_text(), rel
+        assert not (REPO / f"infra/images/payloads/mojang-web-db/{rel}").exists(), \
+            f"DB tier must ship no web app ({rel})"
 
 
 def test_images_builder_deterministic_scrubbed_public_keys_only(tmp_path):

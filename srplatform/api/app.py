@@ -1017,6 +1017,15 @@ def begin_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
             Deployment.status == "ready")
             .order_by(Deployment.created_at.desc())).scalars().first()
         uptime.start_for_session(db, sess, dep)
+        # INJECTS (plan 13 phase 6): the trusted server derives the
+        # release/deadline schedule from the FROZEN snapshot duration —
+        # clients can never move it; a disabled inject set releases
+        # nothing. Idempotent: a duplicate Begin re-reads, never re-times.
+        from srplatform import injects as injects_svc
+        from srplatform.scenario_engine.loader import load_scenario
+        injects_svc.schedule(db, sess.session_id, m,
+                             load_scenario(sess.scenario_id),
+                             actor=p.username)
         _ok = True
         return {"ok": True, "run_id": str(run.run_id), "status": "running",
                 "session_id": str(sess.session_id),
@@ -1026,6 +1035,54 @@ def begin_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
                 "pace_seconds": m.pace_seconds if m else None}
     finally:
         _release_claim_safely(db, sess.session_id, _ok, _claim_owner)
+
+
+@app.get("/sessions/{session_id}/injects")
+def list_injects(session_id: uuid.UUID, p: Principal = Depends(any_member),
+                 db: DbSession = None):
+    """Inject inbox: what is released, when it closes, and the outcome —
+    per-session access enforced at the API (competition visibility is not
+    a UI concern). Verification internals stay server-side."""
+    from srplatform import injects as injects_svc
+    from srplatform.db.models import InjectRelease
+    sess = _get_session(db, p, session_id)
+    rows = db.execute(select(InjectRelease).where(
+        InjectRelease.session_id == sess.session_id)
+        .order_by(InjectRelease.scheduled_at)).scalars().all()
+    return {"releases": [{
+        "release_id": str(r.release_id), "inject_id": r.inject_id,
+        "kind": r.kind, "status": r.status,
+        "description": injects_svc.CATALOG[r.inject_id]["description"],
+        "scheduled_at": r.scheduled_at.isoformat(),
+        "deadline_at": r.deadline_at.isoformat(),
+        "submitted_at": r.submitted_at.isoformat() if r.submitted_at else None,
+        "submissions": r.submissions} for r in rows],
+        "score": injects_svc.summary(db, sess.session_id)}
+
+
+class InjectSubmission(BaseModel):
+    content: dict | str | None = None
+
+
+@app.post("/sessions/{session_id}/injects/{release_id}")
+def submit_inject(session_id: uuid.UUID, release_id: uuid.UUID,
+                  body: InjectSubmission, p: Principal = Depends(any_member),
+                  db: DbSession = None):
+    """One identity-bound submission. The FIRST answer decides; duplicates
+    count but never re-decide; the first answer after the deadline is
+    `late`; written work is advisory (never verified points); an
+    unverifiable moment keeps the release open instead of scoring a
+    failure. Releases that are not yet open are refused, not queued."""
+    from srplatform import injects as injects_svc
+    from srplatform.db.models import InjectRelease
+    sess = _get_session(db, p, session_id)
+    rel = db.get(InjectRelease, release_id)
+    if rel is None or rel.session_id != sess.session_id:
+        raise HTTPException(404, {"error": "no_such_release"})
+    result = injects_svc.submit(db, rel, actor=p.username)
+    if result["status"] == "not_released":
+        raise HTTPException(409, result)
+    return result
 
 
 @app.get("/runs/{run_id}")

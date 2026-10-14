@@ -10,6 +10,8 @@ export default function LiveSession() {
   const [live, setLive] = useState(null);
   const [conns, setConns] = useState(null);
   const [hint, setHint] = useState("");
+  const [injects, setInjects] = useState(null);
+  const [injectDraft, setInjectDraft] = useState({});
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const [seconds, setSeconds] = useState(0);
@@ -38,8 +40,15 @@ export default function LiveSession() {
     };
     tick();
     const t = setInterval(tick, 2000);
+    const tin = () => {
+      api(`/sessions/${id}/injects`)
+        .then(d => { if (!stop) setInjects(d); })
+        .catch(() => { if (!stop) setInjects(null); });
+    };
+    tin();
+    const ti = setInterval(tin, 5000);
     const tc = setInterval(() => { if (startRef.current) setSeconds(s => s + 1); }, 1000);
-    return () => { stop = true; clearInterval(t); clearInterval(tc); };
+    return () => { stop = true; clearInterval(t); clearInterval(ti); clearInterval(tc); };
   }, [id]);
 
   async function act(fn, label) {
@@ -78,6 +87,13 @@ export default function LiveSession() {
     const r = await api(`/sessions/${id}/hint`, { method: "POST", body: { question: "" } });
     setHint(r.hint);
   }, "hint");
+  const submitInject = (releaseId) => act(async () => {
+    // identity-bound; the FIRST answer decides (duplicates never re-decide)
+    await api(`/sessions/${id}/injects/${releaseId}`, {
+      method: "POST", body: { content: injectDraft[releaseId] || "" },
+    });
+    setInjects(await api(`/sessions/${id}/injects`));
+  }, "inject submission");
 
   if (err && !sess) return <p className="bad">{err}</p>;
   if (!sess) return <p className="dim">loading…</p>;
@@ -161,6 +177,49 @@ export default function LiveSession() {
           ) : (
             <p className="dim">unscored — no valid checks yet (unknown/missed never count)</p>
           )}
+        </div>
+        <div className="panel">
+          <h3>injects</h3>
+          {!injects ? <p className="dim">loading…</p>
+            : injects.releases.length === 0 ? (
+            <p className="dim">no injects released for this match</p>) : (
+            <>
+              <ul>{injects.releases.map(r => {
+                const open = new Date(r.scheduled_at).getTime() <= Date.now();
+                const past = new Date(r.deadline_at).getTime() < Date.now();
+                return (
+                  <li key={r.release_id} style={{ marginBottom: 10 }}>
+                    <b>{r.inject_id.replace("@1", "")}</b>{" "}
+                    <span className={r.status === "correct" ? "ok"
+                      : r.status === "pending" ? "dim" : "bad"}>[{r.status}]</span>
+                    <br />
+                    <span className="dim">{r.description}</span>
+                    {r.kind === "written" && <><br />
+                      <span className="dim">advisory feedback only — never verified points</span></>}
+                    <br />
+                    <span className="dim">
+                      {open ? (past ? "window closed" : `closes ${new Date(r.deadline_at).toLocaleTimeString()}`)
+                        : `opens ${new Date(r.scheduled_at).toLocaleTimeString()}`}
+                    </span>
+                    {r.status === "pending" && open && !past &&
+                      <>
+                        <br />
+                        <textarea rows={2} style={{ width: "100%" }}
+                          placeholder="your answer / actions taken…"
+                          value={injectDraft[r.release_id] || ""}
+                          onChange={e => setInjectDraft({ ...injectDraft, [r.release_id]: e.target.value })} />
+                        <button onClick={() => submitInject(r.release_id)} disabled={busy}>submit</button>
+                      </>}
+                  </li>
+                );
+              })}</ul>
+              <p className="dim">
+                inject score: {injects.score.scored
+                  ? `${injects.score.correct}/${injects.score.technical_closed} (${injects.score.pct}%)`
+                  : "unscored"}{" "}
+                — separate from availability and the security scorecard
+              </p>
+            </>)}
         </div>
         <div className="panel">
           <h3>detections</h3>

@@ -553,8 +553,10 @@ timeout 60 systemctl restart auditd || true
 bash /srv/sr-bake-keys.sh || {{ mark KEYS-FAIL; poweroff; }}
 ufw --force enable; ufw allow 22/tcp
 systemctl enable --now ssh qemu-guest-agent || true
-mark SETUP-OK
+# package report BEFORE the completion marker: the harness powers off on
+# SETUP-OK, so anything printed after it never reaches the serial log.
 for p in {pins}; do n=${{p%%=*}}; v=$(dpkg-query -W -f='${{Version}}' "$n" 2>/dev/null || echo unknown); echo "SR-GUEST-PKG:$n=$v" > $S; done
+mark SETUP-OK
 poweroff
 """, perms="0755")
     return f"""#cloud-config

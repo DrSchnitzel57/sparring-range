@@ -1132,7 +1132,12 @@ Delivered:
   private keys parse-checked at startup with ssh-keygen-format fingerprints
   recorded in `TEMPLATE-INFO.json` for rotation drift detection; typed
   broker policy REFUSES `gw=` — range guests are on-link only, no default
-  route by construction.
+  route by construction. The guest-facing range listener answers with
+  nothing but the authenticated enrollment/ingest routes
+  (`SR_API_INGEST_ONLY`; 404 elsewhere, bounded bodies); `GET /stages`
+  distinguishes install-ready / lab-ready / attack-authorized with the
+  explicit `SR_ATTACK_AUTHORIZED` operator gate, and the three-plane
+  separation is documented in `deploy/README` §2a.
 - **Phase 5 (durable lifecycle operations)**: `deploy_operations` table
   (migration 0014) + orchestrator helpers; launch/reset commit identity,
   fence, phase and deadline BEFORE effects; redacted
@@ -1140,14 +1145,25 @@ Delivered:
   executors `interrupted` before clearing claims (live fences survive;
   stale requests cannot finalize replacements); 4 db-layer tests pass in the
   db gate.
-- **Phase 6 (match contract, partial)**: snapshot v2 freezes bounded
+- **Phase 6 (match contract)**: snapshot v2 freezes bounded
   choices (mode practice|competition, start condition manual|auto-on-ready,
-  intensity pace ∈ {0,15,30,60}, injects toggle) with 422 before
+  intensity pace ∈ {0,15,30,60}, injects toggle) plus scenario/rubric/seed/
+  image versions, the scenario digest and effective settings with 422 before
   storage; `uptime.coverage` computes the EXPECTED schedule from the match
   clock — gaps are visible `missed`, unknown ≠ downtime, zero valid
-  unscored. **Open requirement:** the versioned inject subsystem
-  (restricted-account/web-restoration/DB-recovery/incident-report) and the
-  full control-matrix live tests remain unimplemented; the release gate
+  unscored; the prober additionally runs an authenticated read-only MySQL
+  BUSINESS TRANSACTION every cycle for provisioned DB tiers (three truths
+  separate: wrong seeded count = down, unestablished session = unknown,
+  broken probe credential = probe-infrastructure interrupt). Versioned
+  injects (`srplatform/injects.py`, migration 0015): trusted server
+  schedule from the frozen duration at Begin, four versioned injects
+  (restricted-account, web-restoration, DB-data-recovery technical;
+  incident-report written/advisory-only), identity-bound submissions where
+  the FIRST answer decides (pending|correct|incorrect|late|duplicate|
+  advisory), deterministic verification through the shared verifier
+  registry, disabled set releases nothing, and a SEPARATE inject score —
+  no combined grade. **Open requirement:** the full control-matrix live
+  tests and browser inject inbox (phase 7 UI) remain; the release gate
   exists but refuses to run without a deployed lab.
 - **Phase 8 (installer/gates)**: `deploy/install.sh` (idempotent,
   key-preserving, verify-before-enable, explicit migrations, optional
