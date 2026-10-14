@@ -1095,8 +1095,9 @@ with `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD`):
 | `…acceptance.py frontend` | **PASS** — npm ci, production build, audit zero high/critical |
 | `…acceptance.py compose` | **PASS** — full stack + seed-bastion-keys success gate, cleaned |
 | `…acceptance.py browser` | **PASS** — isolated real-browser workflow + replay, 1 passed |
+| `…acceptance.py db` | **PASS** after 155.7s — disposable fixture, fresh + forward migrations (incl. 0014), **140 passed, 0 failed** (the five phase-3/6 regressions repaired at `6ae72df`; the four phase-5 deploy-operation tests pass) |
 | `…acceptance.py install` | Sandbox contract **PASS** (dry-run, idempotent rerun, key preservation, invalid manifest refused before effects); **FAILS** on the managed-service VM half until the disposable-VM job sets `SR_INSTALL_VM_EVIDENCE` — deliberately not accepted from a sandbox |
-| `…acceptance.py images` / `capture` | running at this recording; results appended below when complete |
+| `…acceptance.py images` / `capture` | rerunning with the disk-backed cache (`SR_GUEST_CACHE`) after the tmpfs build was OOM-killed; results appended below when complete |
 
 Delivered:
 
@@ -1137,8 +1138,8 @@ Delivered:
   fence, phase and deadline BEFORE effects; redacted
   `GET /sessions/{id}/operation` polling; startup reconcile marks dead
   executors `interrupted` before clearing claims (live fences survive;
-  stale requests cannot finalize replacements); 4 db-layer tests pending
-  the db gate.
+  stale requests cannot finalize replacements); 4 db-layer tests pass in the
+  db gate.
 - **Phase 6 (match contract, partial)**: snapshot v2 freezes bounded
   choices (mode practice|competition, start condition manual|auto-on-ready,
   intensity pace ∈ {0,15,30,60}, injects toggle) with 422 before
