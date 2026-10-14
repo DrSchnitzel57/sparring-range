@@ -31,11 +31,17 @@ if [ ! -f ca.crt ]; then
   openssl req -x509 -new -key ca.key -sha256 -days "$DAYS" -subj "/CN=sparring-range-broker-CA" -out ca.crt
 fi
 
-# broker server cert
+# broker server cert — SAN type must match how the API dials it: an IP
+# target requires an iPAddress SAN (a DNS SAN never matches an IP).
+if printf '%s' "$BROKER_HOST" | grep -qE '^[0-9.]+$|:'; then
+  broker_san="IP:$BROKER_HOST"
+else
+  broker_san="DNS:$BROKER_HOST"
+fi
 openssl genrsa -out broker-server.key 2048
 openssl req -new -key broker-server.key -subj "/CN=$BROKER_HOST" -out broker-server.csr
-printf "subjectAltName=DNS:%s%s\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n" \
-  "$BROKER_HOST" "${HTTPS_IP:+,IP:$HTTPS_IP}" > broker-server.ext
+printf "subjectAltName=%s%s\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n" \
+  "$broker_san" "${HTTPS_IP:+,IP:$HTTPS_IP}" > broker-server.ext
 openssl x509 -req -in broker-server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
   -days "$DAYS" -sha256 -extfile broker-server.ext -out broker-server.crt
 
