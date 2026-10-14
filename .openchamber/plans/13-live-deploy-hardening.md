@@ -32,6 +32,14 @@ fence caught and what layer should have caught it earlier.
       tests stayed green (`db01932`).
 - [x] Dead-man switch demonstrated live: lease expiry latched, honest
       release with empty ledger (audit trail #1–#5).
+- [x] 401 wall resolved: running `sr-brokerd` held a stale/placeholder
+      `PROXMOX_TOKEN_ID` (example shipped `sr-broker@pve` with a stray
+      hyphen); live probe proved file+client+token healthy after restart
+      (`version()` 200 on PVE 9.2.21). Example placeholder defused (`12e22fa`).
+- [x] PVE's SECOND absence dialect — 500 "Configuration file
+      'nodes/<n>/qemu-server/<vmid>.conf' does not exist" — classified as
+      confirmed absence + tests (`d45f8f7`); this unblocked `next_vmid`
+      against the real host.
 
 ## Remaining improvements
 - [ ] Production settings validation: refuse to start `sr-api` with
@@ -66,9 +74,9 @@ fence caught and what layer should have caught it earlier.
       reserved claim + possible `clone-outcome-unknown` obligation
       (verify absent in PVE, settle via tools/teardown, never by
       hand-editing the ledger).
-- [ ] Live blocker carry-over: 401 from `sr-brokerd` while curl with the
-      same token works — restart the service (stale env), retest, then
-      first green Launch (handoff §2).
+- [ ] Live carry-over: first green Launch still pending — after pulling
+      `d45f8f7` on the broker VM, next attempt reaches the real clone
+      path (new-error territory: storage/ACL/boot, not auth).
 
 ## Out of scope
 Re-architecting the lease/latch model; relaxing any policy check;
