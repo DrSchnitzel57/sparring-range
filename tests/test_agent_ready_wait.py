@@ -1,74 +1,77 @@
-"""Guest-agent readiness wait (live-deploy find, 2026-10-14).
+"""Guest-agent first-boot readiness (live-deploy finds, 2026-10-14).
 
-Right after a clone starts, real PVE answers every guest-agent call with
-500 "QEMU guest agent is not running" until the agent daemon inside the
-guest connects its channel — the first live deploy failed exactly there
-("host-key read uncertain ... guest agent is not running"). The broker
-now waits, bounded, before the single honest host-key read; only that
-exact signature retries, and a timeout stays uncertain (never success).
+Right after a clone starts, real PVE answers guest-agent calls with 500
+"QEMU guest agent is not running" until the in-guest agent connects its
+channel — the first live deploy failed exactly there. There is NO
+separate status endpoint (second live find: GET .../agent/status answers
+501 "Not Implemented"), so readiness is probed by retrying the real
+allowlisted host-key read itself. Only that exact signature retries;
+absence and any other error raise immediately, and a timeout stays
+uncertain — never a silent success.
 """
 import pytest
 
 from infra.broker.testing import make_fake_broker
-from infra.proxmox_client import PveNotFound, PveUnavailable, ProxmoxClient
+from infra.proxmox_client import (PveNotFound, PveUnavailable, ProxmoxClient,
+                                  ProxmoxError)
+
+HOSTKEY = ProxmoxClient.GUEST_HOST_KEY_PATH
 
 
-def _setup(**kw):
-    client, service, http = make_fake_broker(**kw)
-    return client, service, http
-
-
-def test_wait_agent_ready_returns_when_agent_answers():
-    _, _, http = _setup()
+def _client_with_vm():
+    _, _, http = make_fake_broker()
     http.vms[9100] = {"name": "sr-x", "status": "running"}
-    ProxmoxClient(api=http).wait_agent_ready("r740", 9100, timeout_s=1)
-    assert any("/agent/status" in p for _, p, _ in http.requests)
+    return ProxmoxClient(api=http), http
 
 
-def test_wait_agent_ready_retries_only_not_running():
-    _, _, http = _setup()
-    http.vms[9100] = {"name": "sr-x", "status": "running"}
-    http.agent_not_ready_polls = 2  # two live-style 500s, then ready
-    ProxmoxClient(api=http).wait_agent_ready("r740", 9100, timeout_s=5,
-                                             poll_s=0.01)
-    probes = [p for _, p, _ in http.requests if "/agent/status" in p]
-    assert len(probes) == 3
+def test_read_when_ready_returns_key_when_agent_answers():
+    c, http = _client_with_vm()
+    key = c.read_guest_file_when_ready("r740", 9100, HOSTKEY, timeout_s=1)
+    assert key.startswith("ssh-ed25519 ")
 
 
-def test_wait_agent_ready_timeout_stays_uncertain():
-    _, _, http = _setup()
-    http.vms[9100] = {"name": "sr-x", "status": "running"}
+def test_read_when_ready_retries_only_not_running():
+    c, http = _client_with_vm()
+    http.agent_not_ready_polls = 2  # two live-style 500s, then the key
+    key = c.read_guest_file_when_ready("r740", 9100, HOSTKEY, timeout_s=5,
+                                       poll_s=0.01)
+    assert key.startswith("ssh-ed25519 ")
+    assert sum(1 for _, p, _ in http.requests
+               if "/agent/file-read" in p) == 3
+
+
+def test_read_when_ready_timeout_stays_uncertain():
+    c, http = _client_with_vm()
     http.agent_not_ready_polls = 10 ** 6
     with pytest.raises(PveUnavailable) as e:
-        ProxmoxClient(api=http).wait_agent_ready("r740", 9100, timeout_s=0.05,
-                                                 poll_s=0.01)
+        c.read_guest_file_when_ready("r740", 9100, HOSTKEY, timeout_s=0.05,
+                                     poll_s=0.01)
     assert "not ready within" in str(e.value)
 
 
-def test_wait_agent_ready_absent_vm_raises_immediately():
-    _, _, http = _setup()  # 9999 was never created
+def test_read_when_ready_absent_vm_raises_immediately():
+    c, http = _client_with_vm()  # 9999 was never created
     with pytest.raises(PveNotFound):
-        ProxmoxClient(api=http).wait_agent_ready("r740", 9999, timeout_s=5,
-                                                 poll_s=0.01)
+        c.read_guest_file_when_ready("r740", 9999, HOSTKEY, timeout_s=5,
+                                     poll_s=0.01)
 
 
-def test_wait_agent_ready_other_error_raises_immediately():
-    _, _, http = _setup()
-    http.vms[9100] = {"name": "sr-x", "status": "running"}
-    http.fail_requests = {"/agent/status": 403}  # e.g. missing privilege
-    from infra.proxmox_client import ProxmoxError
+def test_read_when_ready_other_error_raises_immediately():
+    c, http = _client_with_vm()
+    http.fail_requests = {"/agent/file-read": 403}  # e.g. missing privilege
     with pytest.raises(ProxmoxError) as e:
-        ProxmoxClient(api=http).wait_agent_ready("r740", 9100, timeout_s=5,
-                                                 poll_s=0.01)
+        c.read_guest_file_when_ready("r740", 9100, HOSTKEY, timeout_s=5,
+                                     poll_s=0.01)
     assert "403" in str(e.value)
     # NOT retried: exactly one probe, then straight out.
-    assert sum(1 for _, p, _ in http.requests if "/agent/status" in p) == 1
+    assert sum(1 for _, p, _ in http.requests
+               if "/agent/file-read" in p) == 1
 
 
-def test_host_key_read_waits_for_agent_before_reading():
-    """The broker's read_host_key probes readiness (retrying the live 500)
-    and only then performs its single allowlisted file-read."""
-    client, service, http = _setup(templates=(9005,))
+def test_host_key_read_survives_first_boot_window():
+    """The broker's read_host_key rides out the live 500 dialect and pins
+    the key; the fake never saw a separate status endpoint (501 lesson)."""
+    client, service, http = make_fake_broker(templates=(9005,))
     service.agent_ready_poll_s = 0.01
     vmid = service.next_vmid("r740", 200, session_id="s1")
     service.clone_and_wait("r740", 9005, vmid, "sr-attacker-s1", full=False,
@@ -77,7 +80,5 @@ def test_host_key_read_waits_for_agent_before_reading():
     key = client.read_host_key("r740", vmid, session_id="s1", generation="g1")
     assert key.startswith("ssh-ed25519 ")
     paths = [p for _, p, _ in http.requests]
-    probes = [i for i, p in enumerate(paths) if "/agent/status" in p]
-    reads = [i for i, p in enumerate(paths) if "/agent/file-read" in p]
-    assert len(probes) == 3 and len(reads) == 1
-    assert max(probes) < reads[0]  # readiness confirmed BEFORE the read
+    assert not any("/agent/status" in p for p in paths)  # endpoint does not exist
+    assert sum(1 for p in paths if "/agent/file-read" in p) == 3

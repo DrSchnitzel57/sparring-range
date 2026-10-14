@@ -124,13 +124,13 @@ class BrokerService:
             # Ownership verified BEFORE the read (claim) — now read the key.
             try:
                 # First-boot reality (live find 2026-10-14): the agent needs
-                # time after start; waiting here keeps the read a single
-                # honest attempt instead of a certain-fail + obligation.
-                self.pve.wait_agent_ready(node, int(vmid),
-                                          timeout_s=self.agent_ready_timeout_s,
-                                          poll_s=self.agent_ready_poll_s)
-                key = self.pve.read_guest_file(node, int(vmid),
-                                               _PC.GUEST_HOST_KEY_PATH)
+                # time after start; retrying the real read here (only the
+                # not-running signature) keeps it one honest, bounded read
+                # instead of a certain-fail + obligation.
+                key = self.pve.read_guest_file_when_ready(
+                    node, int(vmid), _PC.GUEST_HOST_KEY_PATH,
+                    timeout_s=self.agent_ready_timeout_s,
+                    poll_s=self.agent_ready_poll_s)
             except Exception as e:  # noqa: BLE001 — uncertain, retain
                 self.ledger.add_obligation("host-key-read-uncertain", int(vmid),
                                            str(e)[:300])

@@ -341,23 +341,25 @@ class ProxmoxClient:
                 f"guest-agent host-key response for vmid {vmid} exceeds bounds")
         return content
 
-    def wait_agent_ready(self, node: str, vmid: int, timeout_s: float = 120.0,
-                         poll_s: float = 2.0) -> None:
-        """Wait (bounded) until the guest agent answers its status channel.
+    def read_guest_file_when_ready(self, node: str, vmid: int, path: str,
+                                   timeout_s: float = 120.0,
+                                   poll_s: float = 2.0) -> str:
+        """`read_guest_file`, tolerating the first-boot agent window.
 
-        Live find 2026-10-14: right after a clone starts, PVE answers every
-        agent call with 500 "QEMU guest agent is not running" until the
-        agent daemon inside the guest connects its virtio channel — normally
-        tens of seconds after the VM is merely "running". ONLY that exact
-        signature is retried; confirmed absence (the VM is gone) or any
-        other PVE error raises immediately, and a timeout stays
-        PveUnavailable — uncertain, never a silent success."""
+        Live find 2026-10-14 (two-part): right after a clone starts, PVE
+        answers guest-agent calls with 500 "QEMU guest agent is not
+        running" until the in-guest agent connects its channel. There is
+        NO separate status endpoint (a second live find: GET .../agent/
+        status answers 501 "Not Implemented"), so readiness is probed by
+        retrying the real allowlisted read itself — same endpoint, same
+        privilege, no new surface. ONLY the not-running signature is
+        retried; confirmed absence or any other error raises immediately,
+        and a timeout stays PveUnavailable — uncertain, never success."""
         deadline = time.monotonic() + timeout_s
         last: Exception | None = None
         while True:
             try:
-                self.get(f"/nodes/{node}/qemu/{vmid}/agent/status")
-                return
+                return self.read_guest_file(node, vmid, path)
             except Exception as e:  # noqa: BLE001 — classified below
                 err = classify_pve_error(e)
                 if isinstance(err, PveNotFound):
@@ -450,18 +452,13 @@ class FakePVEHttp:
     def get(self, path, **kw):
         self.requests.append(("GET", path, kw))
         self._maybe_fail(path)
-        if "/agent/status" in path:
-            # Guest-agent readiness probe (live find 2026-10-14): real PVE
-            # answers 500 "QEMU guest agent is not running" until the agent
-            # daemon connects its channel. agent_not_ready_polls replays that.
-            vmid = int(path.split("/qemu/")[1].split("/")[0])
-            if vmid not in self.vms:
-                raise PveNotFound(f"no VM {vmid}")
+        if "/agent/file-read" in path:
+            # First-boot window (live find 2026-10-14): real PVE answers
+            # 500 "QEMU guest agent is not running" until the in-guest
+            # agent connects; agent_not_ready_polls replays that here.
             if self.agent_not_ready_polls > 0:
                 self.agent_not_ready_polls -= 1
                 raise PveHttpError(500, "QEMU guest agent is not running")
-            return {"status": "ok"}
-        if "/agent/file-read" in path:
             # Typed guest-agent FileRead (paired 03+04, step 3): the fake
             # models the documented GET /nodes/{node}/qemu/{vmid}/agent/
             # file-read?file=... endpoint. ONLY the allowlisted host-key path

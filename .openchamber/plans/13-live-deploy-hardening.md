@@ -47,10 +47,12 @@ fence caught and what layer should have caught it earlier.
 - [x] Guest-agent first-boot race: after `start_and_wait` returns, PVE
       answers agent reads with 500 "QEMU guest agent is not running" for
       tens of seconds — the host-key pin failed there on the FIRST real
-      clone. Broker now waits bounded (`wait_agent_ready`,
-      `PROXMOX_AGENT_READY_TIMEOUT_S=120`, only that signature retried,
-      timeout stays uncertain) before its single honest read; client
-      transport gives `read_host_key` a 150 s per-op timeout. 6 tests.
+      clone. And there is NO `/agent/status` endpoint (a probe for it
+      answered 501 "Not Implemented" — my invented path, caught live).
+      `read_guest_file_when_ready` now retries the REAL allowlisted read,
+      bounded (`PROXMOX_AGENT_READY_TIMEOUT_S=120`), only that signature,
+      timeout stays uncertain; client gives `read_host_key` a 150 s
+      per-op timeout. 6 tests.
 
 ## Remaining improvements
 - [ ] Production settings validation: refuse to start `sr-api` with
