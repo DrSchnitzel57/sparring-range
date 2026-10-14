@@ -64,6 +64,10 @@ cd web && npm ci && NEXT_PUBLIC_API_URL=https://<LAN-IP> npm run build && cd ..
 #   listen 443 ssl; ssl_certificate     /etc/sparring-range/tls/https.crt;
 #   ssl_certificate_key /etc/sparring-range/tls/https.key;
 #   location / { proxy_pass http://127.0.0.1:3000; }   # or root web/out
+#   proxy_read_timeout 900s; proxy_send_timeout 900s;  # REQUIRED: launch is
+#     a synchronous deploy (clones + boot + guest-agent key waits) and can
+#     legitimately run for minutes; nginx's 60s default 504s the browser
+#     while the deploy keeps running server-side (live find 2026-10-14).
 ```
 
 Trust instructions for teammates: the web cert is self-signed with the LAN

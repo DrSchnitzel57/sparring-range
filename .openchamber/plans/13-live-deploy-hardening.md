@@ -55,6 +55,11 @@ fence caught and what layer should have caught it earlier.
       per-op timeout. 6 tests.
 
 ## Remaining improvements
+- [ ] Launch is a synchronous HTTP request held for the whole deploy
+      (minutes with agent waits) — nginx 504s the browser at 60s while the
+      deploy keeps running. Run deploys as a background task and let the
+      session page poll status; until then the runbook pins nginx
+      `proxy_read_timeout 900s`.
 - [ ] Production settings validation: refuse to start `sr-api` with
       dev-default `proxmox_node=r740`, `deploy_vmid_base=210`,
       `range_bridge=vmbr1`, `deploy_clone_mode=linked` when `SR_ENV=production`.

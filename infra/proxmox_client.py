@@ -64,12 +64,20 @@ _PVE_ABSENT_CONFIG_RE = re.compile(
 def classify_pve_error(exc: Exception) -> ProxmoxError:
     """Map ANY adapter-layer exception to a typed outcome.
 
-    Only an explicit HTTP 404 is 'absent'. proxmoxer raises
-    PROXMOXER.UnknownStatusCode with `.status_code`; anything carrying a PVE
-    status (401/403/5xx...) or a transport signature is UNCERTAIN — never
-    silently 'missing'. Plain exceptions WITHOUT a PVE/transport signature
-    (e.g. test-injected failures) pass through unclassified so injected
-    failures stay as loud and as typed as the injector wrote them."""
+    Absence is ONLY ever confirmed by: an explicit HTTP 404, or PVE 9.2's
+    per-guest-config-absence 500 wording (_PVE_ABSENT_CONFIG_RE below).
+    Everything else carrying a PVE status (401/403/5xx...) or a transport
+    signature is UNCERTAIN — never silently 'missing'. In particular 500
+    "no such file '<path>'" is NOT absence: source-wise it is emitted only
+    by the API router's static-file fallback when the request matches no
+    API route at all (PVE::APIServer::AnyEvent `die "no such file '$path'"`),
+    i.e. it is the signature of a URL-prefix bug (the db01932 class). An
+    earlier revision classified it as absence — audit A1 (docs/audits/
+    pve92-alignment.md) shows that turns any routing bug into silent false
+    absence (free-looking VMIDs, 'already-absent' teardowns of live VMs).
+    Plain exceptions WITHOUT a PVE/transport signature (e.g. test-injected
+    failures) pass through unclassified so injected failures stay as loud
+    and as typed as the injector wrote them."""
     if isinstance(exc, (PveHttpError, PveUnavailable)):
         return exc
     status = getattr(exc, "status_code", None)
@@ -79,13 +87,6 @@ def classify_pve_error(exc: Exception) -> ProxmoxError:
         except (TypeError, ValueError):
             return PveUnavailable(f"unparseable PVE status {status!r}: {exc}")
         if status == 404:
-            return PveNotFound(str(exc))
-        if status == 500 and "no such file" in str(exc):
-            # Real PVE answers per-guest paths for a NONEXISTENT VMID with
-            # 500 "no such file" (long-standing API quirk; the fake answers
-            # 404). This is PVE itself deterministically confirming absence,
-            # not a transport failure — treating it as uncertain made the
-            # first real next_vmid probe fail (live deploy, 2026-10-14).
             return PveNotFound(str(exc))
         if status == 500 and _PVE_ABSENT_CONFIG_RE.search(str(exc)):
             # Second absence dialect seen live (PVE 9.2.21, 2026-10-14):
@@ -158,7 +159,17 @@ class ProxmoxClient:
             if insecure:
                 verify = False
                 print("WARNING: Proxmox TLS verification DISABLED by explicit lab override")
-            user, _, name = token_id.partition("!")
+            # Audit A5: a malformed PROXMOX_TOKEN_ID (missing '!', wrong
+            # realm form) otherwise surfaces as a confusing 401 from PVE
+            # (live incident 2026-10-14: stray hyphen in the user name).
+            # Fail fast, at construction, with the expected shape.
+            user, sep, name = token_id.partition("!")
+            if not sep or not user or not name or "@" not in user \
+                    or "!" in name:
+                raise ProxmoxError(
+                    f"PROXMOX_TOKEN_ID {token_id!r} is malformed: expected "
+                    "'<user>@<realm>!<tokenname>' (e.g. sr-broker@pve!range)"
+                    " — the user part must match the realm user EXACTLY")
             api = _ProxmoxerPathAdapter(
                 ProxmoxAPI(host, user=user, token_name=name,
                            token_value=token_secret, verify_ssl=verify, timeout=30))
@@ -167,7 +178,14 @@ class ProxmoxClient:
 
     # --- raw pass-through ------------------------------------------------------
     def version(self) -> dict:
-        return self.api.version()
+        """GET /version (PVE::API2 'version', user => 'all').
+
+        Audit A3: NOT `self.api.version()` — with the real proxmoxer that
+        is attribute routing to a resource OBJECT, and calling it with no
+        verb returns the resource itself (proxmoxer core __call__ returns
+        self), so real PVE was never queried; only the fake made it look
+        like a dict. The verb call is the only shape that issues HTTP."""
+        return self.api.get("/version")
 
     def get(self, path: str) -> dict | list:
         return self.api.get(path)
@@ -205,9 +223,21 @@ class ProxmoxClient:
         return self.get("/cluster/resources")
 
     def next_vmid(self, start: int) -> int:
-        """Ask PVE for a free VMID (allocator handles concurrency); fall back to
-        a scan only if the endpoint is unavailable, and let clone failures be
-        handled by the caller as subject to concurrent races."""
+        """Prefer `start` if PVE confirms it free, else scan for the next
+        free VMID >= start. Concurrency is NOT solved here — callers race
+        by design and must treat clone failures as subject to concurrent
+        races (the broker serialises via its ledger + per-candidate probes).
+
+        Audit A4 (source PVE::API2::Cluster 'nextid'): `?vmid=N` is an
+        ASSERTION, not an allocator — PVE returns N when free and 400
+        "VM N already exists" when taken; without `vmid` it scans from the
+        datacenter next-id.lower (100), never from `start`. So the
+        "next free >= start" behaviour below comes from the resources()
+        scan fallback, and that scan only lists VMIDs this token may see
+        (permission-filtered) — a further reason the caller must handle
+        clone collisions. Any non-400 failure (401/403/5xx/transport)
+        also lands in the fallback, where resources() will fail loudly
+        with the real error if the endpoint itself is down."""
         try:
             nid = self.get(f"/cluster/nextid?vmid={start}")
             return int(nid)
@@ -348,13 +378,20 @@ class ProxmoxClient:
     # these mean "retry within the bounded window"; anything else raises
     # immediately. Confirmed VM absence (PveNotFound) is checked BEFORE
     # these and never retries.
+    #
+    # Audit A2 (docs/audits/pve92-alignment.md): signatures must NOT
+    # overlap the two "cannot know" dialects. The router's routing-bug 500
+    # ("no such file '<api path>'") is matched by the qga strerror wording
+    # only ("no such file or directory" — the guest-side file-open error
+    # while the key is absent), never by the bare "no such file" prefix.
+    # "does not exist" was removed: that wording is PVE's per-guest-CONFIG
+    # absence (VM gone), which raises above, not a key-not-ready signal.
     _KEY_NOT_READY_SIGNATURES = (
         "guest agent is not running",
         "not a bounded ssh-ed25519 public key",
         "malformed guest-agent file-read response",
         "file not found",
-        "no such file",
-        "does not exist",
+        "no such file or directory",
     )
 
     def read_guest_file_when_ready(self, node: str, vmid: int, path: str,
@@ -429,18 +466,31 @@ class FakePVEHttp:
     """A fake of the proxmoxer HTTP BOUNDARY (get/post/delete + task queue), so
     ProxmoxClient's REAL code paths — URLs, verbs, UPID polling, error
     propagation — are exercised in tests (F05). Configure task behaviour per
-    path fragment; default tasks complete OK immediately."""
+    path fragment; default tasks complete OK immediately.
 
-    def __init__(self):
+    ``pve_no_such_file=True`` (audit A9/A10, plan 13 AC#4) replays the REAL
+    PVE 9.2 absence dialect instead of the fake's historical 404: per-guest
+    paths for a missing VMID answer 500 "Configuration file
+    'nodes/<node>/qemu-server/<vmid>.conf' does not exist" (source:
+    PVE::QemuConfig->load_config via cfs; live-confirmed 2026-10-14), and a
+    clone onto a used VMID answers 500 "unable to create VM N: config file
+    already exists" (plain die in the clone code — 500, not 400). The 404
+    mode stays the default so existing fixtures keep their current shape."""
+
+    def __init__(self, pve_no_such_file: bool = False):
         self.vms: dict[int, dict] = {}
         self.tasks: dict[str, dict] = {}
         self._upid = 0
         self.requests: list[tuple[str, str, dict]] = []
+        self.pve_no_such_file = bool(pve_no_such_file)
         # behaviour hooks
         self.task_polls_needed = 0          # how long tasks stay "running"
         self.agent_not_ready_polls = 0      # /agent/status 500s before ready
         self.empty_key_polls = 0            # empty host-key reads (cloud-init
         #                                       not regenerated yet) before key
+        self.qga_missing_file_polls = 0     # 500 "No such file or directory"
+        #                                       guest-file-open errors (audit
+        #                                       A2 first-boot key-absent dialect)
         self.fail_task_fragments = ()       # URL fragments whose tasks fail
         self.fail_request_fragments = ()    # raise immediately
         # audit N01: DISTINCT failure responses per URL fragment — value is an
@@ -452,6 +502,16 @@ class FakePVEHttp:
 
     def version(self):
         return {"version": "fake-pve"}
+
+    def _absent(self, vmid: int) -> Exception:
+        """Absence exception for a per-guest path of a missing VMID: the
+        real 9.2 500 dialect in pve_no_such_file mode, else the fake's
+        historical 404 (both classify to PveNotFound — audit A1/A10)."""
+        if self.pve_no_such_file:
+            return PveHttpError(
+                500, f"Configuration file 'nodes/fake/qemu-server/{vmid}.conf'"
+                     " does not exist")
+        return PveNotFound(f"no VM {vmid}")
 
     def _maybe_fail(self, path: str) -> None:
         for frag, failure in self.fail_requests.items():
@@ -473,6 +533,10 @@ class FakePVEHttp:
     def get(self, path, **kw):
         self.requests.append(("GET", path, kw))
         self._maybe_fail(path)
+        if path.strip("/") == "version":
+            # GET /version (user => 'all' in PVE::API2) — served so the
+            # client's version() probe is exercised (audit A3).
+            return {"version": "fake-pve", "release": "9.2", "repoid": "fake"}
         if "/agent/file-read" in path:
             # First-boot window (live find 2026-10-14): real PVE answers
             # 500 "QEMU guest agent is not running" until the in-guest
@@ -480,6 +544,12 @@ class FakePVEHttp:
             if self.agent_not_ready_polls > 0:
                 self.agent_not_ready_polls -= 1
                 raise PveHttpError(500, "QEMU guest agent is not running")
+            if self.qga_missing_file_polls > 0:
+                # Audit A2 dialect: agent answers, guest key file not
+                # regenerated yet — qga file-open strerror (retryable).
+                self.qga_missing_file_polls -= 1
+                raise PveHttpError(500, "Agent error: open failed with error"
+                                        " code 2: No such file or directory")
             if self.empty_key_polls > 0:
                 # Live find 2026-10-14: during first boot the agent answers
                 # while cloud-init's ssh module has not regenerated the
@@ -497,7 +567,7 @@ class FakePVEHttp:
             vmid = int(path.split("/qemu/")[1].split("/")[0])
             v = self.vms.get(vmid)
             if not v:
-                raise PveNotFound(f"no VM {vmid}")
+                raise self._absent(vmid)
             qs = urllib.parse.urlparse(path).query
             file_param = urllib.parse.parse_qs(qs).get("file", [""])[0]
             if file_param != "/etc/ssh/ssh_host_ed25519_key.pub":
@@ -538,7 +608,7 @@ class FakePVEHttp:
             vmid = int(path.split("/qemu/")[1].split("/")[0])
             v = self.vms.get(vmid)
             if not v:
-                raise PveNotFound(f"no VM {vmid}")  # PVE 404s config of missing resources
+                raise self._absent(vmid)  # 404 mode, or real 500 dialect
             # real PVE config includes the VM's NAME (creation identity);
             # the fake must model that or identity checks test nothing
             cfg = dict(v.get("config", {}))
@@ -548,7 +618,7 @@ class FakePVEHttp:
             vmid = int(path.split("/qemu/")[1].split("/")[0])
             v = self.vms.get(vmid)
             if not v:
-                raise PveNotFound(f"no VM {vmid}")  # PVE answers 404 for missing resources
+                raise self._absent(vmid)  # 404 mode, or real 500 dialect
             return {"status": v["status"], "vmid": vmid}
         return {}
 
@@ -575,6 +645,11 @@ class FakePVEHttp:
             tpl = int(path.split("/qemu/")[1].split("/")[0])
             new = int(kw["newid"])
             if new in self.vms:
+                if self.pve_no_such_file:
+                    # Audit A9: real PVE plain-dies here -> 500, not 400.
+                    raise PveHttpError(
+                        500, f"unable to create VM {new}: config file "
+                             "already exists")
                 raise PveHttpError(400, f"VMID {new} in use")
             if tpl not in self.vms:
                 raise PveHttpError(400, f"template {tpl} not found")
@@ -600,7 +675,7 @@ class FakePVEHttp:
             vmid = int(path.split("/qemu/")[1].split("/")[0])
             v = self.vms.get(vmid)
             if not v:
-                raise PveNotFound(f"no VM {vmid}")
+                raise self._absent(vmid)
             upid = self._new_upid(path)
             self.tasks[upid]["_done_cb"] = lambda: v.update(status="running")
             return upid
@@ -608,7 +683,7 @@ class FakePVEHttp:
             vmid = int(path.split("/qemu/")[1].split("/")[0])
             v = self.vms.get(vmid)
             if not v:
-                raise PveNotFound(f"no VM {vmid}")
+                raise self._absent(vmid)
             upid = self._new_upid(path)
             self.tasks[upid]["_done_cb"] = lambda: v.update(status="stopped")
             return upid
@@ -616,7 +691,7 @@ class FakePVEHttp:
             vmid = int(path.split("/qemu/")[1].split("/")[0])
             v = self.vms.get(vmid)
             if not v:
-                raise PveNotFound(f"no VM {vmid}")
+                raise self._absent(vmid)
             if "tags" in kw and not self.TAG_LIST_RE.match(str(kw["tags"])):
                 # real PVE validates pve-tag-list on PUT (audit N01: validate
                 # request schemas against the supported PVE version)
@@ -630,7 +705,7 @@ class FakePVEHttp:
         self._maybe_fail(path)
         vmid = int(path.rsplit("/", 1)[1])
         if vmid not in self.vms:
-            raise PveNotFound(f"no VM {vmid}")  # PVE 404
+            raise self._absent(vmid)  # 404 mode, or real 500 dialect
         upid = self._new_upid(path)
         self.tasks[upid]["_done_cb"] = lambda: self.vms.pop(vmid, None)
         return upid
