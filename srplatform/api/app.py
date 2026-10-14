@@ -63,6 +63,31 @@ class _StartupCORSMiddleware(CORSMiddleware):
 app.add_middleware(_StartupCORSMiddleware)
 
 
+#: The guest-facing telemetry listener (plan 13 phase 4): when this process
+#: serves the controller's RANGE address it must expose ONLY the
+#: authenticated enrollment/ingest routes — never the general API, web,
+#: auth, scoring, model or operator surface. Enabled by SR_API_INGEST_ONLY=1
+#: on that listener's unit only; the internal (loopback) and LAN listeners
+#: keep the full app. Unknown paths answer 404 (not 401/403 — the listener
+#: does not advertise what exists), and bodies are bounded at the header.
+INGEST_ALLOWLIST = frozenset({("POST", "/enroll/confirm"),
+                              ("POST", "/ingest/auditd")})
+
+
+@app.middleware("http")
+async def _ingest_only_guard(request, call_next):
+    from srplatform.settings import get_settings as _gs
+    s = _gs()
+    if not s.api_ingest_only:
+        return await call_next(request)
+    if (request.method, request.url.path) not in INGEST_ALLOWLIST:
+        return JSONResponse({"detail": "not_found"}, status_code=404)
+    cl = request.headers.get("content-length", "")
+    if cl.isdigit() and int(cl) > s.ingest_max_body_bytes:
+        return JSONResponse({"detail": "body_too_large"}, status_code=413)
+    return await call_next(request)
+
+
 # The ONE shared request DB session (function scope — commit completes before
 # the response is sent; see srplatform/api/deps.py for why) and the auth
 # dependencies built on it.
@@ -112,6 +137,56 @@ def readyz():
             "runner": {"ok": runner_ok, "detail": runner_why},
             "recordings_writable": rec_ok,
             "safety": get_supervisor().verify()}
+
+
+@app.get("/stages")
+def release_stages(p: Principal = Depends(operator), db: DbSession = None):
+    """Release-stage ladder (plan 13 phase 4), operator-authorized and
+    redacted. install-ready: configuration valid, schema at head, state
+    writable — NO clone or pin is required, so bootstrap cannot deadlock.
+    lab-ready: install-ready AND the broker answers with its latch state
+    (templates, pins and the range inventory are only resolvable through
+    it). attack-authorized: lab-ready PLUS the explicit operator gate
+    (SR_ATTACK_AUTHORIZED=1), set only after isolation and emergency-stop
+    verification. No stage waives a later gate, and a successful
+    deployment never implies authorization to attack."""
+    from srplatform.api.deps import get_broker
+    issues = []
+    v = None
+    try:
+        v = db.execute(text("SELECT version_num FROM alembic_version "
+                            "LIMIT 1")).scalar()
+        from alembic.config import Config as _Acfg
+        from alembic.script import ScriptDirectory as _SD
+        head = _SD.from_config(_Acfg("alembic.ini")).get_current_head()
+        if v and head and v != head:
+            issues.append(f"schema {v} behind head {head}")
+    except Exception as e:  # noqa: BLE001 — a stage report never 500s
+        issues.append(f"db: {str(e)[:200]}")
+    s = get_settings()
+    rec_dir = s.recordings_dir
+    if not os.path.isdir(rec_dir):
+        try:  # state dirs are ours to create (idempotent, non-destructive)
+            os.makedirs(rec_dir, exist_ok=True)
+        except OSError:
+            pass
+    rec_ok = os.access(rec_dir, os.W_OK) if os.path.isdir(rec_dir) else False
+    if not rec_ok:
+        issues.append("recordings/state dir not writable")
+    install_ready = v is not None and not issues
+    broker = None
+    if install_ready:
+        try:
+            broker = {"ok": True, "latch": get_broker().latch_status()}
+        except Exception as e:  # noqa: BLE001
+            broker = {"ok": False, "detail": str(e)[:200]}
+    lab_ready = install_ready and bool(broker and broker.get("ok"))
+    return {"install_ready": install_ready,
+            "lab_ready": lab_ready,
+            "attack_authorized": lab_ready and s.attack_authorized,
+            "operator_gate": s.attack_authorized,
+            "broker": broker,
+            "issues": issues}
 
 
 # --- auth (F04) ----------------------------------------------------------------

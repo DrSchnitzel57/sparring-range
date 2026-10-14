@@ -142,6 +142,20 @@ class Settings(BaseSettings):
     # one launch/reset attempt, recorded BEFORE dispatch so pollers and
     # reconciliation see the same deadline the executor works against.
     deploy_operation_deadline_s: int = 900
+    # Plan 13 phase 4 — network-plane separation. The controller serves the
+    # SAME app on three listeners (see deploy/README §2): trusted processes
+    # on loopback, users on the LAN HTTPS front, and GUESTS on the range
+    # address. Only the range listener sets SR_API_INGEST_ONLY=1: it then
+    # answers with nothing but the authenticated enrollment/ingest routes
+    # (404 elsewhere, bounded bodies) — a compromised guest reaches no
+    # general API/web/auth/scoring/model/operator endpoint from there.
+    api_ingest_only: bool = False
+    ingest_max_body_bytes: int = 262_144
+    # Explicit operator authorization (plan 13 phase 4 stage ladder):
+    # attack-authorized requires lab-ready PLUS this flag, set only after
+    # isolation and emergency-stop verification. Default off; never implied
+    # by a successful deployment.
+    attack_authorized: bool = False
     enroll_capture_timeout_s: int = 30
     # local-dev command-group identity sidecar directory (audit F7): the
     # LocalDevRunner records each command group's identity here so the API's

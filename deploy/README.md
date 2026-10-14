@@ -100,6 +100,30 @@ verify it out-of-band once, then import `https.crt` into the browser/OS or
 accept the pin on first visit. The bastion banner shows the session token
 login; SSH instructions come from the web UI (server-served, re-fetchable).
 
+### 2a. Network planes and release stages (plan 13 phase 4)
+
+The control plane serves the SAME app on three planes; only the guest-
+facing one is reduced:
+
+| Plane | Bind | Surface |
+|---|---|---|
+| Internal (trusted local processes: CLI, scheduler, coach) | `127.0.0.1:8000` HTTP | full app, loopback only |
+| LAN users (browser + API) | LAN address, HTTPS front (self-signed `https.crt`) | full app, authenticated |
+| Guest telemetry | controller RANGE address, HTTPS with a SAN matching it | **ingest-only**: `POST /enroll/confirm`, `POST /ingest/auditd` — everything else 404, bodies bounded |
+
+The ingest plane is the same unit with `deploy/env.telemetry-listener.example`
+loaded last (`SR_API_INGEST_ONLY=1`); guests verify it against the CA
+provisioned at `/etc/sparring-range/tls/api-ca.crt` with an explicit SSL
+context — TLS checks are never disabled. Guests carry NO default route (the
+broker policy refuses `gw=`), so the range address is their only path.
+
+`GET /stages` (operator) reports the release ladder: **install-ready**
+(config valid, schema at head, state writable — no clone or pin required,
+so bootstrap cannot deadlock), **lab-ready** (install-ready + the broker
+answers with its latch state), **attack-authorized** (lab-ready + the
+explicit `SR_ATTACK_AUTHORIZED=1` operator gate, set only after the §8
+isolation and emergency-stop checks). No stage waives a later gate.
+
 ## 3. Broker VM (fresh Ubuntu 24.04)
 
 ```bash
