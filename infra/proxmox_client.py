@@ -52,6 +52,15 @@ class PveUnavailable(ProxmoxError):
     """
 
 
+# Exact per-guest-config-absence wording PVE 9.2 returns for a nonexistent
+# VMID (live capture 2026-10-14). Deliberately narrow: node name, the
+# qemu-server directory, digits, .conf, and the literal wording must all
+# match before any 500 is treated as confirmed absence.
+_PVE_ABSENT_CONFIG_RE = re.compile(
+    r"Configuration file 'nodes/[^/']+/qemu-server/\d+\.conf' does not exist"
+)
+
+
 def classify_pve_error(exc: Exception) -> ProxmoxError:
     """Map ANY adapter-layer exception to a typed outcome.
 
@@ -77,6 +86,14 @@ def classify_pve_error(exc: Exception) -> ProxmoxError:
             # 404). This is PVE itself deterministically confirming absence,
             # not a transport failure — treating it as uncertain made the
             # first real next_vmid probe fail (live deploy, 2026-10-14).
+            return PveNotFound(str(exc))
+        if status == 500 and _PVE_ABSENT_CONFIG_RE.search(str(exc)):
+            # Second absence dialect seen live (PVE 9.2.21, 2026-10-14):
+            # 500 "Configuration file 'nodes/<node>/qemu-server/<vmid>.conf'
+            # does not exist". The guest config file IS the VM definition,
+            # so PVE naming that exact file is deterministic confirmation
+            # the VMID is free — not an outage. The regex is anchored to
+            # that per-guest shape so no other 500 can be swallowed.
             return PveNotFound(str(exc))
         return PveUnavailable(f"PVE status {status}: {exc}")
     if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
