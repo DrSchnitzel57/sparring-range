@@ -1091,11 +1091,13 @@ with `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD`):
 
 | Exact command | Fresh result |
 |---|---|
-| `…python -m pytest -q -p no:cacheprovider` (fast default) | Exit 0: **315 passed, 0 failed, 0 skipped, 212 deselected**, 4 warnings, 50.4s |
+| `…python -m pytest -q -p no:cacheprovider` (fast default) | Exit 0: **328 passed, 0 failed, 0 skipped, 222 deselected**, 4 warnings, 50.4s |
 | `…acceptance.py frontend` | **PASS** — npm ci, production build, audit zero high/critical |
 | `…acceptance.py compose` | **PASS** — full stack + seed-bastion-keys success gate, cleaned |
 | `…acceptance.py browser` | **PASS** — isolated real-browser workflow + replay, 1 passed |
-| `…acceptance.py db` | **PASS** after 155.7s — disposable fixture, fresh + forward migrations (incl. 0014), **140 passed, 0 failed** (the five phase-3/6 regressions repaired at `6ae72df`; the four phase-5 deploy-operation tests pass) |
+| `…acceptance.py db` | **PASS** after 155.7s — disposable fixture, fresh + forward migrations (incl. 0014/0015), **150 passed, 0 failed** (phase-3/6 regressions repaired; deploy-operation, network-plane and inject tests included) |
+| `…acceptance.py containment` | **PASS** after 11.6s — real namespace/cgroup fixtures created, positive-control process migration, 21 required-mode regressions 0 skipped, no leaked run cgroups |
+| `…acceptance.py packet` | **FAIL (prerequisite)** — needs root + nft (missing here); runs only in the approved disposable-netns CI packet job; never accepted from this host |
 | `…acceptance.py install` | Sandbox contract **PASS** (dry-run, idempotent rerun, key preservation, invalid manifest refused before effects); **FAILS** on the managed-service VM half until the disposable-VM job sets `SR_INSTALL_VM_EVIDENCE` — deliberately not accepted from a sandbox |
 | `…acceptance.py images` / `capture` | rerunning with the disk-backed cache (`SR_GUEST_CACHE`) after the tmpfs build was OOM-killed; results appended below when complete |
 
