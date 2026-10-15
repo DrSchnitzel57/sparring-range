@@ -388,3 +388,83 @@ do not become optional because development tests pass.
 
 Windows licensing/templates, Sysmon/WEC installed capture, Windows verification
 and access are later milestone-12 gates, not marked complete by Linux acceptance.
+
+## 10. Operator shell pitfalls (field notes 2026-10-15)
+
+Learned the hard way during the first production install. All of these
+look like something else when they bite.
+
+### Scope file edits to the stanza you mean
+
+A `sed` pattern matching line content (e.g. `bridge-vids 2-4094`) matches
+every stanza with that line — including `vmbr0`. Narrowing the wrong
+bridge to vid 66 drops untagged LAN/management traffic and kills your
+own SSH mid-session. Always `diff` against a backup before `ifreload -a`,
+and keep the backup until the change is verified:
+
+```bash
+cp -a /etc/network/interfaces /root/interfaces.bak-$(date +%F)
+# ... edit ...
+diff /root/interfaces.bak-* /etc/network/interfaces   # must show ONLY your stanza
+```
+
+### `set -e` in pasted blocks ends your session, not your network
+
+A pasted block starting with `set -e` aborts the shell on the first
+failed command — and an exited login shell prints `Connection ... closed`,
+which reads exactly like a network drop. If SSH "drops" right after a
+command fails, check whether the shell simply exited before blaming the
+transport. Prefer blocks without `set -e` for interactive pastes so
+failures print errors instead of ejecting you.
+
+### Wildcards expand before `sudo` runs
+
+An unprivileged shell expands `*` before `sudo` ever executes. Against a
+`0700 root:<group>` directory the glob fails and the literal `*` reaches
+the command, which then reports files "not found" that plainly exist.
+Let root's shell do the expanding:
+
+```bash
+# wrong (your shell expands, fails, sudo sees a literal '*'):
+sudo cp /etc/sparring-range/ssh/*_ed25519.pub /tmp/
+# right:
+sudo bash -c 'cp /etc/sparring-range/ssh/*_ed25519.pub /tmp/'
+```
+
+Same rule over SSH — quote so the *remote root* shell expands:
+
+```bash
+ssh -t host "sudo bash -c 'cp /src/*_ed25519.pub /tmp/'"
+```
+
+(`ssh host "sudo cmd ..."` without a TTY also cannot prompt for a
+password; `ssh -t` fixes that half.)
+
+### Service identities before keys, always
+
+Key generation assumes the service user/group already exists
+(`install.sh` step 2 runs before step 3 for exactly this reason). Any
+manual key flow must preserve that order: create `srrange`/`srbastion`/
+`srbroker` first, then generate, then `chown root:<group>` + `chmod`.
+Stray keys generated in `$HOME` by a failed run must be deleted, never
+left beside the real ones.
+
+### `urls.ingest` is the controller's real range address
+
+The shipped example uses a candidate ingest address. In production
+`urls.ingest` (and therefore `trust.san_ips`, and the guests'
+`SR_API_URL`) must name the address the control-plane ingest listener
+actually binds — the range NIC of the control-plane VM. A wrong value
+here fails closed everywhere at once (shipper TLS, enrollment, probes),
+which is the intended behavior, not a bug to work around.
+
+### Diagnosing dropped SSH sessions
+
+In order: (1) rule out shell-exit masquerading as a drop (above);
+(2) `journalctl -b -p err` for OOM kills — under critical memory
+pressure, `fork()` on Enter is exactly when the killer strikes, so
+sessions die on keystroke while idling fine; (3) link flaps
+(`dmesg | grep -iE 'link|down|up'`, cable/switch); (4) fail2ban or
+throttled auth; (5) client-side sleep, Wi-Fi roam, or VPN flap —
+correlate with continuous pings to each path before concluding
+anything about the host.

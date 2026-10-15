@@ -1,6 +1,6 @@
 {
   "manifest_version": 1,
-  "_comment": "CANDIDATE example (plan 13): node pve, bridge srrange, VLAN 66, storage local-zfs, VMIDs 9005/9011/9012 and 9100-9199 are values to VERIFY with fresh operator discovery, never silent assumptions. Copy, verify every value, then use. Contains no secrets.",
+  "_comment": "CANDIDATE example (plan 13): node pve, bridge srrange, VLAN 66, storage local-zfs, VMIDs 9005/9011/9012 and 9100-9199 are values to VERIFY with fresh operator discovery, never silent assumptions. Copy, verify every value, then use. Contains no secrets. NOTE: urls.ingest (and therefore trust.san_ips and the guests' SR_API_URL) must be the control-plane VM's ACTUAL range address — the example .2 is a placeholder. Template sha256 values must come from your own TEMPLATE-INFO.json after building, never from this example.",
   "release": {
     "revision": "44a712a"
   },
