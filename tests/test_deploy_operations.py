@@ -1,14 +1,16 @@
-"""Plan 13 phase 5 — durable deploy-operation records.
+"""Plan 13 phase 5 — durable deploy-operation records + 202 executor.
 
 DB layer: drives the real routes and asserts persisted operation state —
-durable acceptance before effects, duplicate refusal, redacted polling,
-and startup reconciliation that marks a dead executor's attempt
+202 durable acceptance before effects, background completion, duplicate
+refusal with the live operation id, redacted polling WITH the completed
+result, and startup reconciliation that marks a dead executor's attempt
 `interrupted` without erasing it or clearing a live replacement's claim.
 """
 from __future__ import annotations
 
 import pytest
 from sqlalchemy import select
+from tests.conftest import launch_and_wait, wait_operation
 
 pytestmark = pytest.mark.db
 
@@ -24,24 +26,36 @@ def _ops(session_id):
         ).scalars().all())
 
 
-def test_launch_records_durable_operation_and_polling(client, users,
-                                                      fake_broker):
+def test_launch_accepts_202_then_completes_in_background(
+        client, users, fake_broker):
     sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
                       headers=users["member"]).json()["session_id"]
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code == 200, r.text
+    assert r.status_code == 202, r.text
+    accepted = r.json()
+    assert accepted["status"] == "accepted" and accepted["operation_id"]
+    assert accepted["deadline_at"]
+
+    # the durable row exists BEFORE any effect completes
     ops = _ops(sid)
     assert len(ops) == 1
-    assert ops[0].operation == "launch" and ops[0].state == "succeeded"
-    assert ops[0].phase == "readiness" and ops[0].fence
-    assert ops[0].deadline_at is not None and ops[0].completed_at is not None
+    assert ops[0].operation == "launch" and ops[0].fence
+    assert ops[0].deadline_at is not None
 
-    poll = client.get(f"/sessions/{sid}/operation", headers=users["member"])
-    assert poll.status_code == 200
-    body = poll.json()
-    assert body["state"] == "succeeded" and body["operation_id"] == str(ops[0].operation_id)
-    # redacted: no tokens, no provisioning commands
-    assert "SR_TELEMETRY_TOKEN" not in poll.text
+    done = wait_operation(client, users["member"], sid)
+    assert done["state"] == "succeeded", done
+    assert done["operation_id"] == accepted["operation_id"]
+    result = done["result"]
+    assert result["status"] == "ready" and result["connections"]
+    assert result["readiness"]["ok"]
+    # redacted: plaintext enrollments never persist, references do
+    assert "SR_TELEMETRY_TOKEN" not in str(done)
+    assert result["enrollments_issued"] >= 1
+    assert result["enrolled_hosts"]
+
+    ops = _ops(sid)
+    assert ops[0].state == "succeeded" and ops[0].phase == "readiness"
+    assert ops[0].completed_at is not None
 
 
 def test_failed_launch_records_failure_and_second_launch_resumes(
@@ -52,16 +66,43 @@ def test_failed_launch_records_failure_and_second_launch_resumes(
     fake_broker.http.fail_requests = {
         "/agent/file-read": PveHttpError(403, "permission check failed")}
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code >= 500
+    assert r.status_code == 202, r.text
+    failed = wait_operation(client, users["member"], sid)
+    assert failed["state"] == "failed", failed
+    assert failed["error"] and len(failed["error"]) <= 500
+    assert failed["result"] is None  # no result on failure
     ops = _ops(sid)
     assert len(ops) == 1 and ops[0].state == "failed"
-    assert ops[0].error and len(ops[0].error) <= 500
 
     fake_broker.http.fail_requests = {}
-    r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code == 200, r.text
+    done = launch_and_wait(client, users["member"], sid)
+    assert done["state"] == "succeeded"
     ops = _ops(sid)
-    assert len(ops) == 2 and ops[1].state == "succeeded"  # attempt history kept
+    assert len(ops) == 2 and ops[1].state == "succeeded"  # history kept
+
+
+def test_duplicate_launch_returns_live_operation_id_never_a_second_deploy(
+        client, users, fake_broker):
+    """While the executor works, a duplicate is refused 409 WITH the live
+    operation id — no new row, no second deployment. After completion the
+    next launch is a NEW attempt (deploy is idempotent: returns ready)."""
+    sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
+                      headers=users["member"]).json()["session_id"]
+    first = client.post(f"/sessions/{sid}/launch",
+                        headers=users["member"]).json()
+    dup = client.post(f"/sessions/{sid}/launch", headers=users["member"])
+    if dup.status_code == 202:
+        # the first attempt already finished (fast fixture): the retry is a
+        # legitimately new attempt, not a duplicate — assert idempotence
+        done = wait_operation(client, users["member"], sid)
+        assert done["state"] == "succeeded"
+    else:
+        assert dup.status_code == 409
+        assert dup.json()["detail"]["error"] == "operation_in_progress"
+        assert dup.json()["detail"]["operation_id"] == first["operation_id"]
+        assert len(_ops(sid)) == 1  # no phantom row
+        done = wait_operation(client, users["member"], sid)
+        assert done["state"] == "succeeded", done
 
 
 def test_startup_reconcile_marks_dead_executors_interrupted(client, users,

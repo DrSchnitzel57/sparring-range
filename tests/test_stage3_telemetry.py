@@ -18,6 +18,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
+from tests.conftest import launch_and_wait
+
 
 REPO = Path(__file__).resolve().parents[1]
 SHIPPER = REPO / "telemetry" / "shipper.py"
@@ -357,11 +359,18 @@ def test_deploy_enrolls_session_bound_telemetry(client, users):
 
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
-    r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code == 200, r.text
-    enroll = r.json()["deployment"].get("telemetry_enrollments") or {}
-    assert enroll, "deploy must return per-host telemetry enrollments"
-    host, token = next(iter(enroll.items()))
+    done = launch_and_wait(client, users["member"], sid)
+    # the completed result carries enrollment REFERENCES, never plaintext
+    assert done["result"]["enrollments_issued"] >= 1
+    host = done["result"]["enrolled_hosts"][0]
+    assert "telemetry_enrollments" not in str(done["result"])
+    # the durable ServiceToken row is the capability record (recovery path)
+    from srplatform.scenario_engine.orchestrator import _recover_telemetry_token
+    import uuid as _uuid
+    with db() as s:
+        rec = _recover_telemetry_token(s, _uuid.UUID(sid), host)
+        assert rec is not None
+        token = rec[0]
 
     # inventory keeps only a reference — no plaintext token in deployment state
     with db() as s:
@@ -389,7 +398,7 @@ def test_deploy_enrolls_session_bound_telemetry(client, users):
     # a NEW session's events cannot be reached by the old capability
     sid2 = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                        headers=users["member"]).json()["session_id"]
-    client.post(f"/sessions/{sid2}/launch", headers=users["member"])
+    launch_and_wait(client, users["member"], sid2)
     r = client.post("/ingest/auditd", json={"events": [
         {"kind": "command", "argv": "whoami", "source_id": "3", "boot_id": "b1"}]},
         headers={"Authorization": f"Bearer {token}"})

@@ -532,13 +532,18 @@ def _release_claim_safely(db, session_id, succeeded: bool, owner: str | None = N
         pass
 
 
-@app.post("/sessions/{session_id}/launch")
+@app.post("/sessions/{session_id}/launch", status_code=202)
 def launch_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
                    db: DbSession = None):
-    """Shared backend workflow for CLI and browser:
-    authenticate → claim → reserve (lease) → validate → deploy → issue per-host
-    connection capabilities → ready."""
+    """Shared backend workflow for CLI and browser (plan 13 phase 5, 202
+    refinement): authenticate → claim → reserve (lease) → DURABLE ACCEPT
+    → 202 with the operation reference. The supervised executor performs
+    deploy → readiness → capabilities → ready in the background; poll
+    GET /sessions/{id}/operation. A duplicate while accepted/running is
+    refused 409 with the live operation — it can never create a second
+    deployment."""
     from srplatform.scenario_engine import orchestrator
+    from srplatform.scenario_engine import deploy_executor
     from srplatform.api.deps import get_broker
 
     sess = db.get(SessionModel, session_id)
@@ -553,94 +558,47 @@ def launch_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
     try:
         _claim_owner = orchestrator.claim_operation(db, sess.session_id, "launch")
     except orchestrator.OperationInProgress as e:
-        raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
-    # DURABLE ACCEPTANCE (plan 13 phase 5): the attempt's identity, fence,
-    # phase and deadline are committed BEFORE any side effect; a lost
-    # response never creates a second deployment, and a restart reconciles
-    # this row to `interrupted` instead of forgetting the attempt.
+        row = orchestrator.latest_deploy_operation(db, sess.session_id)
+        raise HTTPException(409, {"error": "operation_in_progress",
+                                  "operation": e.operation,
+                                  "operation_id": str(row.operation_id)
+                                  if row is not None else None})
+    # DURABLE ACCEPTANCE: the attempt's identity, fence, phase and deadline
+    # are committed BEFORE any side effect; the lease is reserved in the
+    # same request so conflict answers stay synchronous and deterministic.
     from srplatform.settings import get_settings as _gs_op
+    deadline_s = _gs_op().deploy_operation_deadline_s
     op_row = orchestrator.begin_deploy_operation(
         db, sess.session_id, "launch", fence=_claim_owner,
-        deadline_s=_gs_op().deploy_operation_deadline_s)
-    _ok = False
+        deadline_s=deadline_s)
     try:
-        try:
-            orchestrator.acquire_lease(db, sess.session_id)
-        except orchestrator.LeaseConflict as e:
-            raise HTTPException(409, {"error": "range_busy", "holder_session": e.holder_session_id,
-                                      "acquired_at": e.acquired_at})
-        orchestrator.advance_deploy_operation(db, op_row, "deploying")
-        try:
-            result = orchestrator.deploy(db, sess.session_id, sess.scenario_id, get_broker())
-        except orchestrator.ForeignResourceError as e:
-            raise HTTPException(409, {"error": "foreign_resource", "detail": str(e)[:500]})
-
-        # SERVICE READINESS + ENROLLMENT GATE (audit N10 item 4, T05, T06):
-        # the session reaches `ready` only after declared services verify on
-        # the owned inventory AND every clone's telemetry enrollment is
-        # confirmed (when the provisioning channel is available). Failure is
-        # explicit — machines stay deployed for a documented retry, the
-        # session does NOT pretend to be ready.
-        from srplatform import verification_service
-        orchestrator.advance_deploy_operation(db, op_row, "readiness")
-        instructions, readiness = _finalize_ready(db, sess, p, result,
-                                                  verification_service)
-        _ok = True
-        orchestrator.finish_deploy_operation(db, op_row, "succeeded")
-        return {"session_id": str(sess.session_id), "status": sess.status,
-                "operation_id": str(op_row.operation_id),
-                "deployment": result, "connections": instructions,
-                "readiness": readiness}
-    except HTTPException as e:
+        orchestrator.acquire_lease(db, sess.session_id)
+    except orchestrator.LeaseConflict as e:
         _fail_deploy_operation(sess.session_id, _claim_owner,
-                               str(e.detail if isinstance(e.detail, (dict, str))
-                                   else e.status_code))
+                               f"range_busy holder={e.holder_session_id}")
+        _release_claim_safely(db, sess.session_id, False, _claim_owner)
+        raise HTTPException(409, {"error": "range_busy",
+                                  "holder_session": e.holder_session_id,
+                                  "acquired_at": e.acquired_at})
+    try:
+        broker = get_broker()
+    except Exception as e:  # noqa: BLE001 — broker unresolvable pre-dispatch
+        _fail_deploy_operation(sess.session_id, _claim_owner,
+                               f"broker_unavailable: {str(e)[:200]}")
+        _release_claim_safely(db, sess.session_id, False, _claim_owner)
         raise
-    except Exception as e:  # noqa: BLE001 — recorded, then stays loud
-        _fail_deploy_operation(sess.session_id, _claim_owner, str(e))
-        raise
-    finally:
-        _release_claim_safely(db, sess.session_id, _ok, _claim_owner)
-
-
-def _finalize_ready(db, sess, p, result, verification_service):
-    """Shared READY workflow (audit T06): readiness gate, per-host member
-    connection capabilities, status transition, evidence. Used by BOTH
-    /launch and /reset so a reset can never skip the launch checks."""
-    readiness = verification_service.readiness_checks(db, sess.session_id)
-    if readiness["enforced"] and not readiness["ok"]:
-        # the request transaction is discarded on the raise — persist the
-        # failure evidence through a SEPARATE session (audit T06: assert DB
-        # state, not just the route status)
-        from srplatform.db.session import db as db_ctx
-        with db_ctx() as s2:
-            s2.add(Event(session_id=sess.session_id, ts=_now(), actor="system",
-                         action_type="readiness_failed", payload=readiness))
-            s2.commit()
-        raise HTTPException(409, {"error": "readiness_failed",
-                                  "reason": readiness["reason"],
-                                  "checks": readiness["checks"],
-                                  "enrollments": readiness.get("enrollments", [])})
-    # member-specific host connection capabilities (F08)
-    s = get_settings()
-    instructions = []
-    for r in result["hosts"]:
-        tok = f"tok-{r['host']}-{uuid.uuid4().hex[:6]}"
-        db.add(LoginToken(token=tok, session_id=sess.session_id, user_id=p.user_id,
-                          target_host=r["ip"], target_port=22,
-                          expires_at=_now() + timedelta(hours=s.web_token_ttl_hours)))
-        instructions.append({"host": r["host"], "ip": r["ip"], "login_token": tok,
-                             "ssh": f"ssh {s.bastion_address} -p {s.bastion_listen_port} -l {tok}"})
-    sess.status = "ready"
-    db.add(Event(session_id=sess.session_id, ts=_now(), actor="system",
-                 action_type="session_ready",
-                 payload={"hosts": [i["host"] for i in instructions]}))
-    # MATCH: the idle-expiry clock starts now (ready-but-unstarted labs
-    # expire after 15 minutes — pilot step 4)
-    from srplatform import lifecycle
-    lifecycle.mark_ready(db, sess.session_id)
-    db.flush()
-    return instructions, readiness
+    deploy_executor.submit(operation_id=op_row.operation_id,
+                           session_id=sess.session_id,
+                           user_id=str(p.user_id),
+                           operation="launch",
+                           scenario_id=sess.scenario_id,
+                           broker=broker, owner=_claim_owner)
+    return {"session_id": str(sess.session_id),
+            "operation_id": str(op_row.operation_id),
+            "status": "accepted",
+            "deadline_at": op_row.deadline_at.isoformat()
+            if op_row.deadline_at else None,
+            "operation": "/sessions/%s/operation" % sess.session_id}
 
 
 @app.post("/sessions/{session_id}/end")
@@ -761,71 +719,70 @@ def teardown_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
 
 
 @app.post("/sessions/{session_id}/reset")
+@app.post("/sessions/{session_id}/reset", status_code=202)
 def reset_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
                   db: DbSession = None):
+    """Reset via the supervised executor (plan 13 phase 5, 202 refinement):
+    the worker is stopped and old capabilities revoked synchronously (fast,
+    durable, synchronous conflicts), then the redeploy + readiness work runs
+    in the background. Returns 202; poll GET /sessions/{id}/operation."""
     from srplatform.scenario_engine import orchestrator
+    from srplatform.scenario_engine import deploy_executor
     from srplatform.api.deps import get_broker
     sess = _get_session(db, p, session_id)
     try:
         _claim_owner = orchestrator.claim_operation(db, sess.session_id, "reset")
     except orchestrator.OperationInProgress as e:
-        raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
+        row = orchestrator.latest_deploy_operation(db, sess.session_id)
+        raise HTTPException(409, {"error": "operation_in_progress",
+                                  "operation": e.operation,
+                                  "operation_id": str(row.operation_id)
+                                  if row is not None else None})
     from srplatform.settings import get_settings as _gs_op
+    deadline_s = _gs_op().deploy_operation_deadline_s
     op_row = orchestrator.begin_deploy_operation(
         db, sess.session_id, "reset", fence=_claim_owner,
-        deadline_s=_gs_op().deploy_operation_deadline_s)
-    _ok = False
+        deadline_s=deadline_s)
     try:
         # stop the worker BEFORE anything is destroyed (audit N03)
         _stop_active_run_or_conflict(db, sess)
         # old machines are about to die — their capabilities must die first
         _revoke_session_capabilities(db, sess.session_id, "reset")
-        orchestrator.advance_deploy_operation(db, op_row, "redeploy")
-        try:
-            # orchestrator.reset ACQUIRES/VERIFIES the global lease first (R07)
-            out = orchestrator.reset(db, sess.session_id, sess.scenario_id, get_broker())
-        except orchestrator.LeaseConflict as e:
-            raise HTTPException(409, {"error": "range_busy", "holder_session": e.holder_session_id})
-        except RuntimeError as e:
-            raise HTTPException(409, str(e))
-        # T06: reset runs the SAME readiness + credential workflow as launch.
-        # Success => fresh `ready` state with NEW connection capabilities;
-        # failure => session is explicitly `preparing` (redeployed but not
-        # ready), never left claiming the pre-reset state.
-        from srplatform import verification_service
-        try:
-            orchestrator.advance_deploy_operation(db, op_row, "readiness")
-            instructions, readiness = _finalize_ready(db, sess, p, out,
-                                                      verification_service)
-        except HTTPException as e:
-            # persisted through a SEPARATE session — the request transaction
-            # is discarded by the raise (audit T06: clear new session state)
-            from srplatform.db.session import db as db_ctx
-            with db_ctx() as s2:
-                sess2 = s2.get(SessionModel, sess.session_id)
-                sess2.status = "preparing"
-                s2.add(Event(session_id=sess.session_id, ts=_now(), actor="system",
-                             action_type="session_reset_incomplete",
-                             payload={"detail": e.detail if isinstance(e.detail, (dict, str))
-                                      else str(e.detail)}))
-                s2.commit()
-            raise
-        _ok = True
-        orchestrator.finish_deploy_operation(db, op_row, "succeeded")
-        out.update({"status": sess.status, "connections": instructions,
-                    "operation_id": str(op_row.operation_id),
-                    "readiness": readiness})
-        return out
     except HTTPException as e:
         _fail_deploy_operation(sess.session_id, _claim_owner,
                                str(e.detail if isinstance(e.detail, (dict, str))
                                    else e.status_code))
+        _release_claim_safely(db, sess.session_id, False, _claim_owner)
         raise
-    except Exception as e:  # noqa: BLE001
-        _fail_deploy_operation(sess.session_id, _claim_owner, str(e))
+    # the lease is reserved synchronously so range_busy stays deterministic;
+    # orchestrator.reset re-verifies it inside the executor (R07).
+    try:
+        orchestrator.acquire_lease(db, sess.session_id)
+    except orchestrator.LeaseConflict as e:
+        _fail_deploy_operation(sess.session_id, _claim_owner,
+                               f"range_busy holder={e.holder_session_id}")
+        _release_claim_safely(db, sess.session_id, False, _claim_owner)
+        raise HTTPException(409, {"error": "range_busy",
+                                  "holder_session": e.holder_session_id})
+    try:
+        reset_broker = get_broker()
+    except Exception:  # noqa: BLE001 — broker unresolvable pre-dispatch
+        _fail_deploy_operation(sess.session_id, _claim_owner,
+                               "broker_unavailable")
+        _release_claim_safely(db, sess.session_id, False, _claim_owner)
         raise
-    finally:
-        _release_claim_safely(db, sess.session_id, _ok, _claim_owner)
+    deploy_executor.submit(operation_id=op_row.operation_id,
+                           session_id=sess.session_id,
+                           user_id=str(p.user_id),
+                           operation="reset",
+                           scenario_id=sess.scenario_id,
+                           broker=reset_broker, owner=_claim_owner)
+    return {"session_id": str(sess.session_id),
+            "operation_id": str(op_row.operation_id),
+            "status": "accepted",
+            "deadline_at": op_row.deadline_at.isoformat()
+            if op_row.deadline_at else None,
+            "operation": "/sessions/%s/operation" % sess.session_id}
 
 
 @app.get("/sessions/{session_id}/operation")
@@ -845,6 +802,7 @@ def get_session_operation(session_id: uuid.UUID,
             "state": row.state, "phase": row.phase,
             "deadline_at": row.deadline_at.isoformat() if row.deadline_at else None,
             "error": row.error,
+            "result": (row.progress or {}).get("result"),
             "created_at": row.created_at.isoformat(),
             "updated_at": row.updated_at.isoformat(),
             "completed_at": row.completed_at.isoformat() if row.completed_at else None}
@@ -855,10 +813,11 @@ class DeployIn(BaseModel):
     session_id: uuid.UUID
 
 
-@app.post("/deploy/{scenario_id}")
+@app.post("/deploy/{scenario_id}", status_code=202)
 def deploy_scenario(scenario_id: str, body: DeployIn, p: Principal = Depends(any_member),
                     db: DbSession = None):
     from srplatform.scenario_engine import orchestrator
+    from srplatform.scenario_engine import deploy_executor
     from srplatform.api.deps import get_broker
     sess = _get_session(db, p, body.session_id)
     # the legacy route must not become a side door: URL scenario == session
@@ -873,18 +832,41 @@ def deploy_scenario(scenario_id: str, body: DeployIn, p: Principal = Depends(any
     try:
         _claim_owner = orchestrator.claim_operation(db, sess.session_id, "deploy")
     except orchestrator.OperationInProgress as e:
-        raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
-    _ok = False
+        row = orchestrator.latest_deploy_operation(db, sess.session_id)
+        raise HTTPException(409, {"error": "operation_in_progress",
+                                  "operation": e.operation,
+                                  "operation_id": str(row.operation_id)
+                                  if row is not None else None})
+    from srplatform.settings import get_settings as _gs_op
+    deadline_s = _gs_op().deploy_operation_deadline_s
+    op_row = orchestrator.begin_deploy_operation(
+        db, sess.session_id, "launch", fence=_claim_owner,
+        deadline_s=deadline_s)
     try:
-        try:
-            orchestrator.acquire_lease(db, sess.session_id)
-        except orchestrator.LeaseConflict as e:
-            raise HTTPException(409, {"error": "range_busy", "holder_session": e.holder_session_id})
-        out = orchestrator.deploy(db, sess.session_id, scenario_id, get_broker())
-        _ok = True
-        return out
-    finally:
-        _release_claim_safely(db, sess.session_id, _ok, _claim_owner)
+        orchestrator.acquire_lease(db, sess.session_id)
+    except orchestrator.LeaseConflict as e:
+        _fail_deploy_operation(sess.session_id, _claim_owner,
+                               f"range_busy holder={e.holder_session_id}")
+        _release_claim_safely(db, sess.session_id, False, _claim_owner)
+        raise HTTPException(409, {"error": "range_busy",
+                                  "holder_session": e.holder_session_id})
+    try:
+        legacy_broker = get_broker()
+    except Exception:  # noqa: BLE001 — broker unresolvable pre-dispatch
+        _fail_deploy_operation(sess.session_id, _claim_owner,
+                               "broker_unavailable")
+        _release_claim_safely(db, sess.session_id, False, _claim_owner)
+        raise
+    deploy_executor.submit(operation_id=op_row.operation_id,
+                           session_id=sess.session_id,
+                           user_id=str(p.user_id),
+                           operation="launch",
+                           scenario_id=scenario_id,
+                           broker=legacy_broker, owner=_claim_owner)
+    return {"session_id": str(sess.session_id),
+            "operation_id": str(op_row.operation_id),
+            "status": "accepted",
+            "operation": "/sessions/%s/operation" % sess.session_id}
 
 
 @app.get("/scenarios")
@@ -1462,6 +1444,43 @@ def killswitch_release(p: Principal = Depends(operator)):
 @app.get("/safety/status")
 def safety_status(p: Principal = Depends(operator)):
     return get_supervisor().verify()
+
+
+@app.get("/safety/panel")
+def safety_panel(p: Principal = Depends(operator), db: DbSession = None):
+    """Operator safety panel (plan 13 phase 7): BOTH latch states side by
+    side — the supervisor killswitch latch (local workers + datapath) and
+    the broker's independent cessation authority (remote commands on the
+    isolated runner) — plus the authorized recovery procedure. Read-only:
+    broker-local release authority stays behind ITS OWN endpoint; no
+    browser action moves it here."""
+    from srplatform.api.deps import get_broker
+    sup = get_supervisor().latch_status()
+    try:
+        broker_latch = get_broker().latch_status()
+    except Exception as e:  # noqa: BLE001 — a panel never 500s
+        broker_latch = {"ok": False, "detail": str(e)[:200]}
+    executors = []
+    try:
+        from srplatform.scenario_engine import deploy_executor
+        executors = deploy_executor.live_executors()
+    except Exception:  # noqa: BLE001
+        pass
+    return {
+        "supervisor_latch": sup,
+        "broker_cessation": broker_latch,
+        "live_deploy_executors": executors,
+        "recovery_procedure": [
+            "1. Confirm the range is quiet: no live_deploy_executors, no "
+            "active runs (GET /runs/active).",
+            "2. Confirm remote cessation: broker_cessation must report "
+            "confirmed stop for every dispatched remote operation.",
+            "3. Only then release: POST /safety/killswitch-release "
+            "(supervisor latch) through the broker's OWN release endpoint "
+            "for broker-local authority — never from this panel.",
+            "4. Re-verify: GET /safety/panel must show both latches clear.",
+        ],
+    }
 
 
 class BaselineCheckIn(BaseModel):

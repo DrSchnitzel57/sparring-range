@@ -16,16 +16,16 @@ import threading
 import uuid
 
 import pytest
+from tests.conftest import launch_and_wait, wait_operation
 
 _REAL_POPEN = subprocess.Popen
 
 
 def _launch(client, users, scenario="quick-win-01", headers=None):
+    headers = headers or users["member"]
     sid = client.post("/sessions", json={"scenario_id": scenario},
-                      headers=headers or users["member"]).json()["session_id"]
-    r = client.post(f"/sessions/{sid}/launch", headers=headers or users["member"])
-    assert r.status_code == 200, r.text
-    return sid, r.json()
+                      headers=headers).json()["session_id"]
+    return sid, launch_and_wait(client, headers, sid)["result"]
 
 
 # --------------------------------------------------------------------------- #
@@ -112,7 +112,9 @@ def test_pending_vmid_now_foreign_receives_zero_mutation(client, users, fake_pve
     # crash between clone-completion and config (config endpoint down)
     fake_pve.api.fail_request_fragments = ("/config",)
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code >= 500 or r.status_code == 409
+    assert r.status_code == 202, r.text  # durable acceptance; executor fails
+    failed = wait_operation(client, users["member"], sid)
+    assert failed["state"] == "failed", failed
     fake_pve.api.fail_request_fragments = ()
 
     from sqlalchemy import select
@@ -131,8 +133,10 @@ def test_pending_vmid_now_foreign_receives_zero_mutation(client, users, fake_pve
 
     requests_before = len(fake_pve.api.requests)
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code == 409, r.text
-    assert r.json()["detail"]["error"] == "foreign_resource"
+    assert r.status_code == 202, r.text  # accepted; the executor refuses it
+    refused = wait_operation(client, users["member"], sid)
+    assert refused["state"] == "failed", refused
+    assert "foreign_resource" in (refused["error"] or ""), refused
 
     mutations = [q for q in fake_pve.api.requests[requests_before:]
                  if q[0] in ("POST", "DELETE") and f"/qemu/{vmid}" in q[1]]
@@ -194,7 +198,11 @@ def test_concurrent_launch_cannot_double_deploy(client, users, fake_pve):
     [t.start() for t in ts]
     [t.join(timeout=30) for t in ts]
     codes = sorted(r.status_code for r in outs.values())
-    assert codes == [200, 200] or codes == [200, 409], codes
+    assert codes == [202, 409], codes
+    # the winner's executor owns the single deployment: wait for it, then
+    # clone side effects must have happened EXACTLY once
+    done = wait_operation(client, users["member"], sid)
+    assert done["state"] == "succeeded", done
     clones = [q for q in fake_pve.api.requests if q[0] == "POST" and "/clone" in q[1]]
     assert len(clones) == 1, f"duplicate deployment side effects: {clones}"
 

@@ -7,6 +7,7 @@ import uuid as U
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from tests.conftest import launch_and_wait
 
 pytestmark = pytest.mark.db
 
@@ -43,8 +44,7 @@ def _exec_broken(addr: str, cmd: str):
 def _begin(client, users, scenario="mojang-web-db-01", **create):
     sid = client.post("/sessions", json={"scenario_id": scenario, **create},
                       headers=users["member"]).json()["session_id"]
-    r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code == 200, r.text
+    launch_and_wait(client, users["member"], sid)
     r = client.post(f"/sessions/{sid}/begin", headers=users["member"])
     assert r.status_code == 202, r.text
     return sid

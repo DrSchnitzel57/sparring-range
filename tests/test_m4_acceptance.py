@@ -11,6 +11,8 @@ import pytest
 from srplatform import verification_service
 from verifiers.base import Context
 from verifiers import registry
+from tests.conftest import launch_and_wait
+
 
 # db layer membership derives from the fixture closure (milestone 01)
 
@@ -19,7 +21,7 @@ from verifiers import registry
 def test_m4_yaml_only_scenario_deploys_verifies_scores(client, users, fake_pve):
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
-    assert client.post(f"/sessions/{sid}/launch", headers=users["member"]).status_code == 200
+    launch_and_wait(client, users["member"], sid)
 
     def host_exec(host, command):
         if command.startswith("cat "):
@@ -50,7 +52,7 @@ def test_m4_yaml_only_scenario_deploys_verifies_scores(client, users, fake_pve):
 def test_m4_unreachable_state_is_unknown_not_fabricated(client, users):
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
-    client.post(f"/sessions/{sid}/launch", headers=users["member"])
+    launch_and_wait(client, users["member"], sid)
 
     def dead_exec(host, command):
         raise TimeoutError("host unreachable")

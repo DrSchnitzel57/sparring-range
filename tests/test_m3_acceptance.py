@@ -18,6 +18,8 @@ from srplatform.red_agent.loop import RedAgentLoop
 from srplatform.red_agent.sandbox import FakeSandbox
 from srplatform.red_agent.transport import TestClientTransport
 from tests.helpers import FakeLLM, make_runner_token, tool
+from tests.conftest import launch_and_wait
+
 
 pytestmark = pytest.mark.db
 
@@ -26,7 +28,7 @@ def _setup(client, users):
     """Launch a session and wire scripted host state into the verifier exec."""
     sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
                       headers=users["member"]).json()["session_id"]
-    client.post(f"/sessions/{sid}/launch", headers=users["member"])
+    launch_and_wait(client, users["member"], sid)
 
     state = {"flag": None, "cron_files": ["e2scrub_all"], "crontab": ""}
 
@@ -180,7 +182,7 @@ def test_m3_run_endpoint_guards(client, users, monkeypatch):
                     headers=users["member"])
     assert r.status_code == 409  # not launched yet
 
-    client.post(f"/sessions/{sid}/launch", headers=users["member"])
+    launch_and_wait(client, users["member"], sid)
     # engage the latch: /run must now refuse with reasons (423), never spawn
     client.post("/safety/killswitch", headers=users["op"])
     r = client.post("/run/web-foothold-01", json={"session_id": sid},
@@ -211,7 +213,7 @@ def test_m3_run_endpoint_supervises_worker_lifecycle(client, users, monkeypatch)
     try:
         sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                           headers=users["member"]).json()["session_id"]
-        client.post(f"/sessions/{sid}/launch", headers=users["member"])
+        launch_and_wait(client, users["member"], sid)
 
         r = client.post("/run/quick-win-01", json={"session_id": sid},
                         headers=users["member"])

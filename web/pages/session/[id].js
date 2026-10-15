@@ -14,6 +14,7 @@ export default function LiveSession() {
   const [injectDraft, setInjectDraft] = useState({});
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
+  const [opNote, setOpNote] = useState(null);
   const [seconds, setSeconds] = useState(0);
   const startRef = useRef(null);
 
@@ -25,10 +26,21 @@ export default function LiveSession() {
       setSess(s);
     }).catch(e => setErr(String(e.message || e)));
     // connection instructions are SERVED BY THE API (pilot step 4): they
-    // survive refreshes and other devices — no browser-session secret
-    api(`/sessions/${id}/connections`)
-      .then(c => { if (!stop) setConns(c.connections); })
-      .catch(() => { if (!stop) setConns(null); });
+    // survive refreshes and other devices — no browser-session secret.
+    // After a 202 launch the executor may still be provisioning: retry a
+    // few times before showing the empty state.
+    const loadConns = async (tries = 6) => {
+      try {
+        const c = await api(`/sessions/${id}/connections`);
+        if (stop) return;
+        if ((!c.connections || !c.connections.length) && tries > 0) {
+          setTimeout(() => { if (!stop) loadConns(tries - 1); }, 2000);
+          return;
+        }
+        setConns(c.connections);
+      } catch { if (!stop) setConns(null); }
+    };
+    loadConns();
     const tick = async () => {
       try {
         const d = await api(`/sessions/${id}/live`);
@@ -77,8 +89,28 @@ export default function LiveSession() {
       setSess({ ...sess, status: r.status, outcome: r.outcome });
     }, "end");
   };
+  // 202 lifecycle: launch/reset are accepted immediately and completed by
+  // the supervised executor — poll the durable operation, then refresh
+  // server-served state. A lost response never re-posts (no second deploy).
+  const awaitOperation = async (opId) => {
+    for (let i = 0; i < 150; i++) {
+      const op = await api(`/sessions/${id}/operation`);
+      if (op.operation_id !== opId) return op;
+      if (op.state === "succeeded") return op;
+      if (op.state === "failed" || op.state === "interrupted")
+        throw new Error(`deploy ${op.state}: ${op.error || op.phase}`);
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    throw new Error("deploy timed out waiting for the operation");
+  };
   const redeploy = () => act(async () => {
-    await api(`/sessions/${id}/launch`, { method: "POST" });
+    const acc = await api(`/sessions/${id}/launch`, { method: "POST" });
+    setOpNote(`deploy ${acc.operation_id.slice(0, 8)}… accepted, provisioning`);
+    try {
+      await awaitOperation(acc.operation_id);
+    } finally {
+      setOpNote(null);
+    }
     const c = await api(`/sessions/${id}/connections`);
     setConns(c.connections);
     setSess(await api(`/sessions/${id}`));
@@ -141,6 +173,7 @@ export default function LiveSession() {
             {sess.status !== "complete" && <button className="danger" onClick={endSession} disabled={busy}>end session</button>}
           </div>
           {err && <p className="bad">{err}</p>}
+          {opNote && <p className="dim">{opNote}</p>}
         </div>
         <div className="panel">
           <h3>connections</h3>

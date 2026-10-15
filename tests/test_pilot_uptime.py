@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from srplatform import uptime
+from tests.conftest import launch_and_wait
+
 
 
 def _s(state, secs_ago=0, latency=None):
@@ -126,8 +128,7 @@ def test_begin_starts_prober_and_samples_are_identity_bound(client, users,
     st.get_settings.cache_clear()
     sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
                       headers=users["member"]).json()["session_id"]
-    assert client.post(f"/sessions/{sid}/launch",
-                       headers=users["member"]).status_code == 200
+    launch_and_wait(client, users["member"], sid)
     assert client.post(f"/sessions/{sid}/begin",
                        headers=users["member"]).status_code == 202
     rows = []
@@ -156,8 +157,7 @@ def test_uptime_samples_append_only_and_displayed(client, users, fake_pve,
     from sqlalchemy.exc import ProgrammingError
     sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
                       headers=users["member"]).json()["session_id"]
-    assert client.post(f"/sessions/{sid}/launch",
-                       headers=users["member"]).status_code == 200
+    launch_and_wait(client, users["member"], sid)
     with _db() as s:  # the app role may INSERT (prober path) — proven here
         for state in ("up", "up", "down", "unknown"):
             s.execute(text("INSERT INTO uptime_samples (session_id, "

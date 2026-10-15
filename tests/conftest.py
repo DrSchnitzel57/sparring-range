@@ -370,3 +370,42 @@ def users(client):
     tok2 = client.post("/auth/login", json={"username": "blue", "password": MEM_PW}).json()["token"]
     return {"op": op, "op_token": tok, "member": {"Authorization": f"Bearer {tok2}"},
             "member_token": tok2}
+
+
+# --- async lifecycle helpers (plan 13 phase 5, 202 refinement) ----------------
+# /launch and /reset return 202 immediately after durable acceptance; the
+# supervised executor completes the attempt in the background. Tests that
+# need the completed deployment poll the operation to a terminal state.
+def wait_operation(client, headers, session_id, timeout_s: float = 120.0):
+    """Poll GET /sessions/{id}/operation until terminal. Returns the body.
+    Terminal failure returns the body too (caller asserts the outcome)."""
+    import time as _t
+    deadline = _t.monotonic() + timeout_s
+    last = None
+    while True:
+        r = client.get(f"/sessions/{session_id}/operation", headers=headers)
+        assert r.status_code == 200, r.text
+        last = r.json()
+        if last["state"] in ("succeeded", "failed", "interrupted"):
+            return last
+        assert _t.monotonic() < deadline, \
+            f"operation {last['operation_id']} stuck in {last['state']}/{last['phase']}"
+        _t.sleep(0.2)
+
+
+def launch_and_wait(client, headers, session_id, timeout_s: float = 120.0):
+    """POST /launch (expect 202 accepted) then wait for completion. Returns
+    the operation body including the redacted `result` on success."""
+    r = client.post(f"/sessions/{session_id}/launch", headers=headers)
+    assert r.status_code == 202, r.text
+    body = wait_operation(client, headers, session_id, timeout_s)
+    assert body["state"] == "succeeded", body
+    return body
+
+
+def reset_and_wait(client, headers, session_id, timeout_s: float = 120.0):
+    r = client.post(f"/sessions/{session_id}/reset", headers=headers)
+    assert r.status_code == 202, r.text
+    body = wait_operation(client, headers, session_id, timeout_s)
+    assert body["state"] == "succeeded", body
+    return body

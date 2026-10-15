@@ -16,6 +16,7 @@ import threading
 import time
 
 import pytest
+from tests.conftest import launch_and_wait
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable
@@ -117,6 +118,8 @@ def test_worker_crash_does_not_abandon_command_group(tmp_path):
 import sys, time
 sys.path.insert(0, {REPO!r})
 from srplatform.red_agent.runner import LocalDevRunner
+from tests.conftest import launch_and_wait
+
 r = LocalDevRunner()
 r.run("sh -c 'echo $$ > {pidfile}; exec sleep 300'")
 """
@@ -283,7 +286,7 @@ def test_killswitch_test_record_required_for_start(client, users, monkeypatch):
 
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
-    client.post(f"/sessions/{sid}/launch", headers=users["member"])
+    launch_and_wait(client, users["member"], sid)
     r = client.post("/run/quick-win-01", json={"session_id": sid},
                     headers=users["member"])
     assert r.status_code == 423

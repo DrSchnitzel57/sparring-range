@@ -26,6 +26,7 @@ from srplatform.safety import Supervisor, set_supervisor
 from srplatform.safety.datapath import NoopDatapath
 from srplatform.settings import get_settings
 from tests.helpers import FakeLLM, make_runner_token, tool
+from tests.conftest import wipe_data
 
 pytestmark = pytest.mark.db
 

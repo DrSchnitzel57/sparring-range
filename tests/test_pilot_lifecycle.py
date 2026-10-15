@@ -11,6 +11,7 @@ import pytest
 from sqlalchemy import text
 
 from srplatform import lifecycle
+from tests.conftest import launch_and_wait
 
 pytestmark = pytest.mark.db
 
@@ -28,9 +29,7 @@ def _broker():
 def _launch(client, users, scenario="web-foothold-01", **create):
     sid = client.post("/sessions", json={"scenario_id": scenario, **create},
                       headers=users["member"]).json()["session_id"]
-    r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code == 200, r.text
-    return sid, r.json()
+    return sid, launch_and_wait(client, users["member"], sid)["result"]
 
 
 def _backdate(session_id, column, minutes):
@@ -139,8 +138,7 @@ def test_ready_unstarted_lab_expires_after_15_minutes(client, users, fake_pve):
     assert leftover == []
     sid2 = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
                        headers=users["op"]).json()["session_id"]
-    assert client.post(f"/sessions/{sid2}/launch",
-                       headers=users["op"]).status_code == 200
+    launch_and_wait(client, users["op"], sid2)
     with _db() as s:
         revoked = s.execute(text("SELECT revoked_at FROM login_tokens WHERE token=:t"),
                             {"t": tok}).scalar()
@@ -177,8 +175,7 @@ def test_deadline_ends_match_destroys_vms_releases_lease(client, users, fake_pve
     # the range is free again
     sid2 = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
                        headers=users["op"]).json()["session_id"]
-    assert client.post(f"/sessions/{sid2}/launch",
-                       headers=users["op"]).status_code == 200
+    launch_and_wait(client, users["op"], sid2)
 
 
 # ---------------------------------------------------------------- user end ---
@@ -194,8 +191,7 @@ def test_end_destroys_owned_vms_and_frees_range(client, users, fake_pve):
     # a second session can launch IMMEDIATELY after end (no separate teardown)
     sid2 = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
                        headers=users["op"]).json()["session_id"]
-    assert client.post(f"/sessions/{sid2}/launch",
-                       headers=users["op"]).status_code == 200
+    launch_and_wait(client, users["op"], sid2)
     # capabilities revoked; end is idempotent
     with _db() as s:
         assert s.execute(text("SELECT revoked_at FROM login_tokens WHERE token=:t"),
@@ -221,8 +217,7 @@ def test_end_with_failed_destroy_keeps_lease_and_retries(client, users, fake_pve
     r2 = client.post(f"/sessions/{sid}/end", headers=users["member"])
     assert r2.status_code == 200 and r2.json()["lease_released"] is True
     assert _match_row(sid)["state"] == "completed"
-    assert client.post(f"/sessions/{sid2}/launch",
-                       headers=users["op"]).status_code == 200
+    launch_and_wait(client, users["op"], sid2)
 
 
 # ------------------------------------------------------------- api restart ---
@@ -246,8 +241,7 @@ def test_api_restart_interrupts_and_never_resumes(client, users, fake_pve):
     if m["state"] == "completed":
         sid2 = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
                            headers=users["op"]).json()["session_id"]
-        assert client.post(f"/sessions/{sid2}/launch",
-                           headers=users["op"]).status_code == 200
+        launch_and_wait(client, users["op"], sid2)
 
 
 # ------------------------------------------------------------- connections ---

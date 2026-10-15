@@ -55,6 +55,25 @@ def call(method: str, path: str, **kw) -> httpx.Response:
     return r
 
 
+def await_operation(session_id: str, operation_id: str,
+                    timeout_s: float = 600.0) -> dict:
+    """Poll a 202 lifecycle operation to terminal (plan 13 phase 5). The
+    CLI never re-posts: a duplicate could never create a second deployment,
+    but polling is the honest client contract."""
+    import time as _t
+    deadline = _t.monotonic() + timeout_s
+    while True:
+        op = call("GET", f"/sessions/{session_id}/operation").json()
+        if op["operation_id"] != operation_id:
+            return op  # superseded by a newer attempt
+        if op["state"] in ("succeeded", "failed", "interrupted"):
+            return op
+        if _t.monotonic() > deadline:
+            raise SystemExit(f"operation {operation_id} stuck in "
+                             f"{op['state']}/{op['phase']}")
+        _t.sleep(2.0)
+
+
 def _detail(r: httpx.Response) -> str:
     try:
         d = r.json().get("detail", r.text)

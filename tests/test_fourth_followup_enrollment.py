@@ -27,6 +27,7 @@ import uuid
 
 import pytest
 from sqlalchemy import select
+from tests.conftest import wait_operation
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 SHIPPER = REPO / "telemetry" / "shipper.py"
@@ -260,7 +261,11 @@ def test_t05_active_service_without_callback_stuck_at_delivery(
 
     sid = _session(client, users)
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code == 409 and r.json()["detail"]["error"] == "readiness_failed"
+    assert r.status_code == 202, r.text
+    from tests.conftest import wait_operation
+    failed = wait_operation(client, users["member"], sid)
+    assert failed["state"] == "failed", failed
+    assert "readiness_failed" in (failed["error"] or ""), failed
     st = _enroll_state(client, sid)
     assert st.get("phase") == "confirm_failed" and st.get("stage") == "delivery_confirmed", st
     assert "callback" in st.get("error", "").lower() or "delivery" in st.get("error", "").lower()
@@ -285,7 +290,11 @@ def test_t05_delivery_ok_but_capture_broken_blocks_confirmation(
 
     sid = _session(client, users)
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code == 409 and r.json()["detail"]["error"] == "readiness_failed"
+    assert r.status_code == 202, r.text
+    from tests.conftest import wait_operation
+    failed = wait_operation(client, users["member"], sid)
+    assert failed["state"] == "failed", failed
+    assert "readiness_failed" in (failed["error"] or ""), failed
     st = _enroll_state(client, sid)
     assert st.get("phase") == "confirm_failed" and st.get("stage") == "capture_verified", st
     assert st.get("delivery_confirmed_at"), "delivery evidence must be retained"

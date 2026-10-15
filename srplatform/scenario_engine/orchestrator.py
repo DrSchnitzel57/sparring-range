@@ -28,7 +28,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from infra.broker.errors import BrokerError, BrokerUnavailable
-from srplatform.db.models import (Deployment, Event, OperationClaim, RangeLease,
+from srplatform.db.models import (Deployment, Event, LoginToken, OperationClaim,
+                                  RangeLease,
                                   ServiceToken,
                                   Session as SessionModel)
 from srplatform.scenario_engine.loader import load_scenario
@@ -48,8 +49,15 @@ class OperationInProgress(RuntimeError):
     def __init__(self, session_id, operation, claimed_at):
         self.session_id, self.operation = str(session_id), operation
         self.claimed_at = claimed_at.isoformat() if claimed_at else None
-        super().__init__(f"operation '{operation}' already in progress for session "
-                         f"{self.session_id}")
+
+
+class ReadinessFailed(RuntimeError):
+    """The readiness gate refused `ready` (audit T06). Carries the full
+    readiness payload for evidence; the HTTP mapping happens at the route."""
+
+    def __init__(self, payload: dict):
+        super().__init__(payload.get("reason") or "readiness_failed")
+        self.payload = payload
 
 
 class ForeignResourceError(RuntimeError):
@@ -161,15 +169,20 @@ def advance_deploy_operation(db: Session, row, phase: str) -> None:
 
 
 def finish_deploy_operation(db: Session, row, state: str, *,
-                            error: str | None = None) -> None:
+                            error: str | None = None,
+                            result: dict | None = None) -> None:
     """Terminal outcome, committed. `error` is redacted + bounded by the
-    caller; full provisioning commands and secrets never reach this row."""
+    caller; full provisioning commands and secrets never reach this row.
+    `result` is the REDACTED completed payload pollers receive (no
+    plaintext enrollments — the ServiceToken rows are the durable record)."""
     from srplatform.db.models import DeployOperation
     row = db.get(DeployOperation, row.operation_id)
     if row is None:
         return
     row.state = state
     row.error = (error or None) and str(error)[:500]
+    if result is not None:
+        row.progress = {"result": result}
     row.completed_at = _now()
     row.updated_at = row.completed_at
     db.commit()
@@ -200,6 +213,45 @@ def latest_deploy_operation(db: Session, session_id):
         .where(DeployOperation.session_id == session_id)
         .order_by(DeployOperation.created_at.desc())
     ).scalars().first()
+
+
+def finalize_ready(db: Session, session_id, user_id, result) -> tuple[list, dict]:
+    """Shared READY workflow (audit T06): readiness gate, per-host member
+    connection capabilities, status transition, evidence. Used by the
+    supervised executor for BOTH launch and reset so a reset can never skip
+    the launch checks. Raises ReadinessFailed (routes map it to 409)."""
+    from srplatform import lifecycle, verification_service
+
+    sess = db.get(SessionModel, session_id)
+    if sess is None:
+        raise ReadinessFailed({"reason": "session vanished mid-deploy",
+                               "enforced": True, "ok": False, "checks": []})
+    readiness = verification_service.readiness_checks(db, session_id)
+    if readiness["enforced"] and not readiness["ok"]:
+        raise ReadinessFailed(readiness)
+    # member-specific host connection capabilities (F08)
+    s = get_settings()
+    instructions = []
+    for r in result["hosts"]:
+        tok = f"tok-{r['host']}-{uuidlib.uuid4().hex[:6]}"
+        db.add(LoginToken(token=tok, session_id=session_id, user_id=user_id,
+                          target_host=r["ip"], target_port=22,
+                          expires_at=_now() + timedelta(
+                              hours=s.web_token_ttl_hours)))
+        instructions.append({"host": r["host"], "ip": r["ip"],
+                             "login_token": tok,
+                             "ssh": f"ssh {s.bastion_address} -p "
+                                    f"{s.bastion_listen_port} -l {tok}"})
+    sess.status = "ready"
+    db.add(Event(session_id=session_id, ts=_now(), actor="system",
+                 action_type="session_ready",
+                 payload={"hosts": [i["host"] for i in instructions]}))
+    # MATCH: the idle-expiry clock starts now (ready-but-unstarted labs
+    # expire after 15 minutes — pilot step 4)
+    lifecycle.mark_ready(db, session_id)
+    db.flush()
+    db.commit()
+    return instructions, readiness
 
 
 def _now():

@@ -18,6 +18,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from srplatform.bastion.proxy import BastionProxy
+from tests.conftest import launch_and_wait
+
 
 pytestmark = pytest.mark.asyncio  # db-marked tests derive automatically (milestone 01)
 
@@ -62,7 +64,7 @@ async def range_env(client, users, tmp_path):
     sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
                       headers=ctx.headers).json()["session_id"]
     ctx.session_id = sid
-    out = client.post(f"/sessions/{sid}/launch", headers=ctx.headers).json()
+    out = launch_and_wait(client, ctx.headers, sid)["result"]
     ctx.login_token = out["connections"][0]["login_token"]
     # retarget that token at the fake ssh server (owner column unchanged)
     from sqlalchemy import select

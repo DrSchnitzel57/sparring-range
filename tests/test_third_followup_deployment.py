@@ -12,6 +12,7 @@ import uuid
 
 import pytest
 from sqlalchemy import select
+from tests.conftest import launch_and_wait, reset_and_wait, wait_operation
 
 pytestmark = pytest.mark.db
 
@@ -59,7 +60,8 @@ def test_t04_launch_and_reset_use_the_session_snapshot_not_live_yaml(
     assert len(cur["topology"]["hosts"]) == 2  # the live file really changed
 
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code == 200, r.text
+    assert r.status_code == 202, r.text
+    wait_operation(client, users["member"], sid)
     non_tpl = [v for v in fake_pve.api.vms if v not in (9001, 9002, 9003, 9004)]
     assert len(non_tpl) == 1, "the snapshot has ONE host — the edited second host must NOT be cloned"
     v = fake_pve.api.vms[non_tpl[0]]
@@ -67,13 +69,12 @@ def test_t04_launch_and_reset_use_the_session_snapshot_not_live_yaml(
     assert "10.66.0.10" in v["config"]["ipconfig0"], "cloned with the EDITED IP"
 
     # reset must ALSO resolve the snapshot, not the mutated YAML
-    r = client.post(f"/sessions/{sid}/reset", headers=users["member"])
-    assert r.status_code == 200, r.text
+    out = reset_and_wait(client, users["member"], sid)["result"]
     non_tpl = [v for v in fake_pve.api.vms if v not in (9001, 9002, 9003, 9004)]
     assert len(non_tpl) == 1
     v = fake_pve.api.vms[non_tpl[0]]
     assert v["template"] == 9001 and "10.66.0.10" in v["config"]["ipconfig0"]
-    assert len(r.json()["hosts"]) == 1
+    assert len(out["hosts"]) == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -191,9 +192,20 @@ def test_t05_enrollment_provisions_env_and_confirms_service(
 
     sid = _session(client, users)
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code == 200, r.text
-    out = r.json()
-    token = out["deployment"]["telemetry_enrollments"]["web01"]
+    assert r.status_code == 202, r.text
+    out = wait_operation(client, users["member"], sid)
+    assert out["state"] == "succeeded", out
+    out = out["result"]
+    # the plaintext enrollment is NEVER in the async result (redacted by
+    # construction) — recover it through the durable ServiceToken record,
+    # exactly as a client that lost its response would.
+    from srplatform.db.session import db as db_ctx
+    from srplatform.scenario_engine.orchestrator import _recover_telemetry_token
+    with db_ctx() as s2:
+        rec = _recover_telemetry_token(s2, uuid.UUID(sid), "web01")
+        assert rec is not None
+        token = rec[0]
+    assert out["readiness"]["enforced"] and out["readiness"]["ok"]
 
     # the REAL provisioning contract: env file written with the session-bound
     # capability AND a fresh enrollment nonce, no placeholders, service
@@ -244,7 +256,10 @@ def test_t05_interrupted_provisioning_resumes_with_the_same_token(
     verification_service.set_verifier_exec(bad)
     sid = _session(client, users)
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code == 409 and r.json()["detail"]["error"] == "readiness_failed"
+    assert r.status_code == 202, r.text
+    failed = wait_operation(client, users["member"], sid)
+    assert failed["state"] == "failed", failed
+    assert "readiness_failed" in (failed["error"] or ""), failed
     assert _enroll_state(client, sid, "web01").get("phase") == "provision_failed"
     with db() as s:
         tokens = s.execute(select(ServiceToken).where(
@@ -260,7 +275,10 @@ def test_t05_interrupted_provisioning_resumes_with_the_same_token(
     enrollment_channel.set_enrollment_exec(good)
     verification_service.set_verifier_exec(good)
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code == 200, r.text
+    assert r.status_code == 202, r.text
+    out = wait_operation(client, users["member"], sid)
+    assert out["state"] == "succeeded", out
+    out = out["result"]
     assert _enroll_state(client, sid, "web01").get("phase") == "confirmed"
     with db() as s:
         tokens = s.execute(select(ServiceToken).where(
@@ -282,9 +300,10 @@ def test_t05_unconfirmed_service_blocks_ready(client, users, fake_pve,
     verification_service.set_verifier_exec(chan)
     sid = _session(client, users)
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code == 409 and r.json()["detail"]["error"] == "readiness_failed"
-    en = r.json()["detail"]["enrollments"]
-    assert en and en[0]["phase"] == "confirm_failed" and en[0]["ok"] is False
+    assert r.status_code == 202, r.text
+    failed = wait_operation(client, users["member"], sid)
+    assert failed["state"] == "failed", failed
+    assert "readiness_failed" in (failed["error"] or ""), failed
     assert _enroll_state(client, sid, "web01").get("phase") == "confirm_failed"
 
 
@@ -292,10 +311,9 @@ def test_t05_dev_relaxation_is_visible(client, users, fake_pve, enrollment_chann
     """Without a provisioning channel the phase is `unconfigured` and
     readiness reports enforced=False — never a silent 'enrolled'."""
     sid = _session(client, users)
-    r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code == 200, r.text
-    assert r.json()["readiness"]["enforced"] is False
-    assert "dev-mode relaxation" in r.json()["readiness"]["reason"]
+    out = launch_and_wait(client, users["member"], sid)["result"]
+    assert out["readiness"]["enforced"] is False
+    assert "dev-mode relaxation" in out["readiness"]["reason"]
     assert _enroll_state(client, sid, "web01").get("phase") == "unconfigured"
 
 
@@ -354,9 +372,11 @@ def test_t06_production_without_channel_refuses_ready(client, users, fake_pve,
     _prod_env(monkeypatch)
     try:
         r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-        assert r.status_code == 409, r.text
-        assert r.json()["detail"]["error"] == "readiness_failed"
-        assert "production" in r.json()["detail"]["reason"]
+        assert r.status_code == 202, r.text
+        failed = wait_operation(client, users["member"], sid)
+        assert failed["state"] == "failed", failed
+        assert "readiness_failed" in (failed["error"] or ""), failed
+        assert "production" in (failed["error"] or ""), failed
         with db() as s:
             sess = s.get(SessionModel, uuid.UUID(sid))
             assert sess.status != "ready"
@@ -368,9 +388,9 @@ def test_t06_dev_relaxation_requires_dev_mode_and_is_visible(client, users, fake
     """Same missing channel in dev: allowed, but the response SAYS it is an
     unverified relaxation (enforced=False)."""
     sid = _session(client, users)
-    r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code == 200, r.text
-    assert r.json()["readiness"]["enforced"] is False
+    from tests.conftest import launch_and_wait
+    out = launch_and_wait(client, users["member"], sid)["result"]
+    assert out["readiness"]["enforced"] is False
 
 
 def test_t06_reset_runs_the_launch_readiness_and_credential_workflow(
@@ -384,14 +404,11 @@ def test_t06_reset_runs_the_launch_readiness_and_credential_workflow(
     from srplatform.db.models import LoginToken, Session as SessionModel
 
     sid = _session(client, users)
-    r1 = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r1.status_code == 200, r1.text
-    old_tokens = {c["login_token"] for c in r1.json()["connections"]}
+    out = launch_and_wait(client, users["member"], sid)["result"]
+    old_tokens = {c["login_token"] for c in out["connections"]}
 
     # (a) happy path: reset -> ready + NEW credentials, old ones revoked
-    r = client.post(f"/sessions/{sid}/reset", headers=users["member"])
-    assert r.status_code == 200, r.text
-    out = r.json()
+    out = reset_and_wait(client, users["member"], sid)["result"]
     assert out["status"] == "ready" and out["connections"]
     new_tokens = {c["login_token"] for c in out["connections"]}
     assert new_tokens and not (new_tokens & old_tokens)
@@ -407,8 +424,10 @@ def test_t06_reset_runs_the_launch_readiness_and_credential_workflow(
     _prod_env(monkeypatch)
     try:
         r = client.post(f"/sessions/{sid}/reset", headers=users["member"])
-        assert r.status_code == 409, r.text
-        assert r.json()["detail"]["error"] == "readiness_failed", r.text
+        assert r.status_code == 202, r.text
+        failed = wait_operation(client, users["member"], sid)
+        assert failed["state"] == "failed", failed
+        assert "readiness_failed" in (failed["error"] or ""), failed
         with db() as s:
             assert s.get(SessionModel, U.UUID(sid)).status == "preparing"
     finally:

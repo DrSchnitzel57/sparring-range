@@ -21,6 +21,7 @@ export default function App({ Component, pageProps }) {
         <nav>
           <Link href="/library">library</Link>
           <Link href="/progress">progress</Link>
+          <Link href="/safety">safety</Link>
           {user && <a href="#" onClick={(e) => { e.preventDefault(); logout(); location.href = "/"; }}>{user} (logout)</a>}
         </nav>
       </header>

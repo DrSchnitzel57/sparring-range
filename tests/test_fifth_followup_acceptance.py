@@ -24,6 +24,8 @@ import pytest
 # Host-identity observation across the PID namespace: the pids a command
 # prints are namespace-local; only the host cgroup tree is authoritative.
 from tests.helpers import find_tree_member as _find_member, wait_value as _wait_value
+from tests.conftest import launch_and_wait
+
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 SUPERVISOR = REPO / "infra" / "runner" / "runner_supervise.sh"
@@ -588,8 +590,7 @@ def test_f2_terminal_row_with_unresolved_op_blocks_end_until_repaired(
 
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
-    assert client.post(f"/sessions/{sid}/launch",
-                       headers=users["member"]).status_code == 200
+    launch_and_wait(client, users["member"], sid)
     tok = make_runner_token(sid)
     run_id = _run_id_for(sid)
     op_id = uuid.uuid4().hex
@@ -751,8 +752,7 @@ def test_f7_local_rows_resolve_truthfully_and_stay_retryable(client, users, tmp_
 
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
-    assert client.post(f"/sessions/{sid}/launch",
-                       headers=users["member"]).status_code == 200
+    launch_and_wait(client, users["member"], sid)
     tok = make_runner_token(sid)
     run_id = _run_id_for(sid)
     op_id = uuid.uuid4().hex
@@ -914,8 +914,7 @@ def test_f3_legacy_phase_only_confirmed_is_not_ready_and_reenrolls(
     chan = HostChannel(host_client=client)
     enrollment_channel.set_enrollment_exec(chan)
     verification_service.set_verifier_exec(chan)
-    assert client.post(f"/sessions/{sid}/launch",
-                       headers=users["member"]).status_code == 200
+    launch_and_wait(client, users["member"], sid)
 
     # simulate the pre-upgrade shape: phase-only confirmation, no evidence
     with db() as s:
@@ -941,7 +940,10 @@ def test_f3_legacy_phase_only_confirmed_is_not_ready_and_reenrolls(
     enrollment_channel.set_enrollment_exec(chan2)
     verification_service.set_verifier_exec(chan2)
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code == 200, r.text
+    assert r.status_code == 202, r.text
+    from tests.conftest import wait_operation
+    resumed = wait_operation(client, users["member"], sid)
+    assert resumed["state"] == "succeeded", resumed
     assert any("shipper.env" in c for _, c in chan2.commands), \
         "stale phase-only enrollment was skipped — zero provisioning commands (F3)"
     with db() as s:

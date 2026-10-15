@@ -10,6 +10,7 @@ Driven through the API front door with the REAL ProxmoxClient over FakePVEHttp
 (so URLs, verbs and UPID polling are exercised). Drew's R740 remains the live gate.
 """
 import pytest
+from tests.conftest import launch_and_wait, reset_and_wait, wait_operation
 
 pytestmark = pytest.mark.db
 
@@ -17,9 +18,7 @@ pytestmark = pytest.mark.db
 def _launch(client, headers, scenario="web-foothold-01"):
     sid = client.post("/sessions", json={"scenario_id": scenario},
                       headers=headers).json()["session_id"]
-    r = client.post(f"/sessions/{sid}/launch", headers=headers)
-    assert r.status_code == 200, r.text
-    return sid, r.json()
+    return sid, launch_and_wait(client, headers, sid)["result"]
 
 
 def test_m1_launch_clones_from_templates_and_issues_connections(client, users, fake_pve):
@@ -54,9 +53,7 @@ def test_m1_reset_replaces_owned_resources_and_teardown_leaves_no_orphans(
     sid, out = _launch(client, users["member"])
     first_vmid = out["deployment"]["hosts"][0]["vmid"]
 
-    r = client.post(f"/sessions/{sid}/reset", headers=users["member"])
-    assert r.status_code == 200, r.text
-    out2 = r.json()
+    out2 = reset_and_wait(client, users["member"], sid)["result"]
     # the owned VM was destroyed and a FRESH clone is serving the session
     # (the PVE allocator may legitimately reuse the freed VMID)
     assert out2["removed"] == [out["deployment"]["hosts"][0]["name"]]
@@ -95,7 +92,7 @@ def test_m1_end_releases_lease_revokes_tokens_and_scores(client, users, fake_pve
     # the range is free: another member can launch immediately
     sid2 = client.post("/sessions", json={"scenario_id": "db-exfil-01"},
                        headers=users["op"]).json()["session_id"]
-    assert client.post(f"/sessions/{sid2}/launch", headers=users["op"]).status_code == 200
+    launch_and_wait(client, users["op"], sid2)
 
     # session bastion tokens revoked at end
     eng = create_engine(migrated_db)
@@ -110,7 +107,9 @@ def test_m1_deploy_failure_is_persisted_and_resources_stay_owned(client, users, 
     sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
                       headers=users["member"]).json()["session_id"]
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code >= 500 or r.status_code == 409  # failed loudly, not silently
+    assert r.status_code == 202, r.text  # durable acceptance, executor fails
+    failed = wait_operation(client, users["member"], sid)
+    assert failed["state"] == "failed", failed
     fake_pve.api.fail_task_fragments = ()
     # lease still held after failure (documented: operator ends/tears down explicitly)
     ev_types = [e["action_type"] for e in

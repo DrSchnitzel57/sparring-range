@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from tests.helpers import tool
+from tests.conftest import launch_and_wait, wipe_data
 
 
 def _minimal_python_env():
@@ -125,7 +126,6 @@ def test_hint_jumps_queued_red_turns_across_processes(migrated_db, test_db_url_o
     httpd = FakePVEHttp()
     for vmid in (9001, 9002, 9003, 9004):
         httpd.vms[vmid] = {"name": f"tpl{vmid}", "template": vmid, "status": "stopped"}
-    from tests.conftest import wipe_data
     wipe_data(test_db_url_owner)
     from infra.broker.testing import make_broker_over, policy_from_settings
     from srplatform.settings import get_settings as _get_settings
@@ -158,7 +158,18 @@ def test_hint_jumps_queued_red_turns_across_processes(migrated_db, test_db_url_o
                         body={"scenario_id": "quick-win-01"}, headers=H,
                         expect=(201,))["session_id"]
         r = httpx.post(f"{base}/sessions/{sid}/launch", headers=H)
-        assert r.status_code == 200, f"launch -> {r.status_code} {r.text[:400]}"
+        assert r.status_code == 202, f"launch -> {r.status_code} {r.text[:400]}"
+        # wait for the background executor: red turns need a ready deployment
+        import time as _t
+        _dl = _t.monotonic() + 180
+        while True:
+            _op = httpx.get(f"{base}/sessions/{sid}/operation",
+                            headers=H).json()
+            if _op["state"] in ("succeeded", "failed", "interrupted"):
+                break
+            assert _t.monotonic() < _dl, f"launch stuck: {_op}"
+            _t.sleep(0.5)
+        assert _op["state"] == "succeeded", _op
         runner_token = _mint_runner_token(sid)
 
         # Warm the coach endpoint probe OUTSIDE the measured window (the
@@ -320,7 +331,7 @@ def test_full_practice_loop_capture_verify_score_report_cleanup(client, users):
 
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
-    assert client.post(f"/sessions/{sid}/launch", headers=users["member"]).status_code == 200
+    launch_and_wait(client, users["member"], sid)
 
     # CAPTURE: telemetry under the enrolled session-bound capability
     from srplatform.db.models import ServiceToken

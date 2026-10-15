@@ -22,6 +22,7 @@ import pytest
 
 from tests.helpers import (alive as _alive, cgroup_tree_members as _tree_members,
                            find_tree_member as _find_member, wait_value as _wait_value)
+from tests.conftest import launch_and_wait
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 SUPERVISOR = REPO / "infra" / "runner" / "runner_supervise.sh"
@@ -464,8 +465,7 @@ def test_t04_unconfirmed_containment_refuses_finalization_stop_and_end(
     runner, state, script, cg = local_supervisor
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
-    assert client.post(f"/sessions/{sid}/launch",
-                       headers=users["member"]).status_code == 200
+    launch_and_wait(client, users["member"], sid)
     tok = make_runner_token(sid)
     run_id = _run_id_for(sid)
 

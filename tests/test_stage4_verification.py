@@ -10,6 +10,8 @@ from __future__ import annotations
 import contextlib
 
 import pytest
+from tests.conftest import launch_and_wait
+
 
 
 @contextlib.contextmanager
@@ -128,7 +130,7 @@ def test_end_then_score_refuses_ssh_at_reused_addresses(client, users):
 
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
-    assert client.post(f"/sessions/{sid}/launch", headers=users["member"]).status_code == 200
+    launch_and_wait(client, users["member"], sid)
 
     calls = []
     verification_service.set_verifier_exec(
@@ -160,7 +162,7 @@ def test_removed_or_pending_resources_filtered_from_host_map(client, users):
 
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
-    client.post(f"/sessions/{sid}/launch", headers=users["member"])
+    launch_and_wait(client, users["member"], sid)
     with _db() as s:
         dep = s.query(Deployment).filter_by(session_id=sid).first()
         res = [dict(r) for r in dep.resources]
@@ -184,7 +186,7 @@ def test_verifier_evidence_records_deployment_identity(client, users):
 
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
-    client.post(f"/sessions/{sid}/launch", headers=users["member"])
+    launch_and_wait(client, users["member"], sid)
     from srplatform import verification_service
     verification_service.set_verifier_exec(lambda h, c: (0, ""))
     try:
@@ -285,9 +287,17 @@ def test_ready_requires_service_readiness_when_channel_configured(client, users,
         monkeypatch.setattr(verification_service, "get_settings",
                             lambda: _configured_settings())
         r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-        assert r.status_code == 409 and r.json()["detail"]["error"] == "readiness_failed"
-        failed = [c for c in r.json()["detail"]["checks"] if c["status"] != "passed"]
-        assert failed and failed[0]["service"] == "http"
+        assert r.status_code == 202, r.text
+        from tests.conftest import launch_and_wait, wait_operation
+        failed = wait_operation(client, users["member"], sid)
+        assert failed["state"] == "failed", failed
+        assert "readiness_failed" in (failed["error"] or ""), failed
+        # the specific failing check survives in the readiness_failed event
+        evs = client.get(f"/events", params={"session_id": sid, "tail": 20},
+                         headers=users["member"]).json()
+        rf = next(e for e in evs if e["action_type"] == "readiness_failed")
+        bad = [c for c in rf["payload"]["checks"] if c["status"] != "passed"]
+        assert bad and bad[0]["service"] == "http"
 
         # template fixed -> readiness passes -> ready
         def nginx_present(host, command):
@@ -295,9 +305,8 @@ def test_ready_requires_service_readiness_when_channel_configured(client, users,
                 return 0, "sshd.service enabled enabled\nnginx.service enabled enabled\n"
             return 0, ""
         verification_service.set_verifier_exec(nginx_present)
-        r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-        assert r.status_code == 200, r.text
-        assert r.json()["readiness"]["enforced"] and r.json()["readiness"]["ok"]
+        out = launch_and_wait(client, users["member"], sid)["result"]
+        assert out["readiness"]["enforced"] and out["readiness"]["ok"]
     finally:
         verification_service.set_verifier_exec(None)
 
@@ -322,7 +331,7 @@ def test_objective_pass_requires_true_host_state_and_reports_it(client, users):
 
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
-    client.post(f"/sessions/{sid}/launch", headers=users["member"])
+    launch_and_wait(client, users["member"], sid)
 
     # TRUE state: flag file present with expected content
     def true_state(host, command):

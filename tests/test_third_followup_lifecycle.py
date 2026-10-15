@@ -22,6 +22,8 @@ import time
 import uuid
 
 import pytest
+from tests.conftest import launch_and_wait
+
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 SUPERVISOR = REPO / "infra" / "runner" / "runner_supervise.sh"
@@ -252,7 +254,7 @@ def test_t01_operation_identity_persisted_before_dispatch_with_deployment(
 
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
-    assert client.post(f"/sessions/{sid}/launch", headers=users["member"]).status_code == 200
+    launch_and_wait(client, users["member"], sid)
     with db_ctx() as s:
         dep = s.query(Deployment).filter_by(session_id=sid, status="ready").first()
         dep_id = str(dep.deployment_id)
@@ -382,7 +384,7 @@ def test_t01_failed_control_connection_keeps_stop_partial(client, users, monkeyp
 
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
-    assert client.post(f"/sessions/{sid}/launch", headers=users["member"]).status_code == 200
+    launch_and_wait(client, users["member"], sid)
     tok = make_runner_token(sid)
     run_id = _run_id_for(client, sid)
     op = f"fail{uuid.uuid4().hex[:8]}"
@@ -418,7 +420,7 @@ def test_t02_run_participates_in_lifecycle_claim(client, users, fake_pve, monkey
 
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
-    assert client.post(f"/sessions/{sid}/launch", headers=users["member"]).status_code == 200
+    launch_and_wait(client, users["member"], sid)
     with db_ctx() as s:
         orchestrator.claim_operation(s, uuid.UUID(sid), "teardown")
     r = client.post("/run/quick-win-01", json={"session_id": sid},
@@ -439,7 +441,7 @@ def test_t02_barrier_run_versus_teardown_never_dispatches_after_release(
 
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
-    assert client.post(f"/sessions/{sid}/launch", headers=users["member"]).status_code == 200
+    launch_and_wait(client, users["member"], sid)
 
     outs = {}
     barrier = threading.Barrier(2)
@@ -479,7 +481,7 @@ def test_t02_queued_stop_spawn_race_persists_terminal_state(client, users, monke
 
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
-    assert client.post(f"/sessions/{sid}/launch", headers=users["member"]).status_code == 200
+    launch_and_wait(client, users["member"], sid)
 
     gate = threading.Event()
     real_env = runs_svc._worker_env

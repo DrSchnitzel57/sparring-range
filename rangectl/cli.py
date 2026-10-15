@@ -248,7 +248,13 @@ def launch(scenario_id: str, run: bool = typer.Option(False, help="start red imm
     sess = c.call("POST", "/sessions", json={"scenario_id": scenario_id}).json()
     sid = sess["session_id"]
     typer.echo(f"session {sid} (scenario snapshot {sess['scenario_sha256'][:12]})")
-    out = c.call("POST", f"/sessions/{sid}/launch").json()
+    acc = c.call("POST", f"/sessions/{sid}/launch").json()
+    assert acc["status"] == "accepted", acc
+    from rangectl.client import await_operation
+    done = await_operation(sid, acc["operation_id"])
+    if done["state"] != "succeeded":
+        raise SystemExit(f"deploy {done['state']}: {done.get('error')}")
+    out = done["result"]
     for i in out["connections"]:
         typer.echo(f"  {i['host']}: {i['ssh']}")
     if run:
@@ -311,7 +317,12 @@ def hint(session_id: str, question: str = typer.Argument("",
 # --- resources ----------------------------------------------------------------------
 @app.command("reset")
 def reset(session: str):
-    out = c.call("POST", f"/sessions/{session}/reset").json()
+    acc = c.call("POST", f"/sessions/{session}/reset").json()
+    from rangectl.client import await_operation
+    done = await_operation(session, acc["operation_id"])
+    if done["state"] != "succeeded":
+        raise SystemExit(f"reset {done['state']}: {done.get('error')}")
+    out = done["result"]
     for n in out.get("removed", []):
         typer.echo(f"  destroyed {n}")
     for h in out["hosts"]:

@@ -22,6 +22,7 @@ REPO = Path(__file__).resolve().parents[1]
 PY = sys.executable
 
 from tests.helpers import ScriptedHostExec, api_json, tool  # noqa: E402
+from tests.conftest import launch_and_wait, wait_operation, wipe_data
 
 
 def _free_port() -> int:
@@ -203,14 +204,11 @@ pytestmark_db = pytest.mark.db
 def test_r09_absent_polarity_flips_with_host_state(client, users, fake_pve,
                                                    monkeypatch):
     from srplatform import verification_service
-    from tests.conftest import wipe_data  # noqa: F401  (ensure helper importable)
 
     sid, out = None, None
     sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
                       headers=users["member"]).json()["session_id"]
-    r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code == 200, r.text
-    ip = r.json()["connections"][0]["ip"]
+    ip = launch_and_wait(client, users["member"], sid)["result"]["connections"][0]["ip"]
 
     def cron_card(cron_d_lines):
         execd = ScriptedHostExec({ip: [
@@ -990,7 +988,8 @@ def test_r07_teardown_failure_retains_lease_until_destroy_succeeds(client, users
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code == 200
+    assert r.status_code == 202, r.text
+    wait_operation(client, users["member"], sid)
 
     # make destroys fail -> teardown must NOT claim completion, lease retained
     fake_pve.api.fail_task_fragments = ("/qemu",)
@@ -1009,21 +1008,21 @@ def test_r07_teardown_failure_retains_lease_until_destroy_succeeds(client, users
     fake_pve.api.fail_task_fragments = ()
     t = client.post(f"/sessions/{sid}/teardown", headers=users["member"])
     assert t.json().get("complete") is True, t.json()
-    assert client.post(f"/sessions/{sid2}/launch", headers=users["op"]).status_code == 200
+    launch_and_wait(client, users["op"], sid2)
 
 
 @pytest.mark.db
 def test_r07_reset_requires_the_lease(client, users, fake_pve):
     sid_a = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                         headers=users["member"]).json()["session_id"]
-    client.post(f"/sessions/{sid_a}/launch", headers=users["member"])
+    launch_and_wait(client, users["member"], sid_a)
     # PILOT STEP 4: end destroys the owned machines and frees the range, so
     # B CAN launch after A ends. The R07 invariant this test guards remains:
     # a completed session's reset must not proceed over a range B now holds.
     client.post(f"/sessions/{sid_a}/end", headers=users["member"])
     sid_b = client.post("/sessions", json={"scenario_id": "db-exfil-01"},
                         headers=users["op"]).json()["session_id"]
-    assert client.post(f"/sessions/{sid_b}/launch", headers=users["op"]).status_code == 200
+    launch_and_wait(client, users["op"], sid_b)
     # A holds no lease -> A's reset conflicts with B's active range
     assert client.post(f"/sessions/{sid_a}/reset", headers=users["member"]).status_code == 409
 
@@ -1035,7 +1034,9 @@ def test_r08_crash_after_clone_leaves_vm_owned_and_resumable(client, users, fake
     # fail AFTER the clone task completes, during config -> pending row must own it
     fake_pve.api.fail_request_fragments = ("/config",)
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code >= 500 or r.status_code == 409
+    assert r.status_code == 202, r.text  # accepted; the executor fails loudly
+    crashed = wait_operation(client, users["member"], sid)
+    assert crashed["state"] == "failed", crashed
     fake_pve.api.fail_request_fragments = ()
 
     from srplatform.db.session import db as db_ctx
@@ -1050,8 +1051,8 @@ def test_r08_crash_after_clone_leaves_vm_owned_and_resumable(client, users, fake
     assert any(v in fake_pve.api.vms for v in vmids), "cloned VM must be inside inventory"
 
     # RESUME: relaunch reuses the deployment, reconciles the existing VM, no dupes
-    r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r.status_code == 200, r.text
+    resumed = launch_and_wait(client, users["member"], sid)
+    assert resumed["state"] == "succeeded", resumed
     assert not getattr(client, "_dup_vmids", False)
     # teardown removes everything owned, including the previously-pending VM
     t = client.post(f"/sessions/{sid}/teardown", headers=users["member"])
@@ -1065,18 +1066,24 @@ def test_r08_launch_is_idempotent(client, users, fake_pve):
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
     r1 = client.post(f"/sessions/{sid}/launch", headers=users["member"])
+    assert r1.status_code == 202, r1.text
+    first = wait_operation(client, users["member"], sid)
+    assert first["state"] == "succeeded", first
     vms_after_1 = set(fake_pve.api.vms)
-    r2 = client.post(f"/sessions/{sid}/launch", headers=users["member"])
-    assert r2.status_code == 200
+    # a second launch is a NEW attempt on the same session: the idempotent
+    # deploy path RETURNS the existing ready deployment, never re-clones
+    second = launch_and_wait(client, users["member"], sid)
+    assert second["state"] == "succeeded", second
     assert set(fake_pve.api.vms) == vms_after_1, "repeated launch must not clone more VMs"
-    assert r2.json()["deployment"]["deployment_id"] == r1.json()["deployment"]["deployment_id"]
+    assert second["result"]["deployment"]["deployment_id"] == \
+        first["result"]["deployment"]["deployment_id"]
 
 
 @pytest.mark.db
 def test_r08_teardown_never_deletes_foreign_vmid(client, users, fake_pve):
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
-    client.post(f"/sessions/{sid}/launch", headers=users["member"])
+    launch_and_wait(client, users["member"], sid)
     from srplatform.db.session import db as db_ctx
     from srplatform.db.models import Deployment
     from sqlalchemy import select
@@ -1233,7 +1240,6 @@ def test_r01_real_worker_end_to_end_over_http(migrated_db, test_db_url_owner, tm
     from srplatform.safety import Supervisor, set_supervisor
     from srplatform.safety.datapath import NoopDatapath
     from srplatform.settings import get_settings
-    from tests.conftest import wipe_data
 
     httpd = FakePVEHttp()
     for vmid in (9001, 9002, 9003, 9004):
@@ -1289,7 +1295,16 @@ def test_r01_real_worker_end_to_end_over_http(migrated_db, test_db_url_owner, tm
         assert r.status_code == 201, r.text
         sid = r.json()["session_id"]
         r = httpx.post(f"{base}/sessions/{sid}/launch", headers=H)
-        assert r.status_code == 200, r.text
+        assert r.status_code == 202, r.text
+        _dl = time.monotonic() + 180
+        while True:
+            _op = httpx.get(f"{base}/sessions/{sid}/operation",
+                            headers=H).json()
+            if _op["state"] in ("succeeded", "failed", "interrupted"):
+                break
+            assert time.monotonic() < _dl, f"launch stuck: {_op}"
+            time.sleep(0.5)
+        assert _op["state"] == "succeeded", _op
 
         r = httpx.post(f"{base}/run/quick-win-01", json={"session_id": sid}, headers=H)
         assert r.status_code == 202, r.text
@@ -1344,7 +1359,6 @@ def test_r02_bastion_token_login_binds_owner_key(migrated_db, test_db_url_owner,
     from srplatform.safety import Supervisor, set_supervisor
     from srplatform.safety.datapath import NoopDatapath
     from srplatform.settings import get_settings
-    from tests.conftest import wipe_data
     from infra.proxmox_client import FakePVEHttp
 
     httpd = FakePVEHttp()
@@ -1408,8 +1422,17 @@ def test_r02_bastion_token_login_binds_owner_key(migrated_db, test_db_url_owner,
                        body={"scenario_id": "quick-win-01"}, headers=HB,
                        expect=(201,))["session_id"]
         r = httpx.post(f"{base}/sessions/{sid}/launch", headers=HB)
-        assert r.status_code == 200, r.text
-        login_token = r.json()["connections"][0]["login_token"]
+        assert r.status_code == 202, r.text
+        _dl = time.monotonic() + 180
+        while True:
+            _op = httpx.get(f"{base}/sessions/{sid}/operation",
+                            headers=HB).json()
+            if _op["state"] in ("succeeded", "failed", "interrupted"):
+                break
+            assert time.monotonic() < _dl, f"launch stuck: {_op}"
+            time.sleep(0.5)
+        assert _op["state"] == "succeeded", _op
+        login_token = _op["result"]["connections"][0]["login_token"]
 
         # bastion service capability (production resolver uses SR_BASTION_TOKEN)
         svc = httpx.post(f"{base}/admin/service_tokens", headers=H,

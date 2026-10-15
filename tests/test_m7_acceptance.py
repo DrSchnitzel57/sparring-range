@@ -12,6 +12,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from tests.conftest import launch_and_wait
+
 
 pytestmark = pytest.mark.db
 
@@ -39,7 +41,7 @@ def test_m7_library_filters_and_one_click_launch(client, users):
     # browser needs to render the "connect" step
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
-    out = client.post(f"/sessions/{sid}/launch", headers=users["member"]).json()
+    out = launch_and_wait(client, users["member"], sid)["result"]
     assert out["connections"] and "ssh" in out["connections"][0]
 
 
@@ -82,7 +84,7 @@ def test_m7_progress_is_per_domain_from_snapshots_over_multiple_sessions(client,
     # session 1: quick-win fully healthy hosts -> 15/15
     s1 = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                      headers=users["member"]).json()["session_id"]
-    client.post(f"/sessions/{s1}/launch", headers=users["member"])
+    launch_and_wait(client, users["member"], s1)
 
     def healthy(host, command):
         if "awk" in command:
@@ -103,7 +105,10 @@ def test_m7_progress_is_per_domain_from_snapshots_over_multiple_sessions(client,
     s2 = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                      headers=users["member"]).json()["session_id"]
     r2 = client.post(f"/sessions/{s2}/launch", headers=users["member"])
-    assert r2.status_code == 200, r2.text
+    assert r2.status_code == 202, r2.text
+    from tests.conftest import wait_operation
+    done2 = wait_operation(client, users["member"], s2)
+    assert done2["state"] == "succeeded", done2
 
     def degraded(host, command):
         if "awk" in command:
