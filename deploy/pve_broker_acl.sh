@@ -113,12 +113,15 @@ run pveum acl modify "/nodes/${NODE}" \
 run pveum acl modify "/sdn/zones/localnetwork/${BRIDGE}" \
     --users "$USER_ID" --roles "${ROLE_BASE}Sdn"
 IFS=',' read -ra TMPLS <<< "$TEMPLATES"
-# Templates carry Clone (source) AND Base (VM.Audit among others):
-# --verify reads template configuration through the token itself, and an
-# audit-less token fails its own verification on a freshly scoped grant.
+# Templates carry Clone (source) plus a dedicated Audit-only grant:
+# --verify reads template configuration through the token itself, but the
+# full Base role would also hand token holders power/config/guest-file
+# rights over the GOLDEN templates (mutate/delete the gold image). Scope
+# precisely: Clone + Audit, nothing else, on template paths only.
+run pveum role add "${ROLE_BASE}Template" --privs "VM.Clone,VM.Audit"
 for t in "${TMPLS[@]}"; do
     run pveum acl modify "/vms/${t}" \
-        --users "$USER_ID" --roles "${ROLE_BASE}Clone,${ROLE_BASE}Base"
+        --users "$USER_ID" --roles "${ROLE_BASE}Template"
 done
 # Clone-window runtime scope (PVE 9.2 audit A7): PVE has no per-VMID-RANGE
 # path and destroy has NO pool alternative, so the bounded window is

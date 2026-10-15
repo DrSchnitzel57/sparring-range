@@ -122,7 +122,17 @@ else
   # key beside surviving certificates) — that fails the install loudly;
   # any other failure is missing operator inputs on a first run (warn).
   set +e
+  # SANs for the guest-facing ingest certificate come from the
+  # manifest (trust.san_ips) — never operator improvisation.
+  _SANS="$("$PY" -c "
+import json,sys
+m = json.load(open(sys.argv[1]))
+out = []
+for ip in m['trust']['san_ips']:
+    out.append(('IP:' if all(c.isdigit() or c == '.' for c in ip) else 'DNS:') + ip)
+print(' '.join(out))" "$MANIFEST")"
   SR_TLS_DIR="$TLS" SR_SSH_DIR="$ETC/ssh" SR_TLS_ROTATE="$ROTATE_TLS" \
+    INGEST_SANS="$_SANS" \
     "$REPO/deploy/bootstrap_tls.sh" >/dev/null
   _tls_rc=$?
   set -e
@@ -219,11 +229,26 @@ lines = [
     f"LLM_MODEL_RED={m['model']['alias']}",
     f"LLM_MODEL_COACH={m['model']['alias']}",
     "SR_TELEMETRY_CA_FILE=/etc/sparring-range/tls/api-ca.crt",
+    f"INGEST_BIND_IP={m['urls']['ingest'].split('://')[1].split(':')[0]}",
+    f"INGEST_PORT={m['urls']['ingest'].split(':')[-1]}",
+    f"INTERNAL_API_URL={m['urls']['internal_api']}",
 ]
 open(out, "w").write("\n".join(lines) + "\n")
 print(f"derived environment written: {out}")
 PYEOF
   say config "rendered $ETC/control-plane.derived.env from the manifest"
+  "$PY" - "$MANIFEST" "$ETC/ingest-listener.env" <<'PYEOF2'
+import json, sys
+m = json.load(open(sys.argv[1]))
+open(sys.argv[2], "w").write(
+    "# Ingest-plane reduction (rendered — do not hand-edit). Loaded AFTER\n"
+    "# the derived facts and BEFORE the operator overrides.\n"
+    "SR_ENV=production\n"
+    "SR_API_INGEST_ONLY=1\n"
+    f"SR_API_BASE_URL={m['urls']['ingest']}\n")
+print("ingest-plane env written")
+PYEOF2
+  say config "rendered $ETC/ingest-listener.env from the manifest"
 fi
 
 # 6 -- systemd units (idempotent copy + reload).
@@ -246,9 +271,10 @@ if [ "$DRY" != 1 ]; then
   ( cd "$REPO" && "$PY" -c 'import rangectl.cli' ) \
     || { say verify "entrypoint import failed — services NOT enabled"; exit 1; }
   say verify "ok — enabling services"
-  # unit names MUST match deploy/systemd (sr-api on the control plane;
-  # sr-brokerd is enabled by the broker VM's own install, never here).
-  systemctl enable sr-api.service 2>/dev/null || \
+  # unit names MUST match deploy/systemd (sr-api + sr-api-ingest on
+  # the control plane; sr-brokerd is enabled by the broker VM's own
+  # install, never here).
+  systemctl enable sr-api.service sr-api-ingest.service 2>/dev/null || \
     say verify "enable skipped (units not installed under $PREFIX — expected with --prefix)"
 else
   echo "DRY: verify + enable"

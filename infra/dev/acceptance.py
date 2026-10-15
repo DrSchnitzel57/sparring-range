@@ -1257,6 +1257,21 @@ def check_install() -> None:
             "shipped unit must load the derived environment"
         assert "User=srrange" in unit, "unit identity must match installer"
         ok("installer renders manifest-derived service environment")
+        # ingest plane driven by manifest urls/trust: unit installed, env
+        # rendered, dedicated API CA + SAN-bound server cert provisioned
+        tlsd = rp / "etc/sparring-range/tls"
+        assert (rp / "etc/systemd/system/sr-api-ingest.service").exists()
+        ing_env = (rp / "etc/sparring-range/ingest-listener.env").read_text()
+        assert "SR_API_INGEST_ONLY=1" in ing_env, ing_env[:300]
+        assert "SR_API_BASE_URL=https://10.66.0.2:8444" in ing_env, ing_env[:300]
+        assert (tlsd / "api-ca.crt").exists(), "API CA missing — guestscoe trust anchor unprovisioned"
+        assert (tlsd / "ingest-server.crt").exists()
+        sans = subprocess.run(
+            ["openssl", "x509", "-in", str(tlsd / "ingest-server.crt"),
+             "-noout", "-ext", "subjectAltName"],
+            capture_output=True, text=True, timeout=60).stdout
+        assert "10.66.0.2" in sans and "10.60.0.11" in sans, sans[:300]
+        ok("installer provisions the manifest-driven ingest plane + trust")
         before = {(p.name, p.read_bytes()) for p in
                   (rp / "etc/sparring-range/tls").glob("*.key")}
         assert before, "first real run must generate TLS identities"
@@ -1313,6 +1328,40 @@ def check_install() -> None:
             fail("installer recovers missing certificates",
                  f"exit {rr6.returncode}:\n{(rr6.stdout + rr6.stderr)[-800:]}")
         ok("installer recovers missing certificates")
+        # HTTPS identity: missing certificate with a surviving key
+        # re-issues onto the SAME key (pinning-safe, rotation untouched)
+        import os as _os
+        henv = dict(renv)
+        henv["HTTPS_IP"] = "10.60.0.11"
+        rr7 = subprocess.run(
+            ["bash", str(REPO / "deploy/bootstrap_tls.sh")],
+            capture_output=True, text=True, cwd=REPO,
+            env={**henv, "SR_TLS_DIR": str(rp / "etc/sparring-range/tls"),
+                 "SR_SSH_DIR": str(rp / "etc/sparring-range/ssh")},
+            timeout=300)
+        hcert = rp / "etc/sparring-range/tls/https.crt"
+        hkey = rp / "etc/sparring-range/tls/https.key"
+        assert rr7.returncode == 0 and hcert.exists(), \
+            (rr7.returncode, (rr7.stdout + rr7.stderr)[-500:])
+        fp1 = subprocess.run(
+            ["openssl", "x509", "-in", str(hcert), "-noout", "-fingerprint",
+             "-sha256"], capture_output=True, text=True,
+            timeout=60).stdout
+        hcert.unlink()
+        rr8 = subprocess.run(
+            ["bash", str(REPO / "deploy/bootstrap_tls.sh")],
+            capture_output=True, text=True, cwd=REPO,
+            env={**henv, "SR_TLS_DIR": str(rp / "etc/sparring-range/tls"),
+                 "SR_SSH_DIR": str(rp / "etc/sparring-range/ssh")},
+            timeout=300)
+        fp2 = subprocess.run(
+            ["openssl", "x509", "-in", str(hcert), "-noout", "-fingerprint",
+             "-sha256"], capture_output=True, text=True,
+            timeout=60).stdout
+        assert rr8.returncode == 0 and hcert.exists(), \
+            (rr8.returncode, (rr8.stdout + rr8.stderr)[-500:])
+        assert fp1 != fp2, "re-issued certificate must differ"
+        ok("installer re-issues HTTPS certificate onto surviving key")
         # partial state with a missing CA key beside surviving certificates
         # is refused explicitly (exit 1), never silently orphaned
         (rp / "etc/sparring-range/tls/ca.key").unlink()

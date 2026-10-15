@@ -124,11 +124,20 @@ def replay(session_id: uuid.UUID, p: Principal = Depends(any_member),
            db: DbSession = None):
     """Multiple recordings; each header's epoch is the sync anchor (F17)."""
     sess = _session_or_403(db, p, session_id)
+    from srplatform.api.visibility import competition_sealed
+    sealed = competition_sealed(db, sess, p)
     events = db.execute(sa_text(
         "SELECT event_id, ts, actor, action_type, phase FROM events "
         "WHERE session_id = :sid ORDER BY event_id"), {"sid": str(session_id)}).fetchall()
+    # Red kill-chain phases are sealed content (a timeline showing live
+    # `priv-esc` is the spoiler, not the timestamps around it). Casts
+    # stay unfiltered: they are the defender's own shell transcripts
+    # (first-party observation of their own environment, no red
+    # internals — the red worker has no recorded sessions).
     timeline = [{"event_id": e.event_id, "ts": e.ts.isoformat(), "actor": e.actor,
-                 "action_type": e.action_type, "phase": e.phase} for e in events]
+                 "action_type": e.action_type,
+                 "phase": (None if sealed and e.actor == "red" else e.phase)}
+                for e in events]
     recs = db.execute(select(Recording).where(Recording.session_id == session_id)
                       .order_by(Recording.created_at)).scalars().all()
     casts = []
@@ -235,7 +244,9 @@ def live(session_id: uuid.UUID, p: Principal = Depends(any_member),
         "started_at": sess.started_at.isoformat() if sess.started_at else None,
         "red_phase": None if sealed else (state.current_phase if state else None),
         "recent": [{"event_id": e.event_id, "ts": e.ts.isoformat(), "actor": e.actor,
-                    "action_type": e.action_type, "phase": e.phase} for e in reversed(recent)],
+                    "action_type": e.action_type,
+                    "phase": (None if sealed and e.actor == "red" else e.phase)}
+                   for e in reversed(recent)],
         "detections": [filter_detection({"event_id": d.event_id,
                                          "ts": d.ts.isoformat()})
                        if sealed else

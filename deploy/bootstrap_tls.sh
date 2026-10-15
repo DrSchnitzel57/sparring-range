@@ -75,6 +75,40 @@ printf "basicConstraints=critical,CA:FALSE\nextendedKeyUsage=clientAuth\n" > api
 openssl x509 -req -in api-client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
   -days "$DAYS" -sha256 -extfile api-client.ext -out api-client.crt
 
+# Guest-facing ingest listener (plan 13 phase 4): a DEDICATED API CA
+# signs ONLY this certificate — compromise of the web UI or broker keys
+# never yields a valid guest-facing identity, and vice versa. SANs come
+# from INGEST_SANS (space-separated "IP:<addr>" / "DNS:<name>" entries;
+# the installer derives them from manifest trust.san_ips). The public
+# half (api-ca.crt) is what enrollments provision into guests as their
+# explicit trust anchor (SR_TELEMETRY_CA_FILE).
+if [ -z "${INGEST_SANS:-}" ]; then
+  echo "bootstrap_tls: INGEST_SANS empty — skipping ingest-server cert (set it from manifest trust.san_ips)" >&2
+elif [ "$FRESH" = 1 ] || [ ! -f api-ca.key ] || [ ! -f api-ca.crt ] || [ ! -f ingest-server.key ] || [ ! -f ingest-server.crt ]; then
+  if [ "$FRESH" = 1 ]; then
+    rm -f api-ca.key api-ca.crt ingest-server.key ingest-server.crt ingest-server.csr
+  fi
+  [ -f api-ca.key ] || openssl genrsa -out api-ca.key 4096
+  openssl req -x509 -new -key api-ca.key -sha256 -days "$DAYS" -subj "/CN=sparring-range-api-CA" -out api-ca.crt
+  sans_list=""
+  for _san in $INGEST_SANS; do
+    case "$_san" in
+      IP:*|DNS:*) sans_list="${sans_list:+$sans_list,}$_san" ;;
+      *) echo "bootstrap_tls: refusing malformed SAN $_san" >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$sans_list" ] || { echo "bootstrap_tls: no valid SANs" >&2; exit 2; }
+  {
+    echo "basicConstraints=critical,CA:FALSE"
+    echo "extendedKeyUsage=serverAuth"
+    echo "subjectAltName=$sans_list"
+  } > ingest-server.ext
+  [ -f ingest-server.key ] || openssl genrsa -out ingest-server.key 2048
+  openssl req -new -key ingest-server.key -subj "/CN=sparring-range-ingest" -out ingest-server.csr
+  openssl x509 -req -in ingest-server.csr -CA api-ca.crt -CAkey api-ca.key -CAcreateserial \
+    -days "$DAYS" -sha256 -extfile ingest-server.ext -out ingest-server.crt
+fi
+
 # web UI: self-signed with the LAN IP in the SAN (teammates import/verify it)
 if { [ -n "$HTTPS_IP" ] && [ ! -f https.key ]; } || { [ -n "$HTTPS_IP" ] && [ "$FRESH" = 1 ]; }; then
   openssl req -x509 -newkey rsa:2048 -sha256 -days "$DAYS" -nodes \

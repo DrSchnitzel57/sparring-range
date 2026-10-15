@@ -1,0 +1,31 @@
+[Unit]
+Description=sparring-range guest telemetry listener (range address, ingest-only)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=srrange
+Group=srrange
+# Manifest-derived facts first, then the ingest-plane reduction, then
+# operator overrides (optional so older installs keep working).
+EnvironmentFile=/etc/sparring-range/control-plane.derived.env
+EnvironmentFile=/etc/sparring-range/ingest-listener.env
+EnvironmentFile=-/etc/sparring-range/control-plane.env
+WorkingDirectory=/opt/sparring-range
+# The range bind address/port come from manifest urls.ingest; TLS uses the
+# dedicated API CA material (ingest-server pair, SANs = trust.san_ips).
+ExecStart=/opt/sparring-range/.venv/bin/uvicorn srplatform.api.app:app \
+  --host ${INGEST_BIND_IP} --port ${INGEST_PORT} \
+  --ssl-keyfile /etc/sparring-range/tls/ingest-server.key \
+  --ssl-certfile /etc/sparring-range/tls/ingest-server.crt
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sparring-range
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
