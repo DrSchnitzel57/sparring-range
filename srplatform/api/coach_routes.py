@@ -130,6 +130,11 @@ def aar_get(session_id: uuid.UUID, p: Principal = Depends(any_member),
                     .order_by(Event.event_id.desc())).scalars().first()
     if not ev:
         return {"status": "no-report", "session_id": str(session_id)}
+    from srplatform.api.visibility import competition_sealed
+    if competition_sealed(db, sess, p):
+        raise HTTPException(409, {"error": "competition_sealed",
+                                  "detail": "the graded report is available "
+                                            "after the match completes"})
     return {"status": "ok", "persisted": True,
             "version": (ev.payload or {}).get("version"),
             **ev.payload["report"]}
@@ -139,6 +144,14 @@ def aar_get(session_id: uuid.UUID, p: Principal = Depends(any_member),
 def aar_post(session_id: uuid.UUID, body: AarIn, p: Principal = Depends(any_member),
              db: DbSession = None):
     sess = _check_access(db, p, session_id)
+    # the graded report narrates the full attack timeline — generating one
+    # mid-match would hand members the spoiler summary. Competition reports
+    # are available after the match completes (practice unaffected).
+    from srplatform.api.visibility import competition_sealed
+    if competition_sealed(db, sess, p):
+        raise HTTPException(409, {"error": "competition_sealed",
+                                  "detail": "the graded report is available "
+                                            "after the match completes"})
     if not body.regenerate:
         existing = db.execute(select(Event).where(Event.session_id == session_id,
                                                    Event.action_type == "aar")

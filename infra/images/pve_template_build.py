@@ -121,9 +121,12 @@ def finalize(overlay: pathlib.Path, run_dir: pathlib.Path, role: str,
             or bool(key_manifest and "emergency" in key_manifest)),
         guest_seed.meta_data(f"sr-finalize-{uuid.uuid4().hex[:8]}",
                              f"sr-finalize-{role}"))
-    qemu_guest.boot_full_guest(disk=overlay, seed_iso=seed, memory_mb=1024,
-                               net="none", expect=("SR-GUEST-DONE rc=0",),
-                               timeout_s=600)
+    rec = qemu_guest.boot_full_guest(disk=overlay, seed_iso=seed, memory_mb=1024,
+                                       net="none", expect=("SR-GUEST-DONE rc=0",),
+                                       timeout_s=600,
+                                       serial_name=f"finalize-{role}")
+    serial = overlay.parent / f"finalize-{role}.serial.log"
+    return guest_build.recorded_users(serial)
 
 
 def flatten(overlay: pathlib.Path, out_qcow2: pathlib.Path,
@@ -172,7 +175,9 @@ def build_role(role: str, out: pathlib.Path, cache_dir: pathlib.Path,
                 role=role, memory_mb=2048, disk_gb=budget["disk_gb"],
                 base_dir=cache_dir)
         overlay = pathlib.Path(rec["overlay"])
-        finalize(overlay, run, role, key_manifest)
+        final_users = finalize(overlay, run, role, key_manifest)
+        build_users = rec.get("users", [])
+        shipped_users = sorted(set(build_users) | set(final_users))
         out_qcow2 = out / f"template-{role}.qcow2"
         meta = flatten(overlay, out_qcow2,
                        specs.check_guest_budget(role)["disk_gb"])
@@ -183,6 +188,9 @@ def build_role(role: str, out: pathlib.Path, cache_dir: pathlib.Path,
                 "virtual_bytes": meta["virtual-size"],
                 "inputs_hash": rec.get("inputs_hash"),
                 "packages": rec.get("packages", {}),
+                # ACTUAL versioned image user baseline (rogue-account
+                # checks compare against this, never a hand-written list)
+                "users": shipped_users,
                 "build_cached": rec.get("cached", False)}
     finally:
         shutil.rmtree(run, ignore_errors=True)

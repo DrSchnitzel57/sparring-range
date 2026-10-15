@@ -83,6 +83,18 @@ def serial_markers(serial: pathlib.Path) -> list[str]:
     return [l for l in text.splitlines() if l.startswith("SR-GUEST-")]
 
 
+def recorded_users(serial: pathlib.Path) -> list[str]:
+    """Versioned image user baseline from SR-GUEST-USER serial markers
+    (rogue-account checks compare against the ACTUAL built image)."""
+    seen: list[str] = []
+    for line in serial_markers(serial):
+        if line.startswith("SR-GUEST-USER:"):
+            name = line[len("SR-GUEST-USER:"):].strip()
+            if name and name not in seen:
+                seen.append(name)
+    return seen
+
+
 def recorded_packages(serial: pathlib.Path) -> dict[str, str]:
     out: dict[str, str] = {}
     for line in serial_markers(serial):
@@ -152,8 +164,8 @@ def build_overlay(*, repo_root: pathlib.Path, run_dir: pathlib.Path,
     if absent:
         raise RuntimeError(f"build overlay missing package families {absent}: "
                            f"recorded {sorted(pkgs)}")
-    meta = {"packages": pkgs, "inputs_hash": key,
-            "qemu": rec["qemu"], "kvm": rec["kvm"]}
+    meta = {"packages": pkgs, "users": recorded_users(serial),
+            "inputs_hash": key, "qemu": rec["qemu"], "kvm": rec["kvm"]}
     (run_dir / "build-meta.json").write_text(json.dumps(meta, indent=2,
                                                         sort_keys=True))
     shutil.copyfile(overlay, cached)
@@ -250,8 +262,9 @@ def build_attacker_overlay(*, repo_root: pathlib.Path, run_dir: pathlib.Path,
                                              "SR-GUEST-BUILD-SETUP-OK"),
                                      timeout_s=timeout_s)
     serial = run_dir / "attacker.serial.log"
-    meta = {"packages": recorded_packages(serial), "inputs_hash": key,
-            "qemu": rec["qemu"], "kvm": rec["kvm"]}
+    meta = {"packages": recorded_packages(serial),
+            "users": recorded_users(run_dir / "attacker.serial.log"),
+            "inputs_hash": key, "qemu": rec["qemu"], "kvm": rec["kvm"]}
     (run_dir / "attacker-build-meta.json").write_text(
         json.dumps(meta, indent=2, sort_keys=True))
     shutil.copyfile(overlay, cached)

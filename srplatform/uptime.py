@@ -150,6 +150,36 @@ def coverage_for_session(db, session_id, *, started_at, ended_at=None,
                     interval_s=interval_s)
 
 
+def live_projection(db, session_id) -> dict:
+    """The LIVE availability projection (plan 13 phase 7): received-sample
+    scoring PLUS the schedule-aware coverage denominator, keyed to the
+    match clock when one exists (else the session clock). Gaps are
+    `missed` evidence — a dead prober can never masquerade as coverage,
+    and unknown/missed never count as downtime. Zero valid => unscored."""
+    from srplatform import lifecycle
+    from srplatform.db.models import Session as SessionModel
+    base = summarize_for_session(db, session_id)
+    m = lifecycle.get_match(db, session_id)
+    if m is not None and m.started_at is not None:
+        started = m.started_at
+        ended = m.deadline_at if m.state == "running" else None
+    else:
+        sess = db.get(SessionModel, session_id)
+        started = (sess.started_at if sess is not None
+                   and sess.started_at else datetime.now(timezone.utc))
+        ended = None
+    try:
+        cov = coverage_for_session(db, session_id, started_at=started,
+                                   ended_at=ended)
+    except Exception:  # noqa: BLE001 — coverage never breaks the projection
+        cov = {"expected_checks": None, "missed": None, "coverage_pct": None}
+    base["expected_checks"] = cov.get("expected_checks")
+    base["missed"] = cov.get("missed")
+    if cov.get("coverage_pct") is not None:
+        base["coverage_pct"] = cov["coverage_pct"]
+    return base
+
+
 # ------------------------------------------------- MySQL business probe ------
 #: Pinned seed facts (paired 03+04): the seeded catalogue has exactly this
 #: many purchase rows; a business transaction that answers anything else is
@@ -310,8 +340,11 @@ def start_for_session(db, sess, dep, *, get=None) -> bool:
     # availability is proven by the seeded data answering correctly, not
     # by the port being open. No channel => no mysql target (never a
     # fabricated or claim-based probe).
+    # ONLY resources the deploy provisioned as a DB tier (mysql_probe):
+    # web guests carry db_configured too (their config targets the DB),
+    # but MySQL is disabled there — probing them would fabricate downtime.
     db_hosts = [r for r in (dep.resources or [])
-                if r.get("ip") and r.get("db_configured")]
+                if r.get("ip") and r.get("mysql_probe")]
     if db_hosts:
         from srplatform.scenario_engine.orchestrator import management_runner
         runner = management_runner()

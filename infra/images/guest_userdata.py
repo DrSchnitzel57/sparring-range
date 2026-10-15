@@ -228,6 +228,10 @@ timeout 60 systemctl restart auditd || true
 {web_lines}{db_setup}mark SETUP-OK
 dpkg-query -W -f='${{Package}}=${{Version}}\\n' {want} > /srv/sr-build/versions.txt 2>/dev/null || true
 while IFS= read -r l; do echo "SR-GUEST-PKG:$l" > $S; done < /srv/sr-build/versions.txt || true
+# versioned image user baseline (rogue-account checks compare against the
+# ACTUAL built image, never a hand-written list): emitted last, after every
+# useradd in this script, so the recorded set is the shipped set.
+cut -d: -f1 /etc/passwd | while IFS= read -r u; do echo "SR-GUEST-USER:$u" > $S; done
 if {gate}; then mark PASS; else mark FAIL; fi
 poweroff
 """
@@ -556,6 +560,7 @@ systemctl enable --now ssh qemu-guest-agent || true
 # package report BEFORE the completion marker: the harness powers off on
 # SETUP-OK, so anything printed after it never reaches the serial log.
 for p in {pins}; do n=${{p%%=*}}; v=$(dpkg-query -W -f='${{Version}}' "$n" 2>/dev/null || echo unknown); echo "SR-GUEST-PKG:$n=$v" > $S; done
+cut -d: -f1 /etc/passwd | while IFS= read -r u; do echo "SR-GUEST-USER:$u" > $S; done
 mark SETUP-OK
 poweroff
 """, perms="0755")
@@ -600,6 +605,10 @@ def finalize_user_data(role: str = "mojang-web-local",
     script = (_HARNESS_HEADER + f"""
 {bake_call}chk SCRUB bash -c 'rm -f /etc/ssh/ssh_host_*; truncate -s 0 /etc/machine-id; rm -f /var/lib/dbus/machine-id; cloud-init clean --logs --seed 2>/dev/null || rm -rf /var/lib/cloud/instances/seed; ! ls /etc/ssh/ssh_host_* 2>/dev/null | grep -q .'
 chk NO-BUILD-LOGS bash -c '! test -s /root/.bash_history; rm -rf /srv/sr-build; true'
+# versioned image user baseline (rogue-account checks compare against the
+# ACTUAL finalized image): emitted AFTER the key bake, so role accounts
+# (attacker/emergency) are included in the shipped set.
+cut -d: -f1 /etc/passwd | while IFS= read -r u; do echo "SR-GUEST-USER:$u" > {SERIAL}; done
 echo "SR-GUEST-DONE rc=$fails" > {SERIAL}; echo "SR-GUEST-DONE rc=$fails" > {SERIAL}
 poweroff
 """)

@@ -208,7 +208,9 @@ def readiness_checks(db: Session, session_id) -> dict:
     # (audit A6), never a waiver.
     if dep is not None:
         for r in (dep.resources or []):
-            if r.get("state") == "created" and not r.get("host_key_ref"):
+            if r.get("state") != "created":
+                continue
+            if not r.get("host_key_ref"):
                 ok = False
                 items.append({"host": r.get("host"), "service": "ssh",
                               "unit": "host-key-pin", "status": "failed",
@@ -216,6 +218,21 @@ def readiness_checks(db: Session, session_id) -> dict:
                               "error": "no pinned host key for this "
                                        "generation — resume must complete it"})
                 reasons.append("unusable/missing host-key pin on "
+                               f"{r.get('host')}")
+            elif r.get("host_key_publish_error"):
+                # the pin exists but was never published to the bastion/
+                # verifier/runner known-hosts: StrictHostKeyChecking clients
+                # (members included) fail loudly, so readiness is red until
+                # republication converges — a green readiness with an
+                # unpublished pin would strand members with no recourse.
+                ok = False
+                items.append({"host": r.get("host"), "service": "ssh",
+                              "unit": "host-key-pin", "status": "failed",
+                              "evidence": None,
+                              "error": "pinned host key not published: "
+                                       f"{r['host_key_publish_error'][:200]} — "
+                                       "resume must republicate it"})
+                reasons.append("unpublished host-key pin on "
                                f"{r.get('host')}")
     if not ok:
         if declared and any(i["status"] != "passed" for i in items):

@@ -27,17 +27,26 @@ export default function LiveSession() {
     }).catch(e => setErr(String(e.message || e)));
     // connection instructions are SERVED BY THE API (pilot step 4): they
     // survive refreshes and other devices — no browser-session secret.
-    // After a 202 launch the executor may still be provisioning: retry a
-    // few times before showing the empty state.
-    const loadConns = async (tries = 6) => {
+    // After a 202 launch the executor provisions in the background, which
+    // takes longer than any fixed retry budget: follow the durable
+    // operation to its terminal state, THEN load connections. A failed
+    // operation surfaces its (redacted) error instead of an empty panel.
+    const loadConns = async () => {
       try {
-        const c = await api(`/sessions/${id}/connections`);
-        if (stop) return;
-        if ((!c.connections || !c.connections.length) && tries > 0) {
-          setTimeout(() => { if (!stop) loadConns(tries - 1); }, 2000);
-          return;
+        for (let i = 0; i < 300; i++) {
+          const op = await api(`/sessions/${id}/operation`).catch(() => null);
+          if (stop) return;
+          if (!op || op.state === "succeeded") break;
+          if (op.state === "failed" || op.state === "interrupted") {
+            setConns(null);
+            setErr(`deploy ${op.state}: ${op.error || op.phase}`);
+            return;
+          }
+          await new Promise(r => setTimeout(r, 2000));
         }
-        setConns(c.connections);
+        if (stop) return;
+        const c = await api(`/sessions/${id}/connections`);
+        if (!stop) setConns(c.connections);
       } catch { if (!stop) setConns(null); }
     };
     loadConns();

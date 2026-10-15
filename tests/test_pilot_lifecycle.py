@@ -276,3 +276,50 @@ def test_worker_env_carries_snapshot_pace_and_deadline(client, users, fake_pve):
         assert "SR_MATCH_DEADLINE_UTC" in env
         # no credential ever rides the worker env
         assert not any(k.startswith(("LLM_", "POSTGRES_", "PROXMOX_")) for k in env)
+
+
+# ------------------------------------------- assumed-breach start condition --
+def test_assumed_breach_rewrites_snapshot_phase_and_discloses_at_begin(
+        client, users, fake_pve):
+    """The agreed start contract (ARCHITECTURE, AI attack behavior):
+    assumed-breach moves the frozen start phase past recon AND discloses the
+    limited foothold at Begin — never silent seeding. Network-entry keeps
+    recon and discloses nothing."""
+    from srplatform import verification_service
+    sid = client.post("/sessions", json={"scenario_id": "web-foothold-01",
+                                         "start_condition": "assumed-breach"},
+                      headers=users["member"]).json()["session_id"]
+    from srplatform.db.session import db as db_ctx
+    with db_ctx() as s:
+        spec = verification_service.scenario_spec(s, sid)
+        assert spec["red"]["start_phase"] == "initial-access", spec["red"]
+    from tests.conftest import launch_and_wait
+    launch_and_wait(client, users["member"], sid)
+    assert client.post(f"/sessions/{sid}/begin",
+                       headers=users["member"]).status_code == 202
+    evs = client.get("/events", params={"session_id": sid, "tail": 30},
+                     headers=users["member"]).json()
+    begin = next(e for e in evs if e["action_type"] == "match_begin")
+    disc = begin["payload"].get("disclosed_foothold")
+    assert disc and disc["user"] == "web-user", begin["payload"]
+    assert "snapshot" in str(disc.get("scope", "")).lower(), disc
+
+
+def test_network_entry_keeps_recon_and_discloses_nothing(
+        client, users, fake_pve):
+    from srplatform import verification_service
+    from srplatform.db.session import db as db_ctx
+    sid = client.post("/sessions", json={"scenario_id": "web-foothold-01",
+                                         "start_condition": "network-entry"},
+                      headers=users["member"]).json()["session_id"]
+    with db_ctx() as s:
+        spec = verification_service.scenario_spec(s, sid)
+        assert spec["red"]["start_phase"] == "recon", spec["red"]
+    from tests.conftest import launch_and_wait
+    launch_and_wait(client, users["member"], sid)
+    assert client.post(f"/sessions/{sid}/begin",
+                       headers=users["member"]).status_code == 202
+    evs = client.get("/events", params={"session_id": sid, "tail": 30},
+                     headers=users["member"]).json()
+    begin = next(e for e in evs if e["action_type"] == "match_begin")
+    assert "disclosed_foothold" not in begin["payload"], begin["payload"]

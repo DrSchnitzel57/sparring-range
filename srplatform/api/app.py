@@ -82,9 +82,38 @@ async def _ingest_only_guard(request, call_next):
         return await call_next(request)
     if (request.method, request.url.path) not in INGEST_ALLOWLIST:
         return JSONResponse({"detail": "not_found"}, status_code=404)
-    cl = request.headers.get("content-length", "")
-    if cl.isdigit() and int(cl) > s.ingest_max_body_bytes:
-        return JSONResponse({"detail": "body_too_large"}, status_code=413)
+    # Enforce on BYTES ACTUALLY RECEIVED, not on the header: a missing or
+    # lying Content-Length (chunked encoding) must not bypass the bound.
+    # The body is replayed downstream so routing/validation are unaffected.
+    limit = s.ingest_max_body_bytes
+    chunks: list[bytes] = []
+    received = 0
+    receive = request.receive
+    while True:
+        message = await receive()
+        if message["type"] == "http.request":
+            chunk = message.get("body", b"")
+            received += len(chunk)
+            if received > limit:
+                return JSONResponse({"detail": "body_too_large"},
+                                    status_code=413)
+            chunks.append(chunk)
+            if not message.get("more_body", False):
+                break
+        elif message["type"] == "http.disconnect":
+            break
+    body = b"".join(chunks)
+    sent = False
+
+    async def _replay():
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": body,
+                    "more_body": False}
+        return {"type": "http.disconnect"}
+
+    request._receive = _replay  # noqa: SLF001 — bounded replay, same bytes
     return await call_next(request)
 
 
@@ -275,7 +304,7 @@ class SessionCreate(BaseModel):
     pace_seconds: int | None = None
     # plan 13 phase 6: bounded, versioned choices frozen into the snapshot
     mode: str = "practice"
-    start_condition: str = "manual"
+    start_condition: str = "network-entry"
     injects_enabled: bool = True
 
 
@@ -294,6 +323,23 @@ def create_session(body: SessionCreate, p: Principal = Depends(any_member),
     from srplatform.scenario_engine.loader import load_scenario
     load_scenario(body.scenario_id)  # validated before anything is stored
     sha, raw = _scenario_snapshot(body.scenario_id)
+    if body.start_condition == "assumed-breach":
+        # The disclosed foothold is PART of the frozen history: rewrite the
+        # snapshotted spec's start phase (the worker reads this snapshot, so
+        # recon is skipped by construction) and re-digest — the sha always
+        # covers exactly what the session runs.
+        import yaml as _yaml
+        from srplatform import lifecycle as _lc
+        spec_doc = _yaml.safe_load(raw)
+        try:
+            spec_doc["red"]["start_phase"] = \
+                _lc.ASSUMED_BREACH_START_PHASE
+        except (KeyError, TypeError) as e:
+            raise HTTPException(422, {"error": "invalid_match_parameters",
+                                      "detail": "scenario has no red.start_phase "
+                                                f"for assumed-breach: {e}"})
+        raw = _yaml.safe_dump(spec_doc, sort_keys=True)
+        sha = hashlib.sha256(raw.encode()).hexdigest()
     sess = SessionModel(scenario_id=body.scenario_id, user_id=p.user_id, players=body.players,
                         status="preparing")
     db.add(sess)
@@ -372,6 +418,12 @@ def get_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
         match = {"state": m.state, "preset": m.preset,
                  "duration_minutes": m.duration_minutes,
                  "pace_seconds": m.pace_seconds,
+                 "mode": (m.snapshot or {}).get("mode", "practice"),
+                 "start_condition": (m.snapshot or {}).get(
+                     "start_condition", "network-entry"),
+                 "snapshot_version": (m.snapshot or {}).get(
+                     "snapshot_version"),
+                 "snapshot": m.snapshot or {},
                  "ready_at": _iso(m.ready_at), "started_at": _iso(m.started_at),
                  "deadline_at": _iso(m.deadline_at), "ended_at": _iso(m.ended_at),
                  "expiry_reason": m.expiry_reason,
@@ -651,7 +703,7 @@ def score_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
     except Exception as e:  # noqa: BLE001
         return JSONResponse(status_code=503, content={"status": "unscored",
                                                       "error": str(e)[:300]})
-    return card
+    return _filter_scorecard(db, sess, p, card)
 
 
 @app.get("/sessions/{session_id}/score")
@@ -662,7 +714,16 @@ def get_score(session_id: uuid.UUID, p: Principal = Depends(any_member),
     card = verification_service.latest_scorecard(db, sess.session_id)
     if card is None:
         return {"status": "unscored"}
-    return card
+    return _filter_scorecard(db, sess, p, card)
+
+
+def _filter_scorecard(db, sess, p, card: dict) -> dict:
+    """Competition scorecard filtering: members see totals and status, but
+    per-check pass/fail/evidence would reveal exactly what the attacker
+    achieved — sealed until the match completes. Operators see everything."""
+    if not _competition_sealed(db, sess, p):
+        return card
+    return _filter_card(card)
 
 
 def _teardown_common(db, sess, p):
@@ -1028,6 +1089,7 @@ def list_injects(session_id: uuid.UUID, p: Principal = Depends(any_member),
     from srplatform import injects as injects_svc
     from srplatform.db.models import InjectRelease
     sess = _get_session(db, p, session_id)
+    injects_svc.expire_releases(db, sess.session_id)
     rows = db.execute(select(InjectRelease).where(
         InjectRelease.session_id == sess.session_id)
         .order_by(InjectRelease.scheduled_at)).scalars().all()
@@ -1061,7 +1123,9 @@ def submit_inject(session_id: uuid.UUID, release_id: uuid.UUID,
     rel = db.get(InjectRelease, release_id)
     if rel is None or rel.session_id != sess.session_id:
         raise HTTPException(404, {"error": "no_such_release"})
-    result = injects_svc.submit(db, rel, actor=p.username)
+    injects_svc.expire_releases(db, sess.session_id)
+    result = injects_svc.submit(db, rel, actor=p.username,
+                                content=body.content)
     if result["status"] == "not_released":
         raise HTTPException(409, result)
     return result
@@ -1389,7 +1453,27 @@ def query_events(session_id: uuid.UUID | None = None,
     else:
         q = q.order_by(Event.event_id).limit(limit)
         rows = db.execute(q).scalars().all()
-    return [_event_json(r) for r in rows]
+    out = [_event_json(r) for r in rows]
+    if getattr(p, "kind", None) == "member" and not p.is_operator:
+        # competition filtering is per-SESSION (a member may own sessions
+        # in different modes): seal red internals session by session.
+        cache: dict[str, object] = {}
+        if session_id is not None and sess is not None:
+            cache[str(sess.session_id)] = sess
+        filtered = []
+        for ev in out:
+            sid = ev.get("session_id")
+            if sid not in cache:
+                try:
+                    cache[sid] = db.get(SessionModel, uuid.UUID(sid)) \
+                        if sid else None
+                except Exception:  # noqa: BLE001 — unresolvable: unfiltered
+                    cache[sid] = None
+            s = cache[sid]
+            filtered.append(_apply_competition_filter(db, s, p, ev)
+                            if s is not None else ev)
+        out = filtered
+    return out
 
 
 def _event_json(r: Event) -> dict:
@@ -1399,6 +1483,17 @@ def _event_json(r: Event) -> dict:
             "actor": r.actor, "host": r.host, "action_type": r.action_type,
             "phase": r.phase, "mitre_technique": r.mitre_technique, "payload": r.payload,
             "raw_ref": r.raw_ref, "raw_output_hash": r.raw_output_hash}
+
+
+from srplatform.api.visibility import (
+    competition_sealed as _competition_sealed,
+    filter_event as _filter_one_event,
+    filter_scorecard as _filter_card,
+)
+
+
+def _apply_competition_filter(db, sess, p, ev: dict) -> dict:
+    return _filter_one_event(db, sess, p, ev)
 
 
 # --- safety (operator-only; no arbitrary PIDs) -----------------------------------
@@ -1593,7 +1688,14 @@ def get_agent_state(session_id: uuid.UUID, p: Principal = Depends(principal),
         if not (p.scope == "runner" and str(p.session_id) == str(session_id)):
             raise HTTPException(403, "runner token mismatch")
     else:
-        _get_session(db, p, session_id)
+        sess = _get_session(db, p, session_id)
+        # the red worker's working memory (plan/summary/phase) is pure
+        # spoiler in competition mode — sealed until the match completes.
+        from srplatform.api.visibility import competition_sealed
+        if competition_sealed(db, sess, p):
+            raise HTTPException(403, {"error": "competition_sealed",
+                                      "detail": "agent memory is sealed until "
+                                                "the match completes"})
     return {"session_id": str(st.session_id), "summary": st.summary,
             "summary_upto": st.summary_upto, "current_phase": st.current_phase}
 
@@ -1791,8 +1893,18 @@ def _log_event(db: Session, session_id, actor, host, action_type, payload, phase
 
 
 # --- startup reconciliation (F13) ----------------------------------------------------
+# NOTE: the ingest-only listener (SR_API_INGEST_ONLY=1, plan 13 phase 4) is
+# a SECOND copy of this application serving the guest range address. It
+# must NEVER reconcile runs, clear operation claims, start heartbeats or
+# run the match scheduler: those belong to the single internal instance,
+# and a listener restart would otherwise interrupt live operations and
+# remove their serialization. The listener serves ingest routes only.
 @app.on_event("startup")
 def _startup():
+    from srplatform.settings import get_settings as _gs0
+    ingest_only = _gs0().api_ingest_only
+    if ingest_only:
+        return
     try:
         runs_svc.reconcile_on_startup()
     except Exception:

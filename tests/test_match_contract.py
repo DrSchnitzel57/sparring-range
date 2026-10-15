@@ -14,7 +14,7 @@ import pytest
 def test_bounded_choices_accepted():
     from srplatform.lifecycle import MATCH_MODES, PACE_CHOICES, START_CONDITIONS
     assert set(MATCH_MODES) == {"practice", "competition"}
-    assert set(START_CONDITIONS) == {"manual", "auto-on-ready"}
+    assert set(START_CONDITIONS) == {"network-entry", "assumed-breach"}
     assert set(PACE_CHOICES) == {0, 15, 30, 60}  # 60/30/15 max cadence + fixture 0
 
 
@@ -41,12 +41,12 @@ def test_snapshot_freezes_versioned_choices():
     db = MagicMock()
     m = create_match(db, "sid", "mojang-web-db-01", duration_minutes=45,
                      pace_seconds=15, mode="competition",
-                     start_condition="auto-on-ready", injects_enabled=False,
+                     start_condition="assumed-breach", injects_enabled=False,
                      actor="drew")
     snap = m.snapshot
     assert snap["snapshot_version"] == 2
     assert snap["mode"] == "competition"
-    assert snap["start_condition"] == "auto-on-ready"
+    assert snap["start_condition"] == "assumed-breach"
     assert snap["injects_enabled"] is False
     assert snap["pace_seconds"] == 15 and snap["duration_minutes"] == 45
 
@@ -257,3 +257,16 @@ def test_dead_prober_is_detectable_never_fakes_coverage():
     c = coverage(["up"] * 3, started_at=now - timedelta(seconds=100),
                  ended_at=now)
     assert c["missed"] == 7 and c["down"] == 0
+
+
+def test_filter_scorecard_keeps_totals_seals_items():
+    from srplatform.api.visibility import filter_scorecard
+    card = {"status": "scored", "earned": 10, "total": 25, "items": [
+        {"verifier": "flag_file_present", "host": "web01", "domain": "x",
+         "points": 10, "awarded": 10, "status": "passed",
+         "evidence": {"path": "/root/flag"}, "error": None}]}
+    out = filter_scorecard(card)
+    assert out["earned"] == 10 and out["total"] == 25
+    assert out["items"] == [{"verifier": "flag_file_present", "host": "web01",
+                             "domain": "x", "points": 10, "sealed":
+                             "competition — sealed until the match completes"}]

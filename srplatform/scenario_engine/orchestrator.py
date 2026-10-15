@@ -525,6 +525,16 @@ def _provision_guest_configs(db: Session, dep: Deployment, spec: dict,
                 "deployment inventory")
         if step["kind"] == "db":
             pw = guest_config.reader_password(resources, step["host"])
+            # PERSIST-BEFORE-EFFECTS: the credential is committed to the
+            # deployment row BEFORE the guest ever sees it. If the guest
+            # applies the command but its response/commit is lost, the
+            # resume reuses THIS password (never a fresh one) and the
+            # converging SQL (CREATE + unconditional ALTER) brings the
+            # guest to exactly this credential.
+            res["db_reader_password"] = pw
+            dep.resources = resources
+            flag_modified(dep, "resources")
+            db.commit()
             cmd = guest_config.db_provision_command(step, pw)
         else:
             pw = (by_host.get(step["db_ref"]) or {}).get("db_reader_password")
@@ -540,7 +550,10 @@ def _provision_guest_configs(db: Session, dep: Deployment, spec: dict,
                 f"guest config provisioning failed on {step['host']} "
                 f"(exit {code}): {str(out)[:300]}")
         if step["kind"] == "db":
-            res["db_reader_password"] = pw
+            # DB tier only: the business-transaction probe targets freshly
+            # provisioned DB guests — never web guests (MySQL is disabled
+            # there; probing it would fabricate downtime).
+            res["mysql_probe"] = True
         res["db_configured"] = True
         dep.resources = resources
         flag_modified(dep, "resources")
@@ -778,6 +791,10 @@ def _pin_host_key(broker, db: Session, session_id, dep: Deployment,
             res["host_key_publish_error"] = err
             _log(db, session_id, "host_key_publish_failed", res.get("host"),
                  {"vmid": res["vmid"], "error": err})
+        else:
+            # republication converged: drop the stale failure so resume and
+            # readiness stop treating a repaired pin as broken
+            res.pop("host_key_publish_error", None)
     dep.resources = resources
     flag_modified(dep, "resources")
     _log(db, session_id, "host_key_pinned", res.get("host"),
@@ -968,12 +985,15 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
             name = _vm_name(scenario_id, host["name"], session_id)
             res = by_host.get(host["name"])
             if res and res.get("state") == "created":
-                if not res.get("host_key_ref"):
+                if not res.get("host_key_ref") or res.get("host_key_publish_error"):
                     # Audit A6: a crash between the created-state commit and
                     # the pin left the resource permanently un-SSH-able —
                     # resume must COMPLETE the missing pin (read + publish),
                     # never skip it. A failing read stays loud (uncertain is
-                    # not success); ownership and lease are retained.
+                    # not success); ownership and lease are retained. A
+                    # recorded publish failure is retried the same way: the
+                    # pin exists but clients cannot use it until republication
+                    # converges (and clears the error).
                     _pin_host_key(broker, db, session_id, dep, res, resources, node)
                 if (res.get("telemetry_enroll") or {}).get("phase") != "confirmed" \
                         or not enrollment_evidence_current(

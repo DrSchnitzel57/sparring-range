@@ -60,7 +60,15 @@ class MatchBlocked(RuntimeError):
 #: DOCUMENTED defaults to pre-upgrade rows (forward migration, never
 #: reinterpretation of history).
 MATCH_MODES = ("practice", "competition")
-START_CONDITIONS = ("manual", "auto-on-ready")
+#: Agreed attacker starting conditions (ARCHITECTURE, AI attack behavior):
+#: network-entry starts with no target credentials against the seeded,
+#: documented vulnerabilities; assumed-breach starts with an explicitly
+#: disclosed limited guest foothold (the worker's start phase moves past
+#: recon AND both sides see the disclosure — never silent seeding).
+START_CONDITIONS = ("network-entry", "assumed-breach")
+#: the foothold phase an assumed-breach match starts from (must be a real
+#: PhaseMachine phase; recon is skipped, never revisited)
+ASSUMED_BREACH_START_PHASE = "initial-access"
 #: attack dispatch cadence (intensity): 60/30/15 s maximum; 0 is the
 #: explicit no-delay fixture mode, never an operator default.
 PACE_CHOICES = (0, 15, 30, 60)
@@ -69,7 +77,7 @@ SNAPSHOT_VERSION = 2
 
 def create_match(db, session_id, preset: str, *, duration_minutes: int = 30,
                  pace_seconds: int = 30, mode: str = "practice",
-                 start_condition: str = "manual",
+                 start_condition: str = "network-entry",
                  injects_enabled: bool = True,
                  scenario_versions: dict | None = None,
                  effective_settings: dict | None = None,
@@ -150,12 +158,29 @@ def start_clock(db, session_id, *, actor: str = "system") -> MatchModel | None:
     m.started_at = _now()
     m.deadline_at = m.started_at + timedelta(minutes=m.duration_minutes)
     m.ready_at = None  # idle timer no longer applies
+    payload = {"started_at": m.started_at.isoformat(),
+               "deadline_at": m.deadline_at.isoformat(),
+               "duration_minutes": m.duration_minutes,
+               "pace_seconds": m.pace_seconds}
+    if (m.snapshot or {}).get("start_condition") == "assumed-breach":
+        # The disclosed foothold both sides see (ARCHITECTURE, AI attack
+        # behavior): limited web-user access on the http tier through the
+        # documented diagnostic flaw — disclosed, never silently seeded.
+        from srplatform import verification_service
+        try:
+            spec = verification_service.scenario_spec(db, session_id)
+            web_host = next(
+                (h["name"] for h in (spec.get("topology") or {}).get("hosts", [])
+                 if "http" in (h.get("services") or [])), None)
+        except Exception:  # noqa: BLE001 — disclosure names best-effort
+            web_host = None
+        payload["disclosed_foothold"] = {
+            "user": "web-user", "host": web_host,
+            "method": "documented diagnostic flaw (MOJANG_DIAG_ENABLED)",
+            "scope": "limited guest foothold; recon phase skipped by snapshot",
+        }
     db.add(Event(session_id=session_id, ts=_now(), actor=actor,
-                 action_type="match_begin",
-                 payload={"started_at": m.started_at.isoformat(),
-                          "deadline_at": m.deadline_at.isoformat(),
-                          "duration_minutes": m.duration_minutes,
-                          "pace_seconds": m.pace_seconds}))
+                 action_type="match_begin", payload=payload))
     db.flush()
     return m
 
@@ -297,7 +322,7 @@ def finalize_match(db, session_id, reason: str, *, broker, actor: str = "system"
             "outcome": sess.outcome,
             "scorecard_status": scorecard.get("status"),
             "earned": scorecard.get("earned"), "total": scorecard.get("total"),
-            "uptime": _uptime.summarize_for_session(db, session_id),
+            "uptime": _uptime.live_projection(db, session_id),
             "lease_released": complete,
             "end_reason": reason,
             "note": ("owned VMs destroyed, lease released" if complete

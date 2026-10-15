@@ -226,14 +226,21 @@ def live(session_id: uuid.UUID, p: Principal = Depends(any_member),
         {"sid": str(session_id)}).fetchall()
     detections = [d for d in reversed(recent) if d.action_type in ("verifier", "detection")]
     from srplatform import uptime as _uptime
+    from srplatform.api.visibility import (
+        competition_sealed, filter_detection)
+    sealed = competition_sealed(db, sess, p)
     return {
         "session_id": str(session_id), "status": sess.status,
-        "uptime": _uptime.summarize_for_session(db, session_id),
+        "uptime": _uptime.live_projection(db, session_id),
         "started_at": sess.started_at.isoformat() if sess.started_at else None,
-        "red_phase": state.current_phase if state else None,
+        "red_phase": None if sealed else (state.current_phase if state else None),
         "recent": [{"event_id": e.event_id, "ts": e.ts.isoformat(), "actor": e.actor,
                     "action_type": e.action_type, "phase": e.phase} for e in reversed(recent)],
-        "detections": [{"event_id": d.event_id, "ts": d.ts.isoformat(),
+        "detections": [filter_detection({"event_id": d.event_id,
+                                         "ts": d.ts.isoformat()})
+                       if sealed else
+                       {"event_id": d.event_id, "ts": d.ts.isoformat(),
                         "objective": (d.payload or {}).get("objective"),
-                        "passed": (d.payload or {}).get("passed")} for d in detections],
+                        "passed": (d.payload or {}).get("passed")}
+                       for d in detections],
     }

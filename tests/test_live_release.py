@@ -94,7 +94,7 @@ def _end(live, headers, sid):
 def test_live_both_presets_launch_begin_end_and_reuse(live):
     """Both presets: create → 202 → ready → begin → end → the range frees
     and a subsequent launch succeeds without any DB/ledger surgery."""
-    for scenario in ("web-foothold-01", "mojang-web-db-01"):
+    for scenario in ("mojang-web-01", "mojang-web-db-01"):
         mem = _member(live, "preset")
         sid = _create(live, mem, scenario)
         try:
@@ -118,9 +118,9 @@ def test_live_both_presets_launch_begin_end_and_reuse(live):
 
 def test_live_modes_start_conditions_and_snapshot_freeze(live):
     mem = _member(live, "snapshot")
-    sid = _create(live, mem, "web-foothold-01", mode="competition",
+    sid = _create(live, mem, "mojang-web-01", mode="competition",
                   duration_minutes=5, pace_seconds=15,
-                  start_condition="manual", injects_enabled=True)
+                  start_condition="network-entry", injects_enabled=True)
     try:
         c = live["client"]
         body = c.get(f"/sessions/{sid}", headers=mem).json()
@@ -130,7 +130,7 @@ def test_live_modes_start_conditions_and_snapshot_freeze(live):
         snap = m.get("snapshot", {}) if isinstance(m.get("snapshot"), dict) else {}
         assert snap.get("scenario_versions", {}).get("scenario_sha256"), m
         # unbounded intensity is refused BEFORE storage
-        r = c.post("/sessions", json={"scenario_id": "web-foothold-01",
+        r = c.post("/sessions", json={"scenario_id": "mojang-web-01",
                                       "pace_seconds": 7}, headers=mem)
         assert r.status_code == 422, r.text
     finally:
@@ -139,7 +139,7 @@ def test_live_modes_start_conditions_and_snapshot_freeze(live):
 
 def test_live_duplicate_launch_never_duplicates(live):
     mem = _member(live, "dupe")
-    sid = _create(live, mem, "web-foothold-01")
+    sid = _create(live, mem, "mojang-web-01")
     try:
         c = live["client"]
         first = c.post(f"/sessions/{sid}/launch", headers=mem).json()
@@ -157,6 +157,17 @@ def test_live_duplicate_launch_never_duplicates(live):
         else:
             op = c.get(f"/sessions/{sid}/operation", headers=mem).json()
             assert op["operation_id"] == first["operation_id"], op
+            # wait out the accepted attempt BEFORE cleanup: ending while
+            # the executor holds the claim would 409, and cleanup must
+            # never strand a running deployment.
+            import time as _t2
+            _dl = _t2.monotonic() + LAUNCH_TIMEOUT_S
+            while op["state"] not in ("succeeded", "failed", "interrupted"):
+                assert _t2.monotonic() < _dl, op
+                _t2.sleep(5.0)
+                op = c.get(f"/sessions/{sid}/operation",
+                           headers=mem).json()
+            assert op["state"] == "succeeded", op
     finally:
         _end(live, mem, sid)
 
@@ -165,7 +176,7 @@ def test_live_deadline_ends_match_and_range_is_reusable(live):
     """A 1-minute match expires by the server clock; the range frees and a
     second launch succeeds — end/expiry never resume attacks."""
     mem = _member(live, "deadline")
-    sid = _create(live, mem, "web-foothold-01", duration_minutes=1,
+    sid = _create(live, mem, "mojang-web-01", duration_minutes=1,
                   pace_seconds=0)
     try:
         done = _launch_wait(live, mem, sid)
@@ -192,7 +203,7 @@ def test_live_competition_visibility_is_api_enforced(live):
     path; the operator can. Hiding a button is not the control."""
     a = _member(live, "vis-a")
     b = _member(live, "vis-b")
-    sid = _create(live, a, "web-foothold-01")
+    sid = _create(live, a, "mojang-web-01")
     try:
         c = live["client"]
         for path in (f"/sessions/{sid}",

@@ -168,3 +168,36 @@ def test_expired_deadline_fails_before_dispatch(client, users, fake_broker):
     assert len(ops) == 1 and ops[0].state == "failed"
     assert "deadline exceeded" in (ops[0].error or "")
     assert fake_broker.http.requests == [], "no side effects after expiry"
+
+
+def test_superseded_executor_performs_no_effects(client, users, fake_broker):
+    """Fence enforced THROUGH execution: if the attempt lost its fence
+    (replacement took over), the stale executor deploys nothing, finalizes
+    nothing, and never touches the replacement's claim or row."""
+    from srplatform.db.models import DeployOperation, OperationClaim
+    from srplatform.db.session import db
+    from srplatform.scenario_engine import deploy_executor, orchestrator
+    sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
+                      headers=users["member"]).json()["session_id"]
+    with db() as s:
+        row = orchestrator.begin_deploy_operation(
+            s, sid, "launch", fence="stale-owner", deadline_s=600)
+        op_id = str(row.operation_id)
+        # a replacement takes over: new fence on the row + live claim
+        row = s.get(DeployOperation, row.operation_id)
+        row.fence = "replacement-owner"
+        s.add(OperationClaim(session_id=sid, operation="launch",
+                             owner="replacement-owner",
+                             claimed_at=row.created_at))
+        s.commit()
+    before = list(fake_broker.http.requests)
+    deploy_executor._execute(operation_id=op_id, session_id=uuid.UUID(sid),
+                             user_id="member", operation="launch",
+                             scenario_id="web-foothold-01",
+                             broker=fake_broker, owner="stale-owner")
+    assert fake_broker.http.requests == before, "stale executor had effects"
+    with db() as s:
+        row = s.get(DeployOperation, uuid.UUID(op_id))
+        assert row.state in ("accepted", "running")  # untouched by stale run
+        claim = s.get(OperationClaim, uuid.UUID(sid))
+        assert claim is not None and claim.owner == "replacement-owner"

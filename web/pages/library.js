@@ -15,7 +15,7 @@ export default function Library() {
   // HERE and frozen into the creation snapshot — never re-read mid-match.
   const [mode, setMode] = useState("practice");
   const [duration, setDuration] = useState(30);
-  const [startCond, setStartCond] = useState("manual");
+  const [startCond, setStartCond] = useState("network-entry");
   const [injects, setInjects] = useState(true);
   const router = useRouter();
 
@@ -73,8 +73,8 @@ export default function Library() {
             </select></label>
           <label>start condition{" "}
             <select value={startCond} onChange={e => setStartCond(e.target.value)}>
-              <option value="manual">manual Begin</option>
-              <option value="auto-on-ready">auto on ready</option>
+              <option value="network-entry">network entry (no creds)</option>
+              <option value="assumed-breach">assumed breach (disclosed web-user foothold)</option>
             </select></label>
           <label><input type="checkbox" checked={injects}
             onChange={e => setInjects(e.target.checked)} /> injects</label>

@@ -87,9 +87,15 @@ def db_provision_command(plan: dict, password: str) -> str:
     """Idempotent in-guest provisioning for the DB tier (run as root via
     the management channel)."""
     web_ips = [ip for _, ip in plan["web_sources"]]
+    # Converging idempotence: CREATE guards first-run, ALTER ALWAYS sets
+    # the password (a retry after an uncertain result must converge the
+    # guest to the persisted credential, never keep a stale one — CREATE
+    # IF NOT EXISTS alone would silently preserve the wrong password).
     sql_users = "; ".join(
         [f"CREATE USER IF NOT EXISTS '{READER_USER}'@'{ip}' "
          f"IDENTIFIED BY '{password}'" for ip in web_ips]
+        + [f"ALTER USER '{READER_USER}'@'{ip}' IDENTIFIED BY '{password}'"
+           for ip in web_ips]
         + [f"ALTER USER '{READER_USER}'@'127.0.0.1' "
            f"IDENTIFIED BY '{password}'"]
         + [f"GRANT SELECT ON {MYSQL_DB}.* TO '{READER_USER}'@'{ip}'"

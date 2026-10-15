@@ -70,12 +70,7 @@ def _execute(*, operation_id, session_id, user_id, operation, scenario_id,
             row = db.get(DeployOperation, uuidlib.UUID(operation_id))
             if row is None:
                 return  # reconciled away; nothing to do
-            if row.deadline_at and datetime.now(timezone.utc) > row.deadline_at:
-                orchestrator.finish_deploy_operation(
-                    db, row, "failed",
-                    error="deadline exceeded before dispatch")
-                orchestrator.release_operation(db, session_id, owner)
-                return
+            _require_live(db, row, owner, operation_id, "dispatch")
             if operation == "launch":
                 orchestrator.advance_deploy_operation(db, row, "deploying")
                 try:
@@ -105,6 +100,18 @@ def _execute(*, operation_id, session_id, user_id, operation, scenario_id,
     except _Failed as e:
         _record_failure(session_id, owner, operation_id,
                         f"{e.code}: {e.error}")
+    except _Superseded:
+        # Lost the fence, already terminal, or deadline passed mid-flight:
+        # stop WITHOUT effects and WITHOUT touching a claim that may now
+        # belong to a replacement. If the claim is still ours (deadline
+        # case), release it so the session is not wedged.
+        try:
+            from srplatform.db.session import db as db_ctx
+            from srplatform.scenario_engine import orchestrator
+            with db_ctx() as db:
+                orchestrator.release_operation(db, session_id, owner)
+        except Exception:  # noqa: BLE001 — fenced release; startup is backstop
+            pass
     except Exception as e:  # noqa: BLE001 — executor never dies silent
         _record_failure(
             session_id, owner, operation_id,
@@ -123,6 +130,37 @@ class _Failed(Exception):
         self.error = detail
 
 
+class _Superseded(Exception):
+    """The attempt lost its fence or terminal state changed underneath it
+    (interrupted/replaced). Effects must STOP: no further side effects, no
+    finalization, no claim release (the claim belongs to someone else now —
+    releasing it would erase the replacement's ownership)."""
+
+
+def _require_live(db, row, owner: str, operation_id: str,
+                  boundary: str) -> None:
+    """Fence + deadline enforcement THROUGH execution (not just dispatch):
+    before any effectful phase and before finalization, the attempt must
+    still own its claim (fence match), still be live (accepted/running —
+    never finalize an interrupted row), and still be within its deadline.
+    A superseded executor stops quietly instead of deploying over a
+    replacement."""
+    from srplatform.scenario_engine import orchestrator
+
+    fresh = db.get(type(row), row.operation_id)
+    if fresh is None:
+        raise _Superseded(f"{boundary}: operation row gone")
+    if fresh.fence != owner:
+        raise _Superseded(f"{boundary}: fence lost (owned by another attempt)")
+    if fresh.state not in ("accepted", "running"):
+        raise _Superseded(f"{boundary}: already terminal ({fresh.state})")
+    if fresh.deadline_at and datetime.now(timezone.utc) > fresh.deadline_at:
+        orchestrator.finish_deploy_operation(
+            db, fresh, "failed",
+            error=f"deadline exceeded at {boundary}")
+        raise _Superseded(f"{boundary}: deadline exceeded")
+
+
 def _finish_launch(db, row, session_id, user_id, scenario_id, result, owner,
                    note) -> None:
     """Readiness gate + capabilities + ready transition (moved from the
@@ -132,6 +170,7 @@ def _finish_launch(db, row, session_id, user_id, scenario_id, result, owner,
     from srplatform.scenario_engine import orchestrator
 
     orchestrator.advance_deploy_operation(db, row, "readiness")
+    _require_live(db, row, owner, str(row.operation_id), "finalize")
     try:
         instructions, readiness = orchestrator.finalize_ready(
             db, session_id, user_id, result)
@@ -154,6 +193,7 @@ def _finish_reset(db, row, session_id, user_id, out, owner, note) -> None:
 
     try:
         orchestrator.advance_deploy_operation(db, row, "readiness")
+        _require_live(db, row, owner, str(row.operation_id), "finalize")
         instructions, readiness = orchestrator.finalize_ready(
             db, session_id, user_id, out)
     except orchestrator.ReadinessFailed as e:

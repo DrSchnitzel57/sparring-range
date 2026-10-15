@@ -222,3 +222,49 @@ def test_images_mojang_verifiers_observe_behavior():
     ctx2 = Context(exec=fail_exec, hosts={"web01": "10.66.0.10"})
     assert http_v.evaluate(ctx2, host="web01",
                            expected_text="Minecraft Legends").status == "unknown"
+
+
+@pytest.mark.images
+def test_images_rogue_baselines_match_recorded_users():
+    """Untouched-guest conformance (review finding): the rogue-account
+    baselines in scenarios + the inject catalog must COVER every account
+    the ACTUAL built images ship — otherwise an untouched guest scores
+    incorrect. Recorded build users plus the analytic bake users (key
+    manifest → role mapping) form the shipped set; any gap fails with the
+    exact missing names (static lists are then expanded, never guessed)."""
+    import json
+    import yaml
+    from infra.images.role_keys import resolve_role_keys
+    from srplatform.injects import IMAGE_BASELINE_USERS
+    from tests.test_mojang_images_deploy import GUEST_CACHE, TEST_KEYS
+
+    with open(REPO / "scenarios/mojang-web-01.yaml") as f:
+        web_spec = yaml.safe_load(f)
+    with open(REPO / "scenarios/mojang-web-db-01.yaml") as f:
+        db_spec = yaml.safe_load(f)
+
+    def known(scenario, host):
+        for chk in (scenario.get("scoring") or {}).get("blue_checks", []):
+            if chk.get("verifier") == "rogue_account" and chk.get("host") == host:
+                return set(chk["known_users"])
+        raise AssertionError(f"no rogue_account baseline for {host}")
+
+    baselines = {"mojang-web-local": known(web_spec, "web01"),
+                 "mojang-web-db": known(db_spec, "db01")}
+    metas = sorted(GUEST_CACHE.glob("overlay-*.json"))
+    assert metas, f"no built overlay metas in {GUEST_CACHE}"
+    for meta_path in metas:
+        meta = json.loads(meta_path.read_text())
+        role = ("mojang-web-local" if "mojang-web-local" in meta_path.name
+                else "mojang-web-db")
+        recorded = set(meta.get("users", []))
+        assert recorded, f"{meta_path.name} records no users (rebuild needed?)"
+        bake_users = set(resolve_role_keys(role, TEST_KEYS))
+        shipped = recorded | bake_users
+        missing = shipped - baselines[role]
+        assert not missing, \
+            f"{role}: baseline misses shipped accounts {sorted(missing)}"
+        if role == "mojang-web-local":
+            missing_inject = shipped - set(IMAGE_BASELINE_USERS)
+            assert not missing_inject, \
+                f"inject baseline misses {sorted(missing_inject)}"

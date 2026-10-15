@@ -62,6 +62,17 @@ CATALOG: dict[str, dict] = {
 _RELEASE_FRACTIONS = (0.2, 0.4, 0.6, 0.8)
 _OPEN_FRACTION = 0.2
 
+#: maximum retained submission text (incident reports stay readable;
+#: the store is evidence, not a file drop)
+MAX_SUBMISSION_CHARS = 4000
+
+
+def _content_preview(content) -> str | None:
+    if content is None:
+        return None
+    text = content if isinstance(content, str) else str(content)
+    return text[:MAX_SUBMISSION_CHARS]
+
 
 def schedule_times(start: datetime, duration_minutes: int):
     """Pure schedule computation (testable): [(offset, deadline)] as
@@ -111,6 +122,24 @@ def schedule(db, session_id, match, spec: dict, *, actor: str = "system") -> lis
     return out
 
 
+#: Versioned image user baseline for the restricted-account inject
+#: (web tier). Accounts the untouched guest ships: noble cloud-image
+#: system set + the tier's service accounts. Anything else present is the
+#: incident. Supersets are safe (extras never match); omissions
+#: false-positive on untouched guests. NOTE: there is deliberately no
+#:`mgmt` unix account — the mgmt principal administers as root per the
+#: role-key policy, so a `mgmt` user on the guest would itself be rogue.
+#: Conformance against RECORDED build data is enforced by
+#: test_mojang_images.py::test_images_rogue_baselines_match_recorded_users.
+IMAGE_BASELINE_USERS = [
+    "root", "daemon", "bin", "sys", "sync", "games", "man", "lp", "mail",
+    "news", "uucp", "proxy", "www-data", "backup", "list", "irc", "nobody",
+    "systemd-network", "systemd-resolve", "systemd-timesync", "systemd-oom",
+    "messagebus", "syslog", "_apt", "uuidd", "tcpdump", "sshd", "tss",
+    "defender", "web-user", "mysql", "srshipper",
+]
+
+
 def verify_release(db, release, *, exec_fn=None):
     """Deterministic technical verification through the shared registry.
     Returns 'correct' | 'incorrect' | 'pending' (unknown keeps the release
@@ -129,8 +158,7 @@ def verify_release(db, release, *, exec_fn=None):
         return "pending"  # owned inventory does not (yet) carry the host
     args = {k: v for k, v in defn["args"].items() if v is not None}
     if defn["verifier"] == "rogue_account":
-        args = {"known_users": ["root", "defender", "web-user", "mysql",
-                                "daemon", "srshipper"]}
+        args = {"known_users": IMAGE_BASELINE_USERS}
     v = registry.get(defn["verifier"])
     exec_ = exec_fn or verification_service.management_exec
     ctx = Context(exec=verification_service._resolve(exec_, hmap),
@@ -148,21 +176,39 @@ def verify_release(db, release, *, exec_fn=None):
 
 
 def submit(db, release, *, now: datetime | None = None, exec_fn=None,
-           actor: str = "member") -> dict:
+           actor: str = "member", content=None) -> dict:
     """One identity-bound submission attempt. First answer decides;
     duplicates count but never re-decide; late-first answers are `late`;
-    written work is advisory. The transition is appended as an event."""
+    written work is advisory. The submission TEXT is persisted (bounded)
+    into the release evidence BEFORE verification acknowledges anything —
+    an incident report is evidence first, advisory second. The transition
+    is appended as an event."""
+    from sqlalchemy import select as _select
+    from srplatform.db.models import InjectRelease as _IR
+    # ATOMIC CLAIM (first answer decides): lock the row; a concurrent
+    # submission arriving while this one verifies sees the decided state
+    # instead of re-verifying and overwriting it.
+    release = db.execute(
+        _select(_IR).where(_IR.release_id == release.release_id)
+        .with_for_update()).scalars().one()
     now = now or datetime.now(timezone.utc)
     release.submissions = int(release.submissions or 0) + 1
     if release.status != "pending":
         db.commit()
-        return {"status": release.status, "note": "duplicate — the first "
-                "submission decided this release", "decided_at":
+        note = ("duplicate — the first submission decided this release"
+                if release.status != "expired"
+                else "window closed unanswered — expired, not scored")
+        return {"status": release.status, "note": note, "decided_at":
                 release.submitted_at.isoformat() if release.submitted_at else None}
     if now < release.scheduled_at:
         db.commit()
         return {"status": "not_released",
                 "opens_at": release.scheduled_at.isoformat()}
+    preview = _content_preview(content)
+    if preview is not None:
+        release.evidence = {**(release.evidence or {}),
+                            "submission": preview,
+                            "submission_chars": len(preview)}
     release.submitted_at = now
     if now > release.deadline_at:
         release.status = "late"
@@ -174,25 +220,55 @@ def submit(db, release, *, now: datetime | None = None, exec_fn=None,
                  action_type="inject_submission",
                  payload={"release_id": str(release.release_id),
                           "inject_id": release.inject_id,
-                          "status": release.status}))
+                          "status": release.status,
+                          "submission_chars": len(preview)
+                          if preview is not None else 0}))
     db.commit()
     return {"status": release.status,
                             "deadline_at": release.deadline_at.isoformat()}
 
 
+def expire_releases(db, session_id, *, now: datetime | None = None) -> int:
+    """Durable expiry: releases still pending past their deadline become
+    `expired` (a closed, non-correct outcome) with an event — ignoring a
+    release can never preserve a perfect score. Idempotent; called on
+    every inbox read and every submission, so expiry never depends on a
+    scheduler tick."""
+    from srplatform.db.models import Event, InjectRelease
+    now = now or datetime.now(timezone.utc)
+    rows = db.execute(
+        select(InjectRelease).where(
+            InjectRelease.session_id == session_id,
+            InjectRelease.status == "pending",
+            InjectRelease.deadline_at <= now)).scalars().all()
+    for r in rows:
+        r.status = "expired"
+        db.add(Event(session_id=r.session_id, ts=now, actor="system",
+                     action_type="inject_expired",
+                     payload={"release_id": str(r.release_id),
+                              "inject_id": r.inject_id}))
+    if rows:
+        db.commit()
+    return len(rows)
+
+
 def summary(db, session_id) -> dict:
     """SEPARATE inject score: correct / technical releases whose window
-    closed. Advisory items never enter it; availability and security stay
-    their own reports."""
+    closed (answered, late, or EXPIRED unanswered). Advisory items never
+    enter it; availability and security stay their own reports. An
+    unanswered release counts as closed-not-correct once its deadline
+    passes — ignoring tasks cannot produce 100%."""
     from srplatform.db.models import InjectRelease
     rows = db.execute(select(InjectRelease).where(
         InjectRelease.session_id == session_id)).scalars().all()
     technical = [r for r in rows if r.kind == "technical"]
     closed = [r for r in technical if r.status != "pending"]
     correct = sum(1 for r in technical if r.status == "correct")
+    expired = sum(1 for r in technical if r.status == "expired")
     return {"releases": len(rows),
             "technical_closed": len(closed),
             "correct": correct,
+            "expired": expired,
             "scored": bool(closed),
             "pct": round(100.0 * correct / len(closed), 1) if closed else None,
             "advisory_only": [r.inject_id for r in rows if r.kind == "written"]}
