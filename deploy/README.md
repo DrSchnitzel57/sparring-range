@@ -192,9 +192,12 @@ verifier/management key.
 
 ## 5. Member onboarding (take-turns accounts)
 
-On the control plane (offline administration exception):
+On the control plane (offline administration exception — the shell needs
+both env files loaded, derived first):
 
 ```bash
+set -a; . /etc/sparring-range/control-plane.derived.env
+. /etc/sparring-range/control-plane.env
 .venv/bin/rangectl user-add teammate01 --role member
 ```
 
@@ -202,6 +205,27 @@ Passwords are scrypt-hashed; per-session bastion capabilities are
 server-issued login tokens (single-use, revoked at end/expiry) — member
 accounts carry no standing range access. Operator-provisioned public keys
 are baked at template build (§1) for emergency console access only.
+
+SSH keys (one per person, once): the bastion demands the token AND the
+member's personal key — a token alone authenticates nothing. The member
+generates a keypair on their own machine and sends only the `.pub`:
+
+```bash
+# member laptop:
+ssh-keygen -t ed25519 -f ~/.ssh/sr-member -N ''
+scp ~/.ssh/sr-member.pub <bastion-login>@<bastion-ip>:/tmp/teammate01.pub
+# on the bastion VM (one `username <key>` line per member, append only):
+{ echo -n "teammate01 "; cat /tmp/teammate01.pub; } >> /etc/sparring-range/authorized_keys
+shred -u /tmp/teammate01.pub
+systemctl restart sr-bastion  # the proxy reads keys at startup
+```
+
+New device for the same person: new keypair, one more line. The member
+then connects with the session page's token login plus their key:
+
+```bash
+ssh <bastion-ip> -p 2222 -l tok-<session> -i ~/.ssh/sr-member
+```
 
 ## 6. Match lifecycle the operator will see
 
