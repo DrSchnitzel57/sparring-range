@@ -48,6 +48,13 @@ export default function LiveSession() {
         setLive(d);
         if (!startRef.current && d.started_at) startRef.current = new Date(d.started_at).getTime();
         if (startRef.current) setSeconds(Math.max(0, Math.floor((Date.now() - startRef.current) / 1000)));
+        // 202 lifecycle: the executor promotes provisioning → ready in the
+        // background — refresh the session (match state/buttons) on every
+        // tick until the session is running or complete. Transient errors
+        // must not freeze stale controls.
+        if (d.status !== "running" && d.status !== "complete") {
+          api(`/sessions/${id}`).then(s => { if (!stop) setSess(s); }).catch(() => {});
+        }
       } catch (e) { /* transient */ }
     };
     tick();
