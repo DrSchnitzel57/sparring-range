@@ -444,20 +444,31 @@ def test_t06_reset_runs_the_launch_readiness_and_credential_workflow(
 
 
 def test_assumed_breach_proof_executes_as_web_user(client, users, fake_pve,
-                                                   enrollment_channel):
-    """The foothold is ESTABLISHED: with a channel, Begin runs the first
-    command AS web-user (no re-exploited network entry) and records the
-    proof; the transcript shows exactly which command proved it."""
-    from srplatform import verification_service
-    from srplatform.scenario_engine import orchestrator
-    chan = ScriptedChannel(host_client=client)
-    enrollment_channel.set_enrollment_exec(chan)
-    verification_service.set_verifier_exec(chan)
+                                                   enrollment_channel,
+                                                   monkeypatch):
+    """The foothold is ESTABLISHED over the attacker-identical path: an
+    unauthenticated HTTP request to the documented flaw, whose response
+    names the web-user identity. No privilege is used to trigger it; the
+    test fakes only the transport, never the verdict logic."""
+    from srplatform import lifecycle as lifecycle_mod
+    seen = {}
+
+    class FlawResp:
+        status_code = 200
+        text = "uid=1001(web-user) gid=1001(web-user) groups=1001(web-user)\n"
+
+    def fake_flaw_get(url, timeout=10.0):
+        seen["url"] = url
+        assert url.startswith("http://10.66.0.10/diagnostic?cmd="), url
+        assert "PRIV" not in url and "sudo" not in url and "runuser" not in url
+        return FlawResp()
+
+    monkeypatch.setattr(lifecycle_mod, "_flaw_get", fake_flaw_get)
+    from tests.conftest import launch_and_wait
     try:
         sid = client.post("/sessions", json={"scenario_id": "web-foothold-01",
                                              "start_condition": "assumed-breach"},
                           headers=users["member"]).json()["session_id"]
-        from tests.conftest import launch_and_wait
         launch_and_wait(client, users["member"], sid)
         assert client.post(f"/sessions/{sid}/begin",
                            headers=users["member"]).status_code == 202
@@ -466,9 +477,12 @@ def test_assumed_breach_proof_executes_as_web_user(client, users, fake_pve,
         begin = next(e for e in evs if e["action_type"] == "match_begin")
         proof = begin["payload"].get("disclosed_foothold")
         assert proof and proof.get("established") is True, proof
-        assert proof.get("exit_code") == 0
-        assert any("runuser -u web-user" in c for _, c in chan.commands), \
-            [c for _, c in chan.commands][-5:]
+        assert proof.get("http_status") == 200
+        # the trigger used zero privilege over plain HTTP (no sudo,
+        # no runuser, no credentials anywhere in the request)
+        assert seen.get("url", "").startswith("http://10.66.0.10/diagnostic?cmd="), seen
+        for banned in ("sudo", "runuser", "PRIV", "token", "password"):
+            assert banned not in seen["url"], seen
         # the worker is SUPPLIED the foothold: agent_state seeds its
         # start phase and prompt summary (the runner token reads this;
         # members cannot — competition sealed)
@@ -485,15 +499,22 @@ def test_assumed_breach_proof_executes_as_web_user(client, users, fake_pve,
 
 
 def test_assumed_breach_refused_begin_spawns_no_worker(
-        client, users, fake_broker, enrollment_channel):
+        client, users, fake_broker, enrollment_channel, monkeypatch):
     """A refused Begin (unproven foothold) must not leave an attacker
     running: the proof runs BEFORE the worker spawns, so the 409 means no
     worker exists and the clock never started."""
-    from srplatform import verification_service
     from srplatform.api import runs as runs_svc
-    chan = ScriptedChannel(host_client=client, fail=("runuser",))
-    enrollment_channel.set_enrollment_exec(chan)
-    verification_service.set_verifier_exec(chan)
+    from srplatform import lifecycle as lifecycle_mod
+
+    def dead_flaw(url, timeout=10.0):
+        raise OSError("flaw unreachable in this test")
+
+    monkeypatch.setattr(lifecycle_mod, "_flaw_get", dead_flaw)
+    # production mode: an unprovable foothold refuses Begin (dev would
+    # proceed explicitly unproven)
+    monkeypatch.setenv("SR_ENV", "production")
+    from srplatform.settings import get_settings
+    get_settings.cache_clear()
     try:
         sid = client.post("/sessions", json={"scenario_id": "web-foothold-01",
                                              "start_condition": "assumed-breach"},
@@ -509,5 +530,4 @@ def test_assumed_breach_refused_begin_spawns_no_worker(
             from srplatform import lifecycle
             assert lifecycle.get_match(s, sid).state != "running"
     finally:
-        enrollment_channel.set_enrollment_exec(None)
-        verification_service.set_verifier_exec(None)
+        get_settings.cache_clear()

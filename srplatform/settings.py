@@ -114,6 +114,11 @@ class Settings(BaseSettings):
     range_bridge_ports: str = ""
     range_cidr: str = "10.66.0.0/24"
     range_gateway: str = "10.66.0.1"
+    # The controller's OWN range NIC address (review finding): the trusted
+    # external MySQL observer dials DB guests from here, so the address is
+    # an explicit setting — never inferred — and the DB tier grants +
+    # firewalls exactly this source (plus owned web guests + loopback).
+    controller_range_ip: str = "10.66.0.1"
     bastion_address: str = "10.66.0.2"
     # Management subnet whose NEW connections to the control plane stay allowed
     management_cidr: str = "10.0.0.0/24"

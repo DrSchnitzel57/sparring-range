@@ -107,6 +107,7 @@ done
 _tls_pair() { [ -f "$TLS/$1.key" ] && [ -f "$TLS/$1.crt" ]; }
 _tls_have() {
   _tls_pair ca && _tls_pair broker-server && _tls_pair api-client &&
+    _tls_pair api-ca && _tls_pair ingest-server &&
     { { [ ! -f "$TLS/https.key" ] && [ -z "${HTTPS_IP:-}" ]; } ||
       _tls_pair https; }
 }
@@ -249,6 +250,40 @@ open(sys.argv[2], "w").write(
 print("ingest-plane env written")
 PYEOF2
   say config "rendered $ETC/ingest-listener.env from the manifest"
+
+# 5d -- TLS file permissions (least privilege per consumer). Service-read
+# keys are root:SERVICE-GROUP 0640 (the service traverses + reads ONLY its
+# own key); CA SIGNING keys stay root:root 0600 (no service may mint
+# identities); certificates are public 0644. The TLS dir itself is
+# traversable (0755) so every service group reaches its files without
+# listing rights conveying anything sensitive.
+declare -A TLS_KEY_GROUPS=(
+  [api-client.key]=srrange
+  [ingest-server.key]=srrange
+  [broker-server.key]=srbroker
+)
+if [ "$DRY" = 1 ]; then
+  echo "DRY: set TLS ownership/permissions per TLS_KEY_GROUPS"
+else
+  run chmod 0755 "$TLS"
+  for _k in "${!TLS_KEY_GROUPS[@]}"; do
+    if [ -f "$TLS/$_k" ]; then
+      run chown root:"${TLS_KEY_GROUPS[$_k]}" "$TLS/$_k"
+      run chmod 0640 "$TLS/$_k"
+    fi
+  done
+  for _ca in ca.key api-ca.key; do
+    if [ -f "$TLS/$_ca" ]; then
+      run chown root:root "$TLS/$_ca"
+      run chmod 0600 "$TLS/$_ca"
+    fi
+  done
+  for _crt in "$TLS"/*.crt; do
+    [ -e "$_crt" ] || continue
+    run chmod 0644 "$_crt"
+  done
+  say config "TLS permissions set (service keys group-readable, CA keys root-only)"
+fi
 fi
 
 # 6 -- systemd units (idempotent copy + reload).

@@ -372,6 +372,8 @@ def test_mysql_integrity_flags_disagreeing_paths():
         ("web01:db-path", "purchases=9 via network path")]))
     out = mysql_integrity(db, "sid", DEP_ID)
     assert out["agree"] is False and out["host"] == "db01", out
+    assert out["legs"]["loopback"] == "purchases=12"
+    assert out["legs"]["network"] == "purchases=9"
 
     # loopback up + network DOWN without a count: incomparable, and the
     # pair is NOT agreement (the old code returned agree:true here)
@@ -384,3 +386,101 @@ def test_mysql_integrity_flags_disagreeing_paths():
     # single leg only: unknown, never agreement
     db = mock_db(rows([("db01", "purchases=12")]))
     assert mysql_integrity(db, "sid") is None
+
+
+def test_mysql_direct_authenticates_and_reads_without_guest_code():
+    """Controller-side authenticated transaction over canned byte streams:
+    handshake → scramble auth → COM_QUERY → first cell. No guest executes
+    anything; wrong passwords, auth-switch demands, error packets and
+    non-read queries all fail closed."""
+    import hashlib
+    import struct
+    from srplatform import mysql_direct as md
+
+    seed = b"12345678abcdefgh1234"
+    plugin = b"mysql_native_password\x00"
+    # server handshake: proto 10, version, conn id, part1, caps, ..., part2
+    hs = (b"\x0a" + b"8.0.36\x00" + struct.pack("<I", 7) + seed[:8] + b"\x00"
+          + struct.pack("<H", 0xFFFF) + b"\x21" + struct.pack("<H", 2)
+          + struct.pack("<H", 0xFFFF) + bytes([len(seed) + 1]) + b"\x00" * 10
+          + seed[8:] + b"\x00" + plugin)
+    coldef = b"\x03def\x06mojang\x09purchases\x09purchases\x08COUNT(*)\x08COUNT(*)\x0c\x21\x00\x0b\x00\x00\x00\x03\x00\x00"
+    script = []
+
+    def fake_connect(addr, timeout=None):
+        script.append(("connect", addr))
+        blobs = [
+            struct.pack("<I", len(hs))[:3] + b"\x00" + hs,          # handshake
+            b"\x07\x00\x00\x02\x00\x00\x00\x02\x00\x00\x00",          # OK
+            b"\x01\x00\x00\x01\x01",                                 # 1 column
+            struct.pack("<I", len(coldef))[:3] + b"\x02" + coldef,   # coldef
+            b"\x05\x00\x00\x03\xfe\x00\x00\x02\x00",                  # EOF
+            b"\x03\x00\x00\x04\x0212",                               # row "12"
+            b"\x05\x00\x00\x05\xfe\x00\x00\x02\x00",                  # EOF
+        ]
+        data = b"".join(blobs)
+        state = {"sent": []}
+
+        class Sock:
+            def settimeout(self, t):
+                pass
+            def sendall(self, b):
+                state["sent"].append(b)
+            def recv(self, n):
+                nonlocal data
+                if not data:
+                    raise OSError("closed")
+                out, data = data[:n], data[n:]
+                return out
+            def close(self):
+                pass
+        script.append(("sock", state))
+        return Sock()
+
+    got = md.select_one("10.66.0.11", "mojang_reader", "secretpw", "mojang",
+                        "SELECT COUNT(*) FROM purchases", connect=fake_connect)
+    assert got == "12", got
+    sent = script[1][1]["sent"]
+    auth = sent[0]
+    assert b"secretpw" not in auth, "password must be scrambled, never sent"
+    assert auth[4:8] == struct.pack("<I", md._CLIENT_CAPS)
+    assert sent[1][4:5] == b"\x03" and b"SELECT COUNT" in sent[1]
+    # non-read queries refused client-side (never touch the wire)
+    try:
+        md.select_one("h", "u", "p", "d", "DROP TABLE purchases",
+                      connect=fake_connect)
+        raise AssertionError("expected MySQLError")
+    except md.MySQLError:
+        pass
+    assert len([s for s in script if s[0] == "connect"]) == 1
+
+
+def test_mysql_direct_classifies_controller_observations(monkeypatch):
+    """The controller-side probe never logs or returns the credential;
+    auth refusal reads DOWN (the guest no longer serves what was
+    provisioned), transport failure reads DOWN, ambiguity reads unknown."""
+    from srplatform import mysql_direct as md
+    from srplatform.uptime import probe_mysql_direct
+
+    def fake_select(ip, user, password, database, query, **kw):
+        assert user == "mojang_reader" and database == "mojang"
+        assert "DROP" not in query
+        return fake_select.value
+
+    monkeypatch.setattr(md, "select_one", fake_select)
+    fake_select.value = "12"
+    st, _, detail = probe_mysql_direct("10.66.0.11", "mojang_reader", "pw")
+    assert st == "up" and detail == "purchases=12 (controller-direct)"
+    assert "pw" not in detail.replace("purchases", "")
+    fake_select.value = "9"
+    assert probe_mysql_direct("10.66.0.11", "mojang_reader", "pw")[0] == "down"
+
+    def boom(*a, **k):
+        raise md.MySQLError("auth refused: Access denied")
+    monkeypatch.setattr(md, "select_one", boom)
+    assert probe_mysql_direct("10.66.0.11", "mojang_reader", "pw")[0] == "down"
+
+    def lost(*a, **k):
+        raise md.MySQLError("mysql port unreachable: refused")
+    monkeypatch.setattr(md, "select_one", lost)
+    assert probe_mysql_direct("10.66.0.11", "mojang_reader", "pw")[0] == "down"

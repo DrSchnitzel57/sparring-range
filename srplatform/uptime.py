@@ -196,13 +196,16 @@ def mysql_integrity(db, session_id, deployment_id=None) -> dict | None:
     # registry passed by the caller when available, else fall back to the
     # loopback host name embedded in the detail line.
     counts: dict[str, str] = {}
-    compared = False
     for r in rows:
         host = r.host or ""
         if host.endswith(":db-path"):
-            # web-origin observation: the detail names the observed table;
-            # attribute it to the deployment's DB host (single-DB lab).
+            # web-origin observation: attribute it to the deployment's DB
+            # host (single-DB lab) under the network leg.
             base, leg = _integrity_db_host(db, session_id, deployment_id), "network"
+        elif host.endswith(":direct"):
+            # controller-direct observation: the DB host itself spoke —
+            # the trust anchor leg.
+            base, leg = host.split(":")[0], "direct"
         elif host.endswith(":banner") or "greeting" in (r.detail or ""):
             continue  # liveness only — no business fact to compare
         else:
@@ -213,26 +216,26 @@ def mysql_integrity(db, session_id, deployment_id=None) -> dict | None:
         if not m:
             # A business check that produced no count (e.g. wrong-count
             # DOWN) is still an observation: without a number it cannot
-            # confirm agreement — mark the pair incomparable, never agree.
+            # confirm agreement — mark the leg uncounted, never agree.
             counts[(base, leg)] = "nocount:" + (r.state or "unknown")
             continue
         counts[(base, leg)] = f"{m.group(1)}={m.group(2)}"
-    for (base, _leg) in list(counts):
-        loop = counts.get((base, "loopback"))
-        net = counts.get((base, "network"))
-        if loop is None or net is None:
+    bases = sorted({b for (b, _leg) in counts})
+    for base in bases:
+        legs = {leg: counts[(base, leg)] for (_b, leg) in counts
+                if _b == base}
+        if len(legs) < 2:
             continue  # one leg silent — unknown, not agreement
-        compared = True
-        if loop != net or loop.startswith("nocount:") or net.startswith("nocount:"):
-            return {"agree": False, "host": base,
-                    "loopback": loop, "network": net,
+        values = set(legs.values())
+        if len(values) != 1 or any(v.startswith("nocount:") for v in values):
+            return {"agree": False, "host": base, "legs": legs,
                     "note": "business facts disagree (or are uncounted) "
                             "across observation paths — possible forgery, "
                             "split-brain, or failed network path"}
-    if not compared:
-        return None  # nothing comparable (yet) — unknown, never agree
-    return {"agree": True, "host": base, "value": loop,
-            "note": "loopback and network path report the same fact"}
+        return {"agree": True, "host": base, "legs": legs,
+                "value": next(iter(values)),
+                "note": "independent observation paths report the same fact"}
+    return None  # nothing comparable (yet) — unknown, never agree
 
 
 def live_projection(db, session_id) -> dict:
@@ -378,6 +381,43 @@ def probe_mysql_banner(db_ip: str, *, port: int = 3306,
         return "up", latency, "mysql greeting verified (no guest code ran)"
     return ("down", latency,
             "port open but no MySQL greeting — wrong service or proxy")
+
+
+def probe_mysql_direct(ip: str, user: str, password: str, *,
+                         table: str = MYSQL_TABLE,
+                         expected: int = MYSQL_EXPECTED_ROWS,
+                         timeout_s: float = 5.0):
+    """Trusted EXTERNAL authenticated transaction (review finding): the
+    CONTROLLER opens MySQL directly against the DB guest's range address
+    and runs the read-only business query with the deployment's own
+    reader credential. No guest code executes anywhere on this path, so
+    a compromised web guest (or a lying guest-local client) cannot forge
+    the result — only the controller↔DB TCP stream itself could, which
+    is outside the attacker model (web-tier foothold). Auth failures mean
+    the guest no longer serves our provisioned credential (tampering or
+    regression) and read as DOWN, never as unknown."""
+    from srplatform import mysql_direct
+    t0 = time.monotonic()
+    try:
+        value = mysql_direct.select_one(
+            ip, user, password, "mojang",
+            f"SELECT COUNT(*) FROM `{table}`", timeout_s=timeout_s)
+    except mysql_direct.MySQLError as e:
+        latency = int((time.monotonic() - t0) * 1000)
+        msg = str(e)
+        low = msg.lower()
+        if "auth refused" in low or "access denied" in low:
+            return ("down", latency,
+                    "controller credential refused — guest no longer serves "
+                    "the provisioned reader")
+        if ("unreachable" in low or "refused" in low or "timeout" in low
+                or "closed" in low or "connect" in low):
+            return ("down", latency, f"controller cannot reach MySQL: {msg[:120]}")
+        return ("unknown", latency, f"controller probe: {msg[:120]}")
+    latency = int((time.monotonic() - t0) * 1000)
+    if value.strip() == str(expected):
+        return "up", latency, f"{table}={expected} (controller-direct)"
+    return "down", latency, f"{table} count wrong (controller-direct)"
 
 
 def probe_mysql(runner, ip: str, *, table: str = MYSQL_TABLE,
@@ -535,6 +575,17 @@ def start_for_session(db, sess, dep, *, get=None) -> bool:
                 targets.append((r.get("host", "db"), "mysql",
                                 functools.partial(probe_mysql, runner,
                                                   r["ip"])))
+        # Controller-direct authenticated transactions: one per DB
+        # guest carrying the deployment's persisted reader credential
+        # (never logged, never stored in samples — only the count is
+        # recorded). This is the trust anchor of the triangle.
+        for r in db_hosts:
+            pw = r.get("db_reader_password")
+            if r.get("ip") and pw:
+                targets.append((r.get("host", "db") + ":direct", "mysql",
+                                functools.partial(probe_mysql_direct,
+                                                  r["ip"], "mojang_reader",
+                                                  pw)))
         # Banner observer: controller-side TCP greeting check per DB
         # guest. Executes NO guest code, so a compromised guest cannot
         # forge it — it independently corroborates that mysqld serves

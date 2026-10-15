@@ -1272,6 +1272,18 @@ def check_install() -> None:
             capture_output=True, text=True, timeout=60).stdout
         assert "10.66.0.2" in sans and "10.60.0.11" in sans, sans[:300]
         ok("installer provisions the manifest-driven ingest plane + trust")
+        # least-privilege TLS map: every service key names its consumer
+        # group; CA signing keys must NEVER appear as group-readable.
+        inst = (REPO / "deploy/install.sh").read_text()
+        m = __import__("re").search(
+            r"declare -A TLS_KEY_GROUPS=\((.*?)\)", inst, __import__("re").S)
+        assert m, "TLS_KEY_GROUPS map missing from installer"
+        body = m.group(1)
+        assert "ingest-server.key" in body and "api-client.key" in body, body
+        assert "broker-server.key" in body, body
+        assert "ca.key" not in body and "api-ca.key" not in body, \
+            f"CA signing keys must stay root-only: {body}"
+        ok("installer scopes TLS key ownership per service (CA root-only)")
         before = {(p.name, p.read_bytes()) for p in
                   (rp / "etc/sparring-range/tls").glob("*.key")}
         assert before, "first real run must generate TLS identities"
@@ -1371,6 +1383,15 @@ def check_install() -> None:
             fail("installer refuses CA-less partial TLS state",
                  "missing ca.key with surviving certificates was accepted")
         ok("installer refuses CA-less partial TLS state")
+        # API CA partial state refuses the same way (guest trust already
+        # installed must never be silently orphaned)
+        (rp / "etc/sparring-range/tls/api-ca.key").unlink()
+        rr9 = subprocess.run(real, capture_output=True,
+                             text=True, cwd=REPO, env=renv, timeout=300)
+        if rr9.returncode == 0:
+            fail("installer refuses API-CA-less partial TLS state",
+                 "missing api-ca.key with surviving certificates was accepted")
+        ok("installer refuses API-CA-less partial TLS state")
 
         if os.environ.get("SR_INSTALL_VM_EVIDENCE") != "1":
             fail("managed-service installation (clean VM, rerun, reboot, "

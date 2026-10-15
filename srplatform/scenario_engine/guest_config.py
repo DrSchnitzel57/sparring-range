@@ -83,9 +83,14 @@ def reader_password(deployment_resources: list[dict], db_host: str) -> str:
     return secrets.token_hex(16)
 
 
-def db_provision_command(plan: dict, password: str) -> str:
+def db_provision_command(plan: dict, password: str,
+                         controller_ip: str | None = None) -> str:
     """Idempotent in-guest provisioning for the DB tier (run as root via
-    the management channel)."""
+    the management channel). When `controller_ip` is given, the trusted
+    external observer gets a SELECT-only grant + firewall pinhole from
+    EXACTLY that source — the controller authenticates directly (no guest
+    code on the observation path), so a compromised web guest cannot forge
+    business results. Nothing broader is ever opened."""
     web_ips = [ip for _, ip in plan["web_sources"]]
     # Converging idempotence: CREATE guards first-run, ALTER ALWAYS sets
     # the password (a retry after an uncertain result must converge the
@@ -99,10 +104,21 @@ def db_provision_command(plan: dict, password: str) -> str:
         + [f"ALTER USER '{READER_USER}'@'127.0.0.1' "
            f"IDENTIFIED BY '{password}'"]
         + [f"GRANT SELECT ON {MYSQL_DB}.* TO '{READER_USER}'@'{ip}'"
-           for ip in web_ips])
+           for ip in web_ips]
+        + ([f"CREATE USER IF NOT EXISTS '{READER_USER}'@'{controller_ip}' "
+            f"IDENTIFIED BY '{password}'",
+            f"ALTER USER '{READER_USER}'@'{controller_ip}' "
+            f"IDENTIFIED BY '{password}'",
+            f"GRANT SELECT ON {MYSQL_DB}.* TO '{READER_USER}'@'{controller_ip}'"]
+           if controller_ip else []))
     # ufw itself skips an existing identical rule — idempotent by design.
+    # The controller source is included ONLY when explicitly provided (the
+    # trusted external observer); the pinhole stays single-source.
+    grant_ips = list(web_ips)
+    if controller_ip:
+        grant_ips = grant_ips + [_ip(controller_ip, "controller_ip")]
     ufw_rules = " ; ".join(
-        f"ufw allow from {ip} to any port 3306 proto tcp" for ip in web_ips)
+        f"ufw allow from {ip} to any port 3306 proto tcp" for ip in grant_ips)
     # Read-back WITHOUT pretending to be the web guest: prove the new
     # password works over loopback TCP, and prove each owned-source grant
     # row exists. (Connecting from the DB host to itself as the web-host
@@ -110,6 +126,10 @@ def db_provision_command(plan: dict, password: str) -> str:
     grant_rows = " ; ".join(
         f"mysql -N -B -e \"SELECT user,host FROM mysql.user WHERE "
         f"user='{READER_USER}'\" | grep -q {ip}" for ip in web_ips)
+    if controller_ip:
+        grant_rows += (
+            f" ; mysql -N -B -e \"SELECT user,host FROM mysql.user WHERE "
+            f"user='{READER_USER}'\" | grep -q {controller_ip}")
     readback = (
         f"mysql --protocol=TCP --host=127.0.0.1 --batch --skip-column-names "
         f"--user={READER_USER} --password='{password}' "

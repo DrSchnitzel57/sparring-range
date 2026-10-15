@@ -547,7 +547,8 @@ def _provision_guest_configs(db: Session, dep: Deployment, spec: dict,
             dep.resources = resources
             flag_modified(dep, "resources")
             db.commit()
-            cmd = guest_config.db_provision_command(step, pw)
+            cmd = guest_config.db_provision_command(
+                step, pw, controller_ip=s.controller_range_ip)
         else:
             pw = (by_host.get(step["db_ref"]) or {}).get("db_reader_password")
             if not pw:

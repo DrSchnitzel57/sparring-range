@@ -84,6 +84,15 @@ openssl x509 -req -in api-client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
 # explicit trust anchor (SR_TELEMETRY_CA_FILE).
 if [ -z "${INGEST_SANS:-}" ]; then
   echo "bootstrap_tls: INGEST_SANS empty — skipping ingest-server cert (set it from manifest trust.san_ips)" >&2
+elif [ "$FRESH" != 1 ] && [ ! -f api-ca.key ] && [ -f ingest-server.crt ]; then
+  # Same partial-state rule as the broker CA: a missing API CA key
+  # beside surviving API-signed certificates would silently orphan guest
+  # trust already installed — refuse unless rotation is explicit.
+  echo "bootstrap_tls: api-ca.key missing but ingest-server.crt exists —" >&2
+  echo "refusing partial regeneration (would orphan installed guest trust)." >&2
+  echo "Recover api-ca.key from backup, or delete the stale certificate for" >&2
+  echo "an explicit full rotation." >&2
+  exit 3
 elif [ "$FRESH" = 1 ] || [ ! -f api-ca.key ] || [ ! -f api-ca.crt ] || [ ! -f ingest-server.key ] || [ ! -f ingest-server.crt ]; then
   if [ "$FRESH" = 1 ]; then
     rm -f api-ca.key api-ca.crt ingest-server.key ingest-server.crt ingest-server.csr
@@ -110,10 +119,19 @@ elif [ "$FRESH" = 1 ] || [ ! -f api-ca.key ] || [ ! -f api-ca.crt ] || [ ! -f in
 fi
 
 # web UI: self-signed with the LAN IP in the SAN (teammates import/verify it)
-if { [ -n "$HTTPS_IP" ] && [ ! -f https.key ]; } || { [ -n "$HTTPS_IP" ] && [ "$FRESH" = 1 ]; }; then
-  openssl req -x509 -newkey rsa:2048 -sha256 -days "$DAYS" -nodes \
-    -keyout https.key -out https.crt -subj "/CN=$HTTPS_IP" \
-    -addext "subjectAltName=IP:$HTTPS_IP"
+if [ -n "$HTTPS_IP" ] && { [ ! -f https.key ] || [ ! -f https.crt ] || [ "$FRESH" = 1 ]; }; then
+  if [ -f https.key ] && [ ! -f https.crt ]; then
+    # surviving key, missing certificate: re-issue the cert onto the SAME
+    # key (clients pinning the key are unaffected; rotation is untouched)
+    openssl req -x509 -key https.key -sha256 -days "$DAYS" -nodes \
+      -out https.crt -subj "/CN=$HTTPS_IP" \
+      -addext "subjectAltName=IP:$HTTPS_IP"
+  else
+    [ "$FRESH" = 1 ] && rm -f https.key https.crt
+    openssl req -x509 -newkey rsa:2048 -sha256 -days "$DAYS" -nodes \
+      -keyout https.key -out https.crt -subj "/CN=$HTTPS_IP" \
+      -addext "subjectAltName=IP:$HTTPS_IP"
+  fi
   echo "web UI certificate SHA256 fingerprint (verify out-of-band):"
   openssl x509 -in https.crt -noout -fingerprint -sha256
 else

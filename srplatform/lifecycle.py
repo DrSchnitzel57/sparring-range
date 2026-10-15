@@ -143,6 +143,14 @@ def mark_ready(db, session_id) -> None:
     db.flush()
 
 
+#: HTTP seam for the foothold proof (tests inject a fake; production
+#: uses httpx straight at the guest — no credentials, mirroring attacker
+#: access exactly).
+def _flaw_get(url: str, timeout: float = 10.0):
+    import httpx
+    return httpx.get(url, timeout=timeout)
+
+
 def prove_assumed_breach(db, session_id) -> dict | None:
     """Establish the disclosed assumed-breach foothold (see start_clock).
     Returns the proof dict for network-entry (None — nothing to prove) or
@@ -166,36 +174,47 @@ def prove_assumed_breach(db, session_id) -> dict | None:
                              "(MOJANG_DIAG_ENABLED)",
                    "scope": "limited guest foothold; recon phase "
                             "skipped by snapshot"}
-    from srplatform.scenario_engine import orchestrator as _orch
+    # The proof travels the ATTACKER-IDENTICAL path: an unauthenticated
+    # HTTP request to the documented diagnostic flaw, which executes AS
+    # web-user and returns the command output. No privilege is used to
+    # trigger it — management impersonation (runuser/sudo) could prove
+    # only that the CONTROLLER is powerful, never that the ATTACKER has
+    # a usable foothold. The response must name the web-user identity.
+    import urllib.parse as _urlparse
     from srplatform.settings import get_settings as _gs
-    chan = _orch.management_runner()
-    if chan is None:
+    from srplatform import verification_service as _vs2
+    hmap = _vs2.host_map_for(db, session_id)
+    addr = hmap.get(web_host) if web_host else None
+    flaw_url = (("http://" + addr + "/diagnostic?cmd="
+                 + _urlparse.quote("id web-user", safe=""))
+                if addr else None)
+    if flaw_url is None:
         proof["established"] = False
-        proof["reason"] = ("no management channel — foothold disclosed "
-                           "but unproven")
+        proof["reason"] = ("owned inventory has no address for "
+                           f"{web_host} — foothold disclosed but unproven")
         if _gs().sr_env == "production":
             raise MatchBlocked(
                 "assumed_breach_unproven",
-                "production assumed-breach requires a management "
-                "channel to establish the disclosed foothold")
+                "production assumed-breach has no owned address for "
+                "the disclosed foothold host")
         return proof
-    hmap = verification_service.host_map_for(db, session_id)
-    addr = hmap.get(web_host) if web_host else None
-    if addr is None:
-        proof["established"] = False
-        proof["reason"] = ("owned inventory has no address for "
-                           f"{web_host}")
-        return proof
-    code, out = chan(addr, "runuser -u web-user -- id -u web-user")
-    proof["established"] = (code == 0)
-    proof["exit_code"] = code
-    proof["output"] = str(out or "")[:200]
-    if code != 0:
-        raise MatchBlocked(
-            "assumed_breach_unproven",
-            f"foothold proof command failed (exit {code}): "
-            f"{str(out or '')[:200]}")
+    try:
+        resp = _flaw_get(flaw_url, timeout=10.0)
+        body = getattr(resp, "text", "") or ""
+        ok = resp.status_code == 200 and "web-user" in body
+    except Exception as e:  # noqa: BLE001 — unreachable flaw
+        ok, body, resp = False, f"flaw unreachable: {e}"[:200], None
+    proof["established"] = bool(ok)
+    proof["http_status"] = getattr(resp, "status_code", None)
+    proof["output"] = body[:200]
+    if not ok:
+        reason = ("flaw did not prove web-user execution "
+                  f"({proof.get('http_status')}: {proof['output'][:120]})")
+        proof["reason"] = reason
+        if _gs().sr_env == "production":
+            raise MatchBlocked("assumed_breach_unproven", reason)
     return proof
+
 
 
 def start_clock(db, session_id, *, actor: str = "system") -> MatchModel | None:
@@ -209,6 +228,11 @@ def start_clock(db, session_id, *, actor: str = "system") -> MatchModel | None:
         return m
     if m.state != "ready":
         raise MatchBlocked("not_ready", f"match is {m.state}")
+    # Validate BEFORE changing state: the foothold proof runs while the
+    # match is still `ready`, so a refusal mutates NOTHING — no running
+    # clock is left behind for a later commit (e.g. a cessation path) to
+    # persist, and retry never sees "already begun" with no worker.
+    _breach_proof = prove_assumed_breach(db, session_id)
     m.state = "running"
     m.started_at = _now()
     m.deadline_at = m.started_at + timedelta(minutes=m.duration_minutes)
@@ -217,9 +241,11 @@ def start_clock(db, session_id, *, actor: str = "system") -> MatchModel | None:
                "deadline_at": m.deadline_at.isoformat(),
                "duration_minutes": m.duration_minutes,
                "pace_seconds": m.pace_seconds}
-    proof = prove_assumed_breach(db, session_id)
-    if proof is not None:
-        payload["disclosed_foothold"] = proof
+    # Reuse the pre-mutation proof (same call, same outcome — the
+    # proof command is not executed twice).
+    if _breach_proof is not None:
+        payload["disclosed_foothold"] = _breach_proof
+        proof = _breach_proof
         # SUPPLY the capability to the attacker: the red loop restores its
         # phase and prompt summary from agent_state at startup, so seed
         # both with the disclosed foothold. The worker demonstrably starts
