@@ -47,7 +47,7 @@ scoring:
     - { verifier: no_rogue_admin, host: web01, points: 10, domain: identify }
     - { verifier: firewall_enabled, host: web01, points: 5, domain: protect }
     - { verifier: rogue_account, host: db01, points: 10, domain: identify,
-        known_users: [root, daemon, bin, sys, sync, games, man, lp, mail, news, uucp, proxy, www-data, backup, list, irc, nobody, systemd-network, systemd-resolve, systemd-timesync, systemd-oom, messagebus, syslog, _apt, uuidd, tcpdump, sshd, tss, defender, web-user, mysql, srshipper, dhcpcd, fwupd-refresh, landscape, polkitd, pollinate] }
+        known_users: [root, daemon, bin, sys, sync, games, man, lp, mail, news, uucp, proxy, www-data, backup, list, irc, nobody, systemd-network, systemd-resolve, systemd-timesync, messagebus, syslog, _apt, uuidd, tcpdump, sshd, tss, defender, web-user, mysql, srshipper, dhcpcd, fwupd-refresh, landscape, polkitd, pollinate] }
     # GOLDEN BASELINE (F10): the hash MUST be generated during golden-image
     # capture (`sha256sum /var/lib/mysql/ibdata1` on the clean template) and is
     # recorded there; normal DB writes make this check fail by design — score
