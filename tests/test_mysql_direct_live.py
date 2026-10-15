@@ -33,10 +33,6 @@ def _docker(*args, timeout=120):
 @pytest.fixture()
 def mysql():
     name = f"sr-mysql-live-{uuid.uuid4().hex[:8]}"
-    vols_before = set(
-        subprocess.run(["docker", "volume", "ls", "-q"],
-                       capture_output=True, text=True,
-                       timeout=60).stdout.split())
     _docker("run", "-d", "--rm", "--name", name,
             "-p", "127.0.0.1::3306",
             "-e", "MYSQL_RANDOM_ROOT_PASSWORD=yes", IMAGE)
@@ -65,11 +61,22 @@ def mysql():
         yield {"name": name, "host": "127.0.0.1", "port": port,
                "rootpw": m.group(1)}
     finally:
-        # Cleanup is verified, not assumed: an unremoved container OR its
-        # anonymous data volume fails the test (a passing test must never
-        # leak its database — `docker rm -f` alone leaves the volume).
-        # vols_before was captured at setup, so concurrent unrelated
-        # docker activity cannot false-positive this check.
+        # Cleanup is verified, not assumed — and scoped to THIS fixture's
+        # own mounts (a host-wide volume diff false-positives on unrelated
+        # concurrent docker work). Record the container's volumes, remove
+        # with -v, then prove each recorded volume is actually gone.
+        import json as _json
+        owned = []
+        insp = subprocess.run(
+            ["docker", "inspect", name],
+            capture_output=True, text=True, timeout=60)
+        if insp.returncode == 0:
+            try:
+                for m in _json.loads(insp.stdout)[0].get("Mounts", []):
+                    if m.get("Type") == "volume" and m.get("Name"):
+                        owned.append(m["Name"])
+            except (ValueError, KeyError, IndexError, TypeError):
+                pass
         rm = subprocess.run(["docker", "rm", "-f", "-v", name],
                             capture_output=True, text=True, timeout=60)
         assert rm.returncode == 0, \
@@ -78,12 +85,12 @@ def mysql():
             ["docker", "inspect", name],
             capture_output=True, text=True, timeout=60)
         assert gone.returncode != 0, f"container still present: {name}"
-        vols_after = set(
-            subprocess.run(["docker", "volume", "ls", "-q"],
-                           capture_output=True, text=True,
-                           timeout=60).stdout.split())
-        leaked = vols_after - vols_before
-        assert not leaked, f"anonymous volumes leaked: {leaked}"
+        for vol in owned:
+            still = subprocess.run(
+                ["docker", "volume", "inspect", vol],
+                capture_output=True, text=True, timeout=60)
+            assert still.returncode != 0, \
+                f"fixture volume leaked: {vol}"
 
 
 def _dexec(mysql, sql):
