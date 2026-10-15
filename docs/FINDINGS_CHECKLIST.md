@@ -1086,7 +1086,15 @@ Delivered:
 
 ### Phases 3–8 — guests, configuration, lifecycle, match contract, tooling
 
-#### Review rounds 3–4 evidence (2026-10-15, branch `plan-13-implementation`)
+#### Review rounds 3–4 evidence (2026-10-15, final — HEAD `496ec7d` + round 10)
+- Images rebuild (mgmt→root key policy + USER markers + native-password
+  seed): 19 passed, 0 skipped — recorded 36-user sets identical across
+  roles, conformance test green against built fixtures.
+- Capture: 11 passed, 0 skipped (incl. live docker-MySQL protocol test
+  with fixture-scoped volume tracking, no leaks).
+- Fast 334/0; db layer 168/0; matrix, frontend, compose, browser,
+  containment, authority, pve-contract all PASS; install sandbox proofs
+  PASS (VM job pending by design). (2026-10-15, branch `plan-13-implementation`)
 - Fast suite 330/0; db layer 167/0 (incl. claim-takeover supersede,
   cross-session interrupt stickiness, atomic expiry, race-decide,
   competition matrix, breach proof + no-worker-on-refusal, pin-error
