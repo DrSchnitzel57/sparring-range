@@ -1142,15 +1142,21 @@ def check_install() -> None:
                  f"{(r2.stdout + r2.stderr)[-1500:]}")
         ok("installer dry-run + idempotent rerun (example manifest)")
 
-        # existing key material must be preserved, never regenerated
-        (prefix / "etc/sparring-range/tls").mkdir(parents=True)
-        key = prefix / "etc/sparring-range/tls/bastion_ed25519"
+        # existing generation key material must be preserved, never
+        # regenerated or shadowed: the canonical bastion key lives in
+        # etc/sparring-range/ssh (owned by bootstrap_tls.sh); the installer
+        # enforces traversal only and must leave the bytes untouched.
+        (prefix / "etc/sparring-range/ssh").mkdir(parents=True)
+        key = prefix / "etc/sparring-range/ssh/bastion_ed25519"
         key.write_text("EXISTING-KEY\n")
         r3 = subprocess.run(cmd, capture_output=True, text=True,
                             cwd=REPO, env=env, timeout=120)
-        if "keeping existing bastion_ed25519" not in r3.stdout \
+        if "etc/sparring-range/ssh" not in r3.stdout \
                 or not key.read_text().startswith("EXISTING"):
             fail("installer preserves existing private keys",
+                 r3.stdout[-800:])
+        if "tls/bastion_ed25519" in r3.stdout:
+            fail("installer must not shadow generation keys under tls/",
                  r3.stdout[-800:])
         ok("installer preserves existing private keys (dry-run)")
 

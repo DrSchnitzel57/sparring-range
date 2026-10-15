@@ -83,21 +83,20 @@ run install -d -m 0750 -o "$SR_USER" -g "$SR_GROUP" "$STATE" "$LOGDIR"
 run install -d -m 0755 "$ETC" "$TLS"
 
 # 3 -- key material: generate ONLY what is missing (never regenerate).
-for k in bastion_ed25519 bastion_client_ed25519; do
-  # --rotate-tls rotates EVERYTHING (explicit act covers all identities);
-  # normal runs never touch surviving keys.
-  if [ "$ROTATE_TLS" = 1 ]; then
-    run rm -f "$TLS/$k" "$TLS/$k.pub"
-  fi
-  if [ -f "$TLS/$k" ]; then
-    say keys "keeping existing $k (rotation is an explicit operator act)"
-  else
-    run ssh-keygen -q -t ed25519 -N '' -f "$TLS/$k" \
-        -C "sparring-range/$k@$(hostname)"
-    run chown root:"$SR_GROUP" "$TLS/$k" "$TLS/$k.pub"
-    run chmod 0640 "$TLS/$k"; run chmod 0644 "$TLS/$k.pub"
-  fi
-done
+# The bastion generation keypair lives ONLY in $ETC/ssh and is owned by
+# deploy/bootstrap_tls.sh (generate-if-missing, preserve otherwise; step 4
+# below). A former revision generated same-named shadow copies under $TLS
+# that nothing consumed — production incident 2026-10-15: the service
+# validated the canonical ssh/ key while stray tls/ copies confused
+# rotation. Never generate key material here; only enforce traversal.
+# The ssh dir holds PRIVATE keys, so it is 0750 root:service-group (group
+# traversal, no listing for others); file contents stay 0640 per-file.
+# A 0700 ssh dir silently denies entitled services (same incident).
+if [ "$DRY" != 1 ]; then
+  run install -d -m 0750 -o root -g "$SR_GROUP" "$ETC/ssh"
+else
+  echo "DRY: ensure $ETC/ssh traversable (0750 root:$SR_GROUP)"
+fi
 
 # 4 -- TLS material. Existing identities are NEVER regenerated: rotation
 # is an explicit operator act (--rotate-tls), never a reinstall side

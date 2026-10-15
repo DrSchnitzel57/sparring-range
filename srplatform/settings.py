@@ -333,7 +333,7 @@ def validate_production(s: Settings, role: str = "controller") -> None:
             if not val:
                 problems.append(f"{name} missing (mutual TLS is the broker's "
                                 "authentication)")
-        if not s.proxmox_token_id or s.proxmox_token_secret in ("", "CHANGE_ME"):
+        if not s.proxmox_token_id or s.proxmox_token_secret in ("", "CHANGE_ME", "CHANGE"):
             problems.append("Proxmox API token missing (broker is the only "
                             "PVE authority)")
         if s.proxmox_insecure_lab_override:
@@ -347,7 +347,7 @@ def validate_production(s: Settings, role: str = "controller") -> None:
     if role != "controller":
         raise RuntimeError(f"unknown SR_PROCESS_ROLE {role!r}")
     # Controller (API): PVE credentials are BROKER-ONLY (milestone 02).
-    if s.proxmox_token_id or s.proxmox_token_secret not in ("", "CHANGE_ME"):
+    if s.proxmox_token_id or s.proxmox_token_secret not in ("", "CHANGE_ME", "CHANGE"):
         problems.append("Proxmox credentials on the controller are forbidden — "
                         "the broker holds the only PVE token")
     if s.proxmox_insecure_lab_override:
