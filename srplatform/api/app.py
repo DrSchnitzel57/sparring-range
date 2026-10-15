@@ -1614,10 +1614,13 @@ def safety_baseline_check(body: BaselineCheckIn, p: Principal = Depends(operator
 
     Audit R04: an operator attestation may record a FAILED check honestly, but
     can never override a failed live backend check to `ok=True` — that turned
-    the evidence trail into a rubber stamp."""
+    the evidence trail into a rubber stamp. A live verdict of None (static
+    datapath: no backend check exists) is NOT a failure — the operator's
+    explicit attestation is the evidence there, and the datapath proof
+    carries the live observations."""
     sup = get_supervisor()
     live = sup.datapath.baseline_status()
-    if body.ok and not live["ok"]:
+    if body.ok and live["ok"] is False:
         raise HTTPException(409, "cannot record a passed baseline check while the live "
                                  "verification FAILS — fix the datapath and re-check")
     ok = live["ok"] if body.ok is None else bool(body.ok)

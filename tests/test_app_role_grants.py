@@ -142,3 +142,38 @@ def test_bastion_api_calls_prepend_route_prefix(monkeypatch):
     out, seen = _run_resolve(monkeypatch, prefix="/api")
     assert out and out["username"] == "ccdc-demo"
     assert seen["url"].endswith("/api/tokens/tok-x"), seen["url"]
+
+
+def test_baseline_explicit_ok_allowed_when_live_has_no_verdict(monkeypatch):
+    import srplatform.api.app as appmod
+    from srplatform.api.app import BaselineCheckIn
+
+    recorded = {}
+
+    class FakeDatapath:
+        def __init__(self, verdict):
+            self.verdict = verdict
+
+        def baseline_status(self):
+            return {"ok": self.verdict, "mechanism": "static"}
+
+    class FakeSup:
+        def __init__(self, verdict):
+            self.datapath = FakeDatapath(verdict)
+
+        def record(self, kind, ok, detail):
+            recorded["kind"] = kind
+            recorded["ok"] = ok
+
+    class FakePrincipal:
+        username = "op"
+
+    import pytest
+    # static datapath (verdict None): explicit operator ok is the evidence
+    monkeypatch.setattr(appmod, "get_supervisor", lambda: FakeSup(None))
+    out = appmod.safety_baseline_check(BaselineCheckIn(ok=True), FakePrincipal())
+    assert out["ok"] is True and recorded == {"kind": "baseline_check", "ok": True}
+    # a FAILED live verdict still cannot be overridden (audit R04)
+    monkeypatch.setattr(appmod, "get_supervisor", lambda: FakeSup(False))
+    with pytest.raises(Exception, match="cannot record a passed baseline"):
+        appmod.safety_baseline_check(BaselineCheckIn(ok=True), FakePrincipal())
