@@ -1166,6 +1166,108 @@ def check_install() -> None:
                  f"exit {r4.returncode}")
         ok("invalid manifest refused before any effect")
 
+        # REAL (non-dry) runs with stubbed privileged commands: proves the
+        # TLS-preservation and manifest-rendering logic actually executes
+        # (dry-run only echoes). Stubs fake id/useradd/install/chown/chmod/
+        # systemctl; openssl + ssh-keygen run for real.
+        stub = tmp / "stubbin"
+        stub.mkdir()
+        (stub / "calls.log").write_text("")
+        for name, body in {
+            "id": 'echo "id $*" >> "$STUB_CALLS"; exit 1',
+            "useradd": 'echo "useradd $*" >> "$STUB_CALLS"; exit 0',
+            "chown": 'echo "chown $*" >> "$STUB_CALLS"; exit 0',
+            "chmod": 'echo "chmod $*" >> "$STUB_CALLS"; exit 0',
+            "systemctl": 'echo "systemctl $*" >> "$STUB_CALLS"; exit 0',
+        }.items():
+            (stub / name).write_text("#!/bin/bash\n" + body + "\n")
+            (stub / name).chmod(0o755)
+        (stub / "install").write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, shutil, sys\n"
+            "open(os.environ['STUB_CALLS'], 'a').write('install ' + ' '.join(sys.argv[1:]) + '\\n')\n"
+            "args = [a for a in sys.argv[1:] if not a.startswith('-') or len(a) > 3 or a[1:].isdigit()]\n"
+            "# minimal coreutils-compatible subset: install [-d] [-m MODE] [-o O] [-g G] SRC DST\n"
+            "args = [a for a in sys.argv[1:]]\n"
+            "dodir = '-d' in args\n"
+            "paths = []\n"
+            "skip = False\n"
+            "for i, a in enumerate(args):\n"
+            "    if skip:\n"
+            "        skip = False\n"
+            "        continue\n"
+            "    if a in ('-m', '-o', '-g'):\n"
+            "        skip = True\n"
+            "        continue\n"
+            "    if a.startswith('-'):\n"
+            "        continue\n"
+            "    paths.append(a)\n"
+            "if dodir:\n"
+            "    [os.makedirs(p, exist_ok=True) for p in paths]\n"
+            "else:\n"
+            "    dst = paths[-1]\n"
+            "    if dst.endswith('/') or os.path.isdir(dst):\n"
+            "        os.makedirs(dst, exist_ok=True)\n"
+            "        dst = os.path.join(dst, os.path.basename(paths[-2]))\n"
+            "    else:\n"
+            "        os.makedirs(os.path.dirname(dst), exist_ok=True)\n"
+            "    shutil.copyfile(paths[-2], dst)\n")
+        (stub / "install").chmod(0o755)
+        renv = {**env, "PATH": f"{stub}:{os.environ['PATH']}",
+                "STUB_CALLS": str(stub / "calls.log")}
+        rp = tmp / "real"
+        real = ["bash", str(REPO / "deploy/install.sh"), "--manifest",
+                str(manifest), "--prefix", str(rp)]
+        rr1 = subprocess.run(real, capture_output=True, text=True,
+                             cwd=REPO, env=renv, timeout=300)
+        if rr1.returncode != 0:
+            fail("installer real run (stubbed privileges)",
+                 f"exit {rr1.returncode}:\n{(rr1.stdout + rr1.stderr)[-1500:]}")
+        pol = rp / "etc/sparring-range/broker-policy.json"
+        try:
+            sys.path.insert(0, str(REPO))
+            from infra.broker.policy import BrokerPolicy
+            loaded = BrokerPolicy.from_dict(
+                json.loads(pol.read_text()), source="install-gate")
+            assert loaded.vmid_min == 9100 and loaded.vmid_max == 9199, \
+                (loaded.vmid_min, loaded.vmid_max)
+            assert set(loaded.templates) >= {9005, 9011}, loaded.templates
+        except Exception as e:  # noqa: BLE001
+            fail("installer renders broker policy from the manifest",
+                 f"{e}\n{(rr1.stdout + rr1.stderr)[-800:]}")
+        ok("installer real run renders manifest-derived broker policy")
+        before = {(p.name, p.read_bytes()) for p in
+                  (rp / "etc/sparring-range/tls").glob("*.key")}
+        assert before, "first real run must generate TLS identities"
+        (stub / "calls.log").write_text("")
+        rr2 = subprocess.run(real, capture_output=True, text=True,
+                             cwd=REPO, env=renv, timeout=300)
+        if rr2.returncode != 0:
+            fail("installer real rerun",
+                 f"exit {rr2.returncode}:\n{(rr2.stdout + rr2.stderr)[-1500:]}")
+        calls = (stub / "calls.log").read_text()
+        after = {(p.name, p.read_bytes()) for p in
+                 (rp / "etc/sparring-range/tls").glob("*.key")}
+        if after != before:
+            fail("installer rerun preserves TLS identities",
+                 "private key bytes changed without --rotate-tls")
+        if (rp / "etc/sparring-range/broker-policy.json").read_bytes() != \
+                pol.read_bytes():
+            fail("installer re-render is deterministic",
+                 "broker policy drifted between identical runs")
+        ok("installer rerun preserves TLS identities + deterministic render")
+        rr3 = subprocess.run(real + ["--rotate-tls"], capture_output=True,
+                             text=True, cwd=REPO, env=renv, timeout=300)
+        if rr3.returncode != 0:
+            fail("installer explicit rotation",
+                 f"exit {rr3.returncode}:\n{(rr3.stdout + rr3.stderr)[-800:]}")
+        rotated = {(p.name, p.read_bytes()) for p in
+                   (rp / "etc/sparring-range/tls").glob("*.key")}
+        if rotated == before:
+            fail("installer explicit rotation",
+                 "--rotate-tls left all identities unchanged")
+        ok("installer explicit --rotate-tls rotates identities")
+
         if os.environ.get("SR_INSTALL_VM_EVIDENCE") != "1":
             fail("managed-service installation (clean VM, rerun, reboot, "
                  "upgrade, recovery)",

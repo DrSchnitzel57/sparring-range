@@ -69,7 +69,13 @@ def test_private_key_and_placeholder_refused_deduplicated():
     script = bake_script("attacker", dup)
     assert script.count("ssh-ed25519 AAAASAMEKEY") >= 2  # per placed user
     assert "awk '!seen[$0]++'" in script                 # dedupe guard present
-    assert set(out) == {"attacker", "mgmt"}
+    assert set(out) == {"attacker", "root"}
+    # the management channel dials root: the mgmt principal MUST resolve to
+    # the admin account on every role, or provisioning/verification cannot
+    # authenticate (fail-closed mapping, not an unprivileged account).
+    for role in ("attacker", "mojang-web-local", "mojang-web-db"):
+        assert resolve_role_keys(role, {"mgmt": _keys()["mgmt"]}) == {
+            "root": _keys()["mgmt"] + "\n"}
 
 
 def test_bake_script_atomic_and_role_scoped():

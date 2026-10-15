@@ -9,7 +9,11 @@ silent duplicate of the daily-use keys.
 Principal -> where it may authenticate:
   runner     the platform red-team runner: attacker guest ONLY, `attacker`
   bastion    the member bastion dial: defender guests ONLY, `defender`
-  mgmt       approved provisioning/verifier accounts (management channel)
+  mgmt       provisioning/verifier administration: `root` on every role
+             (the management channel runs privileged commands — enrollment,
+            DB grants, service control, audit reads; scoping this principal
+             to an unprivileged account would silently break provisioning,
+             so the policy FAILS CLOSED by requiring the admin mapping)
   emergency  operator break-glass: separate key, only when explicitly baked
 
 The builder passes a key manifest {principal: public_key_line(s)}; this
@@ -25,8 +29,8 @@ import re
 PLACEMENT: dict[str, dict[str, str]] = {
     "runner": {"attacker": "attacker"},
     "bastion": {"mojang-web-local": "defender", "mojang-web-db": "defender"},
-    "mgmt": {"attacker": "mgmt", "mojang-web-local": "mgmt",
-             "mojang-web-db": "mgmt"},
+    "mgmt": {"attacker": "root", "mojang-web-local": "root",
+             "mojang-web-db": "root"},
     "emergency": {"attacker": "emergency", "mojang-web-local": "emergency",
                   "mojang-web-db": "emergency"},
 }

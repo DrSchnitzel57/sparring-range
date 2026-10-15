@@ -25,12 +25,13 @@
 #                 is a documented, deliberate choice, not a failure)
 set -euo pipefail
 
-MANIFEST="" PREFIX="/" DRY=0 BACKUP=1
+MANIFEST="" PREFIX="/" DRY=0 BACKUP=1 ROTATE_TLS=0
 while [ $# -gt 0 ]; do case "$1" in
   --manifest) MANIFEST="$2"; shift 2;;
   --prefix) PREFIX="$2"; shift 2;;
   --dry-run) DRY=1; shift;;
   --no-backup) BACKUP=0; shift;;
+  --rotate-tls) ROTATE_TLS=1; shift;;  # explicit identity rotation ONLY
   *) echo "install: unknown argument $1" >&2; exit 2;;
 esac; done
 [ -n "$MANIFEST" ] || { echo "install: --manifest required" >&2; exit 2; }
@@ -62,10 +63,11 @@ TLS="$ETC/tls"
 LOGDIR="$PREFIX/var/log/sparring-range"
 
 # 2 -- identity + state (idempotent).
-run id -u "$SR_USER"
 if [ "$DRY" != 1 ]; then
   id -u "$SR_USER" >/dev/null 2>&1 || useradd --system --home-dir "$STATE" \
       --shell /usr/sbin/nologin "$SR_USER"
+else
+  echo "DRY: ensure user $SR_USER exists"
 fi
 run install -d -m 0750 -o "$SR_USER" -g "$SR_GROUP" "$STATE" "$LOGDIR"
 run install -d -m 0750 "$ETC" "$TLS"
@@ -82,9 +84,19 @@ for k in bastion_ed25519 bastion_client_ed25519; do
   fi
 done
 
-# 4 -- TLS material (bootstrap_tls.sh is itself idempotent).
-if [ "$DRY" = 1 ]; then echo "DRY: deploy/bootstrap_tls.sh $TLS"; else
-  SR_TLS_DIR="$TLS" "$REPO/deploy/bootstrap_tls.sh" >/dev/null || {
+# 4 -- TLS material. Existing identities are NEVER regenerated: rotation
+# is an explicit operator act (--rotate-tls), never a reinstall side
+# effect. bootstrap_tls.sh itself always regenerates, so it runs only when
+# no identity exists yet (or rotation was explicitly requested).
+_tls_have() { [ -f "$TLS/broker-server.key" ] && [ -f "$TLS/ca.key" ]; }
+if [ "$DRY" = 1 ]; then
+  echo "DRY: deploy/bootstrap_tls.sh $TLS (only if no identity exists)"
+elif _tls_have && [ "$ROTATE_TLS" != 1 ]; then
+  say tls "keeping existing TLS identities (rotation needs --rotate-tls)"
+else
+  # SR_SSH_DIR follows the prefix too: bastion keys must never land in
+  # /etc when installing under a sandbox prefix.
+  SR_TLS_DIR="$TLS" SR_SSH_DIR="$ETC/ssh" "$REPO/deploy/bootstrap_tls.sh" >/dev/null || {
     say tls "bootstrap needs the operator CA inputs — see deploy/README.md §3"; }
 fi
 
@@ -103,12 +115,57 @@ for role in control-plane broker; do
   fi
 done
 
+# 5b -- DERIVED artifacts (rendered from the manifest, never hand-copied):
+# the broker policy is fully determined by the manifest's pve/network/
+# storage/templates/budgets sections and validated by the broker's own
+# loader before writing. Re-rendered on every run (deterministic output —
+# no drift, no placeholders).
+if [ "$DRY" = 1 ]; then
+  echo "DRY: render $ETC/broker-policy.json from the manifest"
+else
+"$PY" - "$MANIFEST" "$ETC/broker-policy.json" <<'PYEOF'
+import importlib.util
+import json
+import sys
+sys.path.insert(0, ".")
+spec = importlib.util.spec_from_file_location(
+    "gen_broker_policy", "deploy/gen_broker_policy.py")
+gen_mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gen_mod)
+m = json.load(open(sys.argv[1]))
+out = sys.argv[2]
+tids = ",".join(str(m["templates"][r]["vmid"]) for r in
+                ("attacker", "mojang-web-local", "mojang-web-db")
+                if r in m["templates"])
+lo, hi = m["pve"]["clone_vmid_range"]
+rc = gen_mod.main(["--node", m["pve"]["node"], "--bridge", m["network"]["bridge"],
+          "--vlan", str(m["network"]["vlan"]),
+          "--cidr", m["network"]["range_cidr"],
+          "--gateway", m["network"]["gateway"],
+          "--templates", tids, "--vmid-range", f"{lo}-{hi}",
+          "--storage", m["storage"]["name"],
+          "--clone-mode", m["storage"]["clone_mode"],
+          "--max-vms", str(m["budgets"]["max_vms"]),
+          "--cores-per-vm", str(m["budgets"]["guest_vcpus"]),
+          "--memory-mb-per-vm", str(m["budgets"]["guest_ram_mb"]),
+          "--disk-gb-per-vm", str(m["budgets"]["guest_disk_gb"]),
+          "--out", out])
+sys.exit(rc)
+PYEOF
+  say config "rendered $ETC/broker-policy.json from the manifest"
+fi
+
 # 6 -- systemd units (idempotent copy + reload).
 for u in "$REPO"/deploy/systemd/*.service "$REPO"/deploy/systemd/*.timer; do
   [ -e "$u" ] || continue
   run install -m 0644 "$u" "$PREFIX/etc/systemd/system/"
 done
-run -n true && [ "$DRY" = 1 ] || systemctl daemon-reload
+if [ "$DRY" = 1 ]; then
+  echo "DRY: systemctl daemon-reload"
+else
+  systemctl daemon-reload 2>/dev/null || \
+    say verify "daemon-reload skipped (no systemd here)"
+fi
 
 # 7 -- migrations are EXPLICIT (offline admin), never implicit in install:
 say migrate "run migrations deliberately:  SR_PG_ADMIN_URL=... $PY -m srplatform.db.migrate"
@@ -118,7 +175,9 @@ if [ "$DRY" != 1 ]; then
   ( cd "$REPO" && "$PY" -c 'import rangectl.cli' ) \
     || { say verify "entrypoint import failed — services NOT enabled"; exit 1; }
   say verify "ok — enabling services"
-  systemctl enable sparring-range-api.service sparring-range-broker.service 2>/dev/null || \
+  # unit names MUST match deploy/systemd (sr-api on the control plane;
+  # sr-brokerd is enabled by the broker VM's own install, never here).
+  systemctl enable sr-api.service 2>/dev/null || \
     say verify "enable skipped (units not installed under $PREFIX — expected with --prefix)"
 else
   echo "DRY: verify + enable"
