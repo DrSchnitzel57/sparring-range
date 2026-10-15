@@ -1224,3 +1224,33 @@ real admin terminal casts or mutable generated files as proof in Git.
 
 Only close a blocker after independently executing its agreed milestone criteria.
 No implementation milestone is closed by this documentation pass.
+
+## First production install (2026-10-15, operator-executed, agent-guided)
+
+Host `pve` (PVE 9.2.21), bridge `srrange` (vid 66 only), storage `data`,
+service VMs 201/202/203 (Ubuntu 24.04, `onboot: 1`), templates
+9005/9011/9012 (16/12/16 GiB, never booted), range `10.66.0.0/24`,
+mgmt `10.10.10.0/24`. Release revision `795faf4` on all three service
+VMs. No secrets are recorded here; passwords/capabilities were generated
+locally and transferred staged, never pasted.
+
+| Exact command/probe | Result / meaning |
+|---|---|
+| `python infra/images/pve_template_build.py --out /tmp/sr-templates --cache-dir /data/sr-guest-cache --runner-key ... --bastion-key ... --mgmt-key ... --emergency-key ... --roles attacker,mojang-web-local,mojang-web-db` (KVM, `SR_QEMU_KVM=1`) + `sha256sum -c SHA256SUMS` | Build clean, checksums verify; SHAs `31f3842e…` (9005), `81c15306…` (9011), `141ac244…` (9012) written into `/etc/sparring-range/manifest.json` (no placeholders left) |
+| `deploy/pve_broker_acl.sh` dry-run → `--apply` → `--verify` (node `pve`, bridge `srrange`, templates `9005,9011,9012`, window `9100-9199`, storage `data`, foreign probe `107`) | Applied clean; `pveum user token permissions` shows exactly 106 grants (node audit, bridge SDN, 3× template Clone+Audit, 100× window Base, storage); effective probes pass after the PUT/metadata probe fix (`795faf4`): template/foreign-VM denials `403`, escalation `PUT /access/acl` `403` |
+| Narrow PVE firewall rule (pos 0: in/ACCEPT/vmbr0, `10.10.10.200/32` → TCP 8006) + OPNsense inter-VLAN allowance for the same tuple | `curl -sk https://192.168.86.83:8006/api2/json/version` from 202 answers `401` (transport proven; auth needs the token). Management IPSet untouched (still LAN-only) |
+| `deploy/install.sh --manifest ... --no-backup` on 201 (`HTTPS_IP=10.10.10.150`) | `install[done]`; TLS identities issued; broker policy rendered (templates + window + `10.66.0.0/24` vlan 66); defect found+fixed: installer shadowed generation keys under `tls/` (now removed; bootstrap owns `ssh/`) and the `ssh/` dir blocked traversal (now `0750`) |
+| PostgreSQL 16 install, `sr_owner`/`sr_app` roles, `sparring_range` DB, `alembic upgrade head` | `0001 → 0015` clean; defect found+fixed: app role had CONNECT only (fixtures never exercise the split) — standing DML + default privileges in migration `0016` |
+| `GET /readyz` on 201 | `{"ready":true,"migration_version":"0015","issues":[]}` (runner host-key + recordings pending first deploy, as designed) |
+| `rangectl bootstrap` on 201 | Operator account created; bastion capability minted once into the operator secret store |
+| `sr-brokerd` on 202 (policy + mTLS + token via staged transfer) | `active`, `listening ('0.0.0.0', 8443)`, reconciliation empty, unlatched |
+| `GET /stages` (operator auth) on 201 | `install_ready:true, lab_ready:true` (broker `ok`, latch unlatched), `attack_authorized:false` (gate holds until Manual checks) |
+| `sr-bastion` on 203 (`:2222`, host key pinned by fingerprint `SHA256:uamaB/…`) | `active`, `LISTEN 0.0.0.0:2222`, clean publickey refusal; defect found+fixed: unit missed the derived env (now loads it like `sr-api`) |
+
+Open (operator Manual checks, plan §Manual checks): teammate LAN paths
+(`:8443`/`:2222` allowances), isolation denials with positive controls,
+emergency-stop drill + read-back + release, rehearsal launch→end→cleanup
+→second launch with a second member, then `SR_ATTACK_AUTHORIZED=1`.
+Backup destination/restore remain explicitly unverified (not release-blocking).
+The inference endpoint `http://10.10.10.197:8096/v1` answers
+`qwen3.8-flash-next` `loaded`.

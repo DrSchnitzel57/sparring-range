@@ -165,6 +165,17 @@ task itself starts and then dies with `403 Permission check failed
 SSH host key (no TOFU). Never `Admin.*`. The broker refuses any operation
 the policy file does not fully determine (fail closed).
 
+Reachability and TLS name discipline (live finds 2026-10-15): the broker
+VM reaches the PVE API only through an explicit narrow allowance (one
+host-IN `ACCEPT` for the broker source to `TCP/8006` — never widen the
+`management` IPSet, which also gates host SSH/VNC/SPICE; inter-VLAN
+traffic is denied by default). `PROXMOX_HOST` must be a DNS name in the
+node certificate's SAN (`pve`/`pve.internal` — a stale SAN IP no longer
+matches after DHCP drift), resolved via `/etc/hosts` on the broker VM,
+verified against `/etc/pve/pve-root-ca.pem` (the cluster CA). The example
+`PROXMOX_TOKEN_SECRET=CHANGE` is rejected at startup like `CHANGE_ME` —
+a literal placeholder never boots a broker.
+
 ## 4. TLS + keys
 
 ```bash

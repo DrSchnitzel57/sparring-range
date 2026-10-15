@@ -389,6 +389,7 @@ do not become optional because development tests pass.
 Windows licensing/templates, Sysmon/WEC installed capture, Windows verification
 and access are later milestone-12 gates, not marked complete by Linux acceptance.
 
+<<<<<<< HEAD
 ## 10. Operator shell pitfalls (field notes 2026-10-15)
 
 Learned the hard way during the first production install. All of these
@@ -468,3 +469,63 @@ sessions die on keystroke while idling fine; (3) link flaps
 throttled auth; (5) client-side sleep, Wi-Fi roam, or VPN flap —
 correlate with continuous pings to each path before concluding
 anything about the host.
+=======
+### Inter-VLAN transport is firewall-shaped, not broken cabling (2026-10-15)
+
+Service VMs on the management VLAN reach each other over L2, but anything
+routed (own gateway, LAN, PVE API) dies unless explicitly allowlisted —
+OPNsense denies inter-VLAN by default and the PVE host firewall enforces
+its own layer. Symptom pattern: PVE→guest works while guest→PVE times
+out. Localize with packet counters (`iptables -L PVEFW-HOST-IN -n -v`)
+before changing anything: SYNs arriving means the host rule works and the
+return/forward path is the problem; no arrivals means the forward path.
+
+Narrow-allowlist pattern (used for the broker's PVE API path): one
+`ACCEPT,in,vmbr0,TCP/8006` rule for source `10.10.10.200/32` at pos 0 —
+never widen the `management` IPSet, which also gates host SSH, VNC and
+SPICE (five ports). The same shape applies to teammate paths
+(LAN → control-plane `:8443`, LAN → bastion `:2222`). Prove each rule
+with an authenticated exchange (`401` from the API counts as transport
+proof for an unauthenticated probe), not just ping.
+
+### Names must match certificates, not just route
+
+`PROXMOX_HOST` must be a name in the node certificate's SAN
+(`pve`/`pve.internal` here — the SAN's stale `.84` IP no longer matches
+the host after DHCP drift, so IP-based verification would fail while
+hostname verification passes). Resolve it via `/etc/hosts` on the broker
+VM; verify the chain against `/etc/pve/pve-root-ca.pem` (the cluster CA,
+not the node cert). Same treatment on the control plane: `BROKER_URL`
+uses `broker.range.internal` with a hosts entry, keeping the broker
+server certificate's DNS SAN valid with no regeneration.
+
+### API-wide 500s mean settings validation failed — read the journal
+
+Production settings validate when the middleware stack builds (first
+request), so one bad value 500s every route including `/healthz`. The
+unit log names every problem in a `RuntimeError: production config
+invalid` list (missing/unreadable SSH keys, wrong key paths). Check that
+list before suspecting the network, the database, or the build.
+
+### Generation keys live in one place; env paths must agree with the build
+
+The `.pub` halves baked into templates at build time came from
+`/etc/sparring-range/ssh/` — the verifier and runner key paths in
+`control-plane.env` must name those same private halves, never fresh
+keys generated beside them (fresh keys authenticate nowhere). The
+installer no longer creates same-named shadow copies under `tls/`
+(`bootstrap_tls.sh` owns generation, generate-if-missing). The ssh dir
+itself must stay traversable (`0750 root:<service-group>`); a `0700`
+dir denies entitled services while every file inside looks correct.
+
+### Move secrets staged, never pasted; compare host keys by fingerprint
+
+Remote `sudo` over non-interactive SSH cannot prompt (no TTY): stage
+files to a readable directory on the source with a real terminal, then
+plain `scp` them, fix ownership/permissions at the destination, and
+delete the staging. `ssh -p 2222 -o BatchMode=yes` reporting `Host key
+verification failed` on a first contact is unknown-key refusal, not
+evidence of compromise — `ssh-keyscan` the presented key, compare its
+fingerprint against the host's public half out-of-band, and only then
+pin it with `UserKnownHostsFile` (no TOFU).
+>>>>>>> 5ff3cf0 (docs: first-production-install field notes, broker TLS/firewall discipline, live evidence)
