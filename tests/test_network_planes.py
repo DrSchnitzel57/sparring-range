@@ -136,8 +136,15 @@ def test_ingest_body_cap_counts_actual_bytes_not_headers():
             from fastapi.responses import JSONResponse
             return JSONResponse({"ok": True})
 
-        resp = asyncio.get_event_loop().run_until_complete(
-            _ingest_only_guard(req, downstream))
+        # Explicit isolated loop: asyncio.get_event_loop() depends on
+        # whatever loop an earlier test happened to leave behind (removed
+        # pattern — broke when suites stopped leaking one).
+        loop = asyncio.new_event_loop()
+        try:
+            resp = loop.run_until_complete(
+                _ingest_only_guard(req, downstream))
+        finally:
+            loop.close()
         assert resp.status_code == 413, resp.status_code
         assert called == [], "oversized body must not reach the route"
     finally:

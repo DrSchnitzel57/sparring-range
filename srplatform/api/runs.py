@@ -407,7 +407,14 @@ def _worker_env(s, token: str, session_id, scenario_id: str, run: Run,
     for k, attr in _WORKER_SETTING_KEYS.items():
         env[k] = str(getattr(s, attr))
     env.update({
-        "SR_API_BASE": s.api_base_url,
+        # Worker callbacks must reach FastAPI, not the UI: prefer the
+        # explicitly configured same-box internal API (no TLS, no frontend
+        # mount); otherwise the resolved serving URL with its route prefix.
+        # A hardcoded internal default would strand ephemeral/test servers
+        # (live find 2026-10-15: r01 worker starved on 127.0.0.1:8000).
+        "SR_API_BASE": (s.internal_api_url
+                        if "internal_api_url" in s.model_fields_set
+                        else f"{s.api_base_url}{s.api_route_prefix}"),
         "SR_SESSION_ID": str(session_id),
         "SR_SCENARIO_ID": scenario_id,
         "SR_RUN_ID": str(run.run_id),

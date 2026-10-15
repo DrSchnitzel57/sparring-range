@@ -17,6 +17,10 @@ set -euo pipefail
 
 SR_TLS_DIR="${SR_TLS_DIR:-/etc/sparring-range/tls}"
 SR_SSH_DIR="${SR_SSH_DIR:-/etc/sparring-range/ssh}"
+# Service group entitled to READ generation keys (review find 2026-10-15:
+# ssh-keygen mints root-only 0600, which silently denies the entitled
+# service consumer — the group must be explicit, never assumed).
+SR_SSH_GROUP="${SR_SSH_GROUP:-srrange}"
 BROKER_HOST="${BROKER_HOST:-broker.range.internal}"   # how the API dials the broker
 API_HOST="${API_HOST:-control-plane}"                 # client-cert identity label
 HTTPS_IP="${HTTPS_IP:-}"                              # control-plane LAN IP
@@ -152,6 +156,14 @@ if [ "$FRESH" = 1 ] || [ ! -f "$SR_SSH_DIR/bastion_ed25519" ]; then
   fi
   ssh-keygen -q -t ed25519 -N '' -C 'sr-bastion-generation-1' -f "$SR_SSH_DIR/bastion_ed25519"
 fi
+# Service-readable, never regenerated above: the entitled group traverses
+# (0750) and reads the private half (0640); the public half is world-
+# readable (builds copy it). A missing group fails LOUD, never silent.
+chown root:"$SR_SSH_GROUP" "$SR_SSH_DIR" && chmod 0750 "$SR_SSH_DIR"
+chown root:"$SR_SSH_GROUP" "$SR_SSH_DIR/bastion_ed25519" \
+    "$SR_SSH_DIR/bastion_ed25519.pub"
+chmod 0640 "$SR_SSH_DIR/bastion_ed25519"
+chmod 0644 "$SR_SSH_DIR/bastion_ed25519.pub"
 
 chmod 600 ./*.key ca.key 2>/dev/null || true
 chmod 640 ./*.crt 2>/dev/null || true

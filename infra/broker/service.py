@@ -28,6 +28,7 @@ import uuid
 
 from .errors import (BrokerConflict, BrokerLatched, BrokerRefused,
                      BrokerUnavailable, PolicyViolation)
+from ..proxmox_client import ProxmoxError
 from .ledger import Ledger, args_hash
 from .policy import BrokerPolicy
 
@@ -201,8 +202,23 @@ class BrokerService:
                 claim = self.ledger.get_claim(candidate)
                 if claim is not None and claim["state"] != "destroyed":
                     continue
-                if self.pve.lookup_vm(node, candidate) is not None:
-                    continue
+                try:
+                    if self.pve.lookup_vm(node, candidate) is not None:
+                        continue
+                except ProxmoxError as e:
+                    # Live find 2026-10-15: PVE deletes per-VMID ACL entries
+                    # when it destroys the VM, so a teardown silently eats
+                    # the window grants its own clones used. The next scan
+                    # then dies on a 403 that looks like a broker fault.
+                    # Type stays Unavailable (a transport fault is also
+                    # possible), but the message must name the re-apply.
+                    raise BrokerUnavailable(
+                        f"VMID scan cannot read /vms/{candidate} on "
+                        f"{node}: {e} — if PVE reports 403/"
+                        "permission-denied, that VMID's grant vanished "
+                        "with its destroyed VM: re-run "
+                        "deploy/pve_broker_acl.sh --apply on the host, "
+                        "then relaunch") from e
                 self.ledger.upsert_claim(candidate, node=node, state="reserved",
                                          session_id=session_id,
                                          detail={"source": "next_vmid"})

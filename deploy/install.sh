@@ -135,7 +135,8 @@ out = []
 for ip in m['trust']['san_ips']:
     out.append(('IP:' if all(c.isdigit() or c == '.' for c in ip) else 'DNS:') + ip)
 print(' '.join(out))" "$MANIFEST")"
-  SR_TLS_DIR="$TLS" SR_SSH_DIR="$ETC/ssh" SR_TLS_ROTATE="$ROTATE_TLS" \
+  SR_TLS_DIR="$TLS" SR_SSH_DIR="$ETC/ssh" SR_SSH_GROUP="$SR_GROUP" \
+    SR_TLS_ROTATE="$ROTATE_TLS" \
     INGEST_SANS="$_SANS" \
     "$REPO/deploy/bootstrap_tls.sh" >/dev/null
   _tls_rc=$?

@@ -43,6 +43,11 @@ class Settings(BaseSettings):
 
     # --- API (single front door) ---
     api_base_url: str = "http://localhost:8000"
+    # Same-box trusted API for co-located components (the worker is spawned
+    # by the API on this host). Server-side callbacks must use this, never
+    # the public LAN URL — behind the LAN frontend the public URL serves
+    # the UI except under /api, so unprefixed callbacks 404 (live find).
+    internal_api_url: str = "http://127.0.0.1:8000"
     # Guest-facing ingest address (review finding): shippers dial the
     # RANGE ingest listener, NEVER the public LAN URL — the public URL is
     # for browsers/operators, the ingest URL is the controller's range

@@ -1768,10 +1768,28 @@ def get_token(token: str, p: Principal = Depends(service("bastion")),
     # keyed by username, so the response carries the authenticated username,
     # never just an opaque id the bastion cannot map.
     owner = db.get(User, t.user_id) if t.user_id else None
+    # Authoritative generation-bound pin for the dial target (the broker
+    # pinned it as deployment evidence; the bastion verifies the guest
+    # against THIS in memory instead of a copied file that rots on
+    # relaunch). None when no ready deployment carries it — the proxy must
+    # refuse rather than TOFU or trust a stale copy.
+    host_key = None
+    if t.session_id is not None:
+        dep = db.execute(select(Deployment).where(
+            Deployment.session_id == t.session_id,
+            Deployment.status == "ready").order_by(
+            Deployment.created_at.desc())).scalars().first()
+        if dep is not None:
+            for r in (dep.resources or []):
+                if isinstance(r, dict) and r.get("ip") == t.target_host \
+                        and r.get("host_key_ref"):
+                    host_key = r["host_key_ref"]
+                    break
     return {"token": t.token, "session_id": str(t.session_id) if t.session_id else None,
             "target_host": t.target_host, "target_port": int(t.target_port),
             "user_id": str(t.user_id) if t.user_id else None,
-            "username": owner.username if owner else None}
+            "username": owner.username if owner else None,
+            "target_host_key": host_key}
 
 
 # --- enrollment confirmation (host-originated, audit T-05) ----------------------

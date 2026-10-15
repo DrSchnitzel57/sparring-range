@@ -190,6 +190,20 @@ with that key (`BASTION_TARGET_USER=defender`, `BASTION_CLIENT_KEY_PATH`) —
 the root default is replaced; guest root SSH stays reserved for the
 verifier/management key.
 
+Per-host key placement and ownership (review find 2026-10-15 — a key with
+the wrong group is a silent denial; verify with `namei -l` on the consumer):
+
+| File | Host(s) | Owner:group/mode | Consumer |
+|---|---|---|---|
+| `ssh/bastion_ed25519` | 201 (generated) → 203 (copied) | `root:srrange 0640` / `root:srbastion 0640` | bastion proxy dials defender guests |
+| `ssh/mgmt_ed25519` | 201 only | `root:srrange 0640` | verifier provisions guests as root |
+| `ssh/runner_ed25519` | 201 only | `root:srrange 0640` | isolated runner dials the attacker guest |
+| `tls/api-client.key` | 201 + 203 | `root:srrange 0640` / `root:srbastion 0640` | mutual-TLS client to the broker |
+| `tls/broker-server.key` | 202 only | `root:srbroker 0640` | broker mTLS listener |
+| `tls/*.crt`, `tls/api-ca.crt` | wherever needed | `0644` | public halves and trust anchors |
+| `tls/ca.key`, `tls/api-ca.key` | 201 only | `root:root 0600` | signing keys — no service may mint |
+| `broker-policy.json`, `broker.env` | 202 | `root:srbroker 0640` | broker policy + its ONLY PVE token |
+
 ## 5. Member onboarding (take-turns accounts)
 
 On the control plane (offline administration exception — the shell needs
@@ -214,8 +228,12 @@ generates a keypair on their own machine and sends only the `.pub`:
 # member laptop:
 ssh-keygen -t ed25519 -f ~/.ssh/sr-member -N ''
 scp ~/.ssh/sr-member.pub <bastion-login>@<bastion-ip>:/tmp/teammate01.pub
-# on the bastion VM (one `username <key>` line per member, append only):
-{ echo -n "teammate01 "; cat /tmp/teammate01.pub; } >> /etc/sparring-range/authorized_keys
+# on the bastion VM (one `username <key>` line per member, append only;
+# validate FIRST: exactly one non-blank line that ssh-keygen accepts —
+# a multi-line paste could otherwise register a second line as another
+# account (review find 2026-10-15)):
+[ "$(grep -cve '^\s*$' /tmp/teammate01.pub)" = 1 ] && ssh-keygen -l -f /tmp/teammate01.pub >/dev/null \
+  && { echo -n "teammate01 "; head -1 /tmp/teammate01.pub; } >> /etc/sparring-range/authorized_keys
 shred -u /tmp/teammate01.pub
 systemctl restart sr-bastion  # the proxy reads keys at startup
 ```
@@ -240,7 +258,11 @@ ssh <bastion-ip> -p 2222 -l tok-<session> -i ~/.ssh/sr-member
   captures final evidence, revokes capabilities, **destroys the owned VMs**
   and frees the range for the next teammate. A blocked stop or failed
   destroy shows `recovery required` and RETAINS the reservation — retry
-  `end session`; never work around it.
+  `end session`; never work around it. PVE deletes per-VMID ACL entries
+  with the destroyed VM (live find 2026-10-15): after any teardown that
+  destroyed clones, re-run `deploy/pve_broker_acl.sh --apply` (same
+  arguments as setup — idempotent) before the next launch, or allocation
+  fails naming the re-apply.
 * An API restart **interrupts** running matches (never resumes them) and
   reconciles cleanup on boot. `SR_MATCH_SCHEDULER_ENABLED=1` runs this
   automatically.

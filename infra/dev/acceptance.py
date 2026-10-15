@@ -1290,6 +1290,17 @@ def check_install() -> None:
         assert "ca.key" not in body and "api-ca.key" not in body, \
             f"CA signing keys must stay root-only: {body}"
         ok("installer scopes TLS key ownership per service (CA root-only)")
+        # generation keys: bootstrap owns generation into the canonical ssh
+        # dir with an EXPLICIT entitled group (review find 2026-10-15:
+        # ssh-keygen's default root-only 0600 silently denied services).
+        boot = (REPO / "deploy/bootstrap_tls.sh").read_text()
+        assert 'SR_SSH_GROUP' in boot, "entitled group must be explicit"
+        assert 'chown root:"$SR_SSH_GROUP" "$SR_SSH_DIR/bastion_ed25519"' in boot, \
+            "generated dial key must be group-readable by its consumer"
+        sshd = rp / "etc/sparring-range/ssh/bastion_ed25519"
+        assert sshd.exists(), \
+            "generation dial key missing from the canonical ssh dir"
+        ok("bootstrap generates the dial key service-readable with explicit group")
         # traversal + ownership model (from the stub call log — the real
         # commands execute on the VM job; here we prove the installer
         # INVOKES the right ownership on the right paths, never assumes it)

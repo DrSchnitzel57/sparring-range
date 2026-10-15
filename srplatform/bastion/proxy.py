@@ -143,6 +143,12 @@ class BastionProxy:
         username = process.get_extra_info("username")
         target = await self.resolve_token(username)
         if not target:
+            # Direct member logins and dead tokens carry no session: say so
+            # instead of closing silently (an unexplained exit 1 reads as a
+            # network fault and cost an hour of live debugging).
+            process.stderr.write(
+                "no session attached to this login — connect with a session "
+                "token login from the session page\r\n")
             process.exit(1)
             return
 
@@ -172,7 +178,23 @@ class BastionProxy:
         })
         try:
             known = s.bastion_targets_known_hosts or None
-            if known and not os.path.exists(known):
+            # Authoritative per-session pin (plan 13 phase 4): the deploy
+            # publishes the broker-pinned generation key as deployment
+            # evidence, and the token endpoint serves it back to this
+            # service-authenticated proxy. A pin that travels with the
+            # login can never go stale across relaunches the way copied
+            # files do. The local file remains only as a last resort when
+            # the deployment carries no pin (legacy); TOFU is never used.
+            api_pin = (target.get("target_host_key") or "").strip() or None
+            if api_pin:
+                print("[bastion] pin source: deployment evidence", flush=True)
+                known = f"{target['target_host']} {api_pin}".encode()
+            elif isinstance(known, str):
+                print("[bastion] pin source: local file (no deployment pin)",
+                      flush=True)
+            # A bytes pin came from deployment evidence, not the filesystem:
+            # only file paths get an existence check.
+            if isinstance(known, str) and not os.path.exists(known):
                 known = None
             if known is None and s.sr_env == "production":
                 raise RuntimeError("BASTION_TARGETS_KNOWN_HOSTS required in production — "
@@ -215,8 +237,17 @@ class BastionProxy:
                         t.cancel()
                         await asyncio.gather(t, return_exceptions=True)
                     process.exit(0)
-        except asyncssh.Error as e:
+        except Exception as e:  # noqa: BLE001 — guest dials fail for
+            # network/auth/pin reasons; asyncssh.Error alone misses OSError
+            # (refused/timeout), which used to abort the member session
+            # with no output at all. Report the failure CLASS only — never
+            # keys, tokens, or pin material — to the member, the cast, and
+            # the (root-only) journal, so a stale pin is loud, not silent.
             cast.write("o", f"\n[bastion] target connection failed: {e}\n")
+            print(f"[bastion] guest dial failed: {type(e).__name__}", flush=True)
+            process.stderr.write(
+                "target connection failed (%s) — retry, or ask the operator "
+                "to check range health\r\n" % type(e).__name__)
             process.exit(255)
         finally:
             cast.close()

@@ -13,7 +13,8 @@ from srplatform.settings import get_settings
 
 
 def base() -> str:
-    return get_settings().api_base_url
+    s = get_settings()
+    return f"{s.api_base_url}{s.api_route_prefix}"
 
 
 def token_file() -> Path:
