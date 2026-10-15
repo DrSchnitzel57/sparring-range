@@ -98,17 +98,17 @@ def db_provision_command(plan: dict, password: str,
     # IF NOT EXISTS alone would silently preserve the wrong password).
     sql_users = "; ".join(
         [f"CREATE USER IF NOT EXISTS '{READER_USER}'@'{ip}' "
-         f"IDENTIFIED BY '{password}'" for ip in web_ips]
-        + [f"ALTER USER '{READER_USER}'@'{ip}' IDENTIFIED BY '{password}'"
+         f"IDENTIFIED WITH mysql_native_password BY '{password}'" for ip in web_ips]
+        + [f"ALTER USER '{READER_USER}'@'{ip}' IDENTIFIED WITH mysql_native_password BY '{password}'"
            for ip in web_ips]
         + [f"ALTER USER '{READER_USER}'@'127.0.0.1' "
-           f"IDENTIFIED BY '{password}'"]
+           f"IDENTIFIED WITH mysql_native_password BY '{password}'"]
         + [f"GRANT SELECT ON {MYSQL_DB}.* TO '{READER_USER}'@'{ip}'"
            for ip in web_ips]
         + ([f"CREATE USER IF NOT EXISTS '{READER_USER}'@'{controller_ip}' "
-            f"IDENTIFIED BY '{password}'",
+            f"IDENTIFIED WITH mysql_native_password BY '{password}'",
             f"ALTER USER '{READER_USER}'@'{controller_ip}' "
-            f"IDENTIFIED BY '{password}'",
+            f"IDENTIFIED WITH mysql_native_password BY '{password}'",
             f"GRANT SELECT ON {MYSQL_DB}.* TO '{READER_USER}'@'{controller_ip}'"]
            if controller_ip else []))
     # ufw itself skips an existing identical rule — idempotent by design.

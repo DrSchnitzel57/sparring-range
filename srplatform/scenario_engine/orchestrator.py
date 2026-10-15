@@ -476,13 +476,17 @@ def _provision_command(host: str, token: str, nonce: str, s) -> str:
     provisioned alongside (plan 13 phase 4) so the shipper verifies the
     listener with an explicit trust anchor — never a disabled check."""
     import shlex
-    env = (f"SR_API_URL={s.api_base_url}\n"
+    # Guests dial the RANGE ingest listener, never the public operator URL
+    # (review finding): the ingest address is the controller's isolated
+    # range identity; the public URL is for browsers/operators.
+    ingest_url = getattr(s, "telemetry_ingest_url", None) or s.api_base_url
+    env = (f"SR_API_URL={ingest_url}\n"
            f"SR_TELEMETRY_TOKEN={token}\n"
            f"SR_HOST={host}\n"
            f"SR_ENROLL_NONCE={nonce}\n"
            f"SR_SPOOL_DIR=/var/lib/sparring-range/shipper\n")
     ca_pre, ca_env = "", ""
-    if s.api_base_url.startswith("https://") and s.telemetry_ca_file:
+    if ingest_url.startswith("https://") and s.telemetry_ca_file:
         try:
             ca_pem = open(s.telemetry_ca_file).read()
         except OSError as e:

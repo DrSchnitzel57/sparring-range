@@ -43,6 +43,13 @@ class Settings(BaseSettings):
 
     # --- API (single front door) ---
     api_base_url: str = "http://localhost:8000"
+    # Guest-facing ingest address (review finding): shippers dial the
+    # RANGE ingest listener, NEVER the public LAN URL — the public URL is
+    # for browsers/operators, the ingest URL is the controller's range
+    # address on the isolated network. Falls back to api_base_url only
+    # when unset (dev/fixture single-listener mode); production deployments
+    # render it from manifest urls.ingest.
+    telemetry_ingest_url: str | None = None
     # Explicit LAN origins for the browser (F23: never default teammates to
     # their own localhost). Comma-separated list, e.g. http://gym.lan:3000.
     api_allowed_origins: str = "http://localhost:3000,http://127.0.0.1:3000"

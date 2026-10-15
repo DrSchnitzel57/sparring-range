@@ -120,6 +120,21 @@ IFS=',' read -ra TMPLS <<< "$TEMPLATES"
 # precisely: Clone + Audit, nothing else, on template paths only.
 run pveum role add "${ROLE_BASE}Template" --privs "VM.Clone,VM.Audit"
 for t in "${TMPLS[@]}"; do
+    # PVE ACL modification is ADDITIVE: earlier (broader) grants are never
+    # replaced by narrower ones. Explicitly revoke any previously granted
+    # Base role on template paths first, so a re-run that narrows scope
+    # cannot leave the golden templates mutable/deletable. Revocation of
+    # an absent grant is a loud no-op failure mode: tolerate ONLY the
+    # "no such ACL" wording, nothing else.
+    if [ "$APPLY" -eq 1 ]; then
+        _revoke_out=$(pveum acl delete "/vms/${t}" --users "$USER_ID" \
+            --roles "${ROLE_BASE}Base" 2>&1) || echo "$_revoke_out" | grep -qi \
+            "no such\|does not exist\|no acl" \
+            || die "revocation failed: /vms/${t} Base -> $_revoke_out"
+    else
+        printf '    %q ' pveum acl delete "/vms/${t}" --users "$USER_ID" \
+            --roles "${ROLE_BASE}Base"; echo "  # revoke superseded broad grant"
+    fi
     run pveum acl modify "/vms/${t}" \
         --users "$USER_ID" --roles "${ROLE_BASE}Template"
 done

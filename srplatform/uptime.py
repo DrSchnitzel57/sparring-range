@@ -496,6 +496,13 @@ class Prober:
                 self._interrupt(f"probe infrastructure failure: {e}")
                 self._stop.set()
                 return
+            except Exception as e:  # noqa: BLE001 — one bad target must
+                # never abort its siblings: record the transport truth for
+                # THIS target and continue (a refused socket is down/unknown
+                # for that service, not evidence about the others).
+                self._record(host, "unknown", None,
+                             f"target error: {e}"[:160])
+                continue
             self._record(host, state, latency, detail)
 
     def loop(self) -> None:

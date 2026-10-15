@@ -14,6 +14,9 @@ CREATE TABLE IF NOT EXISTS purchases (
   buyer VARCHAR(64) NOT NULL,
   price_cents INT NOT NULL
 );
-CREATE USER IF NOT EXISTS 'mojang_reader'@'127.0.0.1' IDENTIFIED BY 'synthetic-reader-pw';
+-- Stock MySQL 8.0 defaults to caching_sha2_password; the reader
+-- account is pinned to mysql_native_password so every observer
+-- (guest-local client and controller-direct) authenticates identically.
+CREATE USER IF NOT EXISTS 'mojang_reader'@'127.0.0.1' IDENTIFIED WITH mysql_native_password BY 'synthetic-reader-pw';
 GRANT SELECT ON mojang.* TO 'mojang_reader'@'127.0.0.1';
 FLUSH PRIVILEGES;

@@ -226,6 +226,7 @@ lines = [
     f"DEPLOY_CLONE_MODE={m['storage']['clone_mode']}",
     f"BROKER_POLICY_FILE={policy}",
     f"API_BASE_URL={m['urls']['public_https']}",
+    f"SR_API_INGEST_URL={m['urls']['ingest']}",
     f"LLM_BASE_URL={m['model']['base_url']}",
     f"LLM_MODEL_RED={m['model']['alias']}",
     f"LLM_MODEL_COACH={m['model']['alias']}",

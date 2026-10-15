@@ -29,7 +29,9 @@ PORT = 3306
 _CAP_PROTOCOL_41 = 0x0200
 _CAP_SECURE_CONNECTION = 0x8000
 _CAP_PLUGIN_AUTH = 0x00080000
-_CLIENT_CAPS = _CAP_PROTOCOL_41 | _CAP_SECURE_CONNECTION | _CAP_PLUGIN_AUTH
+_CAP_CONNECT_WITH_DB = 0x00000008
+_CLIENT_CAPS = (_CAP_PROTOCOL_41 | _CAP_SECURE_CONNECTION
+                | _CAP_PLUGIN_AUTH | _CAP_CONNECT_WITH_DB)
 
 
 class MySQLError(RuntimeError):
@@ -67,26 +69,33 @@ def _send(sock, seq: int, payload: bytes) -> None:
     sock.sendall(struct.pack("<I", len(payload))[:3] + bytes([seq]) + payload)
 
 
-def _parse_handshake(payload: bytes) -> tuple[bytes, bool]:
-    """Return (auth_seed, ok). Only mysql_native_password is accepted —
-    anything else (including an auth-switch request) fails closed."""
+def _parse_handshake(payload: bytes) -> tuple[bytes, bytes]:
+    """Return (auth_seed, plugin_name). Empty plugin means the legacy
+    layout (assume native). Callers decide: only mysql_native_password
+    proceeds — anything else fails closed with a plugin-specific error,
+    never a downgrade or a retry loop."""
     if len(payload) < 32 or payload[0] != 10:
-        return b"", False
+        return b"", b""
     nul = payload.find(b"\x00", 1)
     if nul < 0 or len(payload) < nul + 31:
-        return b"", False
+        return b"", b""
     # layout: conn_id[4] part1[8] filler[1] cap1[2] charset[1]
     # status[2] cap2[2] plugin_len[1] reserved[10] part2[..] plugin NUL
     part1 = payload[nul + 5:nul + 13]
     more = payload[nul + 13:]
     if len(more) < 20:
-        return b"", False
+        return b"", b""
     maxlen = max(more[8] - 8, 13)
     part2 = more[19:19 + maxlen].split(b"\x00")[0]
     plugin = more[19 + maxlen:].split(b"\x00")[0]
-    if plugin and plugin != b"mysql_native_password":
-        return b"", False
-    return part1 + part2, True
+    # mysql_native_password's scramble seed is EXACTLY 20 bytes
+    # (part1[8] + part2[12]); longer slices (auth-switch seeds, trailing
+    # NULs) produce a wrong token, which the server answers with an
+    # auth-switch instead of an auth error — fail closed on shape.
+    seed = (part1 + part2)[:20]
+    if len(seed) != 20:
+        return b"", b""
+    return seed, plugin
 
 
 def _scramble(password: str, seed: bytes) -> bytes:
@@ -121,7 +130,10 @@ def select_one(db_ip: str, user: str, password: str, database: str,
         raise MySQLError(f"refusing non-read query {head!r}")
     started = time.monotonic()
     opener = connect or socket.create_connection
-    sock = opener((db_ip, port), timeout=timeout_s)
+    try:
+        sock = opener((db_ip, port), timeout=timeout_s)
+    except OSError as e:
+        raise MySQLError(f"connect failed: {e}") from e
     buf = bytearray()
     try:
         if hasattr(sock, "settimeout"):
@@ -132,9 +144,14 @@ def select_one(db_ip: str, user: str, password: str, database: str,
         seq, payload = _read_packet(sock, buf, timeout_s, started)
         if seq != 0:
             raise MySQLError(f"bad handshake sequence {seq}")
-        seed, ok = _parse_handshake(payload)
-        if not ok:
+        seed, plugin = _parse_handshake(payload)
+        if not seed:
             raise MySQLError("unsupported handshake (need mysql_native_password)")
+        # Attempt native-password auth regardless of the advertised default
+        # plugin: the SERVER arbitrates per account. A native account either
+        # accepts or answers AuthSwitchRequest(native) — both handled below.
+        # A caching_sha2_password account fails closed there. Never downgrade
+        # or retry other plugins client-side.
         token = _scramble(password, seed)
         auth = (struct.pack("<I", _CLIENT_CAPS) + struct.pack("<I", 1 << 24)
                 + b"\x21" + b"\x00" * 23 + user.encode() + b"\x00"
@@ -144,7 +161,27 @@ def select_one(db_ip: str, user: str, password: str, database: str,
         seq, payload = _read_packet(sock, buf, timeout_s, started)
         if payload[:1] == b"\xff":
             raise MySQLError(f"auth refused: {payload[3:120]!r}")
-        if payload[:1] != b"\x00":
+        if payload[:1] == b"\xfe":
+            # AuthSwitchRequest: the server restarts authentication with a
+            # FRESH seed — even when it names the same plugin (observed
+            # against real 8.0.36 for native accounts). Every real client
+            # answers it, so do we — but ONLY for mysql_native_password
+            # (re-scramble over the new seed). Any other plugin (notably
+            # caching_sha2_password) fails closed: we never speak it.
+            rest = payload[1:]
+            name, _, seed2 = rest.partition(b"\x00")
+            if name != b"mysql_native_password" or len(seed2) < 8:
+                raise MySQLError(
+                    f"auth-switch requested ({name[:40]!r}) — server demands "
+                    "a different plugin (e.g. caching_sha2_password); "
+                    "provision the account WITH mysql_native_password")
+            _send(sock, seq + 1, _scramble(password, seed2[:20]))
+            seq, payload = _read_packet(sock, buf, timeout_s, started)
+            if payload[:1] == b"\xff":
+                raise MySQLError(f"auth refused: {payload[3:120]!r}")
+            if payload[:1] != b"\x00":
+                raise MySQLError(f"unexpected auth reply {payload[:1]!r}")
+        elif payload[:1] != b"\x00":
             raise MySQLError(f"unexpected auth reply {payload[:1]!r}")
         _send(sock, 0, b"\x03" + query.encode())
         seq, payload = _read_packet(sock, buf, timeout_s, started)

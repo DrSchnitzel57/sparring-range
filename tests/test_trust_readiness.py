@@ -44,6 +44,7 @@ def test_shipper_provisioned_ca_is_used_and_missing_ca_fails_closed(
 class _S:
     api_base_url = "http://10.66.0.1:8000"
     telemetry_ca_file = None
+    telemetry_ingest_url = None
 
 
 def test_provision_command_plain_http_unchanged():
@@ -51,6 +52,21 @@ def test_provision_command_plain_http_unchanged():
     cmd = _provision_command("web01", "tok", "nonce1", _S())
     assert "api-ca.crt" not in cmd and "SR_TLS_CA_FILE" not in cmd
     assert "SR_API_URL=http://10.66.0.1:8000" in cmd
+
+
+def test_provision_command_prefers_ingest_url_for_guests():
+    """Guests dial the range ingest listener, never the public operator
+    URL — even when both are https (review finding)."""
+    from srplatform.scenario_engine.orchestrator import _provision_command
+
+    class S(_S):
+        api_base_url = "https://10.60.0.11:8443"
+        telemetry_ingest_url = "https://10.66.0.2:8444"
+        telemetry_ca_file = None
+
+    cmd = _provision_command("web01", "tok", "nonce1", S())
+    assert "SR_API_URL=https://10.66.0.2:8444" in cmd
+    assert "10.60.0.11" not in cmd
 
 
 def test_provision_command_https_provisions_ca(tmp_path):
