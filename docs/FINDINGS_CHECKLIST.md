@@ -1091,11 +1091,14 @@ with `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD`):
 
 | Exact command | Fresh result |
 |---|---|
-| `…python -m pytest -q -p no:cacheprovider` (fast default) | Exit 0: **328 passed, 0 failed, 0 skipped, 222 deselected**, 4 warnings, 50.4s |
-| `…acceptance.py frontend` | **PASS** — npm ci, production build, audit zero high/critical (re-run PASS on the inbox-bearing revision) |
-| `bash -e …selection python authority pve-contract…` | **PASS** on the final revision — 102.4s / 5.1s / 16.6s / 26.4s, all four gates exit 0 |
+| `…python -m pytest -q -p no:cacheprovider` (fast default) | Exit 0: **330 passed, 0 failed, 0 skipped, 230 deselected**, 4 warnings, 50.1s |
+| `bash -e …selection python authority pve-contract…` | **PASS** on the final revision — 87.5s / 4.1s / 16.2s / 26.4s, all four gates exit 0 |
+| `…acceptance.py db` | **PASS** after 183.9s — disposable fixture, fresh + forward migrations (incl. 0014/0015), **151 passed, 0 failed** incl. the 202 executor, deadline, network-plane and inject tests |
+| `…acceptance.py images` | **PASS** after 284.1s on the final revision (cache-warm; overlay inputs unchanged) — **18 passed, 0 skipped**, no leaks |
+| `…acceptance.py capture` | **PASS** after 206.8s on the final revision — **10 passed, 0 skipped**, no leaks |
+| `…acceptance.py frontend` | **PASS** — npm ci, production build, audit zero high/critical (re-run PASS on the final UI revision) |
 | `…acceptance.py compose` | **PASS** — full stack + seed-bastion-keys success gate, cleaned |
-| `…acceptance.py browser` | **PASS** — isolated real-browser workflow + replay, 1 passed |
+| `…acceptance.py browser` | **PASS** — isolated real-browser workflow + replay incl. control builder, inject inbox, safety page (re-PASS after the session-tick fix) |
 | `…acceptance.py db` | **PASS** after 155.7s — disposable fixture, fresh + forward migrations (incl. 0014/0015), **150 passed, 0 failed** (phase-3/6 regressions repaired; deploy-operation, network-plane and inject tests included) |
 | `…acceptance.py containment` | **PASS** after 11.6s — real namespace/cgroup fixtures created, positive-control process migration, 21 required-mode regressions 0 skipped, no leaked run cgroups |
 | `…acceptance.py packet` | **FAIL (prerequisite)** — needs root + nft (missing here); runs only in the approved disposable-netns CI packet job; never accepted from this host |
