@@ -160,6 +160,11 @@ def test_expired_deadline_fails_before_dispatch(client, users, fake_broker):
         row = orchestrator.begin_deploy_operation(
             s, sid, "launch", fence="test-fence", deadline_s=-60)
         op_id = str(row.operation_id)
+        from srplatform.db.models import OperationClaim
+        s.add(OperationClaim(session_id=sid, operation="launch",
+                             owner="test-fence",
+                             claimed_at=row.created_at))
+        s.commit()
     deploy_executor._execute(operation_id=op_id, session_id=uuid.UUID(sid),
                              user_id="member", operation="launch",
                              scenario_id="web-foothold-01",

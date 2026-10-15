@@ -441,3 +441,34 @@ def test_t06_reset_runs_the_launch_readiness_and_credential_workflow(
             assert s.get(SessionModel, U.UUID(sid)).status == "preparing"
     finally:
         _clear_prod(monkeypatch)
+
+
+def test_assumed_breach_proof_executes_as_web_user(client, users, fake_pve,
+                                                   enrollment_channel):
+    """The foothold is ESTABLISHED: with a channel, Begin runs the first
+    command AS web-user (no re-exploited network entry) and records the
+    proof; the transcript shows exactly which command proved it."""
+    from srplatform import verification_service
+    from srplatform.scenario_engine import orchestrator
+    chan = ScriptedChannel(host_client=client)
+    enrollment_channel.set_enrollment_exec(chan)
+    verification_service.set_verifier_exec(chan)
+    try:
+        sid = client.post("/sessions", json={"scenario_id": "web-foothold-01",
+                                             "start_condition": "assumed-breach"},
+                          headers=users["member"]).json()["session_id"]
+        from tests.conftest import launch_and_wait
+        launch_and_wait(client, users["member"], sid)
+        assert client.post(f"/sessions/{sid}/begin",
+                           headers=users["member"]).status_code == 202
+        evs = client.get("/events", params={"session_id": sid, "tail": 40},
+                         headers=users["member"]).json()
+        begin = next(e for e in evs if e["action_type"] == "match_begin")
+        proof = begin["payload"].get("disclosed_foothold")
+        assert proof and proof.get("established") is True, proof
+        assert proof.get("exit_code") == 0
+        assert any("runuser -u web-user" in c for _, c in chan.commands), \
+            [c for _, c in chan.commands][-5:]
+    finally:
+        enrollment_channel.set_enrollment_exec(None)
+        verification_service.set_verifier_exec(None)

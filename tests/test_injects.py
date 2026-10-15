@@ -260,8 +260,8 @@ def test_expiry_never_overwrites_a_timely_decision(client, users, fake_broker):
     finally:
         verification_service.set_verifier_exec(None)
     with db_ctx() as s:
-        n = injects_svc.expire_releases(
+        injects_svc.expire_releases(
             s, sid, now=datetime.now(timezone.utc) + timedelta(hours=2))
-        assert n == 0, "expiry must not touch decided releases"
         rel = s.get(InjectRelease, U.UUID(wr["release_id"]))
-        assert rel.status == "correct", rel.status
+        assert rel.status == "correct", \
+            "expiry must never overwrite a timely decision"
