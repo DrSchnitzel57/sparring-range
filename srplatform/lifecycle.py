@@ -220,6 +220,24 @@ def start_clock(db, session_id, *, actor: str = "system") -> MatchModel | None:
     proof = prove_assumed_breach(db, session_id)
     if proof is not None:
         payload["disclosed_foothold"] = proof
+        # SUPPLY the capability to the attacker: the red loop restores its
+        # phase and prompt summary from agent_state at startup, so seed
+        # both with the disclosed foothold. The worker demonstrably starts
+        # informed (initial-access, flaw invocation in context) instead of
+        # re-exploiting network entry. Server-side write (the member
+        # endpoint is sealed in competition; the runner token reads it).
+        from srplatform.db.models import AgentState as _AS
+        st = db.get(_AS, session_id)
+        if st is None:
+            st = _AS(session_id=session_id)
+            db.add(st)
+        st.summary = (
+            "ASSUMED BREACH (disclosed foothold): execute as web-user "
+            f"on {proof.get('host')} through the documented diagnostic "
+            "flaw (MOJANG_DIAG_ENABLED); recon is already complete, "
+            "begin at initial-access.")
+        st.current_phase = "initial-access"
+        db.flush()
     db.add(Event(session_id=session_id, ts=_now(), actor=actor,
                  action_type="match_begin", payload=payload))
     db.flush()

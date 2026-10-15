@@ -305,3 +305,60 @@ def test_mysql_via_proves_the_network_service_path():
     runner.rc, runner.out = 255, "ssh: connect"
     assert probe_mysql_via(runner, "10.66.0.10", "10.66.0.11",
                            "pw")[0] == "unknown"
+
+
+def test_mysql_banner_verifies_greeting_without_guest_code():
+    from srplatform.uptime import probe_mysql_banner
+
+    class FakeSock:
+        def __init__(self, data):
+            self._data = data
+        def settimeout(self, t):
+            pass
+        def recv(self, n):
+            return self._data
+        def close(self):
+            pass
+
+    # real MySQL handshake opening: len(3) + seq 0 + protocol 10
+    greeting = b"\x4a\x00\x00\x00\x0a" + b"8.0.36\x00" + b"\x00" * 40
+    st, _, detail = probe_mysql_banner(
+        "10.66.0.11", connect=lambda addr, timeout=None: FakeSock(greeting))
+    assert st == "up" and "no guest code" in detail
+    # wrong service on the port
+    st, _, _ = probe_mysql_banner(
+        "10.66.0.11",
+        connect=lambda addr, timeout=None: FakeSock(b"SSH-2.0-x\r\n"))
+    assert st == "down"
+    # closed/filtered port
+    def refused(addr, timeout=None):
+        raise OSError("refused")
+    assert probe_mysql_banner("10.66.0.11", connect=refused)[0] == "down"
+
+
+def test_mysql_integrity_flags_disagreeing_paths():
+    from datetime import datetime, timezone
+    from srplatform.uptime import mysql_integrity
+    from unittest.mock import MagicMock
+    now = datetime.now(timezone.utc)
+
+    def rows(pairs):
+        rs = []
+        for host, detail in pairs:
+            r = MagicMock()
+            r.host, r.detail = host, detail
+            rs.append(r)
+        return rs
+
+    db = MagicMock()
+    db.execute.return_value.scalars.return_value.all.return_value = rows([
+        ("db01", "purchases=12"),
+        ("db01:db-path", "purchases=12 via network path")])
+    out = mysql_integrity(db, "sid")
+    assert out["agree"] is True
+
+    db.execute.return_value.scalars.return_value.all.return_value = rows([
+        ("db01", "purchases=12"),
+        ("db01:db-path", "purchases=9 via network path")])
+    out = mysql_integrity(db, "sid")
+    assert out["agree"] is False and out["host"] == "db01"

@@ -95,7 +95,12 @@ def hint(session_id: uuid.UUID, body: HintIn, p: Principal = Depends(any_member)
             raise HTTPException(404, "session not found")
         if not p.is_operator and str(sess.user_id) != str(p.user_id):
             raise HTTPException(403, "not your session")
-        events = _events_of(db, session_id)
+        # The coach reasons ONLY over member-visible evidence in
+        # competition: raw red payloads never reach the model, so a hint
+        # cannot launder sealed attack commands back to the requester.
+        from srplatform.api.visibility import filter_event
+        events = [filter_event(db, sess, p, e)
+                  for e in _events_of(db, session_id)]
 
     llm = get_coach_llm()
     try:

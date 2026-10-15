@@ -469,6 +469,16 @@ def test_assumed_breach_proof_executes_as_web_user(client, users, fake_pve,
         assert proof.get("exit_code") == 0
         assert any("runuser -u web-user" in c for _, c in chan.commands), \
             [c for _, c in chan.commands][-5:]
+        # the worker is SUPPLIED the foothold: agent_state seeds its
+        # start phase and prompt summary (the runner token reads this;
+        # members cannot — competition sealed)
+        from srplatform.db.models import AgentState
+        from srplatform.db.session import db as db_ctx
+        with db_ctx() as s:
+            st = s.get(AgentState, uuid.UUID(sid))
+            assert st is not None and st.current_phase == "initial-access"
+            assert "ASSUMED BREACH" in (st.summary or "") \
+                and "web-user" in st.summary
     finally:
         enrollment_channel.set_enrollment_exec(None)
         verification_service.set_verifier_exec(None)

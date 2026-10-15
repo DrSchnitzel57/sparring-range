@@ -43,7 +43,10 @@ export default function LiveSession() {
           let op = null;
           try { op = await api(`/sessions/${id}/operation`); }
           catch (e) {
-            if (e && e.status === 404) { setConns(null); return; }
+            // 404 = no operation row: pre-202 sessions and never-accepted
+            // launches may still hold live capabilities — fall through to
+            // the server-served connections read instead of abandoning it.
+            if (e && e.status === 404) break;
           }
           if (stop) return;
           if (op && op.state === "succeeded") break;

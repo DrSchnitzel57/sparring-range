@@ -150,6 +150,51 @@ def coverage_for_session(db, session_id, *, started_at, ended_at=None,
                     interval_s=interval_s)
 
 
+def mysql_integrity(db, session_id, deployment_id=None) -> dict | None:
+    """Cross-validate the two differently-privileged MySQL observations:
+    the loopback business transaction (DB-guest execution) vs the
+    web-origin network-path transaction (web-guest execution). Agreement
+    means both paths report the same business fact; disagreement means
+    one side is forged or broken — treated as integrity failure, never
+    averaged away. Returns None when the pair is incomparable (no
+    samples yet on one leg)."""
+    import re
+    from sqlalchemy import select
+    from srplatform.db.models import UptimeSample
+    q = select(UptimeSample).where(UptimeSample.session_id == session_id)
+    if deployment_id:
+        q = q.where(UptimeSample.deployment_id == str(deployment_id))
+    rows = db.execute(
+        q.order_by(UptimeSample.ts.desc()).limit(50)).scalars().all()
+    counts: dict[str, str] = {}
+    for r in rows:
+        host = r.host or ""
+        base = host.split(":")[0]
+        if "db-path" in host or "banner" in host:
+            leg = "network"
+        else:
+            leg = "loopback"
+        if (base, leg) in counts:
+            continue
+        m = re.search(r"(\w+)=(\d+)", r.detail or "")
+        if m:
+            counts[(base, leg)] = f"{m.group(1)}={m.group(2)}"
+    for (base, _leg) in list(counts):
+        pair = {counts.get((base, "loopback")), counts.get((base, "network"))}
+        pair.discard(None)
+        if len(pair) == 2:
+            return {"agree": False, "host": base,
+                    "loopback": counts[(base, "loopback")],
+                    "network": counts[(base, "network")],
+                    "note": "business facts disagree across observation "
+                            "paths — possible forgery or split-brain"}
+        if len(pair) == 1:
+            only = next(iter(pair))
+            return {"agree": True, "host": base, "value": only,
+                    "note": "single observation path so far"}
+    return None
+
+
 def live_projection(db, session_id) -> dict:
     """The LIVE availability projection (plan 13 phase 7): received-sample
     scoring PLUS the schedule-aware coverage denominator, keyed to the
@@ -181,6 +226,12 @@ def live_projection(db, session_id) -> dict:
     base["missed"] = cov.get("missed")
     if cov.get("coverage_pct") is not None:
         base["coverage_pct"] = cov["coverage_pct"]
+    try:
+        integ = mysql_integrity(db, session_id)
+    except Exception:  # noqa: BLE001 — integrity never breaks projection
+        integ = None
+    if integ is not None:
+        base["mysql_integrity"] = integ
     return base
 
 
@@ -245,6 +296,48 @@ def probe_mysql_via(runner, via_ip: str, db_ip: str, password: str, *,
         # this is target downtime even when the loopback probe is green.
         return "down", latency, f"network path: {text[:120]}"
     return "unknown", latency, f"exit {code}"
+
+
+def probe_mysql_banner(db_ip: str, *, port: int = 3306,
+                         timeout_s: float = 3.0, connect=None):
+    """Trusted EXTERNAL observer (no guest code executes): open TCP to the
+    DB guest's range address and verify the MySQL server greeting (length
+    + sequence 0 + protocol version 10). Proves mysqld is listening on the
+    range address and the network path from the controller is open —
+    neither fact is obtainable by forging guest-local command output.
+    No credentials are needed (the greeting is pre-auth) and none are
+    sent. `connect` is the socket seam (tests inject a fake)."""
+    import socket as _socket
+    t0 = time.monotonic()
+    sock = None
+    try:
+        opener = connect or _socket.create_connection
+        sock = opener((db_ip, port), timeout=timeout_s)
+        if hasattr(sock, "settimeout"):
+            try:
+                sock.settimeout(timeout_s)
+            except OSError:
+                pass
+        greeting = sock.recv(64)
+    except (OSError, TimeoutError) as e:
+        return ("down", int((time.monotonic() - t0) * 1000),
+                f"mysql port unreachable: {e}"[:160])
+    except Exception as e:  # noqa: BLE001
+        return ("unknown", int((time.monotonic() - t0) * 1000),
+                f"banner transport: {e}"[:160])
+    finally:
+        try:
+            if sock is not None:
+                sock.close()
+        except Exception:  # noqa: BLE001
+            pass
+    latency = int((time.monotonic() - t0) * 1000)
+    # MySQL handshake: 3-byte little-endian length, sequence id 0,
+    # then protocol version 10.
+    if (len(greeting) >= 5 and greeting[3] == 0 and greeting[4] == 10):
+        return "up", latency, "mysql greeting verified (no guest code ran)"
+    return ("down", latency,
+            "port open but no MySQL greeting — wrong service or proxy")
 
 
 def probe_mysql(runner, ip: str, *, table: str = MYSQL_TABLE,
@@ -401,6 +494,16 @@ def start_for_session(db, sess, dep, *, get=None) -> bool:
             for r in db_hosts:
                 targets.append((r.get("host", "db"), "mysql",
                                 functools.partial(probe_mysql, runner,
+                                                  r["ip"])))
+        # Banner observer: controller-side TCP greeting check per DB
+        # guest. Executes NO guest code, so a compromised guest cannot
+        # forge it — it independently corroborates that mysqld serves
+        # the range address (loopback + business transactions prove
+        # correctness; the banner proves network service).
+        for r in db_hosts:
+            if r.get("ip"):
+                targets.append((r.get("host", "db") + ":banner", "mysql",
+                                functools.partial(probe_mysql_banner,
                                                   r["ip"])))
             # Network-path probes: every web guest whose SPEC declares
             # a db_ref executes the business transaction against its
