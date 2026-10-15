@@ -1086,6 +1086,22 @@ Delivered:
 
 ### Phases 3–8 — guests, configuration, lifecycle, match contract, tooling
 
+#### Review rounds 3–4 evidence (2026-10-15, branch `plan-13-implementation`)
+- Fast suite 330/0; db layer 167/0 (incl. claim-takeover supersede,
+  cross-session interrupt stickiness, atomic expiry, race-decide,
+  competition matrix, breach proof + no-worker-on-refusal, pin-error
+  readiness + republication, assumed-breach snapshot/disclosure tests).
+- Matrix (selection/python/authority/pve-contract) PASS; frontend,
+  compose, browser PASS; install sandbox proofs PASS (render, preserve,
+  rotate, partial recovery, CA-less refusal, 44GiB ceiling).
+- Images rebuild running (role_keys mgmt→root + USER markers change all
+  cache keys); recorded 36-user sets already confirmed identical across
+  roles and match the expanded baselines exactly. Capture queued behind.
+- Declined with documented reasons: PVE range-grants without per-VMID
+  enumeration (implemented instead per audit A7); loopback-only MySQL
+  observation (triangulated instead); replay/scenario-objective filtering
+  (first-party / published-threat-model).
+
 Fresh results at the phase-8 revisions (same environment; every command run
 with `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD`):
 

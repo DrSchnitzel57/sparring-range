@@ -451,6 +451,33 @@ over older prose in this document and the runbook.
 
 ### Plan 13 implementation decisions (2026-10-14, branch `plan-13-implementation`)
 
+#### Review rounds 3–4 (2026-10-15): what changed under reviewer pressure
+- Executor liveness = the live `OperationClaim` owner (takeovers never
+  touch old rows, so row-fence comparison was vacuous) + conditional
+  `UPDATE … WHERE state IN (accepted, running)` for every terminal and
+  phase write (identity-map staleness made read-check-write racy).
+- Competition filtering is centralized (`srplatform/api/visibility.py`)
+  across events/live/scorecard/agent-memory/AAR/hints; replay stays
+  unfiltered (first-party shell transcripts, no red internals present)
+  and scenario red objectives stay catalog-public (the published threat
+  model defenders must know pre-match).
+- PVE grants are per-VMID enumerated (templates + bounded clone window;
+  destroy has no pool alternative per the PVE 9.2 audit) with a split
+  storage role; the `/vms`-wide grant is gone, proven by dry-run output
+  assertions.
+- The installer renders what the non-secret manifest determines (broker
+  policy, topology/URL/model/trust env facts); secrets stay operator-owned
+  and the example no longer overrides derived values. TLS identities are
+  pair-checked, preserved across reruns, and rotate only explicitly.
+- Assumed-breach = snapshot start-phase rewrite + Begin proof executing
+  as web-user + worker context seeded via agent_state (the red loop
+  restores phase/summary from it at startup).
+- MySQL truth is triangulated: loopback business transaction (correctness)
+  + web-origin network-path transaction (service path) + controller TCP
+  greeting (no guest code runs) + loopback/via count cross-validation.
+  Perfect observation of a fully compromised guest is impossible;
+  disagreement is reported as integrity failure, never averaged.
+
 | Chosen | Rejected / deferred | Why |
 |---|---|---|
 | Range guests are **on-link only**: the typed broker policy refuses any `gw=` in `ipconfig0`; every legitimate target (controller range address, bastion, peers) is on-link | Keeping an operator-configurable gateway on clones (a default route is a WAN/management egress path by construction) | Isolation must be impossible to defeat from guest configuration; the plan demands default-route removal via typed policy, not firewall hope |
