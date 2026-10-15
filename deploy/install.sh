@@ -145,7 +145,11 @@ print(' '.join(out))" "$MANIFEST")"
     say tls "refusing partial TLS state (see above) — recover ca.key from backup or rotate explicitly"
     exit 1
   elif [ "$_tls_rc" -ne 0 ]; then
-    say tls "bootstrap needs the operator CA inputs — see deploy/README.md §3"
+    # Unsuccessful TLS provisioning fails the installation outright: the
+    # services cannot authenticate without their identities, and a
+    # warn-and-continue install would leave HTTPS silently unusable.
+    say tls "TLS provisioning failed (exit $_tls_rc) — see deploy/README.md §3"
+    exit 1
   fi
 fi
 

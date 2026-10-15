@@ -119,13 +119,17 @@ elif [ "$FRESH" = 1 ] || [ ! -f api-ca.key ] || [ ! -f api-ca.crt ] || [ ! -f in
 fi
 
 # web UI: self-signed with the LAN IP in the SAN (teammates import/verify it)
-if [ -n "$HTTPS_IP" ] && { [ ! -f https.key ] || [ ! -f https.crt ] || [ "$FRESH" = 1 ]; }; then
-  # Explicit rotation takes precedence over preservation: FRESH=1 always
-  # replaces the key. Otherwise a surviving key with a missing cert
-  # re-issues the cert onto the SAME key (pinning-safe, rotation untouched).
-  if [ "$FRESH" = 1 ]; then
-    rm -f https.key https.crt
-  elif [ -f https.key ] && [ ! -f https.crt ]; then
+# Explicit rotation ALWAYS regenerates (FRESH takes precedence over
+# every preservation branch below — rotation that keeps the old key is a
+# silent no-op, the worst possible outcome for a rotation ceremony).
+if [ -n "$HTTPS_IP" ] && [ "$FRESH" = 1 ]; then
+  rm -f https.key https.crt
+fi
+if [ -n "$HTTPS_IP" ] && { [ ! -f https.key ] || [ ! -f https.crt ]; }; then
+  if [ -f https.key ] && [ ! -f https.crt ]; then
+    # surviving key, missing certificate: re-issue the cert onto the SAME
+    # key (clients pinning the key are unaffected; rotation is untouched
+    # because FRESH already replaced the key above when requested)
     openssl req -x509 -key https.key -sha256 -days "$DAYS" -nodes \
       -out https.crt -subj "/CN=$HTTPS_IP" \
       -addext "subjectAltName=IP:$HTTPS_IP"

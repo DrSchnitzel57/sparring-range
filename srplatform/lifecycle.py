@@ -205,11 +205,19 @@ def prove_assumed_breach(db, session_id) -> dict | None:
     try:
         resp = _flaw_get(flaw_url, timeout=10.0)
         body = getattr(resp, "text", "") or ""
-        # Strict executing-identity match: uid=<n>(web-user) with HTTP 200.
-        # Error text mentioning the account ("id: web-user: no such user",
-        # exit!=0 renderings, root output) can never satisfy this.
-        ok = (resp.status_code == 200
-              and _re.search(r"uid=\d+\(web-user\)", body) is not None)
+        # Strict LIMITED SUCCESSFUL execution proof, parsed from the
+        # flaw's own first-line verdict `[uid=N user=NAME] exit=C`:
+        # the executing identity must be the LIMITED web-user account
+        # (uid != 0 — a root-equivalent `uid=0(web-user)` proves
+        # privilege, not limitation) AND the command must have completed
+        # (exit == 0). Bare mentions, error text, and failed executions
+        # can never satisfy this conjunction.
+        first = (body.splitlines() or [""])[0]
+        m = _re.fullmatch(
+            r"\[uid=(\d+) user=([A-Za-z0-9_.-]+)\] exit=(\d+)", first.strip())
+        ok = (resp.status_code == 200 and m is not None
+              and m.group(2) == "web-user"
+              and int(m.group(1)) != 0 and m.group(3) == "0")
     except Exception as e:  # noqa: BLE001 — unreachable flaw
         ok, body, resp = False, f"flaw unreachable: {e}"[:200], None
     proof["established"] = bool(ok)

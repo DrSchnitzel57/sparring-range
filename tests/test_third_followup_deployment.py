@@ -454,7 +454,8 @@ def test_assumed_breach_proof_executes_as_web_user(client, users, fake_pve,
 
     class FlawResp:
         status_code = 200
-        text = "uid=1001(web-user) gid=1001(web-user) groups=1001(web-user)\n"
+        # exact production verdict line: limited identity + success
+        text = "[uid=1001 user=web-user] exit=0\nid: output follows\n"
 
     def fake_flaw_get(url, timeout=10.0):
         seen["url"] = url
@@ -542,8 +543,10 @@ def test_assumed_breach_rejects_wrong_identity_and_error_text(
     launch_and_wait(client, users["member"], sid)
 
     hostile = {
-        "root": (200, "[uid=0 user=root] exit=1\n"),
+        # root-equivalent execution masquerading with the name attached
+        "root": (200, "[uid=0 user=web-user] exit=0\n"),
         "error": (200, "id: web-user: no such user\n"),
+        "failed": (200, "[uid=1001 user=web-user] exit=1\n"),
         "created": (404, "not found\n"),
     }
 
@@ -555,7 +558,7 @@ def test_assumed_breach_rejects_wrong_identity_and_error_text(
     hostile_flaw.mode = "root"
     monkeypatch.setattr(lifecycle_mod, "_flaw_get", hostile_flaw)
     with db_ctx() as s:
-        for mode in ("root", "error", "created"):
+        for mode in ("root", "error", "failed", "created"):
             hostile_flaw.mode = mode
             proof = lifecycle_mod.prove_assumed_breach(
                 s, __import__("uuid").UUID(sid))
