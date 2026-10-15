@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 #: Versioned catalog. ``host_role`` resolves at schedule time against the
 #: scenario topology (owned hosts only); verification re-reads the live
@@ -241,20 +241,26 @@ def expire_releases(db, session_id, *, now: datetime | None = None) -> int:
     scheduler tick."""
     from srplatform.db.models import Event, InjectRelease
     now = now or datetime.now(timezone.utc)
-    rows = db.execute(
-        select(InjectRelease).where(
-            InjectRelease.session_id == session_id,
-            InjectRelease.status == "pending",
-            InjectRelease.deadline_at <= now)).scalars().all()
-    for r in rows:
-        r.status = "expired"
-        db.add(Event(session_id=r.session_id, ts=now, actor="system",
+    # ATOMIC conditional transition (single UPDATE … WHERE status =
+    # 'pending'): a verify that committed `correct` a microsecond earlier
+    # no longer matches the predicate, so expiry can never overwrite a
+    # timely decision.
+    ids = db.execute(
+        update(InjectRelease)
+        .where(InjectRelease.session_id == session_id,
+               InjectRelease.status == "pending",
+               InjectRelease.deadline_at <= now)
+        .values(status="expired")
+        .returning(InjectRelease.release_id, InjectRelease.inject_id)
+    ).all()
+    for release_id, inject_id in ids:
+        db.add(Event(session_id=session_id, ts=now, actor="system",
                      action_type="inject_expired",
-                     payload={"release_id": str(r.release_id),
-                              "inject_id": r.inject_id}))
-    if rows:
+                     payload={"release_id": str(release_id),
+                              "inject_id": inject_id}))
+    if ids:
         db.commit()
-    return len(rows)
+    return len(ids)
 
 
 def summary(db, session_id) -> dict:

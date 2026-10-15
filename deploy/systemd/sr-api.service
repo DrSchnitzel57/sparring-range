@@ -7,7 +7,10 @@ Wants=network-online.target
 Type=exec
 User=srrange
 Group=srrange
-EnvironmentFile=/etc/sparring-range/control-plane.env
+EnvironmentFile=/etc/sparring-range/control-plane.derived.env
+# Operator secrets and overrides load second (optional so pre-derivation
+# installs keep working); manifest-derived facts above, secrets below.
+EnvironmentFile=-/etc/sparring-range/control-plane.env
 WorkingDirectory=/opt/sparring-range
 ExecStart=/opt/sparring-range/.venv/bin/uvicorn srplatform.api.app:app --host 127.0.0.1 --port 8000
 Restart=always

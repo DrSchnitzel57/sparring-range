@@ -14,7 +14,13 @@ from __future__ import annotations
 
 #: payloads that reveal red internals
 SPOILER_ACTORS = frozenset({"red", "telemetry"})
-SPOILER_KINDS = frozenset({"tool_call", "detection", "verifier"})
+SPOILER_KINDS = frozenset({
+    "tool_call",      # red attack steps
+    "detection",      # what the attacker achieved
+    "verifier",       # per-check pass/fail detail
+    "aar",            # graded report narrates the full timeline
+    "score_snapshot",  # trusted scorecard with per-check evidence
+})
 
 TERMINAL_MATCH_STATES = frozenset({"completed", "interrupted", "failed"})
 

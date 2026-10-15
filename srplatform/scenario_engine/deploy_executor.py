@@ -145,13 +145,20 @@ def _require_live(db, row, owner: str, operation_id: str,
     never finalize an interrupted row), and still be within its deadline.
     A superseded executor stops quietly instead of deploying over a
     replacement."""
+    from srplatform.db.models import OperationClaim
     from srplatform.scenario_engine import orchestrator
 
     fresh = db.get(type(row), row.operation_id)
     if fresh is None:
         raise _Superseded(f"{boundary}: operation row gone")
-    if fresh.fence != owner:
-        raise _Superseded(f"{boundary}: fence lost (owned by another attempt)")
+    # The live CLAIM is the ownership truth: a takeover never touches old
+    # operation rows, so comparing against the row's own stored fence is
+    # vacuous — check the current claim owner instead.
+    claim = db.get(OperationClaim, fresh.session_id)
+    if claim is None or claim.owner != owner:
+        raise _Superseded(
+            f"{boundary}: session claim "
+            f"{'missing' if claim is None else 'owned by another attempt'}")
     if fresh.state not in ("accepted", "running"):
         raise _Superseded(f"{boundary}: already terminal ({fresh.state})")
     if fresh.deadline_at and datetime.now(timezone.utc) > fresh.deadline_at:

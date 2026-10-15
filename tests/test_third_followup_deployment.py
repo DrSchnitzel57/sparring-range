@@ -321,12 +321,15 @@ def test_t05_dev_relaxation_is_visible(client, users, fake_pve, enrollment_chann
 # T06 — production cannot skip readiness; reset shares the launch workflow      #
 # --------------------------------------------------------------------------- #
 
-def _prod_env(monkeypatch):
+def _prod_env(monkeypatch, tmp_path=None):
     """A production config that PASSES validate_production (the review's
     reproduction) while the management channel stays unavailable: pins are
     merely NON-EMPTY (validation does not require existence — the T06 gap)
-    and the verifier key is missing. Milestone 02 contract: the controller
-    presents broker mutual-TLS material and NO PVE credentials."""
+    and the verifier key is missing. Pin PUBLICATION uses isolated tmp
+    known-hosts files when tmp_path is given, so the test exercises the
+    intended channel-missing refusal instead of tripping on unpublished
+    pins first. Milestone 02 contract: the controller presents broker
+    mutual-TLS material and NO PVE credentials."""
     monkeypatch.setenv("SR_ENV", "production")
     # plan 13 phase 4: production trust is mandatory — guests ship
     # authenticated telemetry to the controller's range address over
@@ -344,6 +347,12 @@ def _prod_env(monkeypatch):
     monkeypatch.setenv("BASTION_TARGETS_KNOWN_HOSTS", "/etc/sr/bastion-known-hosts")
     monkeypatch.setenv("VERIFIER_SSH_KNOWN_HOSTS", "/etc/sr/verifier-known-hosts-MISSING")
     monkeypatch.setenv("VERIFIER_SSH_KEY_PATH", "")
+    if tmp_path is not None:
+        for var in ("RUNNER_SSH_KNOWN_HOSTS", "BASTION_TARGETS_KNOWN_HOSTS",
+                    "VERIFIER_SSH_KNOWN_HOSTS"):
+            f = tmp_path / (var.lower() + ".test")
+            f.write_text("")
+            monkeypatch.setenv(var, str(f))
     from srplatform.settings import get_settings
     get_settings.cache_clear()
 
@@ -360,8 +369,8 @@ def _clear_prod(monkeypatch):
     get_settings.cache_clear()
 
 
-def test_t06_production_without_channel_refuses_ready(client, users, fake_pve,
-                                                      monkeypatch):
+def test_t06_production_without_channel_refuses_ready(
+        client, users, fake_pve, monkeypatch, tmp_path):
     """The dev relaxation EXPLICITLY requires dev mode: with production
     settings and no management key/pins, /launch must 409 and the session
     must not be `ready` in the database."""
@@ -369,7 +378,7 @@ def test_t06_production_without_channel_refuses_ready(client, users, fake_pve,
     from srplatform.db.models import Session as SessionModel
 
     sid = _session(client, users)
-    _prod_env(monkeypatch)
+    _prod_env(monkeypatch, tmp_path)
     try:
         r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
         assert r.status_code == 202, r.text
@@ -394,7 +403,7 @@ def test_t06_dev_relaxation_requires_dev_mode_and_is_visible(client, users, fake
 
 
 def test_t06_reset_runs_the_launch_readiness_and_credential_workflow(
-        client, users, fake_pve, monkeypatch):
+        client, users, fake_pve, monkeypatch, tmp_path):
     """Reset must (a) succeed to a clear NEW ready state with NEW connection
     capabilities, and (b) when readiness fails (production, no channel),
     refuse with 409 and leave the session explicitly `preparing`."""
@@ -421,7 +430,7 @@ def test_t06_reset_runs_the_launch_readiness_and_credential_workflow(
 
     # (b) readiness failure path: production without a channel -> reset
     # destroys+redeploys but CANNOT claim ready
-    _prod_env(monkeypatch)
+    _prod_env(monkeypatch, tmp_path)
     try:
         r = client.post(f"/sessions/{sid}/reset", headers=users["member"])
         assert r.status_code == 202, r.text

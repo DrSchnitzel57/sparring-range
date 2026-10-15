@@ -1236,6 +1236,19 @@ def check_install() -> None:
             fail("installer renders broker policy from the manifest",
                  f"{e}\n{(rr1.stdout + rr1.stderr)[-800:]}")
         ok("installer real run renders manifest-derived broker policy")
+        derived = rp / "etc/sparring-range/control-plane.derived.env"
+        text = derived.read_text()
+        for want in ("PROXMOX_NODE=pve", "RANGE_BRIDGE=srrange",
+                     "RANGE_VLAN=66", "RANGE_CIDR=10.66.0.0/24",
+                     "DEPLOY_VMID_BASE=9100",
+                     f"BROKER_POLICY_FILE={pol}"):
+            assert want in text, f"derived env missing {want}:\n{text[:600]}"
+        assert "CHANGE" not in text, "derived config must not carry placeholders"
+        unit = (REPO / "deploy/systemd/sr-api.service").read_text()
+        assert "control-plane.derived.env" in unit, \
+            "shipped unit must load the derived environment"
+        assert "User=srrange" in unit, "unit identity must match installer"
+        ok("installer renders manifest-derived service environment")
         before = {(p.name, p.read_bytes()) for p in
                   (rp / "etc/sparring-range/tls").glob("*.key")}
         assert before, "first real run must generate TLS identities"
@@ -1267,6 +1280,29 @@ def check_install() -> None:
             fail("installer explicit rotation",
                  "--rotate-tls left all identities unchanged")
         ok("installer explicit --rotate-tls rotates identities")
+        # partial recovery: deleting ONE disposable key regenerates only
+        # it — surviving identities are preserved without any flag
+        doomed = rp / "etc/sparring-range/tls/broker-server.key"
+        survivor = (rp / "etc/sparring-range/tls/api-client.key").read_bytes()
+        doomed.unlink()
+        rr4 = subprocess.run(real, capture_output=True,
+                             text=True, cwd=REPO, env=renv, timeout=300)
+        if rr4.returncode != 0 or not doomed.exists():
+            fail("installer partial recovery regenerates only the missing",
+                 f"exit {rr4.returncode}:\n{(rr4.stdout + rr4.stderr)[-800:]}")
+        if (rp / "etc/sparring-range/tls/api-client.key").read_bytes() != survivor:
+            fail("installer partial recovery regenerates only the missing",
+                 "a SURVIVING identity rotated without --rotate-tls")
+        ok("installer partial recovery preserves survivors")
+        # partial state with a missing CA key beside surviving certificates
+        # is refused explicitly (exit 1), never silently orphaned
+        (rp / "etc/sparring-range/tls/ca.key").unlink()
+        rr5 = subprocess.run(real, capture_output=True,
+                             text=True, cwd=REPO, env=renv, timeout=300)
+        if rr5.returncode == 0:
+            fail("installer refuses CA-less partial TLS state",
+                 "missing ca.key with surviving certificates was accepted")
+        ok("installer refuses CA-less partial TLS state")
 
         if os.environ.get("SR_INSTALL_VM_EVIDENCE") != "1":
             fail("managed-service installation (clean VM, rerun, reboot, "

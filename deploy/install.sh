@@ -56,7 +56,11 @@ except ManifestError as e:
 print("install[1]: manifest valid (schema v%s)" % m.get("schema_version"))
 PYEOF
 
-SR_USER=sr-app; SR_GROUP=sr-app
+# canonical service identities (match deploy/systemd units, README and
+# shipped file ownership: srrange/srbastion/srbroker — one per role so a
+# compromised role cannot write another role's state)
+SR_USER=srrange; SR_GROUP=srrange
+SR_ALL_USERS="srrange srbastion srbroker"
 STATE="$PREFIX/var/lib/sparring-range"
 ETC="$PREFIX/etc/sparring-range"
 TLS="$ETC/tls"
@@ -64,10 +68,12 @@ LOGDIR="$PREFIX/var/log/sparring-range"
 
 # 2 -- identity + state (idempotent).
 if [ "$DRY" != 1 ]; then
-  id -u "$SR_USER" >/dev/null 2>&1 || useradd --system --home-dir "$STATE" \
-      --shell /usr/sbin/nologin "$SR_USER"
+  for _u in $SR_ALL_USERS; do
+    id -u "$_u" >/dev/null 2>&1 || useradd --system \
+        --home-dir "$STATE" --shell /usr/sbin/nologin "$_u"
+  done
 else
-  echo "DRY: ensure user $SR_USER exists"
+  echo "DRY: ensure users $SR_ALL_USERS exist"
 fi
 run install -d -m 0750 -o "$SR_USER" -g "$SR_GROUP" "$STATE" "$LOGDIR"
 run install -d -m 0750 "$ETC" "$TLS"
@@ -95,9 +101,22 @@ elif _tls_have && [ "$ROTATE_TLS" != 1 ]; then
   say tls "keeping existing TLS identities (rotation needs --rotate-tls)"
 else
   # SR_SSH_DIR follows the prefix too: bastion keys must never land in
-  # /etc when installing under a sandbox prefix.
-  SR_TLS_DIR="$TLS" SR_SSH_DIR="$ETC/ssh" "$REPO/deploy/bootstrap_tls.sh" >/dev/null || {
-    say tls "bootstrap needs the operator CA inputs — see deploy/README.md §3"; }
+  # /etc when installing under a sandbox prefix. SR_TLS_ROTATE=1 reaches
+  # through only for explicit --rotate-tls (normal runs preserve).
+  # Exit 3 from bootstrap is an explicit partial-state REFUSAL (missing CA
+  # key beside surviving certificates) — that fails the install loudly;
+  # any other failure is missing operator inputs on a first run (warn).
+  set +e
+  SR_TLS_DIR="$TLS" SR_SSH_DIR="$ETC/ssh" SR_TLS_ROTATE="$ROTATE_TLS" \
+    "$REPO/deploy/bootstrap_tls.sh" >/dev/null
+  _tls_rc=$?
+  set -e
+  if [ "$_tls_rc" -eq 3 ]; then
+    say tls "refusing partial TLS state (see above) — recover ca.key from backup or rotate explicitly"
+    exit 1
+  elif [ "$_tls_rc" -ne 0 ]; then
+    say tls "bootstrap needs the operator CA inputs — see deploy/README.md §3"
+  fi
 fi
 
 # 5 -- config rendering: env files from the manifest + examples. Existing
@@ -153,6 +172,36 @@ rc = gen_mod.main(["--node", m["pve"]["node"], "--bridge", m["network"]["bridge"
 sys.exit(rc)
 PYEOF
   say config "rendered $ETC/broker-policy.json from the manifest"
+fi
+
+# 5c -- DERIVED service environment (non-secret manifest facts). Rendered
+# every run into control-plane.derived.env; the operator-owned
+# control-plane.env keeps secrets and overrides (loaded second). Secrets
+# can never come from the non-secret manifest — they stay operator-owned.
+if [ "$DRY" = 1 ]; then
+  echo "DRY: render $ETC/control-plane.derived.env from the manifest"
+else
+"$PY" - "$MANIFEST" "$ETC/control-plane.derived.env" "$ETC/broker-policy.json" <<'PYEOF'
+import json, sys
+m = json.load(open(sys.argv[1]))
+out, policy = sys.argv[2], sys.argv[3]
+lo, hi = m["pve"]["clone_vmid_range"]
+lines = [
+    "# DERIVED from the release manifest — do not hand-edit "
+    "(re-rendered by deploy/install.sh). Operator secrets and overrides "
+    "belong in control-plane.env, which is loaded after this file.",
+    f"PROXMOX_NODE={m['pve']['node']}",
+    f"RANGE_BRIDGE={m['network']['bridge']}",
+    f"RANGE_VLAN={m['network']['vlan']}",
+    f"RANGE_CIDR={m['network']['range_cidr']}",
+    f"RANGE_GATEWAY={m['network']['gateway']}",
+    f"DEPLOY_VMID_BASE={lo}",
+    f"BROKER_POLICY_FILE={policy}",
+]
+open(out, "w").write("\n".join(lines) + "\n")
+print(f"derived environment written: {out}")
+PYEOF
+  say config "rendered $ETC/control-plane.derived.env from the manifest"
 fi
 
 # 6 -- systemd units (idempotent copy + reload).

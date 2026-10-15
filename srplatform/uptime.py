@@ -162,7 +162,11 @@ def live_projection(db, session_id) -> dict:
     m = lifecycle.get_match(db, session_id)
     if m is not None and m.started_at is not None:
         started = m.started_at
-        ended = m.deadline_at if m.state == "running" else None
+        # Clock discipline: while running, the window ends NOW (the future
+        # is not evidence — counting it manufactures "missed" checks);
+        # once terminal, the window freezes at ended_at (later reads must
+        # not keep deteriorating completed coverage).
+        ended = None if m.state == "running" else m.ended_at
     else:
         sess = db.get(SessionModel, session_id)
         started = (sess.started_at if sess is not None

@@ -183,9 +183,9 @@ def test_superseded_executor_performs_no_effects(client, users, fake_broker):
         row = orchestrator.begin_deploy_operation(
             s, sid, "launch", fence="stale-owner", deadline_s=600)
         op_id = str(row.operation_id)
-        # a replacement takes over: new fence on the row + live claim
-        row = s.get(DeployOperation, row.operation_id)
-        row.fence = "replacement-owner"
+        # a replacement takes over the LIVE claim (takeover never touches
+        # old operation rows — the stale row keeps its old fence, so the
+        # executor must check claim ownership, not the row's fence)
         s.add(OperationClaim(session_id=sid, operation="launch",
                              owner="replacement-owner",
                              claimed_at=row.created_at))
@@ -201,3 +201,31 @@ def test_superseded_executor_performs_no_effects(client, users, fake_broker):
         assert row.state in ("accepted", "running")  # untouched by stale run
         claim = s.get(OperationClaim, uuid.UUID(sid))
         assert claim is not None and claim.owner == "replacement-owner"
+
+
+def test_interrupted_operation_can_never_become_succeeded(client, users):
+    """Terminal states are sticky: even the owning executor cannot flip an
+    interrupted row to succeeded (crash-recovery evidence is never
+    rewritten by a stale thread)."""
+    from srplatform.db.models import DeployOperation, OperationClaim
+    from srplatform.db.session import db
+    from srplatform.scenario_engine import deploy_executor, orchestrator
+    sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
+                      headers=users["member"]).json()["session_id"]
+    with db() as s:
+        row = orchestrator.begin_deploy_operation(
+            s, sid, "launch", fence="owner-1", deadline_s=600)
+        op_id = str(row.operation_id)
+        s.add(OperationClaim(session_id=sid, operation="launch",
+                             owner="owner-1", claimed_at=row.created_at))
+        s.commit()
+    with db() as s:
+        n = orchestrator.reconcile_deploy_operations(s)
+        assert n == 1
+    deploy_executor._execute(operation_id=op_id, session_id=uuid.UUID(sid),
+                             user_id="member", operation="launch",
+                             scenario_id="web-foothold-01",
+                             broker=None, owner="owner-1")
+    with db() as s:
+        row = s.get(DeployOperation, uuid.UUID(op_id))
+        assert row.state == "interrupted", row.state

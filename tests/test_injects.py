@@ -234,3 +234,34 @@ def test_concurrent_submissions_first_decision_wins(client, users, fake_broker):
         assert rel.status == "correct" and rel.submissions == 2, \
             (rel.status, rel.submissions)
         assert rel.evidence.get("submission", "").startswith("answer from ")
+
+
+def test_expiry_never_overwrites_a_timely_decision(client, users, fake_broker):
+    """Atomic conditional expiry: a `correct` committed before the expiry
+    pass no longer matches the pending predicate — the decision stands and
+    the expiry reports zero transitions."""
+    from datetime import timedelta
+    from srplatform import injects as injects_svc
+    from srplatform import verification_service
+    from srplatform.db.models import InjectRelease
+    from srplatform.db.session import db as db_ctx
+    sid = _begin(client, users, duration_minutes=30)
+    inbox = client.get(f"/sessions/{sid}/injects",
+                       headers=users["member"]).json()
+    wr = next(x for x in inbox["releases"]
+              if x["inject_id"] == "web-restoration@1")
+    _open_window(wr["release_id"])
+    verification_service.set_verifier_exec(_exec_ok)
+    try:
+        r = client.post(f"/sessions/{sid}/injects/{wr['release_id']}",
+                        json={"content": "restored"},
+                        headers=users["member"])
+        assert r.json()["status"] == "correct"
+    finally:
+        verification_service.set_verifier_exec(None)
+    with db_ctx() as s:
+        n = injects_svc.expire_releases(
+            s, sid, now=datetime.now(timezone.utc) + timedelta(hours=2))
+        assert n == 0, "expiry must not touch decided releases"
+        rel = s.get(InjectRelease, U.UUID(wr["release_id"]))
+        assert rel.status == "correct", rel.status

@@ -179,6 +179,12 @@ def finish_deploy_operation(db: Session, row, state: str, *,
     row = db.get(DeployOperation, row.operation_id)
     if row is None:
         return
+    # Terminal states are STICKY: a stale executor (or a duplicate
+    # finalizer) must never flip interrupted/failed/succeeded back to
+    # another outcome. The first terminal write wins; later ones are
+    # dropped loudly via the returned flag.
+    if row.state in ("succeeded", "failed", "interrupted"):
+        return False
     row.state = state
     row.error = (error or None) and str(error)[:500]
     if result is not None:
@@ -186,6 +192,7 @@ def finish_deploy_operation(db: Session, row, state: str, *,
     row.completed_at = _now()
     row.updated_at = row.completed_at
     db.commit()
+    return True
 
 
 def reconcile_deploy_operations(db: Session) -> int:
