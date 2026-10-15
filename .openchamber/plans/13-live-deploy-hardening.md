@@ -9,22 +9,30 @@ a claim that the current code or any live deployment has passed acceptance.
 - [x] 1. Establish the release contract, fresh baseline, and deployment manifest.
 - [x] 2. Repair and prove the Proxmox/broker boundary and recovery contracts.
 - [x] 3. Build complete, role-separated, boot-tested guest templates.
-- [ ] 4. Establish production configuration, TLS, telemetry, and readiness.
-- [ ] 5. Implement durable asynchronous deployment and lifecycle recovery.
+- [x] 4. Establish production configuration, TLS, telemetry, and readiness.
+- [x] 5. Implement durable asynchronous deployment and lifecycle recovery.
 - [ ] 6. Complete both presets, match controls, observations, and injects.
-- [ ] 7. Complete browser workflows, visibility policy, and honest reports.
+- [x] 7. Complete browser workflows, visibility policy, and honest reports.
 - [ ] 8. Deliver and rehearse the operator installer and optional backups.
 - [ ] 9. Collect authorized live evidence and reconcile release documents.
 
-Status (2026-10-14, implementation session): steps 1–3 complete and gated
-(step 3 by `images` PASS 18/0 + `capture` PASS on the rebuilt role overlays).
-Steps 4–6 and 8 are implemented with fast/db/browser/gate evidence recorded
-in `docs/FINDINGS_CHECKLIST.md` ("Phases 3–8"); their remaining halves are
-live/operator gates (packet CI job, service-VM install evidence, deployed-
-lab release workflows), and step 7's new UI beyond the shipped inject inbox
-(control builder, safety-panel refinements) remains open. Step 9 is operator
-live evidence and stays open by design. Checkboxes are ticked only when the
-step's own gate passes — never on implementation presence alone.
+Status (2026-10-15, implementation session): steps 1–5 and 7 complete and
+gated. Step 4 by the trust/readiness suites (wrong CA/SAN, unreachable
+ingest, wrong token, invalid keys, pin publication failure, boot-race
+taxonomy all produce bounded truthful outcomes in passing fast/db tests).
+Step 5 by the db gate (commit/effect boundaries, lost-response recovery,
+duplicates with live operation ids, executor deadline, restart reconcile,
+failed destroy, recovery, second-launch idempotence). Step 7 by the
+browser gate (real-browser workflow incl. control builder, inject inbox,
+safety page, session refresh on tick) plus the API negative matrix in the
+db layer. Step 6 is implemented and gated at API level (snapshots,
+coverage, business probe, versioned injects + inbox) while its full
+control-matrix LIVE execution stays open with the deployed lab (the live
+release suite exists: 6 httpx-only workflows). Step 8's installer contract
+passes in sandbox; the service-VM rehearsal stays open. Step 9 is operator
+live evidence and stays open by design.
+Checkboxes are ticked only when the step's own gate passes — never on
+implementation presence alone.
 
 Finish phases in order; each has a stop condition below. Independent tests
 may run in parallel, but unresolved safety or ownership defects block later

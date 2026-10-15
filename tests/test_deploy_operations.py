@@ -8,6 +8,8 @@ result, and startup reconciliation that marks a dead executor's attempt
 """
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from sqlalchemy import select
 from tests.conftest import launch_and_wait, wait_operation
@@ -144,3 +146,25 @@ def test_duplicate_launch_never_creates_second_deployment(client, users,
     assert _ops(sid) == []  # refused BEFORE durable acceptance: no phantom row
     with db() as s:
         orchestrator.release_operation(s, sid)
+
+
+def test_expired_deadline_fails_before_dispatch(client, users, fake_broker):
+    """An attempt whose deadline already passed never dispatches: the
+    executor records `failed` without a single side effect (no clone, no
+    lease use beyond what acceptance already reserved)."""
+    from srplatform.scenario_engine import deploy_executor, orchestrator
+    from srplatform.db.session import db
+    sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
+                      headers=users["member"]).json()["session_id"]
+    with db() as s:
+        row = orchestrator.begin_deploy_operation(
+            s, sid, "launch", fence="test-fence", deadline_s=-60)
+        op_id = str(row.operation_id)
+    deploy_executor._execute(operation_id=op_id, session_id=uuid.UUID(sid),
+                             user_id="member", operation="launch",
+                             scenario_id="web-foothold-01",
+                             broker=fake_broker, owner="test-fence")
+    ops = _ops(sid)
+    assert len(ops) == 1 and ops[0].state == "failed"
+    assert "deadline exceeded" in (ops[0].error or "")
+    assert fake_broker.http.requests == [], "no side effects after expiry"
