@@ -444,7 +444,6 @@ def test_t06_reset_runs_the_launch_readiness_and_credential_workflow(
 
 
 def test_assumed_breach_proof_executes_as_web_user(client, users, fake_pve,
-                                                   enrollment_channel,
                                                    monkeypatch):
     """The foothold is ESTABLISHED over the attacker-identical path: an
     unauthenticated HTTP request to the documented flaw, whose response
@@ -465,41 +464,37 @@ def test_assumed_breach_proof_executes_as_web_user(client, users, fake_pve,
 
     monkeypatch.setattr(lifecycle_mod, "_flaw_get", fake_flaw_get)
     from tests.conftest import launch_and_wait
-    try:
-        sid = client.post("/sessions", json={"scenario_id": "web-foothold-01",
-                                             "start_condition": "assumed-breach"},
-                          headers=users["member"]).json()["session_id"]
-        launch_and_wait(client, users["member"], sid)
-        assert client.post(f"/sessions/{sid}/begin",
-                           headers=users["member"]).status_code == 202
-        evs = client.get("/events", params={"session_id": sid, "tail": 40},
-                         headers=users["member"]).json()
-        begin = next(e for e in evs if e["action_type"] == "match_begin")
-        proof = begin["payload"].get("disclosed_foothold")
-        assert proof and proof.get("established") is True, proof
-        assert proof.get("http_status") == 200
-        # the trigger used zero privilege over plain HTTP (no sudo,
-        # no runuser, no credentials anywhere in the request)
-        assert seen.get("url", "").startswith("http://10.66.0.10/diagnostic?cmd="), seen
-        for banned in ("sudo", "runuser", "PRIV", "token", "password"):
-            assert banned not in seen["url"], seen
-        # the worker is SUPPLIED the foothold: agent_state seeds its
-        # start phase and prompt summary (the runner token reads this;
-        # members cannot — competition sealed)
-        from srplatform.db.models import AgentState
-        from srplatform.db.session import db as db_ctx
-        with db_ctx() as s:
-            st = s.get(AgentState, uuid.UUID(sid))
-            assert st is not None and st.current_phase == "initial-access"
-            assert "ASSUMED BREACH" in (st.summary or "") \
-                and "web-user" in st.summary
-    finally:
-        enrollment_channel.set_enrollment_exec(None)
-        verification_service.set_verifier_exec(None)
+    sid = client.post("/sessions", json={"scenario_id": "web-foothold-01",
+                                         "start_condition": "assumed-breach"},
+                      headers=users["member"]).json()["session_id"]
+    launch_and_wait(client, users["member"], sid)
+    assert client.post(f"/sessions/{sid}/begin",
+                       headers=users["member"]).status_code == 202
+    evs = client.get("/events", params={"session_id": sid, "tail": 40},
+                     headers=users["member"]).json()
+    begin = next(e for e in evs if e["action_type"] == "match_begin")
+    proof = begin["payload"].get("disclosed_foothold")
+    assert proof and proof.get("established") is True, proof
+    assert proof.get("http_status") == 200
+    # the trigger used zero privilege over plain HTTP (no sudo,
+    # no runuser, no credentials anywhere in the request)
+    assert seen.get("url", "").startswith("http://10.66.0.10/diagnostic?cmd="), seen
+    for banned in ("sudo", "runuser", "PRIV", "token", "password"):
+        assert banned not in seen["url"], seen
+    # the worker is SUPPLIED the foothold: agent_state seeds its
+    # start phase and prompt summary (the runner token reads this;
+    # members cannot — competition sealed)
+    from srplatform.db.models import AgentState
+    from srplatform.db.session import db as db_ctx
+    with db_ctx() as s:
+        st = s.get(AgentState, uuid.UUID(sid))
+        assert st is not None and st.current_phase == "initial-access"
+        assert "ASSUMED BREACH" in (st.summary or "") \
+            and "web-user" in st.summary
 
 
 def test_assumed_breach_refused_begin_spawns_no_worker(
-        client, users, fake_broker, enrollment_channel, monkeypatch):
+        client, users, fake_broker, monkeypatch, tmp_path):
     """A refused Begin (unproven foothold) must not leave an attacker
     running: the proof runs BEFORE the worker spawns, so the 409 means no
     worker exists and the clock never started."""
@@ -510,17 +505,16 @@ def test_assumed_breach_refused_begin_spawns_no_worker(
         raise OSError("flaw unreachable in this test")
 
     monkeypatch.setattr(lifecycle_mod, "_flaw_get", dead_flaw)
-    # production mode: an unprovable foothold refuses Begin (dev would
-    # proceed explicitly unproven)
-    monkeypatch.setenv("SR_ENV", "production")
-    from srplatform.settings import get_settings
-    get_settings.cache_clear()
+    # deploy first in dev (production without a channel cannot go
+    # ready), then switch to production with isolated pins for Begin:
+    # valid publication, but the flaw itself unreachable.
+    sid = client.post("/sessions", json={"scenario_id": "web-foothold-01",
+                                         "start_condition": "assumed-breach"},
+                      headers=users["member"]).json()["session_id"]
+    from tests.conftest import launch_and_wait
+    launch_and_wait(client, users["member"], sid)
+    _prod_env(monkeypatch, tmp_path)
     try:
-        sid = client.post("/sessions", json={"scenario_id": "web-foothold-01",
-                                             "start_condition": "assumed-breach"},
-                          headers=users["member"]).json()["session_id"]
-        from tests.conftest import launch_and_wait
-        launch_and_wait(client, users["member"], sid)
         r = client.post(f"/sessions/{sid}/begin", headers=users["member"])
         assert r.status_code == 409, r.text
         assert r.json()["detail"]["error"] == "assumed_breach_unproven"
@@ -530,4 +524,4 @@ def test_assumed_breach_refused_begin_spawns_no_worker(
             from srplatform import lifecycle
             assert lifecycle.get_match(s, sid).state != "running"
     finally:
-        get_settings.cache_clear()
+        _clear_prod(monkeypatch)
