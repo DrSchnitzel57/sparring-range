@@ -188,9 +188,14 @@ def submit(db, release, *, now: datetime | None = None, exec_fn=None,
     # ATOMIC CLAIM (first answer decides): lock the row; a concurrent
     # submission arriving while this one verifies sees the decided state
     # instead of re-verifying and overwriting it.
+    # populate_existing: the caller may already hold this row in the
+    # session (stale snapshot) — the locked read must refresh to the
+    # committed truth, or the increment below silently overwrites a
+    # concurrent submission's count (lost update DESPITE the lock).
     release = db.execute(
         _select(_IR).where(_IR.release_id == release.release_id)
-        .with_for_update()).scalars().one()
+        .with_for_update()
+        .execution_options(populate_existing=True)).scalars().one()
     now = now or datetime.now(timezone.utc)
     release.submissions = int(release.submissions or 0) + 1
     if release.status != "pending":

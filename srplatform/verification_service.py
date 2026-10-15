@@ -133,6 +133,43 @@ def _deployment_identity(db: Session, session_id) -> dict:
             "deployment_created_at": dep.created_at.isoformat() if dep else None}
 
 
+def _pin_items(dep) -> tuple[list, list]:
+    """Host-key pin inventory check (plan 13 phase 4): a created clone
+    without a pinned generation key — or with a recorded publish failure —
+    cannot be honestly reached. Pure inventory truth (deployment row +
+    publish record): checkable WITHOUT the management channel, so it gates
+    readiness in every mode, including the dev relaxation."""
+    items, reasons = [], []
+    if dep is None:
+        return items, reasons
+    for r in (dep.resources or []):
+        if r.get("state") != "created":
+            continue
+        if not r.get("host_key_ref"):
+            items.append({"host": r.get("host"), "service": "ssh",
+                          "unit": "host-key-pin", "status": "failed",
+                          "evidence": None,
+                          "error": "no pinned host key for this "
+                                   "generation — resume must complete it"})
+            reasons.append("unusable/missing host-key pin on "
+                           f"{r.get('host')}")
+        elif r.get("host_key_publish_error"):
+            # the pin exists but was never published to the bastion/
+            # verifier/runner known-hosts: StrictHostKeyChecking clients
+            # (members included) fail loudly, so readiness is red until
+            # republication converges — a green readiness with an
+            # unpublished pin would strand members with no recourse.
+            items.append({"host": r.get("host"), "service": "ssh",
+                          "unit": "host-key-pin", "status": "failed",
+                          "evidence": None,
+                          "error": "pinned host key not published: "
+                                   f"{r['host_key_publish_error'][:200]} — "
+                                   "resume must republicate it"})
+            reasons.append("unpublished host-key pin on "
+                           f"{r.get('host')}")
+    return items, reasons
+
+
 def readiness_checks(db: Session, session_id) -> dict:
     """Service-readiness gate for the provisioning contract (audit N10 item
     4, T05, T06): every service declared by the session's snapshot topology
@@ -167,6 +204,11 @@ def readiness_checks(db: Session, session_id) -> dict:
                                  "evidence_current": evidence_ok,
                                  "ok": phase == "confirmed" and evidence_ok})
     enroll_enforced = orchestrator.enrollment_channel_available()
+    pin_items, pin_reasons = _pin_items(dep)
+    if pin_items:
+        return {"enforced": True, "ok": False, "checks": pin_items,
+                "enrollments": enroll_items,
+                "reason": "; ".join(pin_reasons)}
 
     if not chan_ok and not enroll_enforced:
         if s.sr_env == "dev":
@@ -206,34 +248,11 @@ def readiness_checks(db: Session, session_id) -> dict:
     # generation host key cannot be honestly reached — StrictHostKeyChecking
     # clients fail forever. Refuse readiness; resume must complete the pin
     # (audit A6), never a waiver.
-    if dep is not None:
-        for r in (dep.resources or []):
-            if r.get("state") != "created":
-                continue
-            if not r.get("host_key_ref"):
-                ok = False
-                items.append({"host": r.get("host"), "service": "ssh",
-                              "unit": "host-key-pin", "status": "failed",
-                              "evidence": None,
-                              "error": "no pinned host key for this "
-                                       "generation — resume must complete it"})
-                reasons.append("unusable/missing host-key pin on "
-                               f"{r.get('host')}")
-            elif r.get("host_key_publish_error"):
-                # the pin exists but was never published to the bastion/
-                # verifier/runner known-hosts: StrictHostKeyChecking clients
-                # (members included) fail loudly, so readiness is red until
-                # republication converges — a green readiness with an
-                # unpublished pin would strand members with no recourse.
-                ok = False
-                items.append({"host": r.get("host"), "service": "ssh",
-                              "unit": "host-key-pin", "status": "failed",
-                              "evidence": None,
-                              "error": "pinned host key not published: "
-                                       f"{r['host_key_publish_error'][:200]} — "
-                                       "resume must republicate it"})
-                reasons.append("unpublished host-key pin on "
-                               f"{r.get('host')}")
+    pin_items, pin_reasons = _pin_items(dep)
+    if pin_items:
+        ok = False
+        items.extend(pin_items)
+        reasons.extend(pin_reasons)
     if not ok:
         if declared and any(i["status"] != "passed" for i in items):
             reasons.append("declared services not ready on the owned inventory")

@@ -11,6 +11,8 @@ asserts persisted deployment state, not helper return values.
 """
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from sqlalchemy import select
 
@@ -61,3 +63,41 @@ def test_resume_repins_host_key_missing_after_failed_launch(client, users,
     assert resources[0]["state"] == "created"
     assert resources[0].get("host_key_ref"), \
         "resume must complete the missing host-key pin (audit A6)"
+
+
+def test_unpublished_pin_fails_readiness_and_resume_republicates(
+        client, users, fake_broker):
+    """A recorded host-key publish failure is a RED readiness check (members
+    cannot connect until republication converges), and resume retries the
+    publication instead of skipping it on the existing reference."""
+    from srplatform import verification_service
+    from srplatform.db.models import Deployment
+    from srplatform.db.session import db as db_ctx
+    from sqlalchemy import select
+    sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
+                      headers=users["member"]).json()["session_id"]
+    from tests.conftest import launch_and_wait
+    launch_and_wait(client, users["member"], sid)
+    with db_ctx() as s:
+        dep = s.execute(select(Deployment).where(
+            Deployment.session_id == uuid.UUID(sid))).scalars().first()
+        res = dep.resources[0]
+        res["host_key_publish_error"] = "ssh-keygen: known_hosts unwritable"
+        dep.resources = [res] + dep.resources[1:]
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(dep, "resources")
+        s.commit()
+    red = verification_service.readiness_checks
+    with db_ctx() as s:
+        out = red(s, uuid.UUID(sid))
+    assert out["enforced"] and not out["ok"], out
+    assert any(i.get("unit") == "host-key-pin" and i["status"] == "failed"
+               for i in out["checks"]), out["checks"]
+    # resume republicates (fake broker publish succeeds) and clears the error
+    launch_and_wait(client, users["member"], sid)
+    with db_ctx() as s:
+        dep = s.execute(select(Deployment).where(
+            Deployment.session_id == uuid.UUID(sid))).scalars().first()
+        assert not dep.resources[0].get("host_key_publish_error")
+        out = red(s, uuid.UUID(sid))
+        assert out["ok"], out

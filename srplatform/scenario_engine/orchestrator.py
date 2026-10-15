@@ -950,9 +950,21 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
     if dep is not None and dep.status == "ready":
         # Idempotent return — but enrollment may have been interrupted
         # (lost response / crashed provisioning): RESUME it, never silently
-        # return a "ready" deployment whose clones are unenrolled.
+        # return a "ready" deployment whose clones are unenrolled. The same
+        # holds for pins: a recorded publish failure (or missing ref) is
+        # repaired here, so a ready deployment can never be returned with
+        # known-unusable SSH while claiming success.
         resources = [dict(r) for r in (dep.resources or [])]
         enrollments = {}
+        for r in resources:
+            if r.get("state") == "created" and (
+                    not r.get("host_key_ref")
+                    or r.get("host_key_publish_error")):
+                _pin_host_key(broker, db, session_id, dep, r, resources,
+                              node)
+        dep.resources = resources
+        flag_modified(dep, "resources")
+        db.commit()
         for r in resources:
             if r.get("state") == "created" and (
                     (r.get("telemetry_enroll") or {}).get("phase") != "confirmed"
