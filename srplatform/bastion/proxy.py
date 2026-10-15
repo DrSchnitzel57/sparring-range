@@ -251,7 +251,7 @@ async def api_resolve_token(token: str) -> dict | None:
 
     s = get_settings()
     async with httpx.AsyncClient(verify=s.api_tls_ca_file or True) as c:
-        r = await c.get(f"{s.api_base_url}/tokens/{token}", headers=_svc_headers(), timeout=10)
+        r = await c.get(f"{s.api_base_url}{s.api_route_prefix}/tokens/{token}", headers=_svc_headers(), timeout=10)
         if r.status_code != 200:
             return None
         data = r.json()
@@ -268,7 +268,7 @@ async def api_register_recording(session_id: str, cast_path: str) -> str | None:
 
     s = get_settings()
     async with httpx.AsyncClient(verify=s.api_tls_ca_file or True) as c:
-        r = await c.post(f"{s.api_base_url}/sessions/{session_id}/recordings",
+        r = await c.post(f"{s.api_base_url}{s.api_route_prefix}/sessions/{session_id}/recordings",
                          json={"cast_path": cast_path}, headers=_svc_headers(), timeout=10)
         return r.json().get("recording_id") if r.status_code == 201 else None
 
@@ -280,7 +280,7 @@ async def api_event_sink(event: dict) -> None:
     event = dict(event)
     event.pop("actor", None)  # server assigns the actor from the capability
     async with httpx.AsyncClient(verify=s.api_tls_ca_file or True) as c:
-        r = await c.post(f"{s.api_base_url}/events", json=event, headers=_svc_headers(), timeout=10)
+        r = await c.post(f"{s.api_base_url}{s.api_route_prefix}/events", json=event, headers=_svc_headers(), timeout=10)
         if r.status_code >= 400:
             print(f"[bastion] event sink failed: {r.status_code} {r.text[:200]}", flush=True)
 

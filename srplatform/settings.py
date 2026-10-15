@@ -63,6 +63,11 @@ class Settings(BaseSettings):
     # is self-signed, so the bastion VM pins its copy here — TLS checks are
     # never disabled. Unset on hosts that never dial the API over TLS.
     api_tls_ca_file: str | None = None
+    # Path prefix where the API is mounted behind the LAN frontend
+    # (the UI build bakes NEXT_PUBLIC_API_URL=<https://host:8443/api> and
+    # nginx routes /api/* to FastAPI, everything else to Next). Server-side
+    # API clients (bastion) must prepend it; empty keeps loopback behavior.
+    api_route_prefix: str = ""
 
     # --- Auth (F04) ---
     web_token_ttl_hours: int = 12

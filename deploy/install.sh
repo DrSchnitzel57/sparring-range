@@ -248,6 +248,10 @@ lines = [
     f"INGEST_BIND_IP={m['urls']['ingest'].split('://')[1].split(':')[0]}",
     f"INGEST_PORT={m['urls']['ingest'].split(':')[-1]}",
     f"INTERNAL_API_URL={m['urls']['internal_api']}",
+    # LAN-frontend mount point (nginx routes /api/* to FastAPI, the rest to
+    # Next; the UI build bakes the same suffix). Server-side API clients
+    # must prepend it — without it they ask Next.js and eat a 404.
+    "API_ROUTE_PREFIX=/api",
 ]
 open(out, "w").write("\n".join(lines) + "\n")
 print(f"derived environment written: {out}")

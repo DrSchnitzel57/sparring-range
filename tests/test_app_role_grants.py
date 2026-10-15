@@ -86,10 +86,15 @@ def test_change_placeholder_is_rejected_like_change_me():
         validate_production(c, "controller")
 
 
-def test_bastion_api_calls_verify_with_pinned_anchor():
+def _run_resolve(monkeypatch, prefix=None):
     import asyncio
     import srplatform.bastion.proxy as proxy
-
+    from srplatform.settings import get_settings
+    if prefix is None:
+        monkeypatch.delenv("API_ROUTE_PREFIX", raising=False)
+    else:
+        monkeypatch.setenv("API_ROUTE_PREFIX", prefix)
+    get_settings.cache_clear()
     seen = {}
 
     class FakeResp:
@@ -109,7 +114,8 @@ def test_bastion_api_calls_verify_with_pinned_anchor():
         async def __aexit__(self, *a):
             return False
 
-        async def get(self, *a, **k):
+        async def get(self, url, *a, **k):
+            seen["url"] = url
             return FakeResp()
 
     import httpx
@@ -118,6 +124,21 @@ def test_bastion_api_calls_verify_with_pinned_anchor():
         out = asyncio.run(proxy.api_resolve_token("tok-x"))
     finally:
         httpx.AsyncClient = real
+        get_settings.cache_clear()
+    return out, seen
+
+
+def test_bastion_api_calls_verify_with_pinned_anchor(monkeypatch):
+    out, seen = _run_resolve(monkeypatch)
     assert out and out["username"] == "ccdc-demo"
     assert seen.get("verify") is True, \
         "without a pinned anchor the client must use system verification (fail closed)"
+    assert seen["url"].endswith("/tokens/tok-x"), seen["url"]
+
+
+def test_bastion_api_calls_prepend_route_prefix(monkeypatch):
+    # Live find 2026-10-15: without the LAN-frontend /api prefix the bastion
+    # asks Next.js, eats a 404, and denies every login with valid credentials.
+    out, seen = _run_resolve(monkeypatch, prefix="/api")
+    assert out and out["username"] == "ccdc-demo"
+    assert seen["url"].endswith("/api/tokens/tok-x"), seen["url"]
