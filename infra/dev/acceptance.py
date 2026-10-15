@@ -1284,6 +1284,17 @@ def check_install() -> None:
         assert "ca.key" not in body and "api-ca.key" not in body, \
             f"CA signing keys must stay root-only: {body}"
         ok("installer scopes TLS key ownership per service (CA root-only)")
+        # traversal + ownership model (from the stub call log — the real
+        # commands execute on the VM job; here we prove the installer
+        # INVOKES the right ownership on the right paths, never assumes it)
+        calls = (stub / "calls.log").read_text()
+        for want in ("install -d -m 0755",
+                     "chown root:srrange",
+                     "chown root:srbroker",
+                     "chown root:root"):
+            assert want in calls, f"ownership call missing: {want}\n{calls[-800:]}"
+        assert "chown " in calls and "srbroker" in calls
+        ok("installer sets traversable dirs + per-service ownership")
         before = {(p.name, p.read_bytes()) for p in
                   (rp / "etc/sparring-range/tls").glob("*.key")}
         assert before, "first real run must generate TLS identities"
@@ -1374,6 +1385,21 @@ def check_install() -> None:
             (rr8.returncode, (rr8.stdout + rr8.stderr)[-500:])
         assert fp1 != fp2, "re-issued certificate must differ"
         ok("installer re-issues HTTPS certificate onto surviving key")
+        # explicit rotation takes precedence over preservation: with
+        # FRESH=1 a surviving key must be REPLACED, not kept
+        before = hkey.read_bytes()
+        renv_rot = dict(henv, SR_TLS_ROTATE="1")
+        rr9 = subprocess.run(
+            ["bash", str(REPO / "deploy/bootstrap_tls.sh")],
+            capture_output=True, text=True, cwd=REPO,
+            env={**renv_rot, "SR_TLS_DIR": str(rp / "etc/sparring-range/tls"),
+                 "SR_SSH_DIR": str(rp / "etc/sparring-range/ssh")},
+            timeout=300)
+        assert rr9.returncode == 0, \
+            (rr9.returncode, (rr9.stdout + rr9.stderr)[-500:])
+        assert hkey.read_bytes() != before, \
+            "explicit rotation must replace the surviving private key"
+        ok("installer explicit rotation replaces surviving HTTPS key")
         # partial state with a missing CA key beside surviving certificates
         # is refused explicitly (exit 1), never silently orphaned
         (rp / "etc/sparring-range/tls/ca.key").unlink()

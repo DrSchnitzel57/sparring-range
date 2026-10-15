@@ -525,3 +525,39 @@ def test_assumed_breach_refused_begin_spawns_no_worker(
             assert lifecycle.get_match(s, sid).state != "running"
     finally:
         _clear_prod(monkeypatch)
+
+
+def test_assumed_breach_rejects_wrong_identity_and_error_text(
+        client, users, fake_broker, monkeypatch):
+    """The strict verdict: root execution output and error text that merely
+    mentions the account must NOT establish the foothold (the reviewer's
+    reproduction: `[uid=0 user=root] exit=1` + `no such user` previously
+    passed substring matching)."""
+    from srplatform import lifecycle as lifecycle_mod
+    from srplatform.db.session import db as db_ctx
+    from tests.conftest import launch_and_wait
+    sid = client.post("/sessions", json={"scenario_id": "web-foothold-01",
+                                         "start_condition": "assumed-breach"},
+                      headers=users["member"]).json()["session_id"]
+    launch_and_wait(client, users["member"], sid)
+
+    hostile = {
+        "root": (200, "[uid=0 user=root] exit=1\n"),
+        "error": (200, "id: web-user: no such user\n"),
+        "created": (404, "not found\n"),
+    }
+
+    def hostile_flaw(url, timeout=10.0):
+        mode = hostile_flaw.mode
+        code, text = hostile[mode]
+        return type("R", (), {"status_code": code, "text": text})()
+
+    hostile_flaw.mode = "root"
+    monkeypatch.setattr(lifecycle_mod, "_flaw_get", hostile_flaw)
+    with db_ctx() as s:
+        for mode in ("root", "error", "created"):
+            hostile_flaw.mode = mode
+            proof = lifecycle_mod.prove_assumed_breach(
+                s, __import__("uuid").UUID(sid))
+            assert proof is not None and proof.get("established") is False, \
+                (mode, proof)

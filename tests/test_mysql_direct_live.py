@@ -61,8 +61,16 @@ def mysql():
         yield {"name": name, "host": "127.0.0.1", "port": port,
                "rootpw": m.group(1)}
     finally:
-        subprocess.run(["docker", "rm", "-f", name],
-                       capture_output=True, timeout=60)
+        # Cleanup is verified, not assumed: an unremoved container fails
+        # the test (a passing test must never leak its database).
+        rm = subprocess.run(["docker", "rm", "-f", name],
+                            capture_output=True, text=True, timeout=60)
+        assert rm.returncode == 0, \
+            f"fixture cleanup failed: {(rm.stderr or rm.stdout)[-400:]}"
+        gone = subprocess.run(
+            ["docker", "inspect", name],
+            capture_output=True, text=True, timeout=60)
+        assert gone.returncode != 0, f"container still present: {name}"
 
 
 def _dexec(mysql, sql):

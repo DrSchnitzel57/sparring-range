@@ -120,14 +120,16 @@ fi
 
 # web UI: self-signed with the LAN IP in the SAN (teammates import/verify it)
 if [ -n "$HTTPS_IP" ] && { [ ! -f https.key ] || [ ! -f https.crt ] || [ "$FRESH" = 1 ]; }; then
-  if [ -f https.key ] && [ ! -f https.crt ]; then
-    # surviving key, missing certificate: re-issue the cert onto the SAME
-    # key (clients pinning the key are unaffected; rotation is untouched)
+  # Explicit rotation takes precedence over preservation: FRESH=1 always
+  # replaces the key. Otherwise a surviving key with a missing cert
+  # re-issues the cert onto the SAME key (pinning-safe, rotation untouched).
+  if [ "$FRESH" = 1 ]; then
+    rm -f https.key https.crt
+  elif [ -f https.key ] && [ ! -f https.crt ]; then
     openssl req -x509 -key https.key -sha256 -days "$DAYS" -nodes \
       -out https.crt -subj "/CN=$HTTPS_IP" \
       -addext "subjectAltName=IP:$HTTPS_IP"
   else
-    [ "$FRESH" = 1 ] && rm -f https.key https.crt
     openssl req -x509 -newkey rsa:2048 -sha256 -days "$DAYS" -nodes \
       -keyout https.key -out https.crt -subj "/CN=$HTTPS_IP" \
       -addext "subjectAltName=IP:$HTTPS_IP"

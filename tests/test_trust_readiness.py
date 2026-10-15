@@ -256,3 +256,33 @@ def test_template_manifest_records_baked_key_fingerprints():
     src = (pathlib_repo / "infra/images/pve_template_build.py").read_text()
     assert "baked_key_fingerprints" in src
     assert "public_key_fingerprint" in src
+
+
+def test_manifest_to_provisioning_ingest_chain(tmp_path, monkeypatch):
+    """Complete manifest → environment → settings → provisioning path:
+    the guest shipper address always resolves to the manifest's ingest
+    URL, never the public operator URL (the name-mismatch class of bug
+    fails this test at the settings step)."""
+    import json
+    manifest = json.loads(
+        (__import__("pathlib").Path(__file__).resolve().parents[1]
+         / "deploy/manifest.example.json").read_text())
+    ingest = manifest["urls"]["ingest"]
+    assert ingest != manifest["urls"]["public_https"]
+    env = tmp_path / "derived.env"
+    env.write_text(f"SR_TELEMETRY_INGEST_URL={ingest}\n"
+                   f"API_BASE_URL={manifest['urls']['public_https']}\n")
+    monkeypatch.setenv("SR_ENV_FILE", str(env))
+    from srplatform.settings import Settings
+    s = Settings(_env_file=str(env))
+    assert s.telemetry_ingest_url == ingest, s.telemetry_ingest_url
+    from srplatform.scenario_engine.orchestrator import _provision_command
+
+    class S:
+        api_base_url = manifest["urls"]["public_https"]
+        telemetry_ingest_url = s.telemetry_ingest_url
+        telemetry_ca_file = None
+
+    cmd = _provision_command("web01", "tok", "nonce1", S())
+    assert f"SR_API_URL={ingest}" in cmd
+    assert manifest["urls"]["public_https"] not in cmd

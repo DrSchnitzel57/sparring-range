@@ -185,8 +185,11 @@ def prove_assumed_breach(db, session_id) -> dict | None:
     from srplatform import verification_service as _vs2
     hmap = _vs2.host_map_for(db, session_id)
     addr = hmap.get(web_host) if web_host else None
+    # Bare `id` (no username argument): it reports the EXECUTING
+    # identity — `id web-user` would merely look an account up, and a
+    # substring match would accept error text that mentions the name.
     flaw_url = (("http://" + addr + "/diagnostic?cmd="
-                 + _urlparse.quote("id web-user", safe=""))
+                 + _urlparse.quote("id", safe=""))
                 if addr else None)
     if flaw_url is None:
         proof["established"] = False
@@ -198,10 +201,15 @@ def prove_assumed_breach(db, session_id) -> dict | None:
                 "production assumed-breach has no owned address for "
                 "the disclosed foothold host")
         return proof
+    import re as _re
     try:
         resp = _flaw_get(flaw_url, timeout=10.0)
         body = getattr(resp, "text", "") or ""
-        ok = resp.status_code == 200 and "web-user" in body
+        # Strict executing-identity match: uid=<n>(web-user) with HTTP 200.
+        # Error text mentioning the account ("id: web-user: no such user",
+        # exit!=0 renderings, root output) can never satisfy this.
+        ok = (resp.status_code == 200
+              and _re.search(r"uid=\d+\(web-user\)", body) is not None)
     except Exception as e:  # noqa: BLE001 — unreachable flaw
         ok, body, resp = False, f"flaw unreachable: {e}"[:200], None
     proof["established"] = bool(ok)

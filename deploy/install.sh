@@ -76,7 +76,11 @@ else
   echo "DRY: ensure users $SR_ALL_USERS exist"
 fi
 run install -d -m 0750 -o "$SR_USER" -g "$SR_GROUP" "$STATE" "$LOGDIR"
-run install -d -m 0750 "$ETC" "$TLS"
+# Config dirs are traversable by every service identity (0755 root): file
+# contents are protected per-file below, and filenames alone convey
+# nothing secret. A 0750 root-owned config dir would silently deny the
+# services traversal to keys/env they are entitled to read.
+run install -d -m 0755 "$ETC" "$TLS"
 
 # 3 -- key material: generate ONLY what is missing (never regenerate).
 for k in bastion_ed25519 bastion_client_ed25519; do
@@ -151,11 +155,16 @@ fi
 # complete. Placeholders are REJECTED at service start by settings
 # validation, not silently accepted here.
 for role in control-plane broker; do
+  case "$role" in
+    control-plane) _grp="$SR_GROUP" ;;  # srrange serves the API
+    broker) _grp="srbroker" ;;
+  esac
   f="$ETC/$role.env"
   if [ -f "$f" ]; then
     say config "keeping existing $f (operator edits preserved)"
   else
     run install -m 0640 "$REPO/deploy/env.$role.example" "$f"
+    run chown root:"$_grp" "$f"
     say config "created $f from example — COMPLETE every CHANGE value"
   fi
 done
@@ -198,6 +207,8 @@ rc = gen_mod.main(["--node", m["pve"]["node"], "--bridge", m["network"]["bridge"
           "--out", out])
 sys.exit(rc)
 PYEOF
+  run chown root:srbroker "$ETC/broker-policy.json"
+  run chmod 0640 "$ETC/broker-policy.json"
   say config "rendered $ETC/broker-policy.json from the manifest"
 fi
 
@@ -226,7 +237,7 @@ lines = [
     f"DEPLOY_CLONE_MODE={m['storage']['clone_mode']}",
     f"BROKER_POLICY_FILE={policy}",
     f"API_BASE_URL={m['urls']['public_https']}",
-    f"SR_API_INGEST_URL={m['urls']['ingest']}",
+    f"SR_TELEMETRY_INGEST_URL={m['urls']['ingest']}",
     f"LLM_BASE_URL={m['model']['base_url']}",
     f"LLM_MODEL_RED={m['model']['alias']}",
     f"LLM_MODEL_COACH={m['model']['alias']}",
@@ -238,6 +249,8 @@ lines = [
 open(out, "w").write("\n".join(lines) + "\n")
 print(f"derived environment written: {out}")
 PYEOF
+  run chown root:"$SR_GROUP" "$ETC/control-plane.derived.env"
+  run chmod 0640 "$ETC/control-plane.derived.env"
   say config "rendered $ETC/control-plane.derived.env from the manifest"
   "$PY" - "$MANIFEST" "$ETC/ingest-listener.env" <<'PYEOF2'
 import json, sys
@@ -250,6 +263,8 @@ open(sys.argv[2], "w").write(
     f"SR_API_BASE_URL={m['urls']['ingest']}\n")
 print("ingest-plane env written")
 PYEOF2
+  run chown root:"$SR_GROUP" "$ETC/ingest-listener.env"
+  run chmod 0640 "$ETC/ingest-listener.env"
   say config "rendered $ETC/ingest-listener.env from the manifest"
 
 # 5d -- TLS file permissions (least privilege per consumer). Service-read
