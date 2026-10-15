@@ -209,9 +209,14 @@ if [ "$VERIFY" -eq 1 ]; then
     echo "== effective-permission probes (role names are not proof) =="
     probe GET "/version" allow
     probe GET "/nodes/${NODE}/qemu/${TMPLS[0]}/config" allow
-    probe GET "/access/domains" deny          # no realm administration
-    probe GET "/access/acl" deny              # no ACL readback/changes
-    probe POST "/access/acl" deny "path=/&roles=PVEAdmin&users=${USER_ID}"
+    # Authenticated-metadata endpoints readable by any valid token (like
+    # /version): realm/ACL readback is permission-filtered, not a grant.
+    # The load-bearing boundaries are the foreign-VM and ACL-write denials.
+    probe GET "/access/domains" allow
+    probe GET "/access/acl" allow
+    # Privilege escalation must be denied: ACL writes use PUT (POST answers
+    # 501 Method not implemented, which proves nothing about permissions).
+    probe PUT "/access/acl" deny "path=/&roles=PVEAdmin&users=${USER_ID}"
     probe GET "/nodes/${NODE}/qemu/${PROBE_FOREIGN_VMID}/config" deny
     probe GET "/nodes/${NODE}/qemu/${PROBE_FOREIGN_VMID}/agent/file-read?file=%2Fetc%2Fpasswd" deny
     probe POST "/nodes/${NODE}/qemu/${PROBE_FOREIGN_VMID}/status/stop" deny
