@@ -1049,11 +1049,31 @@ def begin_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
         raise HTTPException(409, {"error": "operation_in_progress", "operation": e.operation})
     _ok = False
     try:
+        # Validate the starting condition BEFORE spawning the worker: a
+        # refused Begin must never leave an attacker running with the
+        # match clock unstarted (the proof is idempotent; start_clock
+        # re-establishes it for the event record).
+        try:
+            lifecycle.prove_assumed_breach(db, sess.session_id)
+        except lifecycle.MatchBlocked as e:
+            raise HTTPException(409, {"error": e.reason, "detail": e.detail,
+                                      "note": "match NOT started; no worker "
+                                              "was spawned, range stays "
+                                              "reserved"})
         run = _start_red_run(db, p, sess.session_id, sess.scenario_id)
         try:
             m = lifecycle.start_clock(db, sess.session_id, actor=p.username)
         except lifecycle.MatchBlocked as e:
+            # The pre-spawn proof passed but establishment failed here
+            # (channel died in between): cease the just-spawned worker so
+            # no attacker outlives the refused Begin, and say so loudly.
+            ceased: dict = {}
+            try:
+                ceased = runs_svc.stop_run(db, run.run_id) or {}
+            except Exception as ce:  # noqa: BLE001
+                ceased = {"ok": False, "detail": str(ce)[:200]}
             raise HTTPException(409, {"error": e.reason, "detail": e.detail,
+                                      "worker_ceased": bool(ceased.get("ok")),
                                       "note": "match NOT started; range stays "
                                               "reserved, fix the cause and "
                                               "begin again"})

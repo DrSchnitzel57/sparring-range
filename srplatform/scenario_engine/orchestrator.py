@@ -158,13 +158,16 @@ def begin_deploy_operation(db: Session, session_id, operation: str, *,
 def advance_deploy_operation(db: Session, row, phase: str) -> None:
     """Phase/progress transitions commit immediately: a poller sees where the
     attempt really is, and a crash leaves the LAST phase it reached."""
+    from sqlalchemy import update
     from srplatform.db.models import DeployOperation
-    row = db.get(DeployOperation, row.operation_id)
-    if row is None or row.state in ("succeeded", "failed", "interrupted"):
-        return
-    row.state = "running"
-    row.phase = phase
-    row.updated_at = _now()
+    # Conditional like the terminal write: a stale executor must not flip
+    # a terminal row back to running (same identity-map staleness hole).
+    db.execute(
+        update(DeployOperation)
+        .where(DeployOperation.operation_id == row.operation_id,
+               DeployOperation.state.in_(("accepted", "running")))
+        .values(state="running", phase=phase[:120],
+                updated_at=_now()))
     db.commit()
 
 
@@ -175,24 +178,26 @@ def finish_deploy_operation(db: Session, row, state: str, *,
     caller; full provisioning commands and secrets never reach this row.
     `result` is the REDACTED completed payload pollers receive (no
     plaintext enrollments — the ServiceToken rows are the durable record)."""
+    from sqlalchemy import update
     from srplatform.db.models import DeployOperation
-    row = db.get(DeployOperation, row.operation_id)
-    if row is None:
-        return
-    # Terminal states are STICKY: a stale executor (or a duplicate
-    # finalizer) must never flip interrupted/failed/succeeded back to
-    # another outcome. The first terminal write wins; later ones are
-    # dropped loudly via the returned flag.
-    if row.state in ("succeeded", "failed", "interrupted"):
-        return False
-    row.state = state
-    row.error = (error or None) and str(error)[:500]
+    # ATOMIC conditional transition (single UPDATE … WHERE state IN
+    # (accepted, running)): terminal states are STICKY at the database
+    # level — a stale executor racing a reconcile/replacement/failure can
+    # never flip interrupted/failed/succeeded to another outcome, no
+    # matter what snapshot its session holds. First terminal write wins.
+    now = _now()
+    values: dict = {"state": state,
+                    "error": (error or None) and str(error)[:500],
+                    "completed_at": now, "updated_at": now}
     if result is not None:
-        row.progress = {"result": result}
-    row.completed_at = _now()
-    row.updated_at = row.completed_at
+        values["progress"] = {"result": result}
+    n = db.execute(
+        update(DeployOperation)
+        .where(DeployOperation.operation_id == row.operation_id,
+               DeployOperation.state.in_(("accepted", "running")))
+        .values(**values)).rowcount
     db.commit()
-    return True
+    return bool(n)
 
 
 def reconcile_deploy_operations(db: Session) -> int:

@@ -234,3 +234,36 @@ def test_interrupted_operation_can_never_become_succeeded(client, users):
     with db() as s:
         row = s.get(DeployOperation, uuid.UUID(op_id))
         assert row.state == "interrupted", row.state
+
+
+def test_cross_session_interrupt_survives_stale_finalize(client, users):
+    """The reviewer's repro: an operation interrupted mid-flight (by
+    another session/connection, bypassing this session's identity map)
+    must NOT become `succeeded` — the terminal write is conditional at
+    the database level, and staleness checks expire before reading."""
+    from sqlalchemy import text
+    from srplatform.db.models import DeployOperation, OperationClaim
+    from srplatform.db.session import db, app_engine
+    from srplatform.scenario_engine import deploy_executor, orchestrator
+    sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
+                      headers=users["member"]).json()["session_id"]
+    with db() as s:
+        row = orchestrator.begin_deploy_operation(
+            s, sid, "launch", fence="owner-1", deadline_s=600)
+        op_id = str(row.operation_id)
+        s.add(OperationClaim(session_id=sid, operation="launch",
+                             owner="owner-1", claimed_at=row.created_at))
+        s.commit()
+    # interrupt from a SEPARATE connection (stale snapshots elsewhere)
+    eng = app_engine()
+    with eng.begin() as c:
+        c.execute(text("UPDATE deploy_operations SET state='interrupted' "
+                       "WHERE operation_id=:op"),
+                  {"op": str(op_id)})
+    deploy_executor._execute(operation_id=op_id, session_id=uuid.UUID(sid),
+                             user_id="member", operation="launch",
+                             scenario_id="web-foothold-01",
+                             broker=None, owner="owner-1")
+    with db() as s:
+        row = s.get(DeployOperation, uuid.UUID(op_id))
+        assert row.state == "interrupted", row.state

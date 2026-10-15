@@ -472,3 +472,32 @@ def test_assumed_breach_proof_executes_as_web_user(client, users, fake_pve,
     finally:
         enrollment_channel.set_enrollment_exec(None)
         verification_service.set_verifier_exec(None)
+
+
+def test_assumed_breach_refused_begin_spawns_no_worker(
+        client, users, fake_broker, enrollment_channel):
+    """A refused Begin (unproven foothold) must not leave an attacker
+    running: the proof runs BEFORE the worker spawns, so the 409 means no
+    worker exists and the clock never started."""
+    from srplatform import verification_service
+    from srplatform.api import runs as runs_svc
+    chan = ScriptedChannel(host_client=client, fail=("runuser",))
+    enrollment_channel.set_enrollment_exec(chan)
+    verification_service.set_verifier_exec(chan)
+    try:
+        sid = client.post("/sessions", json={"scenario_id": "web-foothold-01",
+                                             "start_condition": "assumed-breach"},
+                          headers=users["member"]).json()["session_id"]
+        from tests.conftest import launch_and_wait
+        launch_and_wait(client, users["member"], sid)
+        r = client.post(f"/sessions/{sid}/begin", headers=users["member"])
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "assumed_breach_unproven"
+        from srplatform.db.session import db as db_ctx
+        with db_ctx() as s:
+            assert runs_svc.active_run_for_session(s, sid) is None
+            from srplatform import lifecycle
+            assert lifecycle.get_match(s, sid).state != "running"
+    finally:
+        enrollment_channel.set_enrollment_exec(None)
+        verification_service.set_verifier_exec(None)

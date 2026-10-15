@@ -148,6 +148,11 @@ def _require_live(db, row, owner: str, operation_id: str,
     from srplatform.db.models import OperationClaim
     from srplatform.scenario_engine import orchestrator
 
+    # Fresh read, never the session identity map: this session may
+    # already hold a stale snapshot of the row, and db.get() would serve
+    # it back without touching the database — a terminal transition made
+    # elsewhere (reconcile, replacement, deadline) would stay invisible.
+    db.expire_all()
     fresh = db.get(type(row), row.operation_id)
     if fresh is None:
         raise _Superseded(f"{boundary}: operation row gone")

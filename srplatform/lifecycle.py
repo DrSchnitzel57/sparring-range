@@ -143,6 +143,61 @@ def mark_ready(db, session_id) -> None:
     db.flush()
 
 
+def prove_assumed_breach(db, session_id) -> dict | None:
+    """Establish the disclosed assumed-breach foothold (see start_clock).
+    Returns the proof dict for network-entry (None — nothing to prove) or
+    the disclosure+proof for assumed-breach. Raises MatchBlocked when a
+    production match cannot establish its starting condition. Pure and
+    idempotent: safe to call before spawning the worker AND inside
+    start_clock."""
+    from srplatform import verification_service
+    m = get_match(db, session_id)
+    if m is None or (m.snapshot or {}).get("start_condition") != "assumed-breach":
+        return None
+    try:
+        spec = verification_service.scenario_spec(db, session_id)
+        web_host = next(
+            (h["name"] for h in (spec.get("topology") or {}).get("hosts", [])
+             if "http" in (h.get("services") or [])), None)
+    except Exception:  # noqa: BLE001 — disclosure names best-effort
+        web_host = None
+    proof: dict = {"user": "web-user", "host": web_host,
+                   "method": "documented diagnostic flaw "
+                             "(MOJANG_DIAG_ENABLED)",
+                   "scope": "limited guest foothold; recon phase "
+                            "skipped by snapshot"}
+    from srplatform.scenario_engine import orchestrator as _orch
+    from srplatform.settings import get_settings as _gs
+    chan = _orch.management_runner()
+    if chan is None:
+        proof["established"] = False
+        proof["reason"] = ("no management channel — foothold disclosed "
+                           "but unproven")
+        if _gs().sr_env == "production":
+            raise MatchBlocked(
+                "assumed_breach_unproven",
+                "production assumed-breach requires a management "
+                "channel to establish the disclosed foothold")
+        return proof
+    hmap = verification_service.host_map_for(db, session_id)
+    addr = hmap.get(web_host) if web_host else None
+    if addr is None:
+        proof["established"] = False
+        proof["reason"] = ("owned inventory has no address for "
+                           f"{web_host}")
+        return proof
+    code, out = chan(addr, "runuser -u web-user -- id -u web-user")
+    proof["established"] = (code == 0)
+    proof["exit_code"] = code
+    proof["output"] = str(out or "")[:200]
+    if code != 0:
+        raise MatchBlocked(
+            "assumed_breach_unproven",
+            f"foothold proof command failed (exit {code}): "
+            f"{str(out or '')[:200]}")
+    return proof
+
+
 def start_clock(db, session_id, *, actor: str = "system") -> MatchModel | None:
     """Begin: bind the SERVER clock to the match. Idempotent — a match that
     is already running keeps its ORIGINAL deadline (a duplicate Begin can
@@ -162,59 +217,8 @@ def start_clock(db, session_id, *, actor: str = "system") -> MatchModel | None:
                "deadline_at": m.deadline_at.isoformat(),
                "duration_minutes": m.duration_minutes,
                "pace_seconds": m.pace_seconds}
-    if (m.snapshot or {}).get("start_condition") == "assumed-breach":
-        # The disclosed foothold both sides see (ARCHITECTURE, AI attack
-        # behavior): limited web-user access on the http tier through the
-        # documented diagnostic flaw — disclosed, never silently seeded.
-        # ESTABLISHED, not merely declared: the server executes a first
-        # command AS web-user through the management channel and records
-        # the proof. Without a channel the foothold cannot be established:
-        # dev proceeds with an explicitly unproven disclosure (test/fixture
-        # mode), production refuses Begin rather than start a breach match
-        # on an unproven foothold.
-        from srplatform import verification_service
-        try:
-            spec = verification_service.scenario_spec(db, session_id)
-            web_host = next(
-                (h["name"] for h in (spec.get("topology") or {}).get("hosts", [])
-                 if "http" in (h.get("services") or [])), None)
-        except Exception:  # noqa: BLE001 — disclosure names best-effort
-            web_host = None
-        proof: dict = {"user": "web-user", "host": web_host,
-                       "method": "documented diagnostic flaw "
-                                 "(MOJANG_DIAG_ENABLED)",
-                       "scope": "limited guest foothold; recon phase "
-                                "skipped by snapshot"}
-        from srplatform.scenario_engine import orchestrator as _orch
-        from srplatform.settings import get_settings as _gs
-        chan = _orch.management_runner()
-        if chan is None:
-            proof["established"] = False
-            proof["reason"] = ("no management channel — foothold disclosed "
-                               "but unproven")
-            if _gs().sr_env == "production":
-                raise MatchBlocked(
-                    "assumed_breach_unproven",
-                    "production assumed-breach requires a management "
-                    "channel to establish the disclosed foothold")
-        else:
-            hmap = verification_service.host_map_for(db, session_id)
-            addr = hmap.get(web_host) if web_host else None
-            if addr is None:
-                proof["established"] = False
-                proof["reason"] = ("owned inventory has no address for "
-                                   f"{web_host}")
-            else:
-                code, out = chan(
-                    addr, "runuser -u web-user -- id -u web-user")
-                proof["established"] = (code == 0)
-                proof["exit_code"] = code
-                proof["output"] = str(out or "")[:200]
-                if code != 0:
-                    raise MatchBlocked(
-                        "assumed_breach_unproven",
-                        f"foothold proof command failed (exit {code}): "
-                        f"{str(out or '')[:200]}")
+    proof = prove_assumed_breach(db, session_id)
+    if proof is not None:
         payload["disclosed_foothold"] = proof
     db.add(Event(session_id=session_id, ts=_now(), actor=actor,
                  action_type="match_begin", payload=payload))

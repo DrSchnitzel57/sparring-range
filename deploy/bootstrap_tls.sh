@@ -40,8 +40,9 @@ if [ "$FRESH" != 1 ] && [ ! -f ca.key ] && { [ -f broker-server.crt ] || [ -f ap
   echo "explicit full rotation." >&2
   exit 3
 fi
-if fresh ca.key; then
-  openssl genrsa -out ca.key 4096
+if fresh ca.key || [ ! -f ca.crt ]; then
+  { [ "$FRESH" = 1 ] && rm -f ca.key; } || true
+  [ -f ca.key ] || openssl genrsa -out ca.key 4096
   openssl req -x509 -new -key ca.key -sha256 -days "$DAYS" -subj "/CN=sparring-range-broker-CA" -out ca.crt
 fi
 
@@ -54,8 +55,9 @@ else
 fi
 # Per-artifact preservation: surviving identities are NEVER
 # regenerated as a side effect — only missing artifacts are created.
-if fresh broker-server.key; then
-openssl genrsa -out broker-server.key 2048
+if fresh broker-server.key || [ ! -f broker-server.crt ]; then
+{ [ "$FRESH" = 1 ] && rm -f broker-server.key; } || true
+[ -f broker-server.key ] || openssl genrsa -out broker-server.key 2048
 openssl req -new -key broker-server.key -subj "/CN=$BROKER_HOST" -out broker-server.csr
 printf "subjectAltName=%s%s\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n" \
   "$broker_san" "${HTTPS_IP:+,IP:$HTTPS_IP}" > broker-server.ext
@@ -64,8 +66,9 @@ openssl x509 -req -in broker-server.csr -CA ca.crt -CAkey ca.key -CAcreateserial
 fi
 
 # API client cert (mutual TLS: the broker only accepts this identity)
-if fresh api-client.key; then
-openssl genrsa -out api-client.key 2048
+if fresh api-client.key || [ ! -f api-client.crt ]; then
+{ [ "$FRESH" = 1 ] && rm -f api-client.key; } || true
+[ -f api-client.key ] || openssl genrsa -out api-client.key 2048
 openssl req -new -key api-client.key -subj "/CN=$API_HOST" -out api-client.csr
 fi
 printf "basicConstraints=critical,CA:FALSE\nextendedKeyUsage=clientAuth\n" > api-client.ext
@@ -85,6 +88,10 @@ fi
 
 # bastion dial keypair (public half -> pve_template_build.py --pubkey)
 if [ "$FRESH" = 1 ] || [ ! -f "$SR_SSH_DIR/bastion_ed25519" ]; then
+  # rotation must not hang on ssh-keygen's overwrite prompt (non-interactive)
+  if [ "$FRESH" = 1 ]; then
+    rm -f "$SR_SSH_DIR/bastion_ed25519" "$SR_SSH_DIR/bastion_ed25519.pub"
+  fi
   ssh-keygen -q -t ed25519 -N '' -C 'sr-bastion-generation-1' -f "$SR_SSH_DIR/bastion_ed25519"
 fi
 

@@ -1244,7 +1244,11 @@ def check_install() -> None:
         text = derived.read_text()
         for want in ("PROXMOX_NODE=pve", "RANGE_BRIDGE=srrange",
                      "RANGE_VLAN=66", "RANGE_CIDR=10.66.0.0/24",
-                     "DEPLOY_VMID_BASE=9100",
+                     "DEPLOY_VMID_BASE=9100", "DEPLOY_CLONE_MODE=full",
+                     "API_BASE_URL=https://10.60.0.11:8443",
+                     "LLM_BASE_URL=http://10.60.0.20:8080/v1",
+                     "LLM_MODEL_RED=qwen3.8-flash-next",
+                     "LLM_MODEL_COACH=qwen3.8-flash-next",
                      f"BROKER_POLICY_FILE={pol}"):
             assert want in text, f"derived env missing {want}:\n{text[:600]}"
         assert "CHANGE" not in text, "derived config must not carry placeholders"
@@ -1298,6 +1302,17 @@ def check_install() -> None:
             fail("installer partial recovery regenerates only the missing",
                  "a SURVIVING identity rotated without --rotate-tls")
         ok("installer partial recovery preserves survivors")
+        # missing CERTIFICATE (key survives): the identity is incomplete,
+        # so reinstall regenerates exactly the missing half — never a
+        # false-successful install with a dangling key
+        (rp / "etc/sparring-range/tls/broker-server.crt").unlink()
+        rr6 = subprocess.run(real, capture_output=True,
+                             text=True, cwd=REPO, env=renv, timeout=300)
+        if rr6.returncode != 0 or not (
+                rp / "etc/sparring-range/tls/broker-server.crt").exists():
+            fail("installer recovers missing certificates",
+                 f"exit {rr6.returncode}:\n{(rr6.stdout + rr6.stderr)[-800:]}")
+        ok("installer recovers missing certificates")
         # partial state with a missing CA key beside surviving certificates
         # is refused explicitly (exit 1), never silently orphaned
         (rp / "etc/sparring-range/tls/ca.key").unlink()

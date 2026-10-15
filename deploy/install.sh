@@ -80,6 +80,11 @@ run install -d -m 0750 "$ETC" "$TLS"
 
 # 3 -- key material: generate ONLY what is missing (never regenerate).
 for k in bastion_ed25519 bastion_client_ed25519; do
+  # --rotate-tls rotates EVERYTHING (explicit act covers all identities);
+  # normal runs never touch surviving keys.
+  if [ "$ROTATE_TLS" = 1 ]; then
+    run rm -f "$TLS/$k" "$TLS/$k.pub"
+  fi
   if [ -f "$TLS/$k" ]; then
     say keys "keeping existing $k (rotation is an explicit operator act)"
   else
@@ -94,7 +99,17 @@ done
 # is an explicit operator act (--rotate-tls), never a reinstall side
 # effect. bootstrap_tls.sh itself always regenerates, so it runs only when
 # no identity exists yet (or rotation was explicitly requested).
-_tls_have() { [ -f "$TLS/broker-server.key" ] && [ -f "$TLS/ca.key" ]; }
+# A complete identity is key + certificate: a lone key (or lone cert)
+# is PARTIAL state — reinstalling "successfully" over it would leave the
+# identity unusable. The https pair counts only when it was previously
+# issued (https.key present) or is requested now (HTTPS_IP set); otherwise
+# a LAN-less install would regenerate TLS on every run.
+_tls_pair() { [ -f "$TLS/$1.key" ] && [ -f "$TLS/$1.crt" ]; }
+_tls_have() {
+  _tls_pair ca && _tls_pair broker-server && _tls_pair api-client &&
+    { { [ ! -f "$TLS/https.key" ] && [ -z "${HTTPS_IP:-}" ]; } ||
+      _tls_pair https; }
+}
 if [ "$DRY" = 1 ]; then
   echo "DRY: deploy/bootstrap_tls.sh $TLS (only if no identity exists)"
 elif _tls_have && [ "$ROTATE_TLS" != 1 ]; then
@@ -197,7 +212,13 @@ lines = [
     f"RANGE_CIDR={m['network']['range_cidr']}",
     f"RANGE_GATEWAY={m['network']['gateway']}",
     f"DEPLOY_VMID_BASE={lo}",
+    f"DEPLOY_CLONE_MODE={m['storage']['clone_mode']}",
     f"BROKER_POLICY_FILE={policy}",
+    f"API_BASE_URL={m['urls']['public_https']}",
+    f"LLM_BASE_URL={m['model']['base_url']}",
+    f"LLM_MODEL_RED={m['model']['alias']}",
+    f"LLM_MODEL_COACH={m['model']['alias']}",
+    "SR_TELEMETRY_CA_FILE=/etc/sparring-range/tls/api-ca.crt",
 ]
 open(out, "w").write("\n".join(lines) + "\n")
 print(f"derived environment written: {out}")
