@@ -203,6 +203,50 @@ def mysql_probe_command(table: str = MYSQL_TABLE) -> str:
             f"mojang -e 'SELECT COUNT(*) FROM `{table}`'")
 
 
+def probe_mysql_via(runner, via_ip: str, db_ip: str, password: str, *,
+                    table: str = MYSQL_TABLE,
+                    expected: int = MYSQL_EXPECTED_ROWS):
+    """The NETWORK service path (review finding): execute the SAME
+    read-only business transaction FROM an owned web guest AGAINST the DB
+    guest's range address. The loopback probe proves the DB answers; this
+    proves the grants, firewall, listener and network path the application
+    actually depends on. The credential is the deployment's own reader
+    password (already present on both guests); it never appears in
+    recorded details (see classification below)."""
+    import shlex
+    cmd = ("mysql --protocol=TCP "
+           f"--host={db_ip} --batch --skip-column-names "
+           f"-u mojang_reader --password={shlex.quote(password)} "
+           f"mojang -e 'SELECT COUNT(*) FROM `{table}`'")
+    t0 = time.monotonic()
+    try:
+        code, out = runner(via_ip, cmd)
+    except ProbeInfraError:
+        raise
+    except Exception as e:  # noqa: BLE001 — channel itself unhealthy
+        raise ProbeInfraError(f"management channel call failed: {e}") from e
+    latency = int((time.monotonic() - t0) * 1000)
+    text = str(out or "").strip()
+    if code == 255:
+        return ("unknown", latency,
+                "ssh session not established — cannot tell whether the "
+                "query ran")
+    if code == 0:
+        last = text.splitlines()[-1].strip() if text else ""
+        if last == str(expected):
+            return "up", latency, f"{table}={expected} via network path"
+        return "down", latency, f"{table} count wrong via network path"
+    low = text.lower()
+    if "access denied" in low or "unknown user" in low:
+        raise ProbeInfraError(f"probe credential refused by target: {text[:120]}")
+    if ("refused" in low or "can't connect" in low or "unknown host" in low
+            or "timed out" in low or "timeout" in low):
+        # the NETWORK path is broken (grants/firewall/listener/service) —
+        # this is target downtime even when the loopback probe is green.
+        return "down", latency, f"network path: {text[:120]}"
+    return "unknown", latency, f"exit {code}"
+
+
 def probe_mysql(runner, ip: str, *, table: str = MYSQL_TABLE,
                 expected: int = MYSQL_EXPECTED_ROWS):
     """One authenticated read-only business transaction through the
@@ -349,6 +393,7 @@ def start_for_session(db, sess, dep, *, get=None) -> bool:
     # but MySQL is disabled there — probing them would fabricate downtime.
     db_hosts = [r for r in (dep.resources or [])
                 if r.get("ip") and r.get("mysql_probe")]
+    by_host = {r.get("host"): r for r in (dep.resources or [])}
     if db_hosts:
         from srplatform.scenario_engine.orchestrator import management_runner
         runner = management_runner()
@@ -357,6 +402,23 @@ def start_for_session(db, sess, dep, *, get=None) -> bool:
                 targets.append((r.get("host", "db"), "mysql",
                                 functools.partial(probe_mysql, runner,
                                                   r["ip"])))
+            # Network-path probes: every web guest whose SPEC declares
+            # a db_ref executes the business transaction against its
+            # OWNED DB address (resolved through the deployment
+            # inventory — never topology IPs). A green loopback probe
+            # with a broken web→DB path is DOWN for the application —
+            # this target makes that visible.
+            refs = {h.get("name"): h.get("db_ref")
+                    for h in (spec.get("topology") or {}).get("hosts", [])}
+            for r in (dep.resources or []):
+                db_res = by_host.get(refs.get(r.get("host")) or "")
+                pw = (db_res or {}).get("db_reader_password")
+                if (r.get("ip") and db_res is not None
+                        and db_res.get("ip") and pw):
+                    targets.append((r.get("host", "web") + ":db-path",
+                                    "mysql", functools.partial(
+                                        probe_mysql_via, runner, r["ip"],
+                                        db_res["ip"], pw)))
     if not targets:
         return False
     deployment_id = str(dep.deployment_id)

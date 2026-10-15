@@ -168,6 +168,7 @@ rc = gen_mod.main(["--node", m["pve"]["node"], "--bridge", m["network"]["bridge"
           "--cores-per-vm", str(m["budgets"]["guest_vcpus"]),
           "--memory-mb-per-vm", str(m["budgets"]["guest_ram_mb"]),
           "--disk-gb-per-vm", str(m["budgets"]["guest_disk_gb"]),
+          "--max-total-disk-gb", str(m["budgets"]["disk_gb_total"]),
           "--out", out])
 sys.exit(rc)
 PYEOF

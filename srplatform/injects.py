@@ -137,6 +137,7 @@ IMAGE_BASELINE_USERS = [
     "systemd-network", "systemd-resolve", "systemd-timesync", "systemd-oom",
     "messagebus", "syslog", "_apt", "uuidd", "tcpdump", "sshd", "tss",
     "defender", "web-user", "mysql", "srshipper",
+    "dhcpcd", "fwupd-refresh", "landscape", "polkitd", "pollinate",
 ]
 
 

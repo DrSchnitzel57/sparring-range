@@ -46,6 +46,12 @@ def main(argv=None) -> int:
     ap.add_argument("--cores-per-vm", type=int, default=2)
     ap.add_argument("--memory-mb-per-vm", type=int, default=2048)
     ap.add_argument("--disk-gb-per-vm", type=int, default=16)
+    # Exact aggregate ceilings override the multiplied defaults: the
+    # manifest's approved budgets are authoritative — the generator must
+    # never silently raise them (e.g. 3x16=48 over an approved 44).
+    ap.add_argument("--max-total-cores", type=int, default=None)
+    ap.add_argument("--max-total-memory-mb", type=int, default=None)
+    ap.add_argument("--max-total-disk-gb", type=int, default=None)
     ap.add_argument("--name-prefix", default="sr-")
     ap.add_argument("--out", required=True)
     args = ap.parse_args(argv)
@@ -64,9 +70,15 @@ def main(argv=None) -> int:
             "cores_per_vm": args.cores_per_vm,
             "memory_mb_per_vm": args.memory_mb_per_vm,
             "disk_gb_per_vm": args.disk_gb_per_vm,
-            "max_total_cores": args.max_vms * args.cores_per_vm,
-            "max_total_memory_mb": args.max_vms * args.memory_mb_per_vm,
-            "max_total_disk_gb": args.max_vms * args.disk_gb_per_vm,
+            "max_total_cores": (args.max_total_cores
+                                  if args.max_total_cores is not None
+                                  else args.max_vms * args.cores_per_vm),
+            "max_total_memory_mb": (args.max_total_memory_mb
+                                    if args.max_total_memory_mb is not None
+                                    else args.max_vms * args.memory_mb_per_vm),
+            "max_total_disk_gb": (args.max_total_disk_gb
+                                  if args.max_total_disk_gb is not None
+                                  else args.max_vms * args.disk_gb_per_vm),
         },
         "name_prefix": args.name_prefix,
     }

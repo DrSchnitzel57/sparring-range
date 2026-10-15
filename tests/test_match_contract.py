@@ -270,3 +270,38 @@ def test_filter_scorecard_keeps_totals_seals_items():
     assert out["items"] == [{"verifier": "flag_file_present", "host": "web01",
                              "domain": "x", "points": 10, "sealed":
                              "competition — sealed until the match completes"}]
+
+
+def test_mysql_via_proves_the_network_service_path():
+    """The web-origin probe executes the business transaction against the
+    DB's range address: loopback-green + broken web→DB path reads DOWN
+    (grants/firewall/listener), never healthy. The credential never
+    appears in recorded details."""
+    from srplatform.uptime import ProbeInfraError, probe_mysql_via
+
+    seen = {}
+
+    def runner(ip, cmd):
+        seen["ip"] = ip
+        seen["cmd"] = cmd
+        return runner.rc, runner.out
+
+    runner.rc, runner.out = 0, "12\n"
+    st, _, detail = probe_mysql_via(runner, "10.66.0.10", "10.66.0.11",
+                                    "pw-secret-1")
+    assert st == "up" and seen["ip"] == "10.66.0.10"
+    assert "--host=10.66.0.11" in seen["cmd"] and "pw-secret-1" in seen["cmd"]
+    assert "pw-secret" not in detail
+    # loopback would be green here — the network path is what failed
+    runner.rc, runner.out = 1, "ERROR 2002: Can't connect to MySQL server"
+    assert probe_mysql_via(runner, "10.66.0.10", "10.66.0.11",
+                           "pw")[0] == "down"
+    runner.rc, runner.out = 1, "ERROR 1045: Access denied for user"
+    try:
+        probe_mysql_via(runner, "10.66.0.10", "10.66.0.11", "pw")
+        raise AssertionError("expected ProbeInfraError")
+    except ProbeInfraError:
+        pass
+    runner.rc, runner.out = 255, "ssh: connect"
+    assert probe_mysql_via(runner, "10.66.0.10", "10.66.0.11",
+                           "pw")[0] == "unknown"

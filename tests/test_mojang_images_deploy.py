@@ -433,3 +433,46 @@ def test_images_cloud_init_firewall_auditd_shipper_present():
         assert "PRIVATE KEY" not in text, name
     attacker = (REPO / "infra/cloud-init/attacker.yaml").read_text()
     assert "ssh_authorized_keys: []" in attacker
+
+
+@pytest.mark.images
+def test_images_rogue_baselines_match_recorded_users(web_local_overlay,
+                                                     db_overlay):
+    """Untouched-guest conformance: the rogue-account baselines in scenarios
+    + the inject catalog must COVER every account the ACTUAL built images
+    ship — otherwise an untouched guest scores incorrect. Depends
+    explicitly on both current role artifacts (their build records carry
+    the recorded user baselines); never globs a possibly-cold cache. Any
+    gap fails with the exact missing names (static lists are then expanded,
+    never guessed)."""
+    import yaml
+    from infra.images.role_keys import resolve_role_keys
+    from srplatform.injects import IMAGE_BASELINE_USERS
+    with open(REPO / "scenarios/mojang-web-01.yaml") as f:
+        web_spec = yaml.safe_load(f)
+    with open(REPO / "scenarios/mojang-web-db-01.yaml") as f:
+        db_spec = yaml.safe_load(f)
+
+    def known(scenario, host):
+        for chk in (scenario.get("scoring") or {}).get("blue_checks", []):
+            if chk.get("verifier") == "rogue_account" and chk.get("host") == host:
+                return set(chk["known_users"])
+        raise AssertionError(f"no rogue_account baseline for {host}")
+
+    cases = (("mojang-web-local", web_local_overlay,
+              known(web_spec, "web01"), True),
+             ("mojang-web-db", db_overlay, known(db_spec, "db01"), False))
+    for role, overlay, baseline, check_inject in cases:
+        recorded = set(overlay["record"].get("users", []))
+        assert recorded, f"{role}: build recorded no users (build broken?)"
+        # analytic bake users for this gate's key manifest (finalize boot
+        # creates exactly the mapped users; root pre-exists)
+        bake_users = set(resolve_role_keys(role, TEST_KEYS)) - {"root"}
+        shipped = recorded | bake_users
+        missing = shipped - baseline
+        assert not missing, \
+            f"{role}: baseline misses shipped accounts {sorted(missing)}"
+        if check_inject:
+            missing_inject = shipped - set(IMAGE_BASELINE_USERS)
+            assert not missing_inject, \
+                f"inject baseline misses {sorted(missing_inject)}"

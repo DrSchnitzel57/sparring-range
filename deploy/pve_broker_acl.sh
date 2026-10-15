@@ -84,10 +84,22 @@ run() {
 # ---------------------------------------------------------------- roles ----
 # One narrow role per PATH CLASS (plan: exact per-path roles). PVE unions a
 # user's roles per path, so separate roles keep each grant auditable.
-BASE_PRIVS="VM.Audit,VM.Allocate,VM.Config.Network,VM.Config.Cloudinit,VM.Config.Options,VM.PowerMgmt,VM.GuestAgent.FileRead,Datastore.Allocate,Datastore.AllocateSpace"
+# Split by operation class (audit A7): creation-time privileges
+# (VM.Allocate for clone-newid + destroy, Datastore.* for images) live in
+# Base; template-source Clone lives in Clone. Runtime power/config/guest
+# privileges ride the SAME per-path grants (templates + enumerated window),
+# never a bare /vms path.
+# Per-VM runtime scope (audit A7): audit/allocate(clone-newid +
+# destroy)/config/power/guest-agent — granted ONLY on approved per-VMID
+# paths (templates + enumerated clone window). Datastore privileges are
+# meaningless on VM paths, so they live in their own role on the named
+# storage only.
+BASE_PRIVS="VM.Audit,VM.Allocate,VM.Config.Network,VM.Config.Cloudinit,VM.Config.Options,VM.PowerMgmt,VM.GuestAgent.FileRead"
+STORAGE_PRIVS="Datastore.Allocate,Datastore.AllocateSpace"
 
 echo "== planned grants (dry-run unless --apply) =="
 run pveum role add "${ROLE_BASE}Base" --privs "$BASE_PRIVS"
+run pveum role add "${ROLE_BASE}Storage" --privs "$STORAGE_PRIVS"
 run pveum role add "${ROLE_BASE}Clone" --privs "VM.Clone"
 run pveum role add "${ROLE_BASE}Audit" --privs "Sys.Audit"
 run pveum role add "${ROLE_BASE}Sdn" --privs "SDN.Use"
@@ -105,16 +117,23 @@ for t in "${TMPLS[@]}"; do
     run pveum acl modify "/vms/${t}" \
         --users "$USER_ID" --roles "${ROLE_BASE}Clone"
 done
-# Clone targets + storage live under the resource-pool-free /vms and /storage
-# paths; PVE has no per-VMID-range path, so the bounded window is enforced by
-# the BROKER POLICY (fail-closed typed operations), and the token grant stays
-# at the narrowest real PVE granularity: VM.Allocate/Datastore.* on /vms and
-# the named storage only. Anything outside the policy is refused by the
-# broker before PVE is ever asked.
-run pveum acl modify "/vms" \
-    --users "$USER_ID" --roles "${ROLE_BASE}Base"
+# Clone-window runtime scope (PVE 9.2 audit A7): PVE has no per-VMID-RANGE
+# path and destroy has NO pool alternative, so the bounded window is
+# enumerated as individual per-VMID grants — every approved clone identity
+# gets the runtime role, and NOTHING else does. VM.Allocate on a window
+# path covers both clone-newid creation and destroy (Qemu.pm permission
+# blocks); the broker policy independently enforces the same window with
+# fail-closed typed operations (defense in depth, tested by the authority
+# gate). A bare `/vms` grant is NEVER issued: token theft cannot reach
+# unrelated VMs through PVE itself.
+[ "$((VMID_HI - VMID_LO + 1))" -le 512 ] \
+    || die "VMID window larger than 512 — enumerate explicitly or narrow it"
+for _v in $(seq "$VMID_LO" "$VMID_HI"); do
+    run pveum acl modify "/vms/${_v}" \
+        --users "$USER_ID" --roles "${ROLE_BASE}Base"
+done
 run pveum acl modify "/storage/${STORAGE}" \
-    --users "$USER_ID" --roles "${ROLE_BASE}Base"
+    --users "$USER_ID" --roles "${ROLE_BASE}Storage"
 
 echo
 echo "Token: create ${USER_ID}!${TOKEN_NAME} in the PVE UI (or via pveum with"

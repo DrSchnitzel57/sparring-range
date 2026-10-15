@@ -1050,7 +1050,13 @@ def begin_session(session_id: uuid.UUID, p: Principal = Depends(any_member),
     _ok = False
     try:
         run = _start_red_run(db, p, sess.session_id, sess.scenario_id)
-        m = lifecycle.start_clock(db, sess.session_id, actor=p.username)
+        try:
+            m = lifecycle.start_clock(db, sess.session_id, actor=p.username)
+        except lifecycle.MatchBlocked as e:
+            raise HTTPException(409, {"error": e.reason, "detail": e.detail,
+                                      "note": "match NOT started; range stays "
+                                              "reserved, fix the cause and "
+                                              "begin again"})
         # UPTIME SCORING (pilot step 5): Begin starts the probe loop TOGETHER
         # with the clock + attack worker; samples are identity-bound to the
         # ready deployment generation.

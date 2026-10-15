@@ -1232,6 +1232,10 @@ def check_install() -> None:
             assert loaded.vmid_min == 9100 and loaded.vmid_max == 9199, \
                 (loaded.vmid_min, loaded.vmid_max)
             assert set(loaded.templates) >= {9005, 9011}, loaded.templates
+            limits = json.loads(pol.read_text())["limits"]
+            assert limits["max_total_disk_gb"] == 44, limits
+            assert limits["max_total_disk_gb"] <= 44, \
+                "rendered ceiling must never exceed the manifest budget"
         except Exception as e:  # noqa: BLE001
             fail("installer renders broker policy from the manifest",
                  f"{e}\n{(rr1.stdout + rr1.stderr)[-800:]}")

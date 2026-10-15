@@ -31,13 +31,23 @@ export default function LiveSession() {
     // takes longer than any fixed retry budget: follow the durable
     // operation to its terminal state, THEN load connections. A failed
     // operation surfaces its (redacted) error instead of an empty panel.
+    // Follows the durable operation to its terminal state: provisioning
+    // outlasts any fixed retry budget, so this polls the full server-side
+    // operation deadline (900s). Transient poll failures NEVER abort the
+    // wait (a blip is not a verdict); only a terminal operation state —
+    // or an actually-missing operation (404: nothing was ever accepted) —
+    // ends it. Connections reload after every terminal success.
     const loadConns = async () => {
       try {
-        for (let i = 0; i < 300; i++) {
-          const op = await api(`/sessions/${id}/operation`).catch(() => null);
+        for (let i = 0; i < 450; i++) {
+          let op = null;
+          try { op = await api(`/sessions/${id}/operation`); }
+          catch (e) {
+            if (e && e.status === 404) { setConns(null); return; }
+          }
           if (stop) return;
-          if (!op || op.state === "succeeded") break;
-          if (op.state === "failed" || op.state === "interrupted") {
+          if (op && op.state === "succeeded") break;
+          if (op && (op.state === "failed" || op.state === "interrupted")) {
             setConns(null);
             setErr(`deploy ${op.state}: ${op.error || op.phase}`);
             return;

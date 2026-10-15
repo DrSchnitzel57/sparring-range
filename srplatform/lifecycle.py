@@ -166,6 +166,12 @@ def start_clock(db, session_id, *, actor: str = "system") -> MatchModel | None:
         # The disclosed foothold both sides see (ARCHITECTURE, AI attack
         # behavior): limited web-user access on the http tier through the
         # documented diagnostic flaw — disclosed, never silently seeded.
+        # ESTABLISHED, not merely declared: the server executes a first
+        # command AS web-user through the management channel and records
+        # the proof. Without a channel the foothold cannot be established:
+        # dev proceeds with an explicitly unproven disclosure (test/fixture
+        # mode), production refuses Begin rather than start a breach match
+        # on an unproven foothold.
         from srplatform import verification_service
         try:
             spec = verification_service.scenario_spec(db, session_id)
@@ -174,11 +180,42 @@ def start_clock(db, session_id, *, actor: str = "system") -> MatchModel | None:
                  if "http" in (h.get("services") or [])), None)
         except Exception:  # noqa: BLE001 — disclosure names best-effort
             web_host = None
-        payload["disclosed_foothold"] = {
-            "user": "web-user", "host": web_host,
-            "method": "documented diagnostic flaw (MOJANG_DIAG_ENABLED)",
-            "scope": "limited guest foothold; recon phase skipped by snapshot",
-        }
+        proof: dict = {"user": "web-user", "host": web_host,
+                       "method": "documented diagnostic flaw "
+                                 "(MOJANG_DIAG_ENABLED)",
+                       "scope": "limited guest foothold; recon phase "
+                                "skipped by snapshot"}
+        from srplatform.scenario_engine import orchestrator as _orch
+        from srplatform.settings import get_settings as _gs
+        chan = _orch.management_runner()
+        if chan is None:
+            proof["established"] = False
+            proof["reason"] = ("no management channel — foothold disclosed "
+                               "but unproven")
+            if _gs().sr_env == "production":
+                raise MatchBlocked(
+                    "assumed_breach_unproven",
+                    "production assumed-breach requires a management "
+                    "channel to establish the disclosed foothold")
+        else:
+            hmap = verification_service.host_map_for(db, session_id)
+            addr = hmap.get(web_host) if web_host else None
+            if addr is None:
+                proof["established"] = False
+                proof["reason"] = ("owned inventory has no address for "
+                                   f"{web_host}")
+            else:
+                code, out = chan(
+                    addr, "runuser -u web-user -- id -u web-user")
+                proof["established"] = (code == 0)
+                proof["exit_code"] = code
+                proof["output"] = str(out or "")[:200]
+                if code != 0:
+                    raise MatchBlocked(
+                        "assumed_breach_unproven",
+                        f"foothold proof command failed (exit {code}): "
+                        f"{str(out or '')[:200]}")
+        payload["disclosed_foothold"] = proof
     db.add(Event(session_id=session_id, ts=_now(), actor=actor,
                  action_type="match_begin", payload=payload))
     db.flush()
