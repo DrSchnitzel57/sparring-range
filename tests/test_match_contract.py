@@ -340,7 +340,6 @@ def test_mysql_integrity_flags_disagreeing_paths():
     from datetime import datetime, timezone
     from srplatform.uptime import mysql_integrity
     from unittest.mock import MagicMock
-    now = datetime.now(timezone.utc)
 
     def rows(pairs):
         rs = []
@@ -350,15 +349,38 @@ def test_mysql_integrity_flags_disagreeing_paths():
             rs.append(r)
         return rs
 
-    db = MagicMock()
-    db.execute.return_value.scalars.return_value.all.return_value = rows([
-        ("db01", "purchases=12"),
-        ("db01:db-path", "purchases=12 via network path")])
-    out = mysql_integrity(db, "sid")
-    assert out["agree"] is True
+    import uuid as _uuid
+    DEP_ID = _uuid.uuid4()
 
-    db.execute.return_value.scalars.return_value.all.return_value = rows([
+    def mock_db(sample_rows):
+        db = MagicMock()
+        dep = MagicMock()
+        dep.resources = [{"host": "db01", "mysql_probe": True}]
+        db.get.return_value = dep
+        db.execute.return_value.scalars.return_value.all.return_value = \
+            sample_rows
+        return db
+
+    db = mock_db(rows([
         ("db01", "purchases=12"),
-        ("db01:db-path", "purchases=9 via network path")])
-    out = mysql_integrity(db, "sid")
-    assert out["agree"] is False and out["host"] == "db01"
+        ("web01:db-path", "purchases=12 via network path")]))
+    out = mysql_integrity(db, "sid", DEP_ID)
+    assert out["agree"] is True and out["host"] == "db01", out
+
+    db = mock_db(rows([
+        ("db01", "purchases=12"),
+        ("web01:db-path", "purchases=9 via network path")]))
+    out = mysql_integrity(db, "sid", DEP_ID)
+    assert out["agree"] is False and out["host"] == "db01", out
+
+    # loopback up + network DOWN without a count: incomparable, and the
+    # pair is NOT agreement (the old code returned agree:true here)
+    db = mock_db(rows([
+        ("db01", "purchases=12"),
+        ("web01:db-path", "network path: connection refused")]))
+    out = mysql_integrity(db, "sid", DEP_ID)
+    assert out["agree"] is False, out
+
+    # single leg only: unknown, never agreement
+    db = mock_db(rows([("db01", "purchases=12")]))
+    assert mysql_integrity(db, "sid") is None

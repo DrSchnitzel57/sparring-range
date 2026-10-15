@@ -150,6 +150,30 @@ def coverage_for_session(db, session_id, *, started_at, ended_at=None,
                     interval_s=interval_s)
 
 
+def _integrity_db_host(db, session_id, deployment_id=None) -> str | None:
+    """The deployment's DB host identity (for grouping web-origin
+    observations under the database they observe)."""
+    from srplatform.db.models import Deployment
+    from sqlalchemy import select as _select
+    dep = None
+    if deployment_id:
+        try:
+            import uuid as _uuid
+            dep = db.get(Deployment, _uuid.UUID(str(deployment_id)))
+        except Exception:  # noqa: BLE001 — fall through to latest
+            dep = None
+    if dep is None:
+        dep = db.execute(
+            _select(Deployment)
+            .where(Deployment.session_id == session_id)
+            .order_by(Deployment.created_at.desc())
+        ).scalars().first()
+    for r in ((dep.resources if dep else None) or []):
+        if r.get("mysql_probe"):
+            return r.get("host")
+    return None
+
+
 def mysql_integrity(db, session_id, deployment_id=None) -> dict | None:
     """Cross-validate the two differently-privileged MySQL observations:
     the loopback business transaction (DB-guest execution) vs the
@@ -166,33 +190,49 @@ def mysql_integrity(db, session_id, deployment_id=None) -> dict | None:
         q = q.where(UptimeSample.deployment_id == str(deployment_id))
     rows = db.execute(
         q.order_by(UptimeSample.ts.desc()).limit(50)).scalars().all()
+    # Group by DB IDENTITY, not by probing host: the web-origin target is
+    # labeled by its web guest ("web01:db-path") but observes a DB — the
+    # comparison key is the observed database. Resolve through the target
+    # registry passed by the caller when available, else fall back to the
+    # loopback host name embedded in the detail line.
     counts: dict[str, str] = {}
+    compared = False
     for r in rows:
         host = r.host or ""
-        base = host.split(":")[0]
-        if "db-path" in host or "banner" in host:
-            leg = "network"
+        if host.endswith(":db-path"):
+            # web-origin observation: the detail names the observed table;
+            # attribute it to the deployment's DB host (single-DB lab).
+            base, leg = _integrity_db_host(db, session_id, deployment_id), "network"
+        elif host.endswith(":banner") or "greeting" in (r.detail or ""):
+            continue  # liveness only — no business fact to compare
         else:
-            leg = "loopback"
-        if (base, leg) in counts:
+            base, leg = host.split(":")[0], "loopback"
+        if base is None or (base, leg) in counts:
             continue
         m = re.search(r"(\w+)=(\d+)", r.detail or "")
-        if m:
-            counts[(base, leg)] = f"{m.group(1)}={m.group(2)}"
+        if not m:
+            # A business check that produced no count (e.g. wrong-count
+            # DOWN) is still an observation: without a number it cannot
+            # confirm agreement — mark the pair incomparable, never agree.
+            counts[(base, leg)] = "nocount:" + (r.state or "unknown")
+            continue
+        counts[(base, leg)] = f"{m.group(1)}={m.group(2)}"
     for (base, _leg) in list(counts):
-        pair = {counts.get((base, "loopback")), counts.get((base, "network"))}
-        pair.discard(None)
-        if len(pair) == 2:
+        loop = counts.get((base, "loopback"))
+        net = counts.get((base, "network"))
+        if loop is None or net is None:
+            continue  # one leg silent — unknown, not agreement
+        compared = True
+        if loop != net or loop.startswith("nocount:") or net.startswith("nocount:"):
             return {"agree": False, "host": base,
-                    "loopback": counts[(base, "loopback")],
-                    "network": counts[(base, "network")],
-                    "note": "business facts disagree across observation "
-                            "paths — possible forgery or split-brain"}
-        if len(pair) == 1:
-            only = next(iter(pair))
-            return {"agree": True, "host": base, "value": only,
-                    "note": "single observation path so far"}
-    return None
+                    "loopback": loop, "network": net,
+                    "note": "business facts disagree (or are uncounted) "
+                            "across observation paths — possible forgery, "
+                            "split-brain, or failed network path"}
+    if not compared:
+        return None  # nothing comparable (yet) — unknown, never agree
+    return {"agree": True, "host": base, "value": loop,
+            "note": "loopback and network path report the same fact"}
 
 
 def live_projection(db, session_id) -> dict:
