@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     # into every enrolled guest; the shipper uses an explicit verified SSL
     # context — TLS checks are never disabled for readiness or delivery.
     telemetry_ca_file: str | None = None
+    # Trust anchor for server-to-server calls to api_base_url (the bastion
+    # resolves logins and sinks events over LAN HTTPS). The stock web cert
+    # is self-signed, so the bastion VM pins its copy here — TLS checks are
+    # never disabled. Unset on hosts that never dial the API over TLS.
+    api_tls_ca_file: str | None = None
 
     # --- Auth (F04) ---
     web_token_ttl_hours: int = 12

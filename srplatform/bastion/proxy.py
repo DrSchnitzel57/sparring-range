@@ -250,7 +250,7 @@ async def api_resolve_token(token: str) -> dict | None:
     import httpx
 
     s = get_settings()
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(verify=s.api_tls_ca_file or True) as c:
         r = await c.get(f"{s.api_base_url}/tokens/{token}", headers=_svc_headers(), timeout=10)
         if r.status_code != 200:
             return None
@@ -267,7 +267,7 @@ async def api_register_recording(session_id: str, cast_path: str) -> str | None:
     import httpx
 
     s = get_settings()
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(verify=s.api_tls_ca_file or True) as c:
         r = await c.post(f"{s.api_base_url}/sessions/{session_id}/recordings",
                          json={"cast_path": cast_path}, headers=_svc_headers(), timeout=10)
         return r.json().get("recording_id") if r.status_code == 201 else None
@@ -279,13 +279,18 @@ async def api_event_sink(event: dict) -> None:
     s = get_settings()
     event = dict(event)
     event.pop("actor", None)  # server assigns the actor from the capability
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(verify=s.api_tls_ca_file or True) as c:
         r = await c.post(f"{s.api_base_url}/events", json=event, headers=_svc_headers(), timeout=10)
         if r.status_code >= 400:
             print(f"[bastion] event sink failed: {r.status_code} {r.text[:200]}", flush=True)
 
 
 async def main():
+    s = get_settings()
+    if s.api_base_url.startswith("https://") and not s.api_tls_ca_file:
+        raise SystemExit(
+            "bastion refuses to start: api_base_url is https but API_TLS_CA_FILE "
+            "is unset — pin the API certificate (TLS checks are never disabled)")
     proxy = BastionProxy(api_resolve_token, api_event_sink,
                          register_recording=api_register_recording)
     port = await proxy.start()

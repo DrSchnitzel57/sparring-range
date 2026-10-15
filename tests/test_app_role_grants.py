@@ -84,3 +84,40 @@ def test_change_placeholder_is_rejected_like_change_me():
         proxmox_token_secret="CHANGE")
     with pytest.raises(RuntimeError, match="forbidden"):
         validate_production(c, "controller")
+
+
+def test_bastion_api_calls_verify_with_pinned_anchor():
+    import asyncio
+    import srplatform.bastion.proxy as proxy
+
+    seen = {}
+
+    class FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {"token": "tok-x", "username": "ccdc-demo",
+                    "session_id": None, "target_host": "h", "target_port": 22}
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            seen.update(k)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, *a, **k):
+            return FakeResp()
+
+    import httpx
+    real, httpx.AsyncClient = httpx.AsyncClient, FakeClient
+    try:
+        out = asyncio.run(proxy.api_resolve_token("tok-x"))
+    finally:
+        httpx.AsyncClient = real
+    assert out and out["username"] == "ccdc-demo"
+    assert seen.get("verify") is True, \
+        "without a pinned anchor the client must use system verification (fail closed)"
