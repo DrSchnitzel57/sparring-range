@@ -39,11 +39,13 @@ pin-serving defect — the token endpoint served the truncated display ref
 (`host_key_ref`), which asyncssh silently drops, so every dial failed
 `HostKeyNotVerifiable` while the deployment reported ready. Fixed in
 `6cef3cc` (store/serve the full `host_key_pin`, resume backfill, readiness),
-`0d33723` (bastion refuses a malformed pin; real-dial regression) and
-`a6fd49c` (`read_host_key` bound 300 s; dead except removed). Verified:
-fast 361 passed, authority 25 passed, db 170 passed (gate-owned postgres 16).
-Step 9 stays open: deploy, relaunch once for the backfill, then the operator
-re-tests the live dial (Manual check).
+`0d33723` (bastion refuses a malformed pin; real-dial regression),
+`a6fd49c`/`e00ed70` (client bound 300 s sized to the now genuinely SHARED
+120 s re-read window, review round; dead except removed). Verified:
+fast 363 passed at `e00ed70`, authority 25 passed, db 170 passed at
+`a6fd49c` (gate-owned postgres 16). Step 9 stays open: deploy, relaunch
+once for the backfill, then the operator re-tests the live dial (Manual
+check).
 
 Finish phases in order; each has a stop condition below. Independent tests
 may run in parallel, but unresolved safety or ownership defects block later

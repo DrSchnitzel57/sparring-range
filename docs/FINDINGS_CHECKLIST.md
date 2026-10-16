@@ -1279,10 +1279,10 @@ Repairs (commits `6cef3cc`, `0d33723`, `a6fd49c`):
   material in member output or the recording).
 - Readiness requires the full pin; a ref-only row stays red until resume
   repairs it.
-- `read_host_key` client bound 150 → 300 s (server bound is now a 120 s
-  boot-marker wait + up to 120 s stability read); the duplicated
-  unreachable except was removed and the stage's own retained obligation is
-  no longer re-recorded.
+- `read_host_key` client bound 150 → 300 s (server bound: a 120 s
+  boot-marker wait + ONE SHARED 120 s stability window — each re-read gets
+  only the time left); the duplicated unreachable except was removed and
+  the stage's own retained obligation is no longer re-recorded.
 
 | Exact command/probe | Result / meaning |
 |---|---|
@@ -1292,6 +1292,21 @@ Repairs (commits `6cef3cc`, `0d33723`, `a6fd49c`):
 | `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD .venv/bin/python infra/dev/acceptance.py authority` | Exit 0: **25 passed, 586 deselected, 0 skipped** (broker boundary/durability/cessation, required mode). |
 | `.venv/bin/python infra/dev/acceptance.py db` (gate-owned disposable `postgres:16` fixture; the manual `SR_PG_ADMIN_URL` export was overridden by the gate) | Exit 0: **170 passed, 441 deselected, 0 skipped**, 464.8s; includes the new resume-backfill db tests; owned `srtest_*` resources and the fixture container/volume removed. |
 
-Open (operator Manual check): deploy `a6fd49c`+docs to the service VMs (201
+Review round (2026-10-16, `e00ed70`): an independent review confirmed the
+pin work and raised one blocker — the stability re-reads each received a
+FRESH 120 s window, so a slow-but-working sequence (reviewer's virtual
+clock: 118 s marker + 110 s read + 2 s pause + 110 s confirmation)
+succeeded at ~340 s server-side while the 300 s client bound had already
+failed the deployment. Fixed in `e00ed70`: the re-read phase shares ONE
+window (each read gets only the time left; an exhausted window allows a
+single non-blocking attempt, so `agent_ready_timeout_s=0` fixtures still
+pin instantly-answered keys). Evidence: virtual-clock regression tests in
+`tests/test_broker_grant_recovery.py` — the 340 s sequence now fails
+bounded with `host-key-read-uncertain` retained, and a 118 s marker + 10 s
+read still pins; the negative test fails `DID NOT RAISE` when run against
+the previous code (regression proven genuine). Fast suite **363 passed**,
+authority gate **25 passed** at `e00ed70`.
+
+Open (operator Manual check): deploy `e00ed70` to the service VMs (201
 API / 202 broker / 203 bastion), relaunch/resume the existing deployment once
 so `host_key_pin` backfills, then re-test the recorded SSH login.
