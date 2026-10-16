@@ -1279,10 +1279,12 @@ Repairs (commits `6cef3cc`, `0d33723`, `a6fd49c`):
   material in member output or the recording).
 - Readiness requires the full pin; a ref-only row stays red until resume
   repairs it.
-- `read_host_key` client bound 150 → 300 s (server bound: a 120 s
-  boot-marker wait + ONE SHARED 120 s stability window — each re-read gets
-  only the time left); the duplicated unreachable except was removed and
-  the stage's own retained obligation is no longer re-recorded.
+- `read_host_key` client bound 150 → 300 → 360 s (server worst case:
+  (120 s boot-marker window + one in-flight request of ≤30 s) + (120 s
+  SHARED stability window + one in-flight request of ≤30 s) = 300 s; once
+  a window is exhausted NO further probe is issued, so the bound is real);
+  the duplicated unreachable except was removed and the stage's own
+  retained obligation is no longer re-recorded.
 
 | Exact command/probe | Result / meaning |
 |---|---|
@@ -1306,6 +1308,26 @@ bounded with `host-key-read-uncertain` retained, and a 118 s marker + 10 s
 read still pins; the negative test fails `DID NOT RAISE` when run against
 the previous code (regression proven genuine). Fast suite **363 passed**,
 authority gate **25 passed** at `e00ed70`.
+
+Review round 2 (2026-10-16, after `e819d95`): the shared window fixed the
+polling-sleep case, but `timeout_s=0` bounds retry SLEEPS, not the HTTP
+request — each post-exhaustion probe still cost up to the 30 s HTTP
+timeout and a success response bypassed the deadline check, so extra
+probes could stabilize at **327 s** on the reviewer's virtual clock while
+the 300 s client bound had already failed. Fixed: once the shared window
+is exhausted the read loop issues NO further probe, the documented server
+worst case counts one in-flight request per window (120+30+120+30 = 300 s),
+and the client bound is 360 s (20 % margin). Evidence in
+`tests/test_broker_grant_recovery.py`: with 29 s requests the pre-fix code
+RETURNS a key at t=327 s after 7 key requests; the fixed code raises
+`never stabilized` at t=240 s after 4 (`host-key-unstable` retained), and a
+slow-but-legitimate 29 s sequence still pins inside the window. The
+zero-window fixture `test_pin_waits_for_boot_completion` moved to the
+virtual clock because exhausted/zero windows may no longer probe.
+Evidence at `00571e9`: fast suite exit 0, **365 passed, 0 failed,
+0 skipped, 250 deselected**, 4 warnings, 53.10s; authority gate exit 0,
+**25 passed, 0 skipped**; `tests/test_pve_real_client_contract.py`
+**22 passed** (static `read_host_key > 300` bound).
 
 Open (operator Manual check): deploy `e00ed70` to the service VMs (201
 API / 202 broker / 203 bastion), relaunch/resume the existing deployment once

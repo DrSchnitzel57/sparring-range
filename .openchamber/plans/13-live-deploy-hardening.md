@@ -40,12 +40,14 @@ pin-serving defect — the token endpoint served the truncated display ref
 `HostKeyNotVerifiable` while the deployment reported ready. Fixed in
 `6cef3cc` (store/serve the full `host_key_pin`, resume backfill, readiness),
 `0d33723` (bastion refuses a malformed pin; real-dial regression),
-`a6fd49c`/`e00ed70` (client bound 300 s sized to the now genuinely SHARED
-120 s re-read window, review round; dead except removed). Verified:
-fast 363 passed at `e00ed70`, authority 25 passed, db 170 passed at
-`a6fd49c` (gate-owned postgres 16). Step 9 stays open: deploy, relaunch
-once for the backfill, then the operator re-tests the live dial (Manual
-check).
+`a6fd49c`/`e00ed70`/`00571e9` (client bound sized to the now genuinely
+SHARED 120 s re-read window plus one in-flight 30 s request per window →
+300 s server worst case, client bound 360 s; no probes after window
+exhaustion — review rounds 1-2; dead except removed). Verified:
+fast 365 passed, authority 25 passed, PVE contract 22 passed at `00571e9`;
+db 170 passed at `a6fd49c` (gate-owned postgres 16). Step 9 stays open:
+deploy, relaunch once for the backfill, then the operator re-tests the
+live dial (Manual check).
 
 Finish phases in order; each has a stop condition below. Independent tests
 may run in parallel, but unresolved safety or ownership defects block later
