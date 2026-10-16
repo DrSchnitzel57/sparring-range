@@ -10,12 +10,19 @@ from __future__ import annotations
 
 import types
 
+import asyncssh
 import pytest
+
+# A REAL parseable pin: the old fake ("ssh-ed25519 AAAAPIN") could never
+# catch the truncated-ref bug — asyncssh silently drops the unparseable
+# line and the dial fails with HostKeyNotVerifiable (live find 2026-10-16).
+_PIN_KEY = asyncssh.generate_private_key("ssh-ed25519")
+PIN = _PIN_KEY.export_public_key().decode().strip()
 
 TARGET = {
     "token": "tok-x", "username": "ccdc-demo", "session_id": "sess-1",
     "target_host": "10.66.0.9", "target_port": 22,
-    "target_host_key": "ssh-ed25519 AAAAPIN",
+    "target_host_key": PIN,
 }
 
 
@@ -111,7 +118,7 @@ async def test_resolve_binds_owner_and_pin(monkeypatch):
     finally:
         get_settings.cache_clear()
     assert out["username"] == "ccdc-demo"
-    assert out["target_host_key"] == "ssh-ed25519 AAAAPIN"
+    assert out["target_host_key"] == PIN
     assert seen.get("verify") is True  # fail closed without an anchor
     assert seen["url"].endswith("/tokens/tok-x")
 
@@ -173,11 +180,76 @@ async def test_dial_prefers_deployment_pin(monkeypatch, tmp_path):
     p = _proxy(monkeypatch, tmp_path, TARGET)
     proc = _Proc()
     await p._handle_session(proc)
-    assert captured["known_hosts"] == b"10.66.0.9 ssh-ed25519 AAAAPIN"
+    assert captured["known_hosts"] == f"10.66.0.9 {PIN}".encode()
     assert proc.code == 255
     assert "target connection failed" in proc.stderr.data
     assert "OSError" in proc.stderr.data
-    assert "AAAAPIN" not in proc.stderr.data  # never leak pin material
+    assert PIN.split()[1] not in proc.stderr.data  # never leak pin material
+
+
+async def test_dial_refuses_truncated_display_ref_pin(monkeypatch, tmp_path):
+    """Live find 2026-10-16: the API once served `host_key_ref` (the
+    truncated display form) as the dial pin. asyncssh silently drops the
+    unparseable known_hosts line, so EVERY dial failed
+    HostKeyNotVerifiable while looking like a key mismatch."""
+    import srplatform.bastion.proxy as proxy
+
+    calls = []
+    monkeypatch.setattr(asyncssh, "connect",
+                        lambda *a, **k: calls.append(k))
+    b64 = PIN.split()[1]
+    ref = f"ssh-ed25519 {b64[:24]}…{b64[-8:]}"
+    target = dict(TARGET, target_host_key=ref)
+    p = _proxy(monkeypatch, tmp_path, target)
+    proc = _Proc()
+    await p._handle_session(proc)
+    assert calls == [], "a malformed pin must never reach a dial"
+    assert proc.code == 255
+    assert "PinRefused" in proc.stderr.data
+    assert b64 not in proc.stderr.data  # refuse without echoing material
+
+
+async def test_real_dial_with_full_pin_succeeds(monkeypatch, tmp_path):
+    """End-to-end regression for the same find: with the FULL pin the real
+    dial (real asyncssh server, real host-key verification, real public-key
+    auth) must reach the guest — never a mocked `asyncssh.connect`."""
+    host_key = asyncssh.generate_private_key("ssh-ed25519")
+    client_key = asyncssh.generate_private_key("ssh-ed25519")
+    ck_path = tmp_path / "defender_key"
+    client_key.write_private_key(ck_path)
+    ck_path.chmod(0o600)
+    client_pub = client_key.export_public_key()
+
+    class _Server(asyncssh.SSHServer):
+        def begin_auth(self, username):
+            return True
+
+        def public_key_auth_supported(self):
+            return True
+
+        async def validate_public_key(self, username, key):
+            return username == "defender" and key.export_public_key() == client_pub
+
+    async def _session(process):
+        process.stdout.write("hi\n")
+        process.exit(0)
+
+    srv = await asyncssh.create_server(
+        _Server, "127.0.0.1", 0, server_host_keys=[host_key],
+        process_factory=_session)
+    try:
+        port = srv.sockets[0].getsockname()[1]
+        target = dict(TARGET, target_host="127.0.0.1", target_port=port,
+                      target_host_key=host_key.export_public_key().decode().strip())
+        p = _proxy(monkeypatch, tmp_path, target,
+                   settings_over={"bastion_client_key_path": str(ck_path)})
+        proc = _Proc()
+        await p._handle_session(proc)
+    finally:
+        srv.close()
+        await srv.wait_closed()
+    assert proc.code == 0, proc.stderr.data
+    assert "hi" in proc.stdout.data
 
 
 async def test_dial_falls_back_to_file_without_pin(monkeypatch, tmp_path):

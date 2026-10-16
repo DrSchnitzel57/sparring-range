@@ -41,6 +41,34 @@ class EventSink(Protocol):
     async def __call__(self, event: dict) -> None: ...
 
 
+class PinRefused(RuntimeError):
+    """The deployment-served host-key pin is unusable — fail closed.
+
+    Raised BEFORE any dial. The member sees only the failure class (never
+    pin material); the operator reads the journal. A target that carries a
+    (broken) pin never falls back to TOFU or a stale file: that is exactly
+    how a truncated display ref masqueraded as a dial mismatch and cost a
+    live debugging session (2026-10-16).
+    """
+
+
+def _deployment_known_hosts(target: dict) -> bytes:
+    """known_hosts line built from the deployment-served pin.
+
+    The value must be a parseable public key; a truncated display ref or
+    any other malformed shape raises :class:`PinRefused` instead of becoming
+    a known_hosts line asyncssh silently ignores (zero trusted keys ->
+    HostKeyNotVerifiable on every dial). Never include the value in the
+    error — the class is loud, the material is not leaked.
+    """
+    pin = (target.get("target_host_key") or "").strip()
+    try:
+        asyncssh.import_public_key(pin)
+    except asyncssh.KeyImportError as e:
+        raise PinRefused("deployment pin malformed — refusing dial") from e
+    return f"{target['target_host']} {pin}".encode()
+
+
 def load_authorized_keys(path: str | None) -> dict[str, list[str]]:
     """`user <pubkey...>` lines -> {user: [keys]}."""
     out: dict[str, list[str]] = {}
@@ -185,10 +213,12 @@ class BastionProxy:
             # login can never go stale across relaunches the way copied
             # files do. The local file remains only as a last resort when
             # the deployment carries no pin (legacy); TOFU is never used.
+            # A malformed pin (truncated ref, corruption) is refused here,
+            # before any dial — see _deployment_known_hosts.
             api_pin = (target.get("target_host_key") or "").strip() or None
             if api_pin:
                 print("[bastion] pin source: deployment evidence", flush=True)
-                known = f"{target['target_host']} {api_pin}".encode()
+                known = _deployment_known_hosts(target)
             elif isinstance(known, str):
                 print("[bastion] pin source: local file (no deployment pin)",
                       flush=True)
