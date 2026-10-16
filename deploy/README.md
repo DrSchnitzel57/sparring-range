@@ -259,10 +259,12 @@ ssh <bastion-ip> -p 2222 -l tok-<session> -i ~/.ssh/sr-member
   and frees the range for the next teammate. A blocked stop or failed
   destroy shows `recovery required` and RETAINS the reservation — retry
   `end session`; never work around it. PVE deletes per-VMID ACL entries
-  with the destroyed VM (live find 2026-10-15): after any teardown that
-  destroyed clones, re-run `deploy/pve_broker_acl.sh --apply` (same
-  arguments as setup — idempotent) before the next launch, or allocation
-  fails naming the re-apply.
+  with the destroyed VM (source-verified in Qemu.pm `destroy_vm`: a literal
+  `/vms/{vmid}` check no pool grant can cover), so every teardown eats the
+  grants its clones used. Before relaunching, check and repair (read-only
+  diff first, idempotent restore after):
+  `deploy/pve_broker_acl.sh --node pve --bridge srrange --templates 9005,9011,9012 --vmid-range 9100-9199 --storage data --probe-foreign-vmid 107 --check || deploy/pve_broker_acl.sh --node pve --bridge srrange --templates 9005,9011,9012 --vmid-range 9100-9199 --storage data --probe-foreign-vmid 107 --apply`
+  (or run `--check` on a host cron and `--apply` when it exits 1).
 * An API restart **interrupts** running matches (never resumes them) and
   reconciles cleanup on boot. `SR_MATCH_SCHEDULER_ENABLED=1` runs this
   automatically.

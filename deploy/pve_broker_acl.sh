@@ -30,7 +30,7 @@ set -euo pipefail
 NODE="" BRIDGE="" TEMPLATES="" VMID_RANGE="" STORAGE=""
 USERNAME="sr-broker" REALM="pve" TOKEN_NAME="range"
 TOKEN_SECRET_FILE="" PROBE_FOREIGN_VMID=""
-APPLY=0 VERIFY=0
+APPLY=0 VERIFY=0 CHECK=0
 
 die() { echo "REFUSED: $*" >&2; exit 1; }
 
@@ -49,6 +49,7 @@ while [ $# -gt 0 ]; do
         --dry-run) APPLY=0; shift;;
         --apply) APPLY=1; shift;;
         --verify) VERIFY=1; shift;;
+        --check) CHECK=1; shift;;
         *) die "unknown argument $1";;
     esac
 done
@@ -138,6 +139,49 @@ for t in "${TMPLS[@]}"; do
     run pveum acl modify "/vms/${t}" \
         --users "$USER_ID" --roles "${ROLE_BASE}Template"
 done
+# ---------------------------------------------------------------- check ----
+# PVE deletes per-VMID ACL entries WITH the destroyed VM (source-verified:
+# destroy_vm checks VM.Allocate on the literal /vms/{vmid} path, which no
+# pool grant can cover). Every teardown therefore eats the grants its
+# clones used. --check diffs the live ACL table against the exact expected
+# set and exits 1 listing what --apply would restore. Dry-run safe:
+# reads `pveum acl list` only, changes nothing.
+if [ "$CHECK" -eq 1 ]; then
+    command -v python3 >/dev/null || die "--check needs python3 (JSON parse)"
+    _expected="$(mktemp)"
+    {
+        echo "/nodes/${NODE} ${USER_ID} ${ROLE_BASE}Audit"
+        echo "/sdn/zones/localnetwork/${BRIDGE} ${USER_ID} ${ROLE_BASE}Sdn"
+        for t in "${TMPLS[@]}"; do
+            echo "/vms/${t} ${USER_ID} ${ROLE_BASE}Template"
+        done
+        for _v in $(seq "$VMID_LO" "$VMID_HI"); do
+            echo "/vms/${_v} ${USER_ID} ${ROLE_BASE}Base"
+        done
+        echo "/storage/${STORAGE} ${USER_ID} ${ROLE_BASE}Storage"
+    } > "$_expected"
+    _live_file="$(mktemp)"
+    pveum acl list --output-format json > "$_live_file" \
+        || die "could not read the live ACL table"
+    python3 - "$_expected" "$_live_file" <<'PYEOF'
+import json, sys
+expected = [l.split() for l in open(sys.argv[1]) if l.strip()]
+live = json.load(open(sys.argv[2]))
+have = {(e.get("path"), e.get("ugid"), e.get("roleid")) for e in live}
+missing = [w for w in expected if tuple(w) not in have]
+for path, user, role in missing:
+    print(f"MISSING {path} {user} {role}")
+print(f"acl-check: {len(expected) - len(missing)}/{len(expected)} exact-path "
+      f"grants present")
+sys.exit(1 if missing else 0)
+PYEOF
+    _rc=$?
+    rm -f "$_expected" "$_live_file"
+    if [ "$_rc" -ne 0 ]; then
+        echo "(grants missing — re-run with --apply to restore exactly these)"
+    fi
+    exit "$_rc"
+fi
 # Clone-window runtime scope (PVE 9.2 audit A7): PVE has no per-VMID-RANGE
 # path and destroy has NO pool alternative, so the bounded window is
 # enumerated as individual per-VMID grants — every approved clone identity
@@ -161,6 +205,8 @@ echo "Token: create ${USER_ID}!${TOKEN_NAME} in the PVE UI (or via pveum with"
 echo "the secret redirected into a 0600 file). This script never handles"
 echo "the secret value. The broker policy must bound clone VMIDs to"
 echo "${VMID_LO}-${VMID_HI}; the token alone is not the boundary."
+
+
 
 if [ "$APPLY" -eq 0 ] && [ "$VERIFY" -eq 0 ]; then
     echo

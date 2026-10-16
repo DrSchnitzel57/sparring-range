@@ -45,3 +45,68 @@ def test_acl_plan_splits_storage_role():
     for l in out.splitlines():
         if "/vms/" in l and "role" in l.lower():
             assert "Datastore" not in l, l
+
+
+def _acl_json(entries):
+    import json
+    return json.dumps([
+        {"path": p, "propagate": 1, "roleid": r, "type": "user", "ugid": u}
+        for p, u, r in entries])
+
+
+def _check(extra_env_json):
+    import json
+    import os
+    import stat
+    import tempfile
+    stubdir = tempfile.mkdtemp(prefix="sr-pveum-stub-")
+    stub = os.path.join(stubdir, "pveum")
+    with open(stub, "w") as f:
+        f.write("#!/bin/bash\n"
+                "if [ \"$1 $2\" = \"acl list\" ]; then\n"
+                f"  printf '%s' '{extra_env_json}'; exit 0\n"
+                "fi\n"
+                "echo \"unexpected pveum call: $*\" >&2; exit 3\n")
+    os.chmod(stub, os.stat(stub).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    env = {**os.environ, "PATH": f"{stubdir}:{os.environ['PATH']}"}
+    r = subprocess.run(
+        ["bash", str(REPO / "deploy/pve_broker_acl.sh"),
+         "--node", "pve", "--bridge", "srrange",
+         "--templates", "9005,9011", "--vmid-range", "9100-9101",
+         "--storage", "local-zfs", "--check"],
+        capture_output=True, text=True, timeout=60, env=env)
+    return r
+
+
+def _full_set():
+    U = "sr-broker@pve"
+    return [
+        ("/nodes/pve", U, "SRBrokerAudit"),
+        ("/sdn/zones/localnetwork/srrange", U, "SRBrokerSdn"),
+        ("/vms/9005", U, "SRBrokerTemplate"),
+        ("/vms/9011", U, "SRBrokerTemplate"),
+        ("/vms/9100", U, "SRBrokerBase"),
+        ("/vms/9101", U, "SRBrokerBase"),
+        ("/storage/local-zfs", U, "SRBrokerStorage"),
+    ]
+
+
+def test_acl_check_passes_on_complete_grants():
+    import json
+    r = _check(_acl_json(_full_set()))
+    assert r.returncode == 0, r.stdout[-800:] + r.stderr[-400:]
+    assert "7/7" in r.stdout
+
+
+def test_acl_check_names_missing_window_grant():
+    # a destroyed clone's grant vanishes from the live table (the PVE rot):
+    # --check must name exactly that path for --apply to restore.
+    missing = [e for e in _full_set() if e[0] != "/vms/9100"]
+    r = _check(_acl_json(missing))
+    assert r.returncode == 1, r.stdout[-800:]
+    assert "MISSING /vms/9100 sr-broker@pve SRBrokerBase" in r.stdout
+    assert "6/7" in r.stdout
+    # nothing else executes in check mode: no role/user/acl writes
+    assert "pveum acl modify" not in r.stdout
+    assert "pveum role add" not in r.stdout
+    assert "pveum user add" not in r.stdout
