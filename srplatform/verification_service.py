@@ -145,7 +145,10 @@ def _pin_items(dep) -> tuple[list, list]:
     for r in (dep.resources or []):
         if r.get("state") != "created":
             continue
-        if not r.get("host_key_ref"):
+        if not r.get("host_key_pin"):
+            # The FULL pinned key (`host_key_pin`) is the requirement, never
+            # the truncated display ref: a ref-only row (legacy writer) is
+            # not dialable (live find 2026-10-16).
             items.append({"host": r.get("host"), "service": "ssh",
                           "unit": "host-key-pin", "status": "failed",
                           "evidence": None,

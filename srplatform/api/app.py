@@ -1755,6 +1755,23 @@ def create_service_token(body: ServiceTokenIn, p: Principal = Depends(operator),
             if body.session_id else None, "host": body.host}
 
 
+def dial_pin_for(resources, target_host):
+    """The FULL pinned guest host key for the dial target, or None.
+
+    Only `host_key_pin` may leave the API. `host_key_ref` is a truncated
+    display/evidence form, and a known_hosts line built from it is silently
+    unparseable — asyncssh drops the key and every bastion dial fails
+    HostKeyNotVerifiable while everything looks healthy (live find
+    2026-10-16: pins were never dialable after the API-served-pin change).
+    The pin is a public key, never a secret.
+    """
+    for r in resources or []:
+        if isinstance(r, dict) and r.get("ip") == target_host \
+                and r.get("host_key_pin"):
+            return r["host_key_pin"]
+    return None
+
+
 @app.get("/tokens/{token}")
 def get_token(token: str, p: Principal = Depends(service("bastion")),
               db: DbSession = None):
@@ -1771,8 +1788,10 @@ def get_token(token: str, p: Principal = Depends(service("bastion")),
     # Authoritative generation-bound pin for the dial target (the broker
     # pinned it as deployment evidence; the bastion verifies the guest
     # against THIS in memory instead of a copied file that rots on
-    # relaunch). None when no ready deployment carries it — the proxy must
-    # refuse rather than TOFU or trust a stale copy.
+    # relaunch). Only the FULL pin is served — never the truncated
+    # `host_key_ref` (see dial_pin_for). None when no ready deployment
+    # carries it — the proxy must refuse rather than TOFU or trust a stale
+    # copy.
     host_key = None
     if t.session_id is not None:
         dep = db.execute(select(Deployment).where(
@@ -1780,11 +1799,7 @@ def get_token(token: str, p: Principal = Depends(service("bastion")),
             Deployment.status == "ready").order_by(
             Deployment.created_at.desc())).scalars().first()
         if dep is not None:
-            for r in (dep.resources or []):
-                if isinstance(r, dict) and r.get("ip") == t.target_host \
-                        and r.get("host_key_ref"):
-                    host_key = r["host_key_ref"]
-                    break
+            host_key = dial_pin_for(dep.resources, t.target_host)
     return {"token": t.token, "session_id": str(t.session_id) if t.session_id else None,
             "target_host": t.target_host, "target_port": int(t.target_port),
             "user_id": str(t.user_id) if t.user_id else None,

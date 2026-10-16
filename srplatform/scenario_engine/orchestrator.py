@@ -798,7 +798,13 @@ def _pin_host_key(broker, db: Session, session_id, dep: Deployment,
         return  # pre-03+04 broker double in old unit tests — pins unenforced
     key = read(node, int(res["vmid"]), session_id=session_id,
                generation=str(dep.deployment_id))
+    # The DISPLAY ref (truncated, for logs/events) and the FULL pin. Only the
+    # full pin may be served to the bastion: a known_hosts line built from
+    # the truncated ref is unparseable and asyncssh silently drops it, so
+    # every dial failed HostKeyNotVerifiable while the API looked healthy
+    # (live find 2026-10-16). The pin is a public key, never a secret.
     res["host_key_ref"] = f"{key[:24]}…{key[-8:]}"
+    res["host_key_pin"] = key
     ip = res.get("ip")
     if ip:
         err = _publish_pinned_host_key(ip, key)
@@ -968,7 +974,8 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
         # Idempotent return — but enrollment may have been interrupted
         # (lost response / crashed provisioning): RESUME it, never silently
         # return a "ready" deployment whose clones are unenrolled. The same
-        # holds for pins: a recorded publish failure (or missing ref) is
+        # holds for pins: a recorded publish failure, a missing ref, or a
+        # missing FULL pin (a legacy ref-only row cannot be dialed) is
         # repaired here, so a ready deployment can never be returned with
         # known-unusable SSH while claiming success.
         resources = [dict(r) for r in (dep.resources or [])]
@@ -976,6 +983,7 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
         for r in resources:
             if r.get("state") == "created" and (
                     not r.get("host_key_ref")
+                    or not r.get("host_key_pin")
                     or r.get("host_key_publish_error")):
                 _pin_host_key(broker, db, session_id, dep, r, resources,
                               node)
@@ -1014,7 +1022,9 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
             name = _vm_name(scenario_id, host["name"], session_id)
             res = by_host.get(host["name"])
             if res and res.get("state") == "created":
-                if not res.get("host_key_ref") or res.get("host_key_publish_error"):
+                if (not res.get("host_key_ref")
+                        or not res.get("host_key_pin")
+                        or res.get("host_key_publish_error")):
                     # Audit A6: a crash between the created-state commit and
                     # the pin left the resource permanently un-SSH-able —
                     # resume must COMPLETE the missing pin (read + publish),
@@ -1022,7 +1032,8 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
                     # not success); ownership and lease are retained. A
                     # recorded publish failure is retried the same way: the
                     # pin exists but clients cannot use it until republication
-                    # converges (and clears the error).
+                    # converges (and clears the error). Missing FULL pin
+                    # covers legacy ref-only rows (live find 2026-10-16).
                     _pin_host_key(broker, db, session_id, dep, res, resources, node)
                 if (res.get("telemetry_enroll") or {}).get("phase") != "confirmed" \
                         or not enrollment_evidence_current(

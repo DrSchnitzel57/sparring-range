@@ -136,10 +136,45 @@ def test_production_requires_https_api_and_trust_anchor():
 # --------------------------------------------------------------------------- #
 
 def test_readiness_refuses_unusable_pins():
-    src = (pathlib_repo / "srplatform/verification_service.py").read_text()
-    assert "host-key-pin" in src
-    assert "host_key_ref" in src
-    assert "unusable/missing host-key pin" in src
+    import types as _types
+
+    from srplatform.verification_service import _pin_items
+
+    # A ref-only row (legacy writer or a crash between ref and full pin) is
+    # NOT dialable: the truncated display ref is not a key (live find
+    # 2026-10-16). Readiness must refuse it.
+    legacy = _types.SimpleNamespace(resources=[
+        {"host": "attacker", "state": "created",
+         "host_key_ref": "ssh-ed25519 AAAA…BBBB"}])
+    items, reasons = _pin_items(legacy)
+    assert any(i.get("unit") == "host-key-pin" and i["status"] == "failed"
+               for i in items), items
+    assert reasons, "an unusable pin must produce a readiness reason"
+    # The FULL pin clears it.
+    pinned = _types.SimpleNamespace(resources=[
+        {"host": "attacker", "state": "created",
+         "host_key_ref": "ssh-ed25519 AAAA…BBBB",
+         "host_key_pin": "ssh-ed25519 AAAAFULLKEY"}])
+    assert _pin_items(pinned) == ([], [])
+
+
+def test_readiness_refuses_unpublished_pin():
+    import types as _types
+
+    from srplatform.verification_service import _pin_items
+
+    # A full pin whose publication failed is still unusable for clients
+    # (StrictHostKeyChecking, no TOFU): readiness stays red until resume
+    # republicates.
+    dep = _types.SimpleNamespace(resources=[
+        {"host": "attacker", "state": "created",
+         "host_key_ref": "ssh-ed25519 AAAA…BBBB",
+         "host_key_pin": "ssh-ed25519 AAAAFULLKEY",
+         "host_key_publish_error": "known_hosts unwritable"}])
+    items, reasons = _pin_items(dep)
+    assert any(i.get("unit") == "host-key-pin" and i["status"] == "failed"
+               for i in items), items
+    assert reasons, "an unpublished pin must produce a readiness reason"
 
 
 def test_teardown_unpublishes_pins_keeps_other_hosts(tmp_path, monkeypatch):

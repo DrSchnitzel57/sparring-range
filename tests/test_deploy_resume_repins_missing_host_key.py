@@ -54,6 +54,8 @@ def test_resume_repins_host_key_missing_after_failed_launch(client, users,
     assert resources[0]["state"] == "created", \
         "ownership must survive the failed pin"
     assert not resources[0].get("host_key_ref"), "precondition: pin missing"
+    assert not resources[0].get("host_key_pin"), \
+        "precondition: no full dial pin either"
 
     # Repaired channel: resume must finish the pin (read + publish) and
     # reach ready — never skip it because the state already says created.
@@ -63,6 +65,39 @@ def test_resume_repins_host_key_missing_after_failed_launch(client, users,
     assert resources[0]["state"] == "created"
     assert resources[0].get("host_key_ref"), \
         "resume must complete the missing host-key pin (audit A6)"
+    assert resources[0].get("host_key_pin"), \
+        "resume must store the FULL pin, not only the display ref"
+    assert resources[0]["host_key_pin"] != resources[0]["host_key_ref"]
+
+
+def test_resume_backfills_full_pin_for_legacy_ref_only_row(
+        client, users, fake_broker):
+    """A row written before the 2026-10-16 fix carries only the truncated
+    display ref; the token endpoint then served it as the dial pin and every
+    bastion dial failed HostKeyNotVerifiable. Resume must backfill the FULL
+    pin from the broker (same generation, no re-clone, no re-pin conflict)."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from srplatform.db.models import Deployment
+    from srplatform.db.session import db as db_ctx
+    sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
+                      headers=users["member"]).json()["session_id"]
+    launch_and_wait(client, users["member"], sid)
+    with db_ctx() as s:
+        dep = s.execute(select(Deployment).where(
+            Deployment.session_id == uuid.UUID(sid))).scalars().first()
+        res = dep.resources[0]
+        assert res.get("host_key_pin"), "new rows store the full pin"
+        res.pop("host_key_pin")  # simulate the legacy writer's row
+        assert res.get("host_key_ref")
+        dep.resources = [res] + dep.resources[1:]
+        flag_modified(dep, "resources")
+        s.commit()
+    launch_and_wait(client, users["member"], sid)
+    resources = _deployment_resources(sid)
+    assert resources[0].get("host_key_pin"), \
+        "resume must backfill the full pin for a ref-only row"
+    assert resources[0]["host_key_pin"] != resources[0]["host_key_ref"]
 
 
 def test_unpublished_pin_fails_readiness_and_resume_republicates(
