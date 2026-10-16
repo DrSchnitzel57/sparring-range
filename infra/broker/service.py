@@ -152,10 +152,16 @@ class BrokerService:
         long after the client bound (review find 2026-10-16: 118 s boot
         marker + 110 s read + 110 s confirmation succeeded at ~340 s with a
         300 s client bound — a false deployment failure while the broker
-        kept pinning). Each read may use only the time LEFT in that window;
-        an exhausted window still allows single non-blocking attempts (the
-        agent may answer instantly), but no further retry waiting. Total
-        server bound is boot-marker wait + one shared stability window.
+        kept pinning). Each read may use only the time LEFT in that window,
+        and NO probe starts once it is exhausted (review find 2026-10-16
+        round 2: a zero-timeout probe was NOT free — its HTTP request still
+        costs up to `proxmox_http_timeout_s`, and the reviewer's virtual
+        clock showed three post-exhaustion successes stabilizing at 327 s
+        against the 300 s client bound). One request in flight when a
+        window's deadline passes may still complete: the documented server
+        bound is (boot-marker window + one request) + (stability window +
+        one request) = 2*(agent_ready_timeout_s + proxmox_http_timeout_s),
+        and `HttpTransport.OP_TIMEOUTS["read_host_key"]` covers it.
         """
         from .errors import BrokerUnavailable as _BU
         from infra.proxmox_client import ProxmoxClient as _PC2
@@ -163,7 +169,9 @@ class BrokerService:
         deadline = time.monotonic() + self.agent_ready_timeout_s
         prev = None
         for _ in range(4):
-            remaining = max(0.0, deadline - time.monotonic())
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break  # window exhausted: issue NO further probe
             try:
                 cur = (self.pve.read_guest_file_when_ready(
                     node, int(vmid), _PC2.GUEST_HOST_KEY_PATH,

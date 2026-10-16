@@ -683,8 +683,9 @@ def test_op_timeouts_exceed_server_bounds():
     is never cut off client-side at the old flat 30 s."""
     from infra.broker.client import HttpTransport as T
     assert T.OP_TIMEOUTS["clone_and_wait"] > 300        # task timeout bound
-    assert T.OP_TIMEOUTS["read_host_key"] > 240         # 120 s boot-marker
-    #                                   wait + 120 s SHARED re-read window
+    assert T.OP_TIMEOUTS["read_host_key"] > 300         # (120 s boot-marker
+    #   + 30 s in-flight request) + (120 s SHARED re-read window + 30 s
+    #   in-flight request) = 300 s worst case (review find 2026-10-16 r2)
     assert T.OP_TIMEOUTS["start_and_wait"] > 90
     assert T.OP_TIMEOUTS["stop_and_confirm"] > 60
     assert T.OP_TIMEOUTS["destroy_and_wait"] > 120      # stop + delete waits

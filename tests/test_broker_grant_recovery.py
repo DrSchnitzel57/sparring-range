@@ -71,24 +71,21 @@ def test_ever_rotating_key_is_refused_loudly(tmp_path):
         service.read_host_key("r740", vmid, session_id="s")
 
 
-def test_pin_waits_for_boot_completion(tmp_path):
+def test_pin_waits_for_boot_completion(tmp_path, monkeypatch):
     """Keys readable before first boot completes must not pin: the marker
-    gate precedes even the stability reads."""
+    gate precedes even the stability reads. (Virtual clock with a real
+    window: since the review find 2026-10-16 round 2 an exhausted — or
+    zero-sized — window issues NO probe, so a zero-window fixture could
+    never read twice to confirm.)"""
     from infra.broker.errors import BrokerUnavailable
-    from infra.broker.testing import make_fake_broker, make_test_policy
     import pytest
-    policy = make_test_policy()
-    client, service, http = make_fake_broker(
-        policy=policy, ledger_path=tmp_path / "l5.sqlite3")
-    service.agent_ready_poll_s = 0
-    service.agent_ready_timeout_s = 0
-    vmid = client.next_vmid("r740", 210, session_id="s")
-    http.vms.setdefault(vmid, {"status": "stopped", "name": None})
+    clock, service, http, vmid = _virtual_broker(tmp_path, monkeypatch,
+                                                 "l5.sqlite3")
     http.vms[vmid]["boot_completed"] = False
     with pytest.raises(BrokerUnavailable, match="never finished"):
-        service.read_host_key("r740", vmid, session_id="s")
+        service.read_host_key(NODE, vmid, session_id="s")
     http.vms[vmid]["boot_completed"] = True
-    key = service.read_host_key("r740", vmid, session_id="s")
+    key = service.read_host_key(NODE, vmid, session_id="s")
     assert key.startswith("ssh-ed25519 ")
 
 
@@ -126,13 +123,21 @@ def _virtual_broker(tmp_path, monkeypatch, ledger_name):
     return clock, service, http, vmid
 
 
-def _script_key_polls(http, not_ready):
+def _script_key_polls(http, not_ready, clock=None, latency_s=0.0, key_seq=None):
     """Host-key reads answer 'not ready' per the predicate, then succeed
     with the fake's deterministic per-VM key (real polling code above the
     fake HTTP boundary; only the response schedule is scripted). The file
-    parameter arrives URL-encoded, so decode before matching."""
+    parameter arrives URL-encoded, so decode before matching.
+
+    `clock`/`latency_s` model the HTTP REQUEST itself: every scripted key
+    read costs that much virtual time (review find 2026-10-16 round 2: a
+    `timeout_s=0` probe bounds retry SLEEPS, not the request — only the
+    configured HTTP timeout caps it). `key_seq` rotates the returned key
+    once per SUCCESSFUL read, modelling first-boot regeneration. Returns
+    the counter state so tests can assert how many requests were issued."""
     import urllib.parse
-    state = {"n": 0}
+    state = {"n": 0, "ok": 0}
+    keys = list(key_seq or [])
     orig_get = http.get
 
     def is_key_read(path):
@@ -144,11 +149,18 @@ def _script_key_polls(http, not_ready):
         if "/agent/file-read" in path and is_key_read(path):
             n = state["n"]
             state["n"] = n + 1
+            if clock is not None:
+                clock.t += latency_s
             if not_ready(n):
                 raise PveHttpError(500, "QEMU guest agent is not running")
+            if keys:
+                key = keys[min(state["ok"], len(keys) - 1)]
+                state["ok"] += 1
+                return {"content": key}
         return orig_get(path, **kw)
 
     http.get = scripted_get
+    return state
 
 
 def test_rereads_share_one_window_and_never_outlast_the_client(
@@ -188,3 +200,52 @@ def test_slow_but_in_window_boot_still_pins(tmp_path, monkeypatch):
     key = service.read_host_key(NODE, vmid, session_id="s")
     assert key.startswith("ssh-ed25519 ")
     assert clock.t <= 241.0
+
+
+def test_http_request_latency_never_outlasts_the_client_bound(
+        tmp_path, monkeypatch):
+    """Review find 2026-10-16 round 2: `timeout_s=0` bounds polling SLEEPS,
+    not the HTTP request — each exhausted-window probe still costs up to the
+    30 s HTTP timeout, and a success response bypasses the deadline check.
+    The reviewer's virtual clock (29 s requests): boot marker at 118 s, then
+    successful key reads at 244/273/302/331 s (the same cadence as their
+    240/269/298/327) stabilised server-side while the 300 s client bound had
+    already failed. The read loop must issue NO probe once the shared window
+    is spent; a bounded failure with the obligation retained is the fix."""
+    clock, service, http, vmid = _virtual_broker(tmp_path, monkeypatch,
+                                                 "l8.sqlite3")
+    http.agent_not_ready_polls = 59              # marker completes at t=118
+    keys = [f"ssh-ed25519 {c * 40}" for c in "ABCC"]
+    state = _script_key_polls(http, not_ready=lambda n: n < 3,
+                              clock=clock, latency_s=29.0, key_seq=keys)
+    # Shared deadline is t=238: three not-ready requests (n=0..2, 29 s each,
+    # 2 s poll pauses) end at t=209, 211 sees the successful read start;
+    # it succeeds at t=240 — 2 s past the window, inside the one-in-flight-
+    # request allowance. The old code kept probing (A/B/C/C at 244..331 s);
+    # now it must stop.
+
+    with pytest.raises(BrokerUnavailable, match="never stabilized"):
+        service.read_host_key(NODE, vmid, session_id="s")
+    assert state["n"] == 4, \
+        f"post-exhaustion probes issued: {state['n']} key requests"
+    # (120 s window + one 29 s request) per phase = 298 s worst case.
+    assert clock.t <= 298.0, f"pin sequence ran {clock.t:.0f}s past its bound"
+    kinds = {o["kind"] for o in service.ledger.open_obligations()}
+    assert "host-key-unstable" in kinds
+
+
+def test_http_latency_inside_the_window_still_pins(tmp_path, monkeypatch):
+    """29 s requests are slow but legitimate: two equal reads inside the
+    shared window still pin, and the confirmation request that starts just
+    before the deadline may complete after it (one in-flight request per
+    window is accounted for in the documented bound)."""
+    clock, service, http, vmid = _virtual_broker(tmp_path, monkeypatch,
+                                                 "l9.sqlite3")
+    http.agent_not_ready_polls = 59              # marker completes at t=118
+    state = _script_key_polls(http, not_ready=lambda n: n < 2,
+                              clock=clock, latency_s=29.0)
+
+    key = service.read_host_key(NODE, vmid, session_id="s")
+    assert key.startswith("ssh-ed25519 ")
+    assert state["n"] == 4
+    assert clock.t <= 298.0
