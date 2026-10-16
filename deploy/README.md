@@ -190,6 +190,17 @@ with that key (`BASTION_TARGET_USER=defender`, `BASTION_CLIENT_KEY_PATH`) —
 the root default is replaced; guest root SSH stays reserved for the
 verifier/management key.
 
+Host-key trust on member dials (live fix 2026-10-16): the token endpoint
+serves the FULL broker-pinned guest host key (`host_key_pin`) from the ready
+deployment, and the bastion verifies the guest against it in memory — never
+TOFU, never a stale copied file — and refuses a malformed pin before any
+dial ("deployment pin malformed — refusing dial", `PinRefused` to the
+member). The truncated `host_key_ref` is display/evidence-only: it is never
+served or dialed (an unparseable known_hosts line is silently dropped by
+asyncssh, which made every dial fail `HostKeyNotVerifiable`). Deployments
+that predate the fix are ref-only; their next launch/resume backfills
+`host_key_pin` from the broker without a re-clone.
+
 Per-host key placement and ownership (review find 2026-10-15 — a key with
 the wrong group is a silent denial; verify with `namei -l` on the consumer):
 

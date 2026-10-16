@@ -1254,3 +1254,44 @@ emergency-stop drill + read-back + release, rehearsal launch→end→cleanup
 Backup destination/restore remain explicitly unverified (not release-blocking).
 The inference endpoint `http://10.10.10.197:8096/v1` answers
 `qwen3.8-flash-next` `loaded`.
+
+## Live deployment hardening — the pin-serving failure (2026-10-16, `a6fd49c`)
+
+Live find (operator session on the first production install above): every
+bastion guest dial failed `HostKeyNotVerifiable` after auth and token resolve
+succeeded, on a deployment that reported `ready`. Deterministic, not a race.
+Independent repro (standalone script, not committed): a known_hosts line
+built from the truncated `host_key_ref` display form yields ZERO trusted
+keys — asyncssh silently drops unparseable lines — while the full key
+verifies and connects. The token endpoint served that ref as
+`target_host_key` (introduced by `e6f380f`, "api-served pins"), so no
+deployment pin was ever dialable. The boot-completion/stability gates
+(`5fc6bb7`, `29d1471`) were sound and unrelated.
+
+Repairs (commits `6cef3cc`, `0d33723`, `a6fd49c`):
+
+- `_pin_host_key` stores the FULL public key as `host_key_pin` next to the
+  display-only ref; resume repins when ref, full pin, or publication is
+  missing — legacy ref-only rows backfill without a re-clone.
+- `GET /tokens/{token}` serves only the full pin (`dial_pin_for`); a
+  ref-only row serves `None` so the bastion fails closed.
+- The bastion validates the pin before any dial (`PinRefused`, no pin
+  material in member output or the recording).
+- Readiness requires the full pin; a ref-only row stays red until resume
+  repairs it.
+- `read_host_key` client bound 150 → 300 s (server bound is now a 120 s
+  boot-marker wait + up to 120 s stability read); the duplicated
+  unreachable except was removed and the stage's own retained obligation is
+  no longer re-recorded.
+
+| Exact command/probe | Result / meaning |
+|---|---|
+| `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -ra -p no:cacheprovider` (clean tree at `a6fd49c`) | Exit 0: **361 passed, 0 failed, 0 skipped, 250 deselected**, 4 warnings, 50.29s. Fast layer; seven new tests over the previous 354. |
+| `pytest -q tests/test_bastion_dial_path.py` (real asyncssh server: real host-key verification + public-key auth end-to-end through `_handle_session`) | 10 passed; the full pin reaches the guest (`echo hi`, exit 0); the display-ref shape is refused before any dial (`PinRefused`, no material echoed). |
+| `pytest -q tests/test_dial_pin_serving.py` (new fast contract) | Serves `host_key_pin` only; ref-only rows serve `None`; `asyncssh.import_public_key(ref)` raises `KeyImportError` (documents the mechanism). |
+| `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD .venv/bin/python infra/dev/acceptance.py authority` | Exit 0: **25 passed, 586 deselected, 0 skipped** (broker boundary/durability/cessation, required mode). |
+| `.venv/bin/python infra/dev/acceptance.py db` (gate-owned disposable `postgres:16` fixture; the manual `SR_PG_ADMIN_URL` export was overridden by the gate) | Exit 0: **170 passed, 441 deselected, 0 skipped**, 464.8s; includes the new resume-backfill db tests; owned `srtest_*` resources and the fixture container/volume removed. |
+
+Open (operator Manual check): deploy `a6fd49c`+docs to the service VMs (201
+API / 202 broker / 203 bastion), relaunch/resume the existing deployment once
+so `host_key_pin` backfills, then re-test the recorded SSH login.
