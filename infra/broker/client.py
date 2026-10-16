@@ -52,9 +52,10 @@ class HttpTransport:
 
     # Plan 13 phase 2: client/server/task deadlines are checked TOGETHER.
     # Every bound below exceeds the documented SERVER-side bound of the op
-    # (task timeout 300 s, agent-readiness wait 120 s, start wait 90 s,
-    # stop/destroy waits 60 s each) so a legitimate long task is never cut
-    # off client-side at the old flat 30 s. When the client bound IS
+    # (task timeout 300 s; the pin read is a 120 s boot-marker wait plus a
+    # bounded stability read of up to 120 s; start wait 90 s; stop/destroy
+    # waits 60 s each) so a legitimate long task is never cut off
+    # client-side at the old flat 30 s. When the client bound IS
     # exceeded (or the response is otherwise lost) the call raises
     # BrokerUnavailable — UNCERTAIN, never failure: the broker persisted its
     # intent/claim before the effect, keeps stopping on the latch path, and
@@ -62,7 +63,8 @@ class HttpTransport:
     # Mutations are NEVER retried by this transport; only idempotent reads
     # get one bounded retry, and only for a pure transport failure.
     OP_TIMEOUTS = {
-        "read_host_key": 150.0,     # server bound: 120 s agent wait + margin
+        "read_host_key": 300.0,     # server bound: 120 s boot-marker wait
+                                    # + 120 s stability read + margin
         "clone_and_wait": 330.0,    # server bound: 300 s task timeout
         "start_and_wait": 125.0,    # server bound: 90 s task wait + read-back
         "stop_and_confirm": 95.0,   # server bound: 60 s task wait + read-back

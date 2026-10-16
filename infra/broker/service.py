@@ -185,23 +185,21 @@ class BrokerService:
                     f"not {generation!r} — refusing host-key read for a stale "
                     "generation")
             # Ownership verified BEFORE the read (claim) — now read the key,
-            # requiring first-boot STABILITY (see _stable_host_key).
+            # requiring first-boot STABILITY (see _stable_host_key). Every
+            # failure mode inside already classified itself and retained its
+            # own obligation; an unexpected exception is wrapped here so the
+            # outcome stays a loud "uncertain", never a silent success.
             try:
                 key = self._stable_host_key(node, int(vmid))
+            except BrokerUnavailable:
+                raise
             except Exception as e:  # noqa: BLE001 — uncertain, retain
                 self.ledger.add_obligation("host-key-read-uncertain", int(vmid),
                                            str(e)[:300])
                 self.ledger.audit("host-key-read-uncertain",
                                   {"vmid": int(vmid), "error": str(e)[:200]})
-                from .errors import BrokerUnavailable as _BU
-                raise _BU(f"host-key read uncertain for VMID {vmid}: {e}") from e
-            except Exception as e:  # noqa: BLE001 — uncertain, retain
-                self.ledger.add_obligation("host-key-read-uncertain", int(vmid),
-                                           str(e)[:300])
-                self.ledger.audit("host-key-read-uncertain",
-                                  {"vmid": int(vmid), "error": str(e)[:200]})
-                from .errors import BrokerUnavailable as _BU
-                raise _BU(f"host-key read uncertain for VMID {vmid}: {e}") from e
+                raise BrokerUnavailable(
+                    f"host-key read uncertain for VMID {vmid}: {e}") from e
             # Verify ownership AFTER the read too (VMID recycled mid-read
             # must not pin a foreign machine's key).
             cfg = self.pve.try_lookup_config(node, int(vmid)) or {}
