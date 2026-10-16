@@ -337,6 +337,13 @@ class ProxmoxClient:
     # production; broad `VM.Monitor` / `VM.GuestAgent.Unrestricted` fallback
     # is forbidden and fails closed.
     GUEST_HOST_KEY_PATH = "/etc/ssh/ssh_host_ed25519_key.pub"
+    # First-boot completion marker (live find 2026-10-16): host keys may
+    # regenerate AFTER one successful read on slow first boots (cloud-init
+    # still in modules-final), stranding the pinned generation. The marker
+    # file exists only once first boot completes, so waiting for it before
+    # the stability reads pins post-regen keys. Second fixed path — still
+    # no arbitrary reads, no exec, same FileRead privilege.
+    GUEST_BOOT_MARKER_PATH = "/var/lib/cloud/instance/boot-finished"
 
     def read_guest_file(self, node: str, vmid: int, path: str) -> str:
         """Read ONE allowlisted guest-agent path. Returns the file content.
@@ -378,6 +385,38 @@ class ProxmoxClient:
             raise PveUnavailable(
                 f"guest-agent host-key response for vmid {vmid} exceeds bounds")
         return content
+
+    def read_boot_marker(self, node: str, vmid: int, timeout_s: float = 120.0,
+                         poll_s: float = 2.0) -> bool:
+        """True once the guest's first boot completed (marker file present;
+        it is empty by convention — presence, not content, is the signal).
+        False when the window expires. Only not-ready dialects wait; VM
+        absence, permission errors, and anything else raise immediately,
+        and a timeout is PveUnavailable — uncertain, never success."""
+        import urllib.parse
+        query = urllib.parse.urlencode({"file": self.GUEST_BOOT_MARKER_PATH})
+        deadline = time.monotonic() + timeout_s
+        last: Exception | None = None
+        while True:
+            try:
+                resp = self.get(
+                    f"/nodes/{node}/qemu/{vmid}/agent/file-read?{query}")
+            except Exception as e:  # noqa: BLE001 — classified below
+                err = classify_pve_error(e)
+                if isinstance(err, PveNotFound):
+                    raise  # the VM itself is gone — waiting cannot help
+                if not any(sig in str(err).lower()
+                           for sig in self._KEY_NOT_READY_SIGNATURES):
+                    raise err from e
+                last = err
+            else:
+                if isinstance(resp, dict) and isinstance(resp.get("content"), str):
+                    return True
+                last = PveUnavailable(
+                    f"malformed boot-marker response for vmid {vmid}: {resp!r}")
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(min(poll_s, deadline - time.monotonic()))
 
     # First-boot "key not materialized yet" dialects for the guest-agent
     # read (live finds 2026-10-14): the agent daemon may still be booting,
@@ -566,10 +605,13 @@ class FakePVEHttp:
                 return {"content": ""}
             # Typed guest-agent FileRead (paired 03+04, step 3): the fake
             # models the documented GET /nodes/{node}/qemu/{vmid}/agent/
-            # file-read?file=... endpoint. ONLY the allowlisted host-key path
-            # is served; anything else is a 400 (like real PVE parameter
-            # validation). The key is FRESH per clone (VMID + name bound),
-            # modeling scrubbed-template + first-boot regeneration.
+            # file-read?file=... endpoint. ONLY allowlisted paths are served
+            # (host key + first-boot marker); anything else is a 400 (like
+            # real PVE parameter validation). The key is FRESH per clone
+            # (VMID + name bound), modeling scrubbed-template + first-boot
+            # regeneration. The marker appears only when boot_completed is
+            # set (live find 2026-10-16: keys may regenerate after readable
+            # but before first boot completes).
             import hashlib
             import urllib.parse
             vmid = int(path.split("/qemu/")[1].split("/")[0])
@@ -578,6 +620,11 @@ class FakePVEHttp:
                 raise self._absent(vmid)
             qs = urllib.parse.urlparse(path).query
             file_param = urllib.parse.parse_qs(qs).get("file", [""])[0]
+            if file_param == "/var/lib/cloud/instance/boot-finished":
+                if v.get("boot_completed", True):
+                    return {"content": ""}
+                raise PveHttpError(500, "Agent error: open failed with error"
+                                        " code 2: No such file or directory")
             if file_param != "/etc/ssh/ssh_host_ed25519_key.pub":
                 raise PveHttpError(400, f"file-read refused for {file_param!r}")
             digest = hashlib.sha256(

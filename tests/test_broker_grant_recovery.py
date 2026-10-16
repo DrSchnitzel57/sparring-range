@@ -44,6 +44,7 @@ def _reserved_client(tmp_path, reads):
 
     service.pve.read_guest_file_when_ready = scripted
     vmid = client.next_vmid("r740", 210, session_id="s")
+    http.vms.setdefault(vmid, {"status": "stopped", "name": None})
     return client, service, vmid
 
 
@@ -68,3 +69,24 @@ def test_ever_rotating_key_is_refused_loudly(tmp_path):
     import pytest
     with pytest.raises(BrokerUnavailable, match="never stabilized"):
         service.read_host_key("r740", vmid, session_id="s")
+
+
+def test_pin_waits_for_boot_completion(tmp_path):
+    """Keys readable before first boot completes must not pin: the marker
+    gate precedes even the stability reads."""
+    from infra.broker.errors import BrokerUnavailable
+    from infra.broker.testing import make_fake_broker, make_test_policy
+    import pytest
+    policy = make_test_policy()
+    client, service, http = make_fake_broker(
+        policy=policy, ledger_path=tmp_path / "l5.sqlite3")
+    service.agent_ready_poll_s = 0
+    service.agent_ready_timeout_s = 0
+    vmid = client.next_vmid("r740", 210, session_id="s")
+    http.vms.setdefault(vmid, {"status": "stopped", "name": None})
+    http.vms[vmid]["boot_completed"] = False
+    with pytest.raises(BrokerUnavailable, match="never finished"):
+        service.read_host_key("r740", vmid, session_id="s")
+    http.vms[vmid]["boot_completed"] = True
+    key = service.read_host_key("r740", vmid, session_id="s")
+    assert key.startswith("ssh-ed25519 ")

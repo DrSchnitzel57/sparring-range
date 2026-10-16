@@ -110,6 +110,34 @@ class BrokerService:
     # (post-compromise re-pin attempt) is refused with an obligation retained.
     # Production requires the scoped `VM.GuestAgent.FileRead` privilege;
     # `VM.Monitor` / `VM.GuestAgent.Unrestricted` fallback is forbidden.
+    def _await_first_boot(self, node: str, vmid: int) -> None:
+        """Wait for the guest's first boot to COMPLETE before pinning.
+
+        Live find 2026-10-16: on slow first boots (cloud-init still in
+        modules-final, console at getty) host keys can regenerate after
+        readable-but-unfinished states — even two consecutive identical
+        reads can precede the final regen. The boot-finished marker exists
+        only at completion. Bounded wait; expiry is an obligation +
+        Unavailable (a lab that never finishes booting must fail loud at
+        pin time, never strand at dial time).
+        """
+        from .errors import BrokerUnavailable as _BU
+        from infra.proxmox_client import ProxmoxClient as _PC2
+        try:
+            done = self.pve.read_boot_marker(
+                node, int(vmid), timeout_s=self.agent_ready_timeout_s,
+                poll_s=self.agent_ready_poll_s)
+        except Exception as e:  # noqa: BLE001 — uncertain, retain
+            self.ledger.add_obligation("boot-marker-uncertain", int(vmid),
+                                       str(e)[:300])
+            raise _BU(f"first-boot marker uncertain for VMID {vmid}: {e}") from e
+        if not done:
+            self.ledger.add_obligation("boot-never-finished", int(vmid),
+                                       "cloud-init did not complete in window")
+            self.ledger.audit("boot-never-finished", {"vmid": int(vmid)})
+            raise _BU(f"first boot for VMID {vmid} never finished — refusing "
+                      f"to pin a pre-completion key")
+
     def _stable_host_key(self, node: str, vmid: int) -> str:
         """Pin only a key that survives re-reads (live find 2026-10-15).
 
@@ -121,6 +149,7 @@ class BrokerService:
         """
         from .errors import BrokerUnavailable as _BU
         from infra.proxmox_client import ProxmoxClient as _PC2
+        self._await_first_boot(node, int(vmid))
         prev = None
         for _ in range(4):
             try:
