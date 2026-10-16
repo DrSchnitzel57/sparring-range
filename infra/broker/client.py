@@ -64,7 +64,7 @@ class HttpTransport:
     # get one bounded retry, and only for a pure transport failure.
     OP_TIMEOUTS = {
         "read_host_key": 300.0,     # server bound: 120 s boot-marker wait
-                                    # + 120 s stability read + margin
+                                    # + 120 s SHARED stability window + margin
         "clone_and_wait": 330.0,    # server bound: 300 s task timeout
         "start_and_wait": 125.0,    # server bound: 90 s task wait + read-back
         "stop_and_confirm": 95.0,   # server bound: 60 s task wait + read-back

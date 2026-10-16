@@ -146,16 +146,28 @@ class BrokerService:
         dial fails closed with a three-way pin mismatch). Return the first
         non-empty key observed twice in a row, bounded; anything else is
         an obligation + Unavailable, never a pin.
+
+        The re-read phase SHARES ONE `agent_ready_timeout_s` window. Fresh
+        per-read windows let a slow-but-working sequence finish server-side
+        long after the client bound (review find 2026-10-16: 118 s boot
+        marker + 110 s read + 110 s confirmation succeeded at ~340 s with a
+        300 s client bound — a false deployment failure while the broker
+        kept pinning). Each read may use only the time LEFT in that window;
+        an exhausted window still allows single non-blocking attempts (the
+        agent may answer instantly), but no further retry waiting. Total
+        server bound is boot-marker wait + one shared stability window.
         """
         from .errors import BrokerUnavailable as _BU
         from infra.proxmox_client import ProxmoxClient as _PC2
         self._await_first_boot(node, int(vmid))
+        deadline = time.monotonic() + self.agent_ready_timeout_s
         prev = None
         for _ in range(4):
+            remaining = max(0.0, deadline - time.monotonic())
             try:
                 cur = (self.pve.read_guest_file_when_ready(
                     node, int(vmid), _PC2.GUEST_HOST_KEY_PATH,
-                    timeout_s=self.agent_ready_timeout_s,
+                    timeout_s=remaining,
                     poll_s=self.agent_ready_poll_s) or "").strip() or None
             except Exception as e:  # noqa: BLE001 — uncertain, retain
                 self.ledger.add_obligation("host-key-read-uncertain", int(vmid),
@@ -166,7 +178,8 @@ class BrokerService:
             if cur is not None and cur == prev:
                 return cur
             prev = cur
-            time.sleep(self.agent_ready_poll_s)
+            time.sleep(min(self.agent_ready_poll_s,
+                           max(0.0, deadline - time.monotonic())))
         self.ledger.add_obligation("host-key-unstable", int(vmid),
                                    "guest key kept changing across re-reads")
         self.ledger.audit("host-key-unstable", {"vmid": int(vmid)})
