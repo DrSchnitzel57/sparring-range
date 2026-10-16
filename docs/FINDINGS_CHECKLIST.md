@@ -1329,6 +1329,6 @@ Evidence at `00571e9`: fast suite exit 0, **365 passed, 0 failed,
 **25 passed, 0 skipped**; `tests/test_pve_real_client_contract.py`
 **22 passed** (static `read_host_key > 300` bound).
 
-Open (operator Manual check): deploy `e00ed70` to the service VMs (201
+Open (operator Manual check): deploy `00571e9` to the service VMs (201
 API / 202 broker / 203 bastion), relaunch/resume the existing deployment once
 so `host_key_pin` backfills, then re-test the recorded SSH login.
