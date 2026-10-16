@@ -114,4 +114,6 @@ def test_host_key_read_survives_first_boot_window():
     assert key.startswith("ssh-ed25519 ")
     paths = [p for _, p, _ in http.requests]
     assert not any("/agent/status" in p for p in paths)  # endpoint does not exist
-    assert sum(1 for p in paths if "/agent/file-read" in p) == 3
+    # 2 not-ready polls + initial read + 1 stability confirmation re-read
+    # (first-boot regen race: never pin a key seen only once).
+    assert sum(1 for p in paths if "/agent/file-read" in p) == 4

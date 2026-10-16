@@ -110,9 +110,42 @@ class BrokerService:
     # (post-compromise re-pin attempt) is refused with an obligation retained.
     # Production requires the scoped `VM.GuestAgent.FileRead` privilege;
     # `VM.Monitor` / `VM.GuestAgent.Unrestricted` fallback is forbidden.
+    def _stable_host_key(self, node: str, vmid: int) -> str:
+        """Pin only a key that survives re-reads (live find 2026-10-15).
+
+        First-boot cloud-init may regenerate host keys AFTER one successful
+        read — pinning that transient strands the generation (every later
+        dial fails closed with a three-way pin mismatch). Return the first
+        non-empty key observed twice in a row, bounded; anything else is
+        an obligation + Unavailable, never a pin.
+        """
+        from .errors import BrokerUnavailable as _BU
+        from infra.proxmox_client import ProxmoxClient as _PC2
+        prev = None
+        for _ in range(4):
+            try:
+                cur = (self.pve.read_guest_file_when_ready(
+                    node, int(vmid), _PC2.GUEST_HOST_KEY_PATH,
+                    timeout_s=self.agent_ready_timeout_s,
+                    poll_s=self.agent_ready_poll_s) or "").strip() or None
+            except Exception as e:  # noqa: BLE001 — uncertain, retain
+                self.ledger.add_obligation("host-key-read-uncertain", int(vmid),
+                                           str(e)[:300])
+                self.ledger.audit("host-key-read-uncertain",
+                                  {"vmid": int(vmid), "error": str(e)[:200]})
+                raise _BU(f"host-key read uncertain for VMID {vmid}: {e}") from e
+            if cur is not None and cur == prev:
+                return cur
+            prev = cur
+            time.sleep(self.agent_ready_poll_s)
+        self.ledger.add_obligation("host-key-unstable", int(vmid),
+                                   "guest key kept changing across re-reads")
+        self.ledger.audit("host-key-unstable", {"vmid": int(vmid)})
+        raise _BU(f"host-key for VMID {vmid} never stabilized — refusing "
+                  f"to pin a transient")
+
     def read_host_key(self, node: str, vmid: int, session_id: str | None = None,
                       generation: str | int = 1) -> str:
-        from infra.proxmox_client import ProxmoxClient as _PC
         self._node(node)
         self.policy.check_vmid(int(vmid))
         with self._op_lock:
@@ -122,16 +155,17 @@ class BrokerService:
                     f"VMID {vmid} is generation {claim.get('generation')!r}, "
                     f"not {generation!r} — refusing host-key read for a stale "
                     "generation")
-            # Ownership verified BEFORE the read (claim) — now read the key.
+            # Ownership verified BEFORE the read (claim) — now read the key,
+            # requiring first-boot STABILITY (see _stable_host_key).
             try:
-                # First-boot reality (live find 2026-10-14): the agent needs
-                # time after start; retrying the real read here (only the
-                # not-running signature) keeps it one honest, bounded read
-                # instead of a certain-fail + obligation.
-                key = self.pve.read_guest_file_when_ready(
-                    node, int(vmid), _PC.GUEST_HOST_KEY_PATH,
-                    timeout_s=self.agent_ready_timeout_s,
-                    poll_s=self.agent_ready_poll_s)
+                key = self._stable_host_key(node, int(vmid))
+            except Exception as e:  # noqa: BLE001 — uncertain, retain
+                self.ledger.add_obligation("host-key-read-uncertain", int(vmid),
+                                           str(e)[:300])
+                self.ledger.audit("host-key-read-uncertain",
+                                  {"vmid": int(vmid), "error": str(e)[:200]})
+                from .errors import BrokerUnavailable as _BU
+                raise _BU(f"host-key read uncertain for VMID {vmid}: {e}") from e
             except Exception as e:  # noqa: BLE001 — uncertain, retain
                 self.ledger.add_obligation("host-key-read-uncertain", int(vmid),
                                            str(e)[:300])

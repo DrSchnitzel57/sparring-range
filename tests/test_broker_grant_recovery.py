@@ -26,3 +26,45 @@ def test_next_vmid_denial_names_the_acl_reapply(tmp_path):
     service.pve.lookup_vm = denied
     with pytest.raises(BrokerUnavailable, match=r"pve_broker_acl\.sh --apply"):
         client.next_vmid(NODE, 210, session_id="s")
+
+
+def _reserved_client(tmp_path, reads):
+    from infra.broker.testing import make_fake_broker, make_test_policy
+    policy = make_test_policy()
+    client, service, http = make_fake_broker(
+        policy=policy, ledger_path=tmp_path / "l4.sqlite3")
+    service.agent_ready_poll_s = 0
+    it = iter(reads)
+
+    def scripted(node, vmid, path, timeout_s=None, poll_s=None):
+        try:
+            return next(it)
+        except StopIteration:
+            return reads[-1]
+
+    service.pve.read_guest_file_when_ready = scripted
+    vmid = client.next_vmid("r740", 210, session_id="s")
+    return client, service, vmid
+
+
+def test_pin_waits_out_first_boot_regen(tmp_path):
+    client, service, vmid = _reserved_client(
+        tmp_path, ["ssh-ed25519 AAAA", "ssh-ed25519 BBBB", "ssh-ed25519 BBBB"])
+    key = service.read_host_key("r740", vmid, session_id="s")
+    assert key == "ssh-ed25519 BBBB"
+
+
+def test_pin_skips_empty_reads(tmp_path):
+    client, service, vmid = _reserved_client(
+        tmp_path, ["", "ssh-ed25519 CCCC", "ssh-ed25519 CCCC"])
+    assert service.read_host_key("r740", vmid, session_id="s") == "ssh-ed25519 CCCC"
+
+
+def test_ever_rotating_key_is_refused_loudly(tmp_path):
+    from infra.broker.errors import BrokerUnavailable
+    client, service, vmid = _reserved_client(
+        tmp_path, ["ssh-ed25519 A", "ssh-ed25519 B", "ssh-ed25519 C",
+                   "ssh-ed25519 D", "ssh-ed25519 E"])
+    import pytest
+    with pytest.raises(BrokerUnavailable, match="never stabilized"):
+        service.read_host_key("r740", vmid, session_id="s")
