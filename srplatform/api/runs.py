@@ -264,6 +264,16 @@ def start_run(db: Session, session_id, scenario_id: str) -> Run:
         raise GateRefused(reasons)
 
     run = Run(session_id=session_id, scenario_id=scenario_id, status="queued")
+    from srplatform.settings import get_settings
+    s = get_settings()
+    if s.worker_dispatch != "supervisor":
+        # The credential belongs to the INSERT, not to a later UPDATE: the
+        # durable commit must not leave a dirty ORM object (and its row lock)
+        # open across the spawn window, or a concurrent stop would block on
+        # that lock and only then observe the freshly registered process
+        # group — turning an unconfirmed queued stop into a confirmed kill.
+        token = secrets.token_urlsafe(32)
+        run.worker_token = hashlib.sha256(token.encode()).hexdigest()
     db.add(run)
     try:
         # DURABLE BEFORE SPAWN (audit R01): the run row + credential commit
@@ -278,8 +288,6 @@ def start_run(db: Session, session_id, scenario_id: str) -> Run:
             return existing
         raise RunConflict("an active run already exists for this session")
 
-    from srplatform.settings import get_settings
-    s = get_settings()
     if s.worker_dispatch == "supervisor":
         # Milestone 15: the API has NO authority to spawn or signal a
         # separate-UID worker. A durable queued row is the assignment; the
@@ -287,8 +295,6 @@ def start_run(db: Session, session_id, scenario_id: str) -> Run:
         # child process group. The API only records heartbeats/outcomes.
         return run
 
-    token = secrets.token_urlsafe(32)
-    run.worker_token = hashlib.sha256(token.encode()).hexdigest()
     from srplatform.db.models import MatchModel
     env = _worker_env(s, token, session_id, scenario_id, run,
                       match=db.get(MatchModel, session_id))
