@@ -1,9 +1,8 @@
-"""Live MySQL 8.0 protocol proof (review finding): the controller-side
-client must authenticate against the DEPLOYED server family, not just
-canned byte streams. Spins the pinned `mysql:8.0.36` image, proves
-native-password auth + business reads, proves stock caching_sha2_password
-fails closed with an actionable error (not a hang), and proves wrong
-passwords read as refusal.
+"""Live MySQL 8.0 proof through the locked PyMySQL driver: the
+controller-side client must authenticate against the DEPLOYED server
+family, not just a fake connector. Spins the pinned `mysql:8.0.36` image,
+proves native-password auth + business reads, and proves a wrong password
+is classified as refusal (not a hang or a forged success).
 
 Runs in the capture gate (docker present); fails loudly without docker.
 """
@@ -108,11 +107,11 @@ def test_live_native_password_business_read(mysql):
     provisioning does (native-password reader, SELECT-only grant)."""
     from srplatform import mysql_direct
     host, port = mysql["host"], mysql["port"]
-    # stock root uses caching_sha2_password → must fail closed with the
-    # actionable plugin message, never hang or crash
-    with pytest.raises(mysql_direct.MySQLError, match="auth-switch|caching_sha2"):
-        mysql_direct.select_one(host, "root", mysql["rootpw"], "", "SELECT 1",
-                                port=port, timeout_s=10.0)
+    # A wrong password against stock caching_sha2_password root must be a
+    # bounded, classified refusal — never a hang or a forged success.
+    with pytest.raises(mysql_direct.MySQLError, match="refused|auth|connect"):
+        mysql_direct.select_one(host, "root", "wrong-" + mysql["rootpw"], "",
+                                "SELECT 1", port=port, timeout_s=10.0)
     _dexec(mysql,
            "CREATE DATABASE IF NOT EXISTS mojang; "
            "CREATE TABLE IF NOT EXISTS mojang.purchases "

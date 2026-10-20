@@ -20,6 +20,9 @@ dependencies = [
     # it the real PVE client cannot be constructed (live deploy, 2026-10-13).
     "requests>=2.32",
     "pycdlib>=1.22",
+    # Milestone 15: locked MySQL protocol client for controller-side reads;
+    # replaces the hand-written wire implementation in mysql_direct.py.
+    "PyMySQL>=1.1.2",
     "openai>=1.40",
     "typer>=0.12",
     "pydantic>=2.7",

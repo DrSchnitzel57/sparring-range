@@ -34,6 +34,7 @@ psycopg==3.3.6
 psycopg-binary==3.3.6
 psycopg2-binary==2.9.13
 pycdlib==1.22.0
+PyMySQL==1.1.2
 pycparser==3.0
 pydantic==2.13.5
 pydantic-settings==2.15.0

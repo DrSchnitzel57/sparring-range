@@ -389,70 +389,79 @@ def test_mysql_integrity_flags_disagreeing_paths():
 
 
 def test_mysql_direct_authenticates_and_reads_without_guest_code():
-    """Controller-side authenticated transaction over canned byte streams:
-    handshake → scramble auth → COM_QUERY → first cell. No guest executes
-    anything; wrong passwords, auth-switch demands, error packets and
-    non-read queries all fail closed."""
-    import hashlib
-    import struct
+    """Controller-side transaction through the locked PyMySQL seam: one
+    bounded connection, one SELECT, first cell. No guest executes anything;
+    non-read queries and NULL/empty rows fail closed before/without a wire
+    write."""
     from srplatform import mysql_direct as md
 
-    seed = b"12345678abcdefgh1234"
-    plugin = b"mysql_native_password\x00"
-    # server handshake: proto 10, version, conn id, part1, caps, ..., part2
-    hs = (b"\x0a" + b"8.0.36\x00" + struct.pack("<I", 7) + seed[:8] + b"\x00"
-          + struct.pack("<H", 0xFFFF) + b"\x21" + struct.pack("<H", 2)
-          + struct.pack("<H", 0xFFFF) + bytes([len(seed) + 1]) + b"\x00" * 10
-          + seed[8:] + b"\x00" + plugin)
-    coldef = b"\x03def\x06mojang\x09purchases\x09purchases\x08COUNT(*)\x08COUNT(*)\x0c\x21\x00\x0b\x00\x00\x00\x03\x00\x00"
-    script = []
+    seen = {}
 
-    def fake_connect(addr, timeout=None):
-        script.append(("connect", addr))
-        blobs = [
-            struct.pack("<I", len(hs))[:3] + b"\x00" + hs,          # handshake
-            b"\x07\x00\x00\x02\x00\x00\x00\x02\x00\x00\x00",          # OK
-            b"\x01\x00\x00\x01\x01",                                 # 1 column
-            struct.pack("<I", len(coldef))[:3] + b"\x02" + coldef,   # coldef
-            b"\x05\x00\x00\x03\xfe\x00\x00\x02\x00",                  # EOF
-            b"\x03\x00\x00\x04\x0212",                               # row "12"
-            b"\x05\x00\x00\x05\xfe\x00\x00\x02\x00",                  # EOF
-        ]
-        data = b"".join(blobs)
-        state = {"sent": []}
+    class Cursor:
+        def __init__(self):
+            self.query = None
+            self.closed = False
 
-        class Sock:
-            def settimeout(self, t):
-                pass
-            def sendall(self, b):
-                state["sent"].append(b)
-            def recv(self, n):
-                nonlocal data
-                if not data:
-                    raise OSError("closed")
-                out, data = data[:n], data[n:]
-                return out
-            def close(self):
-                pass
-        script.append(("sock", state))
-        return Sock()
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            self.closed = True
+
+        def execute(self, query):
+            self.query = query
+
+        def fetchone(self):
+            if self.query == "SELECT empty":
+                return None
+            if self.query == "SELECT null":
+                return (None,)
+            return (12,)
+
+    class Conn:
+        def __init__(self):
+            self.cur = Cursor()
+            self.closed = False
+
+        def cursor(self):
+            return self.cur
+
+        def close(self):
+            self.closed = True
+
+    def fake_connect(**kwargs):
+        seen.update(kwargs)
+        return Conn()
 
     got = md.select_one("10.66.0.11", "mojang_reader", "secretpw", "mojang",
                         "SELECT COUNT(*) FROM purchases", connect=fake_connect)
     assert got == "12", got
-    sent = script[1][1]["sent"]
-    auth = sent[0]
-    assert b"secretpw" not in auth, "password must be scrambled, never sent"
-    assert auth[4:8] == struct.pack("<I", md._CLIENT_CAPS)
-    assert sent[1][4:5] == b"\x03" and b"SELECT COUNT" in sent[1]
+    assert seen["host"] == "10.66.0.11" and seen["port"] == 3306
+    assert seen["user"] == "mojang_reader" and seen["password"] == "secretpw"
+    assert seen["database"] == "mojang"
+    assert 1 <= seen["connect_timeout"] <= 5
+    assert 1 <= seen["read_timeout"] <= 5
+
+    calls = []
+
+    def fake_connect2(**kwargs):
+        calls.append(kwargs)
+        return Conn()
+
+    for q in ("SELECT empty", "SELECT null"):
+        try:
+            md.select_one("h", "u", "p", "d", q, connect=fake_connect2)
+            raise AssertionError("expected MySQLError")
+        except md.MySQLError:
+            pass
     # non-read queries refused client-side (never touch the wire)
     try:
         md.select_one("h", "u", "p", "d", "DROP TABLE purchases",
-                      connect=fake_connect)
+                      connect=fake_connect2)
         raise AssertionError("expected MySQLError")
     except md.MySQLError:
         pass
-    assert len([s for s in script if s[0] == "connect"]) == 1
+    assert len(calls) == 2
 
 
 def test_mysql_direct_classifies_controller_observations(monkeypatch):
