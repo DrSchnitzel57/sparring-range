@@ -1,0 +1,25 @@
+[Unit]
+Description=sparring-range separate-UID worker supervisor
+After=network-online.target sr-api.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=srworker
+Group=srworker
+# The supervisor has NO DB, broker socket, libvirt or model endpoint. It
+# receives only its API capability path and loopback API base.
+EnvironmentFile=/etc/sparring-range/worker-supervisor.env
+WorkingDirectory=/opt/sparring-range
+ExecStart=/opt/sparring-range/.venv/bin/python -m srplatform.worker_supervisor
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/sparring-range/worker
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

@@ -12,6 +12,7 @@ worker's settings explicitly into its environment.
 from __future__ import annotations
 
 import os
+import pathlib
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -114,7 +115,11 @@ class Settings(BaseSettings):
     # Controller (API) side: mutual-TLS client material + broker URL. The
     # controller must NOT hold PVE credentials in production — the broker
     # does, and only the broker imports infra/proxmox_client.py.
-    broker_url: str | None = None            # https://broker:8443
+    broker_url: str | None = None            # legacy https://broker:8443
+    # Appliance (milestone 14/15): one local Unix socket replaces remote
+    # mutual TLS. The broker verifies the API's peer UID with SO_PEERCRED;
+    # broker_url/TLS material are then not used and must not be supplied.
+    broker_socket: str | None = None         # /run/sparring-range/broker.sock
     broker_tls_ca_file: str | None = None    # broker CA (verifies server)
     broker_client_cert: str | None = None    # API's client cert (mutual TLS)
     broker_client_key: str | None = None
@@ -189,6 +194,17 @@ class Settings(BaseSettings):
     # resolution pass can verify REAL local cessation after a worker death.
     # Empty = ~/.sparring_range/local_ops.
     runner_local_op_dir: str = ""
+
+    # --- Worker supervisor (milestone 15) -----------------------------------
+    # Inline is the development/test dispatch (API spawns its own child).
+    # Production uses a separate-UID supervisor that claims a durable API
+    # assignment and owns the child process group; the API can neither
+    # spawn nor signal a worker across that UID boundary.
+    worker_dispatch: str = "inline"          # inline | supervisor
+    worker_supervisor_token_file: str | None = None
+    worker_poll_s: float = 2.0
+    worker_heartbeat_s: float = 5.0
+    worker_claim_timeout_s: int = 120
 
     # --- Verifier management exec (trusted backend only, F01/F10) --------------
     verifier_ssh_user: str = "root"
@@ -317,6 +333,26 @@ def validate_production(s: Settings, role: str = "controller") -> None:
     it holds (API + model + runner channel), never on controller-only secrets
     it must not possess (Proxmox token, owner DB, bastion pins)."""
     problems = []
+    if s.worker_dispatch not in ("inline", "supervisor"):
+        problems.append("worker_dispatch must be 'inline' or 'supervisor'")
+    if s.worker_dispatch == "supervisor":
+        if not s.worker_supervisor_token_file:
+            problems.append("worker_supervisor_token_file required for "
+                            "supervisor dispatch")
+        else:
+            try:
+                token = pathlib.Path(s.worker_supervisor_token_file).read_text().strip()
+                if len(token) < 32:
+                    problems.append("worker supervisor token is too short")
+                mode = pathlib.Path(s.worker_supervisor_token_file).stat().st_mode
+                if mode & 0o077:
+                    problems.append("worker supervisor token file must not be "
+                                    "group/world readable")
+            except OSError as exc:
+                problems.append(f"worker supervisor token unreadable: {exc}")
+        if not (1 <= s.worker_heartbeat_s < s.worker_claim_timeout_s):
+            problems.append("worker heartbeat must be positive and shorter than "
+                            "the claim timeout")
     if role == "worker":
         if s.runner_transport != "ssh" or not s.runner_ssh_target \
                 or not s.runner_ssh_known_hosts:
@@ -368,14 +404,18 @@ def validate_production(s: Settings, role: str = "controller") -> None:
     if s.proxmox_insecure_lab_override:
         problems.append("proxmox_insecure_lab_override must be false in production "
                         "(and PVE TLS is the broker's concern anyway)")
-    if not s.broker_url:
-        problems.append("broker_url missing (the API reaches the deployment "
-                        "boundary only through the broker)")
-    for name, val in (("broker_client_cert", s.broker_client_cert),
-                      ("broker_client_key", s.broker_client_key),
-                      ("broker_tls_ca_file", s.broker_tls_ca_file)):
-        if not val:
-            problems.append(f"{name} missing (mutual TLS to the broker)")
+    if not s.broker_socket and not s.broker_url:
+        problems.append("broker_socket (appliance) or broker_url (legacy) is "
+                        "missing — the API reaches the deployment boundary only "
+                        "through the broker")
+    if s.broker_socket and s.broker_url:
+        problems.append("broker_socket and broker_url are mutually exclusive")
+    if s.broker_url:
+        for name, val in (("broker_client_cert", s.broker_client_cert),
+                          ("broker_client_key", s.broker_client_key),
+                          ("broker_tls_ca_file", s.broker_tls_ca_file)):
+            if not val:
+                problems.append(f"{name} missing (mutual TLS to the broker)")
     if s.runner_transport == "local-dev":
         problems.append("local-dev runner forbidden in production")
     # Telemetry trust (plan 13 phase 4): enrollment capabilities and audit

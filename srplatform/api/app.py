@@ -16,6 +16,7 @@ Remediation highlights (F04/F08/F11/F13):
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -1207,6 +1208,87 @@ def internal_model_complete(body: ModelCompleteIn, p: Principal = Depends(servic
     except TimeoutError:
         raise HTTPException(504, "model turn exceeded its bound")
     return {"text": text}
+
+
+# --- separate-UID worker supervisor (milestone 15) ---------------------------
+def _supervisor_token() -> str:
+    s = get_settings()
+    path = s.worker_supervisor_token_file
+    if not path:
+        raise HTTPException(503, "worker supervisor is not configured")
+    try:
+        token = open(path, encoding="utf-8").read().strip()
+    except OSError:
+        raise HTTPException(503, "worker supervisor token is unreadable")
+    if len(token) < 32:
+        raise HTTPException(503, "worker supervisor token is invalid")
+    return token
+
+
+def _require_supervisor(token: str | None) -> None:
+    expected = _supervisor_token()
+    if not token or not hmac.compare_digest(token, expected):
+        raise HTTPException(403, "bad worker supervisor token")
+
+
+class AssignIn(BaseModel):
+    pid: int = Field(gt=1)
+    pgid: int = Field(gt=1)
+    pgid_pstart: int | None = None
+
+
+class WorkerFailedIn(BaseModel):
+    reason: str = Field(default="worker exited", max_length=1000)
+
+
+@app.post("/internal/worker/claim")
+def supervisor_claim(
+        x_worker_supervisor_token: str | None = Header(default=None),
+        db: DbSession = None):
+    """Claim one durable queued run. The token returned to the supervisor is
+    the worker's one-shot API capability; only its sha256 is stored."""
+    _require_supervisor(x_worker_supervisor_token)
+    s = get_settings()
+    claimed = runs_svc.claim_run(db, s.worker_claim_timeout_s)
+    if not claimed:
+        return {"assignment": None}
+    run, token = claimed
+    from srplatform.db.models import MatchModel
+    env = runs_svc._worker_env(s, token, run.session_id, run.scenario_id, run,
+                               match=db.get(MatchModel, run.session_id))
+    return {"assignment": {"run_id": str(run.run_id),
+                           "session_id": str(run.session_id),
+                           "scenario_id": run.scenario_id,
+                           "env": env}}
+
+
+@app.post("/internal/worker/{run_id}/assign")
+def supervisor_assign(run_id: uuid.UUID, body: AssignIn,
+                      x_worker_supervisor_token: str | None = Header(default=None),
+                      db: DbSession = None):
+    _require_supervisor(x_worker_supervisor_token)
+    if not runs_svc.assign_run(db, run_id, body.pid, body.pgid,
+                               body.pgid_pstart):
+        raise HTTPException(409, "run is not a claimed queued assignment")
+    return {"ok": True}
+
+
+@app.post("/internal/worker/{run_id}/heartbeat")
+def supervisor_heartbeat(run_id: uuid.UUID,
+                         x_worker_supervisor_token: str | None = Header(default=None),
+                         db: DbSession = None):
+    _require_supervisor(x_worker_supervisor_token)
+    if not runs_svc.heartbeat_run(db, run_id):
+        raise HTTPException(409, "run is not running")
+    return {"ok": True}
+
+
+@app.post("/internal/worker/{run_id}/failed")
+def supervisor_failed(run_id: uuid.UUID, body: WorkerFailedIn,
+                      x_worker_supervisor_token: str | None = Header(default=None),
+                      db: DbSession = None):
+    _require_supervisor(x_worker_supervisor_token)
+    return runs_svc.worker_failed(db, run_id, body.reason)
 
 
 @app.post("/internal/runs/{run_id}/complete")

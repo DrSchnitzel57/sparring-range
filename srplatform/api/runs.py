@@ -26,9 +26,9 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -264,8 +264,6 @@ def start_run(db: Session, session_id, scenario_id: str) -> Run:
         raise GateRefused(reasons)
 
     run = Run(session_id=session_id, scenario_id=scenario_id, status="queued")
-    token = secrets.token_urlsafe(32)
-    run.worker_token = hashlib.sha256(token.encode()).hexdigest()
     db.add(run)
     try:
         # DURABLE BEFORE SPAWN (audit R01): the run row + credential commit
@@ -282,6 +280,15 @@ def start_run(db: Session, session_id, scenario_id: str) -> Run:
 
     from srplatform.settings import get_settings
     s = get_settings()
+    if s.worker_dispatch == "supervisor":
+        # Milestone 15: the API has NO authority to spawn or signal a
+        # separate-UID worker. A durable queued row is the assignment; the
+        # supervisor claims it (rotating a one-shot run token) and owns the
+        # child process group. The API only records heartbeats/outcomes.
+        return run
+
+    token = secrets.token_urlsafe(32)
+    run.worker_token = hashlib.sha256(token.encode()).hexdigest()
     from srplatform.db.models import MatchModel
     env = _worker_env(s, token, session_id, scenario_id, run,
                       match=db.get(MatchModel, session_id))
@@ -376,6 +383,94 @@ def start_run(db: Session, session_id, scenario_id: str) -> Run:
                            f"({term['detail']})"])
     _watch(proc, str(run.run_id))
     return run
+
+
+# ---------------------------------------------------- supervisor dispatch ----
+def claim_run(db: Session, claim_timeout_s: int = 120):
+    """Atomically claim one queued run for the separate-UID supervisor.
+
+    A queued row with no token is unclaimed. A row whose token was set but
+    whose process never registered is reclaimable after ``claim_timeout_s``
+    (a supervisor may have died between claim and assign); the old token is
+    replaced, so a late supervisor cannot assign with stale authority.
+    """
+    if get_supervisor().latch_status()["latched"]:
+        db.rollback()
+        return None
+    now = _now()
+    stale = now - timedelta(seconds=max(1, int(claim_timeout_s)))
+    q = (select(Run)
+         .where(Run.status == "queued")
+         .where(or_(Run.worker_token.is_(None),
+                    and_(Run.worker_token.is_not(None), Run.pid.is_(None),
+                         Run.started_at.is_not(None), Run.started_at < stale)))
+         .order_by(Run.started_at.asc().nullsfirst())
+         .with_for_update(skip_locked=True))
+    run = db.execute(q).scalars().first()
+    if run is None:
+        db.rollback()
+        return None
+    token = secrets.token_urlsafe(32)
+    run.worker_token = hashlib.sha256(token.encode()).hexdigest()
+    run.started_at = now
+    run.worker_heartbeat_at = now
+    db.commit()
+    return run, token
+
+
+def assign_run(db: Session, run_id, pid: int, pgid: int,
+               pgid_pstart: int | None) -> bool:
+    """Record the supervisor-owned process group. Only a claimed queued run
+    can be assigned; a concurrent stop/latch transition wins, and the
+    supervisor must then kill its child."""
+    now = _now()
+    res = db.execute(
+        update(Run)
+        .where(Run.run_id == run_id, Run.status == "queued",
+               Run.worker_token.is_not(None))
+        .values(status="running", pid=int(pid), pgid=int(pgid),
+                pgid_pstart=pgid_pstart, started_at=now,
+                worker_heartbeat_at=now))
+    db.commit()
+    return bool(res.rowcount)
+
+
+def heartbeat_run(db: Session, run_id) -> bool:
+    res = db.execute(update(Run)
+                     .where(Run.run_id == run_id, Run.status == "running")
+                     .values(worker_heartbeat_at=_now()))
+    db.commit()
+    return bool(res.rowcount)
+
+
+def worker_failed(db: Session, run_id, reason: str) -> dict:
+    """The supervisor confirmed the child group is gone; resolve the run
+    honestly. Remote operations that cannot be confirmed remain
+    'cancel-unknown' and keep the reservation."""
+    run = db.get(Run, run_id)
+    if run is None:
+        return {"ok": False, "detail": "unknown run"}
+    if run.status in TERMINAL:
+        return {"ok": True, "detail": f"run already {run.status}"}
+    cancel = cancel_remote_operations(db, run)
+    ok = bool(cancel.get("ok"))
+    reason = (reason or "worker exited")[:1000]
+    if ok:
+        wrote = guarded_terminal_update(
+            db, run.run_id,
+            {"status": "failed", "outcome": "worker_failure", "error": reason,
+             "ended_at": _now(), "worker_token": None,
+             "worker_heartbeat_at": _now()})
+        if wrote == 0:
+            ok = False
+    if not ok:
+        db.execute(update(Run).where(Run.run_id == run.run_id)
+                   .values(status="cancel-unknown", outcome="worker_failure",
+                           error=(reason + " — cessation UNCONFIRMED")[:1000],
+                           worker_token=None, worker_heartbeat_at=_now()))
+        db.commit()
+    return {"ok": ok, "detail": "worker failure recorded" if ok else
+            "worker exit recorded; remote cessation UNCONFIRMED"}
 
 
 # The worker environment is serialized from the controller's RESOLVED settings
