@@ -1121,6 +1121,13 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
                     broker.start_and_wait(node, vmid, session_id=session_id)
                     res.update({"state": "created", "ip": host["ip"], "node": node,
                                 "name": name})
+                    # The backend's own immutable identity for this guest
+                    # (the libvirt domain UUID).  The VMID is the broker's
+                    # durable key; the UUID is what proves the exact domain is
+                    # the one this deployment created.
+                    domain_uuid = (cfg2 or {}).get("domain_uuid")
+                    if domain_uuid:
+                        res["domain_uuid"] = domain_uuid
                     _pin_host_key(broker, db, session_id, dep, res, resources, node)
                     _enroll_host_telemetry(db, dep, res, resources, session_id,
                                            host["name"], host["ip"], s, enrollments)
