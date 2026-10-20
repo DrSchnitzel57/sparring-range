@@ -183,15 +183,44 @@ def test_seed_carries_only_role_keys_and_no_gateway_in_production(tmp_path):
     assert seed.is_file() and seed.stat().st_size > 0
 
 
-def test_seed_fixture_mode_uses_dhcp_and_fixture_marker(tmp_path):
+def test_seed_addressing_is_static_in_every_mode(tmp_path):
+    """A golden image has no machine-id, so a DHCP client cannot even be
+    configured (systemd-networkd: "Failed to configure DHCPv4 client").  The
+    seed therefore always writes a STATIC address: the fixture gets the
+    isolated network's own gateway, the production range gets no route at
+    all."""
+    m = ApplianceManifest.from_dict(_manifest(tmp_path), verify_images=True)
+    image = m.image_for_role("attacker")
+    fixture = render_user_data(SeedInputs(
+        manifest=m, image=image, vmid=210,
+        session_id="b" * 32, hostname="attacker", address="10.0.2.15",
+        prefix=24, gateway="10.0.2.2"))
+    assert "dhcp4: true" not in fixture
+    assert "dhcp4: false" in fixture
+    assert "10.0.2.15" in fixture
+    assert "10.0.2.2" in fixture
+    assert m.public_key_for("runner") in fixture
+
+    production = render_user_data(SeedInputs(
+        manifest=m, image=image, vmid=210,
+        session_id="b" * 32, hostname="attacker", address="10.66.0.210",
+        prefix=24, gateway=None))
+    assert "dhcp4: true" not in production
+    assert "10.66.0.210" in production
+    assert "to: default" not in production
+    assert m.public_key_for("runner") in production
+
+
+def test_seed_never_blocks_the_boot_on_a_missing_agent_device(tmp_path):
+    """`systemctl --now` waits for the guest-agent device: a guest whose
+    channel is not visible would hang its whole cloud-init stage."""
     m = ApplianceManifest.from_dict(_manifest(tmp_path), verify_images=True)
     user = render_user_data(SeedInputs(
         manifest=m, image=m.image_for_role("attacker"), vmid=210,
         session_id="b" * 32, hostname="attacker", address="10.0.2.15",
-        prefix=24, fixture_dhcp=True))
-    assert "dhcp4: true" in user
-    assert "10.0.2.15" not in user
-    assert m.public_key_for("runner") in user
+        prefix=24, gateway="10.0.2.2"))
+    assert "systemctl enable --now" not in user
+    assert "start --no-block qemu-guest-agent.service" in user
 
 
 def test_network_artifacts_are_isolated_and_fixed(tmp_path):

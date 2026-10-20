@@ -42,7 +42,6 @@ class SeedInputs:
     prefix: int
     gateway: str | None = None       # fixture only; production is on-link
     instance_id: str | None = None
-    fixture_dhcp: bool = False
     fixture_http_port: int | None = None
     api_ingest_url: str | None = None
 
@@ -66,17 +65,20 @@ def render_network_config(inp: SeedInputs) -> str:
 
     Keeping this separate from write_files/runcmd is what removes the
     first-boot ``systemd-networkd-wait-online`` stall: the interface is
-    addressed before cloud-init's later stages, so QGA readiness and SSH do
-    not race a 2+ minute timeout.
+    addressed before cloud-init's later stages.
+
+    The configuration is STATIC.  A golden appliance image has no machine-id
+    (every clone must generate its own), and systemd-networkd's DHCP client
+    cannot even be configured without one — so a DHCP-based guest would come
+    up with no address at all.  Static addressing also matches the production
+    range: an on-link address with no default route.
     """
     nic: dict = {"match": {"name": "en*"}, "dhcp4": False, "dhcp6": False,
-                 "optional": True}
-    if inp.fixture_dhcp:
-        nic.update({"dhcp4": True})
-    else:
-        nic["addresses"] = [f"{inp.address}/{inp.prefix}"]
-        if inp.gateway:
-            nic["routes"] = [{"to": "default", "via": inp.gateway}]
+                 "optional": True, "addresses": [f"{inp.address}/{inp.prefix}"]}
+    if inp.gateway:
+        # The isolated fixture network needs a route to its own gateway; the
+        # production range deliberately has none.
+        nic["routes"] = [{"to": "default", "via": inp.gateway}]
     return yaml.safe_dump({"version": 2, "ethernets": {"range-nic": nic}},
                           sort_keys=False)
 
@@ -126,61 +128,45 @@ def render_user_data(inp: SeedInputs) -> str:
         ],
         # qemu-guest-agent is installed in the golden image but was not
         # running when the image was built (no virtio channel existed then).
-        # Enable it in bootcmd, before network-online waits, so readiness and
-        # host-key reads never depend on cloud-init's later runcmd stage.
+        # Start it WITHOUT blocking: `systemctl --now` waits for the guest
+        # agent device, and a guest whose channel is not (yet) visible would
+        # hang its whole cloud-init stage.  The unit is deliberately NOT
+        # enabled: an enabled unit whose device never appears would block a
+        # later boot at multi-user.target.
         "bootcmd": [
-            "systemctl enable --now qemu-guest-agent.service ssh.service "
-            "2>/dev/null || true",
-            "systemctl enable sr-first-boot-complete.service "
+            "systemctl enable ssh.service 2>/dev/null || true",
+            "systemctl start --no-block qemu-guest-agent.service "
             "2>/dev/null || true",
         ],
         "runcmd": [
-            "systemctl enable --now ssh qemu-guest-agent auditd 2>/dev/null || true",
             "install -d -m 0755 /var/lib/sparring-range",
+            # The marker is written FIRST and unconditionally: readiness must
+            # never be gated on a service that can block or fail.
             f"date -u +%FT%TZ > {_MARKER_PATH}",
+            "systemctl start --no-block qemu-guest-agent.service "
+            "2>/dev/null || true",
+            "systemctl enable auditd.service 2>/dev/null || true",
+            "systemctl enable sr-first-boot-complete.service "
+            "2>/dev/null || true",
         ],
     }
-    if inp.fixture_dhcp:
-        # QEMU user networking: DHCP gives 10.0.2.15 and a gateway inside the
-        # synthetic network. This mode is for the live software gate only;
-        # the appliance installer never selects it for a production guest.
-        doc["write_files"].append({
-            "path": "/etc/netplan/99-sr-fixture.yaml",
-            "permissions": "0600",
-            "content": yaml.safe_dump({
-                "network": {"version": 2, "ethernets": {"range-nic": {
-                    "match": {"name": "en*"},
-                    "dhcp4": True, "dhcp6": False}}}},
-                sort_keys=False),
-        })
-        doc["runcmd"].insert(0, "netplan apply || true")
-    elif inp.gateway is None:
-        # Production range is on-link only: no default route exists, so a
-        # compromised guest cannot even attempt WAN or management egress.
-        doc["write_files"].append({
-            "path": "/etc/netplan/99-sr-range.yaml",
-            "permissions": "0600",
-            "content": yaml.safe_dump({
-                "network": {"version": 2, "ethernets": {"range-nic": {
-                    "match": {"name": "en*"},
-                    "addresses": [f"{inp.address}/{inp.prefix}"],
-                    "dhcp4": False, "dhcp6": False, "optional": True}}}},
-                sort_keys=False),
-        })
-        doc["runcmd"].insert(0, "netplan apply || true")
-    else:
-        doc["write_files"].append({
-            "path": "/etc/netplan/99-sr-fixture.yaml",
-            "permissions": "0600",
-            "content": yaml.safe_dump({
-                "network": {"version": 2, "ethernets": {"range-nic": {
-                    "match": {"name": "en*"},
-                    "addresses": [f"{inp.address}/{inp.prefix}"],
-                    "routes": [{"to": "default", "via": inp.gateway}],
-                    "dhcp4": False, "dhcp6": False, "optional": True}}}},
-                sort_keys=False),
-        })
-        doc["runcmd"].insert(0, "netplan apply || true")
+    # ONE netplan file, ONE interface key ("range-nic"), always static.
+    # The same key is used by the NoCloud network-config, so the two
+    # descriptions merge instead of defining the same device twice, and
+    # nothing in the golden image has to know anything about addressing.
+    doc["write_files"].append({
+        "path": "/etc/netplan/99-sr-range.yaml",
+        "permissions": "0600",
+        "content": yaml.safe_dump({
+            "network": {"version": 2, "ethernets": {"range-nic": {
+                "match": {"name": "en*"},
+                "addresses": [f"{inp.address}/{inp.prefix}"],
+                "routes": ([{"to": "default", "via": inp.gateway}]
+                           if inp.gateway else []),
+                "dhcp4": False, "dhcp6": False, "optional": True}}}},
+            sort_keys=False),
+    })
+    doc["runcmd"].insert(0, "netplan apply || true")
     if inp.api_ingest_url:
         doc["write_files"].append({
             "path": "/etc/sparring-range/shipper.conf",

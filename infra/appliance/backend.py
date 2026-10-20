@@ -39,6 +39,11 @@ from infra.appliance.policy import AppliancePolicy
 from infra.appliance.seed import SeedInputs, build_seed
 
 GUEST_HOST_KEY_PATH = "/etc/ssh/ssh_host_ed25519_key.pub"
+# QEMU user networking (software fixture only): the guest keeps the classic
+# SLIRP address and uses the SLIRP gateway.  Production guests are on-link
+# with no route at all.
+FIXTURE_ADDRESS = "10.0.2.15"
+FIXTURE_GATEWAY = "10.0.2.2"
 FIRST_BOOT_MARKER = "/var/lib/sparring-range/first-boot-complete"
 _DESC_PREFIX = "SRAPPLIANCE:"
 
@@ -341,12 +346,18 @@ class LibvirtBackend:
         prefix = int(m.group(2)) if m else net.range_cidr.prefixlen
         seed = pathlib.Path(desc["seed"])
         seed.parent.mkdir(parents=True, exist_ok=True)
+        # The software fixture lives on QEMU's user network (10.0.2.0/24 with
+        # the SLIRP gateway at 10.0.2.2).  Addressing is STATIC in every
+        # mode: a golden image has no machine-id, and systemd-networkd's DHCP
+        # client cannot be configured without one.
+        if self.cfg.fixture_mode:
+            addr, prefix, gateway = FIXTURE_ADDRESS, 24, FIXTURE_GATEWAY
+        else:
+            gateway = None
         build_seed(seed, SeedInputs(
             manifest=self.manifest, image=image, vmid=vmid,
             session_id=str(desc.get("session_id") or ""), hostname=hostname,
-            address=addr, prefix=prefix,
-            fixture_dhcp=self.cfg.fixture_mode,
-            gateway=None))
+            address=addr, prefix=prefix, gateway=gateway))
 
     def set_config(self, node: str, vmid: int, **cfg) -> None:
         self._require_node(node)

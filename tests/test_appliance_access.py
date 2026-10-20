@@ -1,15 +1,20 @@
 """Real guest SSH + recording replay acceptance (access layer).
 
-Boots an actual Ubuntu qcow2 with a NoCloud seed, forwards its SSH port through
-QEMU user networking, authenticates as the guest's role user with a generated
-key, then connects through the real recording bastion and proves the .cast file
-contains the command output.  No host key is accepted by TOFU: the guest's key
-is read from the live SSH handshake and pinned in a known_hosts file before the
-bastion dials.
+Boots an actual Ubuntu guest with the appliance seed, attaches a QEMU guest
+agent channel, and proves three separate things:
+
+  1. the appliance readiness contract (first-boot marker + fixed host key
+     read through the guest agent, exactly like the production backend),
+  2. real SSH with the role key, against the guest's real host key, and
+  3. a recording: the real bastion proxies the session and the .cast file
+     contains the command output.
+
+No host key is accepted by TOFU: the guest's key is read from the live SSH
+handshake and pinned in a known_hosts file before the bastion dials.
 
 The base image, QEMU and (optionally) KVM are prerequisites.  In required mode
-(`SR_REQUIRE_ACCESS=1`) absence is a FAILURE.  The guest is disposable and the
-fixture clearly labels the software-emulation path.
+(``SR_REQUIRE_ACCESS=1``) absence is a FAILURE.  The guest is disposable and
+the fixture clearly labels the software-emulation path.
 """
 from __future__ import annotations
 
@@ -25,13 +30,16 @@ import time
 import pytest
 
 from infra.appliance.manifest import ApplianceManifest
-from infra.appliance.seed import (SeedInputs, render_network_config,
+from infra.appliance.seed import (SeedInputs, marker_path, render_network_config,
                                  render_user_data)
 from infra.dev import qemu_guest
+from infra.dev.qga import QgaClient
 from infra.images.guest_seed import build_seed_iso, meta_data
 from tests.test_appliance_install import _manifest as install_manifest
 
 pytestmark = pytest.mark.access
+
+HOST_KEY_PATH = "/etc/ssh/ssh_host_ed25519_key.pub"
 
 
 def _require(condition: bool, message: str) -> None:
@@ -56,11 +64,8 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
-def _guest_user_data(tmp_path: pathlib.Path, base: pathlib.Path) -> tuple[
-        ApplianceManifest, pathlib.Path, pathlib.Path, pathlib.Path]:
+def _guest_seed(tmp_path: pathlib.Path, base: pathlib.Path):
     raw = install_manifest(tmp_path)
-    # The real base replaces the synthetic image; the schema test keys remain
-    # valid and are still required for a strict manifest.
     import hashlib
     h = hashlib.sha256()
     with base.open("rb") as fh:
@@ -75,48 +80,41 @@ def _guest_user_data(tmp_path: pathlib.Path, base: pathlib.Path) -> tuple[
                            "max_disk_gb": 44})
     m = ApplianceManifest.from_dict(raw, verify_images=True)
     image = m.image_for_role("attacker")
-    seed_path = tmp_path / "access-seed.iso"
     inp = SeedInputs(
         manifest=m, image=image, vmid=230, session_id="access-gate",
         hostname="sr-access", address="10.0.2.15", prefix=24,
-        fixture_dhcp=True, gateway=None)
-    user_data = render_user_data(inp)
-    network_config = render_network_config(inp)
-    # A serial-visible marker lets the test distinguish "SSH answered" from a
-    # stale boot; it is not accepted as a substitute for the SSH proof.
-    import yaml
-    doc = yaml.safe_load(user_data.removeprefix("#cloud-config\n"))
-    doc["runcmd"].append("echo SR-GUEST-ACCESS-READY")
-    user_data = "#cloud-config\n" + yaml.safe_dump(doc, sort_keys=False,
-                                                    width=4096)
-    build_seed_iso(seed_path, user_data,
+        gateway="10.0.2.2")
+    seed_path = tmp_path / "access-seed.iso"
+    build_seed_iso(seed_path, render_user_data(inp),
                    meta_data(f"iid-access-{os.getpid()}", "sr-access"),
-                   network_config=network_config)
-    runner_key = tmp_path / "runner"
+                   network_config=render_network_config(inp))
     member_key = tmp_path / "member"
     subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "",
                     "-f", str(member_key)], check=True, capture_output=True)
-    return m, seed_path, runner_key, member_key
+    return m, seed_path, member_key
 
 
-def _wait_marker(proc: subprocess.Popen, serial: pathlib.Path,
-                 timeout_s: float = 900) -> str:
+def _wait_ready(qga_sock: pathlib.Path, proc: subprocess.Popen,
+                timeout_s: float = 900) -> dict:
+    """Wait for the guest agent and the appliance readiness marker."""
     deadline = time.monotonic() + timeout_s
+    last = ""
     while time.monotonic() < deadline:
-        try:
-            text = serial.read_text(errors="replace")
-        except OSError:
-            text = ""
-        if "SR-GUEST-ACCESS-READY" in text:
-            return text
         if proc.poll() is not None:
-            raise AssertionError(
-                f"QEMU exited {proc.returncode} before the access marker; "
-                f"serial tail={text[-1200:]!r}")
-        time.sleep(2)
-    raise AssertionError(
-        f"no access marker within {timeout_s}s; serial tail="
-        f"{serial.read_text(errors='replace')[-1200:]!r}")
+            raise AssertionError(f"QEMU exited {proc.returncode} before the "
+                                 f"guest was ready")
+        try:
+            with QgaClient(str(qga_sock), timeout=10) as agent:
+                marker = agent.read_file(marker_path())
+                if marker and marker.strip():
+                    host_key = agent.read_file(HOST_KEY_PATH)
+                    if host_key and host_key.strip():
+                        return {"marker": marker.strip(),
+                                "host_key": host_key.strip()}
+        except Exception as exc:  # noqa: BLE001 — the agent is not up yet
+            last = str(exc)
+        time.sleep(5)
+    raise AssertionError(f"guest never reported readiness: {last}")
 
 
 async def _ssh_and_record(m: ApplianceManifest, port: int, runner_key: pathlib.Path,
@@ -124,14 +122,13 @@ async def _ssh_and_record(m: ApplianceManifest, port: int, runner_key: pathlib.P
                           known_hosts: pathlib.Path):
     import asyncssh
 
-    # Read the guest's key from the live handshake, then pin it explicitly.
     deadline = time.monotonic() + 600
     last = None
     known_key = None
     while time.monotonic() < deadline:
         try:
             async with asyncssh.connect(
-                    "127.0.0.1", port, username="runner",
+                    "127.0.0.1", port, username="attacker",
                     client_keys=[str(runner_key)], known_hosts=None,
                     connect_timeout=5, login_timeout=10) as conn:
                 known_key = conn.get_server_host_key()
@@ -151,12 +148,11 @@ async def _ssh_and_record(m: ApplianceManifest, port: int, runner_key: pathlib.P
     pub = export().decode().strip()
     known_hosts.write_text(f"[127.0.0.1]:{port} {pub}\n")
 
-    # The real bastion proxy: token auth, pinned target key, cast writer.
     from srplatform.bastion.proxy import BastionProxy
     from srplatform.settings import get_settings
     os.environ.update({
         "SR_ENV": "dev",
-        "SR_BASTION_TARGET_USER": "runner",
+        "SR_BASTION_TARGET_USER": "attacker",
         "SR_BASTION_CLIENT_KEY_PATH": str(runner_key),
         "SR_BASTION_TARGETS_KNOWN_HOSTS": str(known_hosts),
         "SR_RECORDINGS_DIR": str(recordings),
@@ -216,10 +212,15 @@ def test_real_guest_ssh_and_bastion_cast_replay(tmp_path):
     _require(qemu is not None, "QEMU (qemu-system-x86_64) is required for access")
     _require(shutil.which("ssh-keygen") is not None, "ssh-keygen is required")
     base = _base_image()
-    m, seed, runner_key, member_key = _guest_user_data(tmp_path, base)
+    m, seed, member_key = _guest_seed(tmp_path, base)
     run_dir = qemu_guest.make_run_dir()
     serial = run_dir / "access.serial.log"
     port = _free_port()
+    # QEMU's UNIX socket path must stay under 108 bytes, so the guest agent
+    # chardev lives in a short run dir under /tmp.
+    sock_dir = pathlib.Path(f"/tmp/sr-access-{os.getpid()}")
+    sock_dir.mkdir(parents=True, exist_ok=True)
+    qga_sock = sock_dir / "qga.sock"
     use_kvm = os.environ.get("SR_ACCESS_KVM") == "1" and pathlib.Path(
         "/dev/kvm").exists()
     accel = ["-accel", "kvm"] if use_kvm else ["-accel", "tcg,thread=multi"]
@@ -229,20 +230,26 @@ def test_real_guest_ssh_and_bastion_cast_replay(tmp_path):
            "-drive", f"file={seed},format=raw,media=cdrom,readonly=on",
            "-netdev", f"user,id=n0,hostfwd=tcp:127.0.0.1:{port}-:22",
            "-device", "virtio-net-pci,netdev=n0",
+           "-device", "virtio-serial-pci,id=vser0",
+           "-chardev", f"socket,id=qga0,path={qga_sock},server=on,wait=off",
+           "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
            "-nographic", "-serial", f"file:{serial}", "-no-reboot",
            "-display", "none", *accel]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
     try:
-        _wait_marker(proc, serial)
+        ready = _wait_ready(qga_sock, proc)
+        assert ready["host_key"].startswith(("ssh-ed25519 ", "ssh-rsa ")), \
+            ready["host_key"]
         recordings = tmp_path / "recordings"
         recordings.mkdir()
         known = tmp_path / "known_hosts"
-        out = asyncio.run(_ssh_and_record(m, port, runner_key, member_key,
-                                          recordings, known))
+        out = asyncio.run(_ssh_and_record(m, port, tmp_path / "runner",
+                                          member_key, recordings, known))
         assert "ssh-" in out["target_key"]
         print("access accelerator:", "kvm" if use_kvm else "tcg",
-              "cast:", out["cast"], "events:", out["events"], flush=True)
+              "marker:", ready["marker"], "cast:", out["cast"],
+              "events:", out["events"], flush=True)
     except Exception:
         dbg = pathlib.Path("/tmp/opencode/sr-gate-debug")
         dbg.mkdir(parents=True, exist_ok=True)
@@ -261,3 +268,4 @@ def test_real_guest_ssh_and_bastion_cast_replay(tmp_path):
                 proc.kill()
                 proc.wait(timeout=15)
         shutil.rmtree(run_dir, ignore_errors=True)
+        shutil.rmtree(sock_dir, ignore_errors=True)
