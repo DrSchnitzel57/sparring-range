@@ -212,6 +212,48 @@ class AppliancePolicy:
                 limits.get("memory_mb_per_vm", 8192),
                 limits.get("disk_gb_per_vm", 48))
 
+    @classmethod
+    def from_manifest(cls, manifest) -> "AppliancePolicy":
+        """Derive the broker policy from the operator-owned manifest.
+
+        The installer writes the result once; the broker still loads and
+        re-validates both files independently, so a later manifest edit that
+        is not re-rendered is refused at boot rather than silently ignored.
+        Clone VMIDs live in a small broker-owned namespace (200..999); image
+        template ids are separate and may be larger.
+        """
+        if not manifest.images:
+            raise PolicyViolation("manifest has no images")
+        max_vcpus = max(i.vcpus for i in manifest.images.values())
+        max_mem = max(i.memory_mb for i in manifest.images.values())
+        max_disk = max(i.disk_gb for i in manifest.images.values())
+        raw = {
+            "node": manifest.installation_id,
+            "templates": sorted({i.template_id for i in manifest.images.values()}),
+            "vmid_range": [200, 999],
+            "storage": ["appliance-local"],
+            "clone_mode": "full",
+            "nic": {"bridge": manifest.network.range_bridge},
+            "provision": {"cidr": str(manifest.network.range_cidr),
+                          "gateway": str(manifest.network.range_gateway)},
+            "limits": {
+                "max_vms": manifest.budgets.max_guests,
+                "cores_per_vm": max_vcpus,
+                "memory_mb_per_vm": max_mem,
+                "disk_gb_per_vm": max_disk,
+                "max_total_cores": manifest.budgets.max_vcpus,
+                "max_total_memory_mb": manifest.budgets.max_memory_mb,
+                "max_total_disk_gb": manifest.budgets.max_disk_gb,
+            },
+            "name_prefix": "sr-",
+            "tag_pattern": r"^srsess-[0-9a-f]{32}$",
+            "lease_ttl_s": 30,
+            "heartbeat_interval_s": 5,
+        }
+        policy = cls.from_dict(raw, source="derived from manifest")
+        policy.validate_manifest(manifest)
+        return policy
+
     def validate_manifest(self, manifest) -> None:
         """Cross-check the two operator inputs at broker boot.
 

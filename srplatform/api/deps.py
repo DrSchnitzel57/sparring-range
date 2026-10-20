@@ -56,17 +56,21 @@ def get_broker():
 
             _broker, _svc, _http = make_fake_broker(policy=policy_from_settings(s))
             return _broker
-        if not s.broker_url:
-            from infra.broker.errors import BrokerUnavailable
-
+        from infra.broker.errors import BrokerUnavailable
+        if s.broker_socket:
+            from infra.broker.client import BrokerClient, HttpTransport
+            url = f"unix://{s.broker_socket}"
+            _broker = BrokerClient(HttpTransport(url))
+        elif s.broker_url:
+            from infra.broker.client import BrokerClient, HttpTransport
+            _broker = BrokerClient(HttpTransport(s.broker_url, s.broker_tls_ca_file,
+                                                 s.broker_client_cert,
+                                                 s.broker_client_key))
+        else:
             raise BrokerUnavailable(
-                "broker not configured (BROKER_URL + mutual-TLS client material "
-                "required) — the API has no direct Proxmox path")
-        from infra.broker.client import BrokerClient, HttpTransport
-
-        _broker = BrokerClient(HttpTransport(s.broker_url, s.broker_tls_ca_file,
-                                             s.broker_client_cert,
-                                             s.broker_client_key))
+                "broker not configured (BROKER_SOCKET or legacy BROKER_URL + "
+                "mutual-TLS material required) — the API has no direct Proxmox "
+                "path")
     return _broker
 
 

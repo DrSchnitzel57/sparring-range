@@ -61,6 +61,26 @@ def _authorized_keys(manifest: ApplianceManifest, role: str) -> dict[str, list[s
     return out
 
 
+def render_network_config(inp: SeedInputs) -> str:
+    """NoCloud network-config (netplan v2) applied in cloud-init's network stage.
+
+    Keeping this separate from write_files/runcmd is what removes the
+    first-boot ``systemd-networkd-wait-online`` stall: the interface is
+    addressed before cloud-init's later stages, so QGA readiness and SSH do
+    not race a 2+ minute timeout.
+    """
+    nic: dict = {"match": {"name": "en*"}, "dhcp4": False, "dhcp6": False,
+                 "optional": True}
+    if inp.fixture_dhcp:
+        nic.update({"dhcp4": True})
+    else:
+        nic["addresses"] = [f"{inp.address}/{inp.prefix}"]
+        if inp.gateway:
+            nic["routes"] = [{"to": "default", "via": inp.gateway}]
+    return yaml.safe_dump({"version": 2, "ethernets": {"range-nic": nic}},
+                          sort_keys=False)
+
+
 def render_user_data(inp: SeedInputs) -> str:
     instance_id = inp.instance_id or f"sr-{inp.image.role}-{uuid.uuid4().hex[:12]}"
     keys = _authorized_keys(inp.manifest, inp.image.role)
@@ -180,7 +200,8 @@ def build_seed(path: pathlib.Path, inp: SeedInputs) -> pathlib.Path:
     instance_id = inp.instance_id or f"sr-{inp.image.role}-{uuid.uuid4().hex[:12]}"
     user_data = render_user_data(inp)
     meta = meta_data(instance_id, inp.hostname)
-    return build_seed_iso(path, user_data, meta)
+    return build_seed_iso(path, user_data, meta,
+                          network_config=render_network_config(inp))
 
 
 def marker_path() -> str:

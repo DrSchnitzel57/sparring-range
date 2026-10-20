@@ -348,6 +348,12 @@ class ApplianceManifest:
                 raise _bad(f"access_keys.{role} must be an absolute path")
             keys[str(role)] = AccessKey(str(role), path)
 
+        required_key_roles = {"runner", "bastion", "mgmt"}
+        missing_key_roles = required_key_roles - set(keys)
+        if missing_key_roles:
+            raise _bad(f"access_keys missing role public keys "
+                       f"{sorted(missing_key_roles)}")
+
         model = _need_obj(raw, "model")
         _closed(model, {"base_url", "alias", "api_key_file"}, "model")
         base_url = _str(model, "base_url", "model")
