@@ -102,6 +102,49 @@ class Plan:
         return {f.path: f for f in self.files}
 
 
+@dataclass(frozen=True)
+class Layout:
+    """Where the installer writes.
+
+    ``root`` is the filesystem root the installation is applied to.  The
+    default "/" is the real appliance; any other root is a SANDBOX, which is
+    what the install gate uses to exercise the real sequences (clean, rerun,
+    reboot, populated upgrade, failure recovery) without root and without
+    touching the host.
+    """
+
+    root: pathlib.Path = pathlib.Path("/")
+    prefix: pathlib.Path = DEFAULT_PREFIX
+    etc: pathlib.Path = DEFAULT_ETC
+    state: pathlib.Path = DEFAULT_STATE
+    run: pathlib.Path = DEFAULT_RUN
+    units_dir: pathlib.Path = pathlib.Path("/etc/systemd/system")
+    network_dir: pathlib.Path = pathlib.Path("/etc/systemd/network")
+    nftables_dir: pathlib.Path = pathlib.Path("/etc/nftables.d")
+
+    @property
+    def sandboxed(self) -> bool:
+        return pathlib.Path(self.root) != pathlib.Path("/")
+
+    @property
+    def receipt(self) -> pathlib.Path:
+        return self.etc / "install-receipt.json"
+
+
+def default_layout(*, root: pathlib.Path = pathlib.Path("/"),
+                   prefix: pathlib.Path | None = None,
+                   etc: pathlib.Path | None = None) -> Layout:
+    root = pathlib.Path(root)
+    prefix = pathlib.Path(prefix) if prefix else root / "opt/sparring-range"
+    etc = pathlib.Path(etc) if etc else root / "etc/sparring-range"
+    return Layout(root=root, prefix=prefix, etc=etc,
+                  state=root / "var/lib/sparring-range",
+                  run=root / "run/sparring-range",
+                  units_dir=root / "etc/systemd/system",
+                  network_dir=root / "etc/systemd/network",
+                  nftables_dir=root / "etc/nftables.d")
+
+
 def _atomic_write(path: pathlib.Path, content: str, mode: int,
                   uid: int, gid: int) -> bool:
     """Write only when bytes differ.  Never chmod/chown through a symlink."""
@@ -357,35 +400,38 @@ WantedBy=multi-user.target
 
 def render_files(m: ApplianceManifest, *,
                  prefix: pathlib.Path = DEFAULT_PREFIX,
-                 etc: pathlib.Path = DEFAULT_ETC) -> Plan:
+                 etc: pathlib.Path = DEFAULT_ETC,
+                 layout: Layout | None = None) -> Plan:
+    lay = layout or default_layout(prefix=prefix, etc=etc)
     files = [
-        RenderedFile(etc / "appliance-manifest.json",
+        RenderedFile(lay.etc / "appliance-manifest.json",
                      json.dumps(m.raw, indent=2, sort_keys=True) + "\n", 0o644),
-        RenderedFile(etc / "appliance-policy.json", render_policy(m), 0o644),
-        RenderedFile(etc / "control-plane.derived.env",
-                     render_control_env(m, etc=etc, prefix=prefix),
+        RenderedFile(lay.etc / "appliance-policy.json", render_policy(m), 0o644),
+        RenderedFile(lay.etc / "control-plane.derived.env",
+                     render_control_env(m, etc=lay.etc, prefix=lay.prefix),
                      0o640, "root", "srrange"),
-        RenderedFile(etc / "broker.env", render_broker_env(m, etc=etc),
+        RenderedFile(lay.etc / "broker.env",
+                     render_broker_env(m, etc=lay.etc),
                      0o640, "root", "sr-broker-clients"),
-        RenderedFile(etc / "worker-supervisor.env",
-                     render_supervisor_env(m, etc=etc, prefix=prefix),
+        RenderedFile(lay.etc / "worker-supervisor.env",
+                     render_supervisor_env(m, etc=lay.etc, prefix=lay.prefix),
                      0o640, "root", "srworker"),
-        RenderedFile(pathlib.Path("/etc/systemd/network/10-srlab.netdev"),
+        RenderedFile(lay.network_dir / "10-srlab.netdev",
                      render_networkd(m).split("\n\n", 1)[0] + "\n", 0o644),
-        RenderedFile(pathlib.Path("/etc/systemd/network/20-srlab.network"),
+        RenderedFile(lay.network_dir / "20-srlab.network",
                      render_networkd(m).split("\n\n", 1)[1], 0o644),
-        RenderedFile(pathlib.Path("/etc/nftables.d/sr-appliance.nft"),
+        RenderedFile(lay.nftables_dir / "sr-appliance.nft",
                      render_nftables(m), 0o644),
-        RenderedFile(pathlib.Path("/etc/systemd/system/sr-appliance-broker.service"),
-                     render_broker_unit(m, etc=etc, prefix=prefix), 0o644),
-        RenderedFile(pathlib.Path("/etc/systemd/system/sr-appliance-ingest.service"),
-                     render_ingest_unit(m, etc=etc, prefix=prefix), 0o644),
-        RenderedFile(pathlib.Path("/etc/systemd/system/sr-worker-supervisor.service"),
+        RenderedFile(lay.units_dir / "sr-appliance-broker.service",
+                     render_broker_unit(m, etc=lay.etc, prefix=lay.prefix), 0o644),
+        RenderedFile(lay.units_dir / "sr-appliance-ingest.service",
+                     render_ingest_unit(m, etc=lay.etc, prefix=lay.prefix), 0o644),
+        RenderedFile(lay.units_dir / "sr-worker-supervisor.service",
                      _unit_from_template("sr-worker-supervisor.service"),
                      0o644),
-        RenderedFile(pathlib.Path("/etc/systemd/system/sr-api.service"),
+        RenderedFile(lay.units_dir / "sr-api.service",
                      _unit_from_template("sr-api.service"), 0o644),
-        RenderedFile(pathlib.Path("/etc/systemd/system/sr-bastion.service"),
+        RenderedFile(lay.units_dir / "sr-bastion.service",
                      _unit_from_template("sr-bastion.service"), 0o644),
     ]
     actions = [
@@ -424,7 +470,10 @@ class Runner:
 
     def __call__(self, *cmd: str, check: bool = True) -> subprocess.CompletedProcess:
         printable = " ".join(str(c) for c in cmd)
-        print(("DRY: " if self.dry_run else "$ ") + printable, flush=True)
+        # Progress belongs on stderr: stdout carries the machine-readable
+        # result of the command.
+        print(("DRY: " if self.dry_run else "$ ") + printable, file=sys.stderr,
+              flush=True)
         if self.dry_run:
             return subprocess.CompletedProcess(list(cmd), 0, "", "")
         r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True)
@@ -458,7 +507,7 @@ def _ids(name: str) -> tuple[int, int]:
     return pw.pw_uid, pw.pw_gid
 
 
-def _ensure_dirs(m: ApplianceManifest, run: Runner) -> None:
+def _ensure_dirs(m: ApplianceManifest, run: Runner, lay: Layout) -> None:
     for path, mode, user, group in (
             (pathlib.Path(m.state_dir), 0o750, "srrange", "srrange"),
             (pathlib.Path(m.images_dir), 0o755, "root", "root"),
@@ -466,14 +515,20 @@ def _ensure_dirs(m: ApplianceManifest, run: Runner) -> None:
             (pathlib.Path(m.secrets_dir), 0o700, "root", "root"),
             (pathlib.Path(m.broker_ledger).parent, 0o750, "srbroker",
              "sr-broker-clients"),
-            (DEFAULT_RUN, 0o750, "srbroker", "sr-broker-clients"),
-            (DEFAULT_ETC / "tls", 0o755, "root", "root"),
-            (DEFAULT_ETC / "ssh", 0o750, "root", "srbastion")):
-        run("install", "-d", "-m", oct(mode)[2:], "-o", user, "-g", group,
-            str(path))
+            (lay.run, 0o750, "srbroker", "sr-broker-clients"),
+            (lay.etc / "tls", 0o755, "root", "root"),
+            (lay.etc / "ssh", 0o750, "root", "srbastion")):
+        if lay.sandboxed:
+            # A sandbox install cannot create system identities; the mode is
+            # still enforced so the receipt describes the intended layout.
+            run("install", "-d", "-m", oct(mode)[2:], str(path))
+        else:
+            run("install", "-d", "-m", oct(mode)[2:], "-o", user, "-g", group,
+                str(path))
 
 
-def _write_files(files: list[RenderedFile], run: Runner) -> list[str]:
+def _write_files(files: list[RenderedFile], run: Runner,
+                 lay: Layout) -> list[str]:
     changed = []
     for f in files:
         uid, gid = _ids(f.owner)
@@ -482,8 +537,11 @@ def _write_files(files: list[RenderedFile], run: Runner) -> list[str]:
                 gid = grp.getgrnam(f.group).gr_gid
             except KeyError:
                 gid = _ids(f.owner)[1]
+        if lay.sandboxed:
+            uid = gid = os.getuid()
         if run.dry_run:
-            print(f"DRY: write {oct(f.mode)} {f.owner}:{f.group} {f.path}")
+            print(f"DRY: write {oct(f.mode)} {f.owner}:{f.group} {f.path}",
+                  file=sys.stderr)
             changed.append(str(f.path))
             continue
         if _atomic_write(f.path, f.content, f.mode, uid, gid):
@@ -491,7 +549,8 @@ def _write_files(files: list[RenderedFile], run: Runner) -> list[str]:
     return changed
 
 
-def _ensure_supervisor_token(etc: pathlib.Path, run: Runner) -> str:
+def _ensure_supervisor_token(etc: pathlib.Path, run: Runner,
+                             lay: Layout) -> str:
     path = etc / "secrets/worker-supervisor.token"
     if path.exists():
         text = path.read_text().strip()
@@ -500,41 +559,78 @@ def _ensure_supervisor_token(etc: pathlib.Path, run: Runner) -> str:
                                "explicitly rather than silently replacing it")
         return "preserved"
     if run.dry_run:
-        print(f"DRY: generate {path} (0600 srworker)")
+        print(f"DRY: generate {path} (0600 srworker)", file=sys.stderr)
         return "would create"
     path.parent.mkdir(parents=True, exist_ok=True)
     token = secrets.token_urlsafe(48)
-    uid, _ = _ids("srworker")
+    uid = os.getuid() if lay.sandboxed else _ids("srworker")[0]
     _atomic_write(path, token + "\n", 0o600, uid, uid)
     return "created"
+
+
+def _receipt(m: ApplianceManifest, plan: Plan, lay: Layout) -> dict:
+    """A digest-only record of what the installation consists of.
+
+    It contains NO secret: the worker capability is recorded as a digest, and
+    the file digests are what the install gate compares against to prove a
+    rerun changed nothing and a repair restored exactly what was intended.
+    """
+    import hashlib
+
+    def sha(text: str) -> str:
+        return hashlib.sha256(text.encode()).hexdigest()
+
+    files = {}
+    for f in plan.files:
+        files[str(f.path)] = {"sha256": sha(f.content), "mode": f"{f.mode:04o}"}
+    token_path = lay.etc / "secrets/worker-supervisor.token"
+    receipt = {
+        "installation_id": m.installation_id,
+        "manifest_sha256": sha(json.dumps(m.raw, indent=2, sort_keys=True)),
+        "policy_sha256": sha(render_policy(m)),
+        "files": files,
+    }
+    if token_path.exists():
+        receipt["supervisor_token_sha256"] = sha(token_path.read_text())
+    return receipt
 
 
 def apply_plan(m: ApplianceManifest, plan: Plan, *,
                prefix: pathlib.Path = DEFAULT_PREFIX,
                etc: pathlib.Path = DEFAULT_ETC,
+               layout: Layout | None = None,
                dry_run: bool = False) -> dict:
+    lay = layout or default_layout(prefix=prefix, etc=etc)
     run = Runner(dry_run=dry_run)
-    if not dry_run and os.geteuid() != 0:
-        raise InstallError("apply requires root (use --dry-run for a plan)")
-    if not (prefix / ".venv/bin/python").exists() and not dry_run:
-        raise InstallError(f"appliance venv missing at {prefix}/.venv; "
+    if not dry_run and not lay.sandboxed and os.geteuid() != 0:
+        raise InstallError("apply requires root (use --dry-run for a plan, "
+                           "or --system-root for a sandbox installation)")
+    if not dry_run and not lay.sandboxed \
+            and not (lay.prefix / ".venv/bin/python").exists():
+        raise InstallError(f"appliance venv missing at {lay.prefix}/.venv; "
                            "install the locked project first")
-    for g in GROUPS:
-        _ensure_group(g, run)
-    for user, (group, extras) in USERS.items():
-        _ensure_user(user, group, run)
-        for extra in extras:
-            run("usermod", "-a", "-G", extra, user, check=False)
-    _ensure_dirs(m, run)
-    token_action = _ensure_supervisor_token(etc, run)
-    changed = _write_files(plan.files, run)
-    run("systemctl", "daemon-reload", check=False)
-    run("systemd-sysctl", check=False)
-    # Network artifacts are installed but not applied to the host by this
-    # command: the operator applies them during the approved maintenance
-    # window after reviewing the generated rules.
-    for unit in plan.units:
-        run("systemctl", "enable", unit, check=False)
+    if not lay.sandboxed:
+        for g in GROUPS:
+            _ensure_group(g, run)
+        for user, (group, extras) in USERS.items():
+            _ensure_user(user, group, run)
+            for extra in extras:
+                run("usermod", "-a", "-G", extra, user, check=False)
+    _ensure_dirs(m, run, lay)
+    token_action = _ensure_supervisor_token(lay.etc, run, lay)
+    changed = _write_files(plan.files, run, lay)
+    receipt = _receipt(m, plan, lay)
+    if not dry_run:
+        _atomic_write(lay.receipt, json.dumps(receipt, indent=2, sort_keys=True)
+                      + "\n", 0o644, os.getuid(), os.getgid())
+    if not lay.sandboxed:
+        run("systemctl", "daemon-reload", check=False)
+        run("systemd-sysctl", check=False)
+        # Network artifacts are installed but not applied to the host by this
+        # command: the operator applies them during the approved maintenance
+        # window after reviewing the generated rules.
+        for unit in plan.units:
+            run("systemctl", "enable", unit, check=False)
     return {"changed": changed, "supervisor_token": token_action,
             "dry_run": dry_run}
 
@@ -726,8 +822,95 @@ def recovery_resolve(m: ApplianceManifest, policy: AppliancePolicy,
 # CLI                                                                         #
 # --------------------------------------------------------------------------- #
 
+def _under_root(path: str, root: pathlib.Path) -> str:
+    """Map an absolute manifest path into the installation root.
+
+    A sandbox installation must not create anything on the host, so every
+    absolute path the manifest names (state, images, recordings, secrets,
+    ledger, broker socket) is re-rooted.  The manifest itself is untouched:
+    the operator's file keeps describing the real appliance.
+    """
+    p = pathlib.Path(path)
+    if not p.is_absolute():
+        return path
+    return str(root / p.relative_to("/"))
+
+
+def sandbox_manifest(m: ApplianceManifest, root: pathlib.Path) -> ApplianceManifest:
+    """A copy of the manifest whose absolute paths live under ``root``."""
+    if root == pathlib.Path("/"):
+        return m
+    import dataclasses
+    return dataclasses.replace(
+        m,
+        broker_socket=_under_root(m.broker_socket, root),
+        broker_ledger=_under_root(m.broker_ledger, root),
+        state_dir=_under_root(m.state_dir, root),
+        images_dir=_under_root(m.images_dir, root),
+        recordings_dir=_under_root(m.recordings_dir, root),
+        secrets_dir=_under_root(m.secrets_dir, root),
+    )
+
+
+def verify_install(m: ApplianceManifest, layout: Layout) -> dict:
+    """Compare the installed files with the install receipt.
+
+    The receipt is written by ``apply`` and records the digest and mode of
+    every file the installation owns.  A later verification therefore answers
+    "is what is on disk still exactly what was installed?" without trusting a
+    flag, a timestamp or an environment assertion.
+    """
+    import hashlib
+    receipt_path = layout.receipt
+    if not receipt_path.exists():
+        return {"ok": False, "error": f"no install receipt at {receipt_path}",
+                "drift": []}
+    try:
+        receipt = json.loads(receipt_path.read_text())
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": f"install receipt unreadable: {exc}",
+                "drift": []}
+    drift: list[dict] = []
+    for path, expect in sorted(receipt.get("files", {}).items()):
+        p = pathlib.Path(path)
+        if not p.exists():
+            drift.append({"path": path, "problem": "missing"})
+            continue
+        actual = hashlib.sha256(p.read_bytes()).hexdigest()
+        if actual != expect["sha256"]:
+            drift.append({"path": path, "problem": "content",
+                          "expected": expect["sha256"], "actual": actual})
+            continue
+        mode = f"{p.stat().st_mode & 0o777:04o}"
+        if mode != expect["mode"]:
+            drift.append({"path": path, "problem": "mode",
+                          "expected": expect["mode"], "actual": mode})
+    return {"ok": not drift, "drift": drift,
+            "files": len(receipt.get("files", {})),
+            "manifest_sha256": receipt.get("manifest_sha256")}
+
+
+def _layout(args) -> Layout:
+    """The installation layout for the requested (possibly sandboxed) root."""
+    root = pathlib.Path(getattr(args, "system_root", "/"))
+    prefix = getattr(args, "prefix", None)
+    etc = getattr(args, "etc", None)
+    if prefix and pathlib.Path(prefix).is_absolute() and root != pathlib.Path("/"):
+        # an explicit absolute prefix stays outside the sandbox only when the
+        # operator asked for it; a sandbox keeps everything under its root.
+        prefix = None
+    if etc and pathlib.Path(etc).is_absolute() and root != pathlib.Path("/"):
+        etc = None
+    return default_layout(root=root, prefix=prefix, etc=etc)
+
+
 def _load(args) -> tuple[ApplianceManifest, AppliancePolicy]:
-    m = ApplianceManifest.load(args.manifest, verify_images=args.verify_images)
+    # Applying or upgrading the appliance ALWAYS verifies the base image
+    # digests: a drifted image must be refused before any effect, not
+    # discovered later when a guest is cloned from it.
+    verify = bool(getattr(args, "verify_images", False)) or \
+        getattr(args, "cmd", "") in ("apply", "upgrade")
+    m = ApplianceManifest.load(args.manifest, verify_images=verify)
     if args.policy:
         p = AppliancePolicy.load(args.policy)
     else:
@@ -746,6 +929,10 @@ def main(argv: list[str] | None = None) -> int:
                                        "from the manifest)")
         p.add_argument("--verify-images", action="store_true",
                        help="hash every base image before acting")
+        p.add_argument("--system-root", default="/",
+                       help="filesystem root the installation is applied to; "
+                            "any other root is a SANDBOX (no root, no system "
+                            "identities, nothing outside that root is touched)")
 
     pv = sub.add_parser("validate")
     common(pv)
@@ -762,6 +949,10 @@ def main(argv: list[str] | None = None) -> int:
     pa.add_argument("--prefix", default=str(DEFAULT_PREFIX))
     pa.add_argument("--etc", default=str(DEFAULT_ETC))
     pa.add_argument("--dry-run", action="store_true")
+
+    pvf = sub.add_parser("verify")
+    common(pvf)
+    pvf.add_argument("--json", action="store_true")
 
     ps = sub.add_parser("status")
     common(ps)
@@ -803,8 +994,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"manifest/policy valid: {m.installation_id} "
                       f"{m.network.range_cidr} broker {m.broker_socket}")
         elif args.cmd == "plan":
-            plan = render_files(m, prefix=pathlib.Path(args.prefix),
-                                etc=pathlib.Path(args.etc))
+            lay = _layout(args)
+            plan = render_files(sandbox_manifest(m, lay.root), layout=lay)
             if args.json:
                 print(json.dumps({"actions": plan.actions,
                                   "files": [{"path": str(f.path),
@@ -813,29 +1004,38 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(plan_document(plan, m), end="")
         elif args.cmd == "apply":
-            plan = render_files(m, prefix=pathlib.Path(args.prefix),
-                                etc=pathlib.Path(args.etc))
-            out = apply_plan(m, plan, prefix=pathlib.Path(args.prefix),
-                             etc=pathlib.Path(args.etc), dry_run=args.dry_run)
+            lay = _layout(args)
+            sm = sandbox_manifest(m, lay.root)
+            plan = render_files(sm, layout=lay)
+            out = apply_plan(sm, plan, layout=lay, dry_run=args.dry_run)
             print(json.dumps(out, indent=2, sort_keys=True))
         elif args.cmd == "upgrade":
             # Re-render config/units and run forward migrations; data, keys and
             # the ledger are never deleted or recreated.
-            for f in render_files(m, prefix=pathlib.Path(args.prefix),
-                                  etc=pathlib.Path(args.etc)).files:
-                if f.path.name == "worker-supervisor.token":
-                    continue
-            plan = render_files(m, prefix=pathlib.Path(args.prefix),
-                                etc=pathlib.Path(args.etc))
-            out = apply_plan(m, plan, prefix=pathlib.Path(args.prefix),
-                             etc=pathlib.Path(args.etc), dry_run=args.dry_run)
-            run = Runner(dry_run=args.dry_run)
-            run("systemctl", "restart", "sr-appliance-broker.service",
-                "sr-api.service", "sr-appliance-ingest.service",
-                "sr-worker-supervisor.service", "sr-bastion.service",
-                check=False)
+            lay = _layout(args)
+            sm = sandbox_manifest(m, lay.root)
+            plan = render_files(sm, layout=lay)
+            out = apply_plan(sm, plan, layout=lay, dry_run=args.dry_run)
+            if not lay.sandboxed:
+                run = Runner(dry_run=args.dry_run)
+                run("systemctl", "restart", "sr-appliance-broker.service",
+                    "sr-api.service", "sr-appliance-ingest.service",
+                    "sr-worker-supervisor.service", "sr-bastion.service",
+                    check=False)
             out["upgrade"] = "config/units re-rendered; data and keys preserved"
             print(json.dumps(out, indent=2, sort_keys=True))
+        elif args.cmd == "verify":
+            lay = _layout(args)
+            out = verify_install(sandbox_manifest(m, lay.root), lay)
+            if args.json:
+                print(json.dumps(out, indent=2, sort_keys=True))
+            else:
+                for d in out.get("drift", []):
+                    print(f"[DRIFT] {d['path']}: {d['problem']}")
+                print("install verified" if out.get("ok")
+                      else f"install drift: {len(out.get('drift', []))} file(s)")
+            if not out.get("ok"):
+                return 1
         elif args.cmd == "status":
             status(m, as_json=args.json)
         elif args.cmd == "doctor":

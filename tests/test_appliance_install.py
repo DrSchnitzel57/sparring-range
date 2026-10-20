@@ -143,7 +143,12 @@ def test_cli_plan_is_idempotent_and_apply_dry_run_has_no_effect(tmp_path):
          "--etc", str(tmp_path / "etc"), "--dry-run"],
         capture_output=True, text=True, cwd=REPO, env=env)
     assert dry.returncode == 0, (dry.stdout + dry.stderr)[-1200:]
-    assert "DRY:" in dry.stdout
+    # stdout carries the machine-readable result; the progress goes to stderr.
+    assert "DRY:" in dry.stderr
+    result = json.loads(dry.stdout)
+    assert result["dry_run"] is True
+    assert result["supervisor_token"] == "would create"
+    assert result["changed"], result
     assert not prefix.exists() and not (tmp_path / "etc").exists()
 
 
