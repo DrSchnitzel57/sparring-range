@@ -180,7 +180,12 @@ class LibvirtBackend:
         if dom is None:
             return None
         return {"vmid": int(vmid), "name": desc.get("name") or dom.name(),
-                "node": node, "state": "running" if dom.isActive() else "stopped"}
+                "node": node, "state": "running" if dom.isActive() else "stopped",
+                # The domain's own immutable identity.  The VMID is the
+                # broker's durable key, but a recreated domain would reuse the
+                # VMID: the UUID is what proves the exact guest is the one
+                # this deployment created.
+                "domain_uuid": self._domain_uuid(dom)}
 
     def lookup_config(self, node: str, vmid: int):
         dom, desc = self._find(int(vmid), node)
@@ -193,6 +198,14 @@ class LibvirtBackend:
             return self.lookup_config(node, vmid)
         except BackendUnavailable as exc:
             return {"_unavailable": str(exc)}
+
+    @staticmethod
+    def _domain_uuid(dom) -> str:
+        """The libvirt domain UUID — the guest's own immutable identity."""
+        try:
+            return str(dom.UUID())
+        except Exception:  # noqa: BLE001 — an unreadable UUID is unknown
+            return ""
 
     def _config_from(self, dom, desc: dict) -> dict:
         try:
@@ -209,7 +222,8 @@ class LibvirtBackend:
                "ipconfig0": desc.get("ipconfig0", ""),
                "tags": desc.get("tags", ""), "vmid": int(desc["vmid"]),
                "role": desc.get("role", ""), "generation": desc.get("generation"),
-               "session_id": desc.get("session_id")}
+               "session_id": desc.get("session_id"),
+               "domain_uuid": self._domain_uuid(dom)}
         if ifdesc is None:
             cfg["_unavailable"] = "domain has no network interface"
         return cfg
@@ -322,9 +336,27 @@ class LibvirtBackend:
         root.mkdir(parents=True, exist_ok=True)
         return root / str(int(vmid))
 
+    def _backing_size_gb(self, image: ImageSpec) -> int:
+        """The base image's virtual size in GiB (0 when it cannot be read)."""
+        try:
+            p = subprocess.run(
+                [self.cfg.qemu_img, "info", "--output=json", image.path],
+                capture_output=True, text=True, timeout=120)
+            if p.returncode != 0:
+                return 0
+            return int(int(json.loads(p.stdout)["virtual-size"]) // (1024 ** 3))
+        except Exception:  # noqa: BLE001 — a smaller overlay is the failure
+            return 0
+
     def _overlay(self, image: ImageSpec, overlay: pathlib.Path) -> None:
+        # The overlay must never be SMALLER than its backing image: a smaller
+        # qcow2 truncates the partition table, the guest cannot find its root
+        # filesystem and drops to an initramfs shell.  The guest therefore
+        # sees at least the base's size, and the manifest's disk budget is a
+        # floor, not a ceiling on an existing image.
+        size_gb = max(int(image.disk_gb), self._backing_size_gb(image))
         cmd = [self.cfg.qemu_img, "create", "-f", "qcow2", "-F", "qcow2",
-               "-b", image.path, str(overlay), f"{image.disk_gb}G"]
+               "-b", image.path, str(overlay), f"{size_gb}G"]
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         except (OSError, subprocess.TimeoutExpired) as exc:

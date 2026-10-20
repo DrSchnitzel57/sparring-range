@@ -235,3 +235,33 @@ def test_network_artifacts_are_isolated_and_fixed(tmp_path):
     assert "Name=srlab0" in netdev
     assert "IPMasquerade=no" in netdev
     assert f"Address={m.network.controller_range_ip}/{m.network.range_cidr.prefixlen}" in netdev
+
+
+def test_overlay_is_never_smaller_than_its_base(tmp_path, monkeypatch):
+    """A qcow2 overlay smaller than its backing file truncates the partition
+    table: the guest then cannot find root=LABEL=... and drops to an
+    initramfs shell.  The overlay therefore inherits at least the base's
+    virtual size, and the manifest's disk budget is a floor."""
+    from infra.appliance.backend import BackendConfig, LibvirtBackend
+    from infra.appliance.policy import AppliancePolicy
+
+    m = ApplianceManifest.from_dict(_manifest(tmp_path), verify_images=True)
+    policy = AppliancePolicy.from_manifest(m)
+    base = pathlib.Path(m.image_for_role("attacker").path)
+    base.write_bytes(b"fake-image")
+
+    calls = []
+
+    def fake_qemu_img(args, **kwargs):
+        calls.append(args)
+        if args[1] == "info":
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps({"virtual-size": 12 * 1024 ** 3}), "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_qemu_img)
+    backend = LibvirtBackend(m, policy, BackendConfig(fixture_mode=True))
+    backend._overlay(m.image_for_role("attacker"), tmp_path / "disk.qcow2")
+    create = [c for c in calls if c[1] == "create"]
+    assert create, calls
+    assert create[0][-1] == "12G", create[0]
