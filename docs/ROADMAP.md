@@ -4,6 +4,100 @@ Design: [ARCHITECTURE.md](ARCHITECTURE.md). Baseline/open evidence:
 [FINDINGS_CHECKLIST.md](FINDINGS_CHECKLIST.md). Operator work:
 [OPERATOR_RUNBOOK.md](OPERATOR_RUNBOOK.md).
 
+## Current completion sequence — draft 2026-10-20
+
+User-approved direction: a complete individual-practice product in **one Ubuntu
+appliance using KVM/libvirt for nested full lab VMs**, with a separate local broker
+service and no outer-Proxmox credentials. No deadline-driven scope reductions.
+The user authorized planning the full sequence together;
+the three plans below await approval before implementation. Their numbers follow
+plan 13 and are completion milestones, not a renumbering of historical 01–12.
+Tests were deferred by the user; this planning pass supplies no new acceptance.
+
+- [ ] **14 — Nested appliance foundation and working SSH.**
+  [Plan](../.openchamber/plans/14-nested-appliance-foundation.md).
+  Deliver the minimal real appliance installer, libvirt broker, isolated network,
+  clean guest images, actual member SSH/replay and recoverable resource lifecycle.
+  **Promotion gate:** independent automated hypervisor/access/install proofs AND an operator
+  fresh-launch → member SSH/sudo/reconnect/replay → cleanup → second-fresh-launch
+  rehearsal with real nested KVM/isolation/stop. The user's deployed SSH has not
+  worked; a ready flag cannot close it. No attacks are needed for this milestone.
+- [ ] **15 — Complete integrated individual practice.**
+  [Plan](../.openchamber/plans/15-complete-practice-product.md).
+  Complete both presets, durable lifecycle, honest service/inject/security results,
+  sustained AI behavior under a distinct worker identity, browser/CLI authorization,
+  reports and history. Reuse
+  existing functionality; repair missing end-to-end behavior rather than rebuild.
+- [ ] **16 — Installable appliance and qualified release.**
+  [Plan](../.openchamber/plans/16-appliance-release.md).
+  Finish the checksummed release bundle, upgrade/history-import/recovery tooling
+  and operator guide; prove the complete software matrix at a pinned candidate,
+  then collect operator/human acceptance. Backup destination/live restore remain
+  optional. Runtime practice features and their tests are delivered in 15.
+
+Three milestones are the minimum useful split: an accessible/recoverable platform,
+a complete practice product, then a qualified release. Each has internal coding
+checkpoints and its own tests. Implement one at a time on a user-selected
+non-default branch; commit coherent changes, never push. Reviewers run the relevant
+gates independently. Any requirement not met stays open, regardless of plan ticks.
+
+### Carry-forward map (no requirements silently dropped)
+
+| Existing contract | Completion owner |
+|---|---|
+| Plan 13 phase 1: manifest, settings, baseline, amendments | 14; final reconciliation 16 |
+| Phase 2: authority, deadlines, ownership and cessation | 14, translated to libvirt/Unix-UID contracts; old PVE ACL/UPID work superseded |
+| Phase 3: role-separated pinned artifacts, runner, guest identities/data | 14 access prerequisites; 15 both-preset installed behavior |
+| Phase 4: trust, role config, network planes, capture/readiness | 14; local broker socket replaces remote mTLS, public/ingest HTTPS retained |
+| Phase 5: durable async deploy/recovery | 14 deployment; 15 match/finalization integration |
+| Phase 6: controls, probes, injects, attacker | 15 |
+| Phase 7: browser, visibility, reports | 14 connection/diagnostic UI; 15 complete journey |
+| Phase 8: real installer, consolidation, persistence, backup/restore tools | 14 minimal working appliance install; 16 bundle/upgrade/import/recovery |
+| Phase 9 and criteria 1–10: final matrix, live/human proof, documents | Per-milestone tests plus 16 final evidence; live SSH is an earlier 14 gate |
+| Original 03/04 separate image/capture acceptance | Separate gates in 14/15/16; never collapsed into a single image claim |
+| Original 05–09 functional acceptance | 15, confirmed by 16 release evidence |
+| Original 10–11 operational/live acceptance | 14 and 16; original checkboxes require their own evidence |
+
+### Explicit substitutions, not hidden scope cuts
+
+The architecture's [appliance contract](ARCHITECTURE.md#ubuntu-kvm-appliance--2026-10-20)
+is authoritative for the new backend. Plan 13's product/evidence/failure requirements
+carry forward, but its PVE-specific mechanisms are replaced as follows:
+
+| Old mechanism / acceptance | New equivalent |
+|---|---|
+| Separate service VMs + broker mTLS | Appliance service UIDs, private peer-authenticated broker socket, local cast storage |
+| PVE token/ACL/VMIDs/UPIDs/template import | Typed libvirt domain UUID/owned overlay operations, durable intent and read-back; no outer authority |
+| PVE range bridge/VLAN | Operator-installed inner bridge + appliance host-input/forward/bridge filtering |
+| PVE guest-agent FileRead pin | Fixed domain-bound QGA read-only key/first-boot operations; identical no-TOFU/generation invariants |
+| `pve-contract` mandatory release gate | `hypervisor` actual libvirt/KVM plus `authority` UID/policy/ledger gate; legacy tests retained as appropriate |
+| Full/linked PVE clone alternatives | One immutable flattened base + fresh per-generation qcow2 overlay mode |
+| Appliance-specific keys baked into templates | Public keys injected into typed per-instance seed; no private keys or live capabilities in image/seed |
+| Deleted-installation assumption | Preserve/discover old VMs; import closed history only; operator reconciles/retires old infrastructure |
+
+No old plan is retrospectively marked complete. Historical 03–11 checkboxes can
+close only with recorded equivalent appliance evidence, explicitly naming changed
+mechanisms; there is no need to reimplement the superseded PVE design to tick them.
+No automatic PVE ACL maintenance task or separate broker VM belongs to this plan.
+
+### Execution and handoff
+
+1. Review/approve these drafts, then commit the agreed documentation on master.
+2. User selects the implementation branch. Start 14; inspect current code and
+   reproduce safe baselines then, recording genuine failures before repairs.
+3. Finish each plan's internal steps with coherent commits, exact test evidence
+   and an acceptance table. No speculative future-milestone changes.
+4. Operator supplies the manual 14 promotion evidence. Models do not run live
+   host changes or infer success from old notes. Resume 15 only after that gate.
+5. Complete 15, then 16. Failed proof stays open; narrow fixes return to their
+   owning modules and rerun affected gates, not a new open-ended remediation plan.
+
+## Historical release milestones and acceptance ledger
+
+The sections below preserve the original sequence and evidence. Statements about
+then-missing code are historical, not a fresh inventory; use the completion
+sequence above and current findings to direct new work.
+
 These are **new release milestones**, not retroactive completion of the old
 M0–M7 plan. Milestone 01 is accepted (reopened by independent review, then
 closed by the repair round recorded in the findings).

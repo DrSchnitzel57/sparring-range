@@ -1,5 +1,64 @@
 # Current findings and validation evidence
 
+## Current planning assessment — 2026-10-20
+
+Source-inspected at `933f6a1`, clean `master`, equal to `origin/master`.
+User selected a **single Ubuntu/KVM appliance with nested full VMs**, retaining
+full individual-practice scope with no deadline-driven cuts. Draft plans 14–16
+and the architecture's appliance section describe the completion sequence.
+
+**No new test acceptance:** the user deferred tests and cancelled the started
+fast suite. Cancellation is not a test failure. Existing counts below remain
+historical and revision-bound; implementation must reproduce its own baseline.
+
+**User-reported deployment blocker:** member SSH has not worked successfully.
+Do not close this from the pin-fix claims below. Knowledge-panel field notes say
+the old clones were destroyed; current inventory needs operator discovery, and
+the next proof is a fresh deployment and real member login, not assumed resume.
+
+Source-inspected remaining work (not claims of reproduced live behavior):
+
+- `infra/broker/ledger.py::resolve_obligation` has no production callers;
+  `service.py::release_latch` refuses open obligations. Add evidence-based,
+  broker-local recovery including destroyed claims and foreign VMID handling.
+- `deploy/install.sh` is a partial control-plane installer: it prints migration/
+  backup instructions, enables only API/ingest and lacks complete web/DB/bastion/
+  broker bootstrap. Its renderer duplicates `infra/release_manifest.py`.
+- `deploy/systemd/` has no web unit; the separate deployed bastion described in
+  field notes complicates the local-file recording contract in `web_routes.py`.
+  Consolidation requires preservation/migration, not deletion of that installation.
+- Bastion production dial still has a local-file pin fallback. The complete
+  member → capability/API → pinned guest → recording/replay path needs one
+  production contract and actual service-identity diagnostics.
+- `rangectl/commands/db.py` derives the migration root from package location;
+  non-editable installation layout needs explicit support.
+- `infra/dev/acceptance.py::check_install` accepts the managed-service half from
+  an environment assertion; it does not execute that VM sequence. The live
+  release suite's HTTP checks do not establish all advertised SSH, actual
+  service repair, model/scorer failure, replay-byte or mode-matrix behavior.
+- API startup swallows controller-loop initialization failures. Controller
+  singleton/health and a minimal separate ingest application need an explicit
+  contract rather than additional full-app configuration combinations.
+- `deploy/pve_broker_acl.sh` documents grants disappearing on VM deletion.
+  The selected appliance removes that dependency; do not implement the discarded
+  intermediate proposal for automatic outer-PVE ACL repair.
+- Current-state prose is inconsistent with later evidence; the operator runbook
+  even contains committed conflict markers. Preserve historical evidence while
+  making current commands/status unambiguous in milestone 14.
+
+Plans 14–16 inherit unresolved plan-13 requirements. A successful SSH check alone
+does not accept plan 13 step 9 or the full release. Real isolation/emergency-stop
+proof must still precede attacks. Backups remain optional/non-blocking but their
+tooling and truthful status remain required.
+
+The new libvirt adapter, domain-bound key acquisition, appliance installer,
+role-isolated worker and actual nested-KVM/access acceptance do **not** exist yet.
+The roadmap explicitly replaces PVE-only mechanisms/gates while carrying forward
+their ownership, cessation, trust and failure invariants. Do not present existing
+PVE test results as acceptance of the new architecture.
+
+## Historical evidence (revision-bound)
+
 Updated: 2026-10-08. Application revision inspected/tested: **`23de4f4`**
 (planning baseline); milestone-01 implementation evidence recorded at **`ac5a61b`**.
 Release contract: [ARCHITECTURE.md](ARCHITECTURE.md); ordered work:

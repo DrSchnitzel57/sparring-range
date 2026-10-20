@@ -1,6 +1,10 @@
 # Architecture — Linux-first CCDC practice release
 
 Status: **agreed release design, not a claim of implemented or deployed behavior**.
+**Current direction: Ubuntu/KVM appliance, selected by the user 2026-10-20.**
+Read [the appliance contract](#ubuntu-kvm-appliance--2026-10-20) first. It overrides
+older direct-Proxmox deployment decisions below; retained release features and
+safety invariants still apply. Plans 14–16 are implementation drafts awaiting approval.
 Agreed 2026-10-08. Application baseline: `23de4f4`.
 
 Read [ROADMAP.md](ROADMAP.md) for implementation order,
@@ -490,7 +494,378 @@ over older prose in this document and the runbook.
 | Durable `deploy_operations` rows (identity, fence, phase, deadline committed before effects) + startup reconcile to `interrupted` before claims clear; redacted polling endpoint WITH the completed result. Lifecycle routes return **202** after synchronous durable acceptance (claim + row + lease/preconditions); the supervised executor (`deploy_executor.py`, own DB session, fence-owned) runs deploy/reset + readiness + capabilities, records redacted outcomes (plaintext enrollments NEVER persist), and always releases the claim — a lost response or restart can neither duplicate a deployment nor erase the first attempt | Fire-and-forget synchronous launches whose evidence dies with the response; a half-built async executor changing every client contract in one step | A lost response or restart must never duplicate a deployment or erase the first attempt — that is the safety property; non-blocking UX adds no safety and can land later without migration |
 | `install`/`release` gates FAIL without their real fixtures (service VM / deployed lab); sandbox passes are reported as sandbox passes | Accepting a sandbox or a skip as release acceptance | Green must mean the contract ran; prerequisite absence is a loud failure, never a pass |
 
-## Risks and explicitly unverified inputs
+## Ubuntu/KVM appliance — 2026-10-20
+
+### Status, goal and precedence
+
+The user selected **option 2: one Ubuntu VM running KVM/libvirt and the product**,
+and authorized a full start-to-finish plan with the fewest manageable milestones.
+This supersedes direct-PVE provisioning, the separate broker VM, remote broker
+mTLS, per-PVE-VMID ACL maintenance and an outer range VLAN for this release.
+The detailed design below and plans 14–16 are drafts for approval; choosing the
+architecture does not authorize code on master or live infrastructure changes.
+
+Discovery: `933f6a1`, initially clean master equal to origin/master. Source was
+inspected; tests were deferred by the user and the started baseline cancelled.
+**Deployed member SSH has never worked successfully**, per the user. Fix commits,
+old test totals and ready flags do not prove access. First prove a fresh nested
+guest through the real member/bastion/replay chain, then a second fresh deployment.
+
+Complete individual practice remains the product: one active environment, two
+Linux presets, all match options, real services, AI attacks, injects, three
+separate verified score components, recorded SSH, coaching and persistent history.
+No deadline-driven feature cuts. Shared-team sessions, concurrent ranges,
+Windows/AD, public hosting, browser terminals and extra scenarios remain later work.
+
+### Decisions and why
+
+| Chosen | Rejected / deferred | Why |
+|---|---|---|
+| One Ubuntu 24.04 LTS appliance, with hardware-accelerated nested full VMs | Vulnerable containers; Proxmox inside Proxmox; continuing outer-PVE provisioning | Preserve real Linux administration while eliminating outer tokens, clone ACL repair and inter-service-VM trust/storage wiring |
+| Existing FastAPI/PostgreSQL/Next application and guest payloads | Framework rewrite, Kubernetes, Redis/Celery, generalized multi-cloud abstraction | Most product logic is reusable; change the infrastructure boundary and integrate existing features |
+| Local typed broker, separate OS identity and SQLite ownership ledger | Giving the API/model libvirt access; deleting the broker because it is co-located | Infrastructure effects and fail-closed cessation remain independently supervised |
+| Three milestones: working nested access; complete practice; packaged/rehearsed release | One giant coding assignment or many small milestone handoffs | Each model gets a coherent deliverable and independently checkable exit |
+| Fresh per-generation qcow2 overlays over immutable flattened bases | Restoring dirty running guests; a general snapshot manager | Cheap reproducible reset; simple ownership, cleanup and disk accounting |
+| Public access keys in per-instance NoCloud seeds; private keys stay with their consumers | Baking appliance-specific access keys into every image; shared host keys | Key rotation no longer requires rebuilding guest software; each clone generates its own SSH identity |
+| One production pin source: broker-proven current guest host key | TOFU, truncated display refs, stale local-known-hosts fallback | Eliminate competing SSH trust paths and preserve generation binding |
+| One canonical operator installer and a checksummed release bundle | Ad-hoc per-host shell repairs; two independently maintained install paths | Install, rerun, upgrade and recovery execute the same artifacts |
+| Fixed local isolated bridge plus appliance input/forward filtering | Libvirt default NAT, physical bridging, or relying only on missing guest routes | Guest root can add a route, and an isolated libvirt network still reaches its host |
+| Preserved historical records with explicit backend identity | Reinterpreting old PVE VMIDs as libvirt domains; maintaining two production backends | Keep history without carrying the old deployment system into the new product |
+
+### A. Topology, resources and outer-host responsibilities
+
+```text
+Existing Proxmox (operator controls one appliance VM; no product API token)
+  Ubuntu appliance / L1
+    LAN: HTTPS web + API; recorded SSH bastion; operator-only administration
+    trusted services: PostgreSQL, controller, model gateway, worker supervisor
+    private: typed broker -> local libvirt/KVM; independent broker ledger
+    isolated inner bridge: attacker VM <-> web VM [<-> DB VM] / L2
+    ingest-only HTTPS on inner bridge; trusted SSH/probes originate on appliance
+Existing inference LXC: outside the lab; only trusted model gateway connects
+```
+
+Candidate outer sizing: 8 vCPUs, 16 GiB fixed RAM, 250 GiB fast virtual storage;
+measure capacity/I/O/headroom before accepting it. This is not a claim about
+available R740 storage. Retain guest caps: at most three, each 2 vCPU/2 GiB,
+16/12/16 GiB attacker/web/DB disks. Budget OS, bases, maximum overlay growth,
+build cache, database, casts and reserve separately. Quotas and minimum free-space
+checks protect evidence and control services; sparse files are not free capacity.
+Guest CPU/I/O limits must leave control-plane headroom. No GPU/device/host-folder
+passthrough to L2 guests; they do not receive nested VMX/SVM or /dev/kvm.
+
+The operator creates the outer VM, exposes supported virtualization CPU features,
+and verifies nested KVM. `/dev/kvm` existence alone is insufficient: boot an L2
+domain using KVM and record actual capabilities/performance. No silent software-
+emulation production fallback. TCG remains useful for some synthetic image tests,
+but never satisfies the nested-appliance gate. Do not unload host KVM modules,
+reconfigure unrelated VMs, or change outer networking from product automation.
+If nesting is unavailable, stop for a deployment decision rather than falling
+back to containers or restoring outer-Proxmox credentials.
+
+Outer power-off is the operator's independent emergency fallback. No live outer
+VM migration, memory snapshots or suspend/resume are supported during practice;
+quiesce first. After restart or detected time discontinuity, interrupt and
+reconcile, never silently resume attacks. Same-appliance kernel/hypervisor failure
+can affect control and guests together; this is an explicit reduction from
+separate-broker-VM fault isolation, not a claim of independent hardware safety.
+
+### B. Process and authority contracts
+
+Use managed services and one codebase. Keep web/API business logic in modules,
+thin HTTP/CLI adapters, one PostgreSQL database and a singleton controller.
+Refuse a second controller before reconciliation. Supervise deployment/scoring/
+scheduler loops; surface failed initialization and stale heartbeats rather than
+swallowing exceptions and reporting ready. Keep durable operations/fences and
+interrupt-on-controller-restart; no distributed scheduler or HA promise.
+
+| Identity | Allowed authority | Explicitly absent |
+|---|---|---|
+| controller | app-role DB, typed broker socket, verifier SSH, gateway credentials | owner DB, raw libvirt/KVM, outer PVE |
+| broker | local libvirt, owned volume area, protected SQLite ledger | app DB/owner secrets, model tools, outer PVE |
+| bastion | scoped API capability, defender guest key, shared cast directory | broker/libvirt, verifier key, DB secrets |
+| worker supervisor/children | run-scoped API and fixed attacker SSH | controller files, broker socket, DB/model endpoint credentials |
+| ingest | authenticated enrollment/audit handlers, narrow persistence access | controller jobs, deployment/model/admin endpoints or keys |
+| offline operator | installation, schema migration, key/backup administration | no credentials passed into model-selected execution |
+
+Replace remote broker mTLS with a private Unix socket: strict mode/group, peer-UID
+verification, bounded versioned messages and typed requests. Only controller UID
+and explicit broker-local operator tooling may invoke their respective surfaces.
+Bastion/ingest/worker use distinct UIDs and cannot read controller environment or
+connect to broker/libvirt sockets. Directory traversal permissions are tested as
+the actual service users. Co-location alone is never the authorization mechanism.
+
+Run the existing per-match worker under a separate fixed-identity systemd worker
+supervisor. It claims a durable assignment through the API with its own limited
+service capability, receives only a run capability/owned attacker channel and
+spawns the supervised child. It cannot choose arbitrary executable/UID/host paths.
+Cancellation, heartbeat loss and controller restart fence assignments; broker VM
+stop remains the backstop. Do not grant controller general sudo/systemd control
+or build a second queue/database. Preserve process-identity-safe child supervision.
+
+Broker owns libvirt authority on a dedicated appliance; do not pretend libvirt
+group membership is per-domain authorization. Its typed API is the enforcement
+boundary. Only fixed domain/disk/network profiles may be rendered. No user XML,
+QEMU arguments, arbitrary file paths, guest exec/monitor commands, host shell,
+storage mounts or NIC changes. Ubuntu libvirt/QEMU confinement stays enabled.
+The operator installer creates fixed networking/pools; runtime does not execute
+firewall commands. Retain the independent 5-second control heartbeat / 30-second
+expiry policy, latched stop and broker restart reconciliation.
+
+### C. Backend replacement, identities and disk lifecycle
+
+Introduce a small typed infrastructure contract and one libvirt production
+implementation. Keep policy/ownership/fencing semantics, not PVE-shaped paths,
+UPIDs, `net0`, numeric VMIDs or template grants. Requests identify session,
+generation, role, approved image and operation UUID. Broker assigns domain UUID,
+MAC/IP and owned disk paths; persist intent before volume creation/domain define/
+start. Bind domain metadata and ledger to an appliance installation UUID plus
+session/generation. Verify metadata, disks and network on every mutation. Names
+alone never establish ownership; foreign or unconfirmable resources are untouched.
+
+Use maintained libvirt Python bindings and bounded API operations; narrowly fixed
+argument-vector image utilities are permitted behind broker validation, never
+shell interpolation. Canonical root-owned flattened base images are hash-pinned
+and read-only. Create one fresh overlay per role/generation in an owned directory;
+reject symlinks/path escape/backing-chain substitution. Serialize base import,
+referencing and retirement. Never delete a base referenced by an active claim.
+No domain autostart/managed-save or automatic restoration of guest memory.
+
+Lifecycle: reserve -> create overlay/seed -> define -> start -> pin -> provision
+-> ready; stop -> verify inactive -> undefine -> remove owned overlay/seed ->
+verify absent -> release. Reset creates fresh disks/identity for every lab role,
+including attacker. Libvirt events accelerate observation but are not proof by
+themselves: use read-back. A missing response/error is uncertain, not absence;
+fence late effects, reconcile partial define/delete and keep the reservation.
+
+Forward migrations add backend/resource identity without rewriting historical
+events/specifications. Old PVE resources remain explicitly legacy and cannot be
+operated on by the libvirt backend. Port provider-independent regressions before
+retiring obsolete production PVE paths/settings/scripts. Preserve history and
+reviewable test provenance; do not keep a selectable second production backend.
+
+Add broker-local status/reconcile/resolve commands. An obligation closes only
+after fresh matching-generation cessation/absence evidence, with actor/reason/
+evidence audit. Handle lost domains, destroyed claims, disk leftovers, ledger
+corruption, connection failure and foreign UUIDs without SQLite edits. Latch
+release is explicit and cannot discard unresolved obligations. Unknown outcomes
+remain visible; application range availability and broker obligations must agree.
+
+### D. Network boundary and first-boot trust
+
+One fixed inner bridge, no physical uplink, no forwarding/NAT, DNS relay, DHCP,
+default guest route or IPv6 RA. Use deterministic manifest-derived static
+addresses delivered through NoCloud. The operator installer owns narrowly scoped
+appliance input/forward/bridge rules and their boot ordering. Guests may contact
+only the ingest address/port on the appliance and replies to trusted initiated
+SSH/probe flows. Deny appliance LAN/loopback-bound services through every interface,
+admin SSH, PostgreSQL, web/business API, model endpoint, outer management, NAS,
+WAN/DNS/IPv6 and unrelated workloads. Interface-aware rules must resist spoofed
+source addresses and guest-added routes; preserve intended guest-to-guest traffic.
+
+Do not use libvirt's default NAT network. An isolated network's label does not
+protect host input: libvirt/firewalld defaults may allow host SSH/DNS. Prove
+effective rule ordering with real packets, both bridge and routed paths, existing
+flows, IPv6 and positive controls. Bind libvirt locally; expose no TCP management
+socket. No guest host mounts, socket forwarding or reachable metadata/seed service.
+Image dependency fetching happens only in a separate build phase, never matches.
+
+Each sanitized base boots with fresh machine/SSH identity. Typed NoCloud seeds
+contain only role-appropriate **public** access keys, network, installation/session/
+generation identity and fixed setup instructions. Private keys are generated and
+retained only in their consuming service's protected state; generation secrets are
+provisioned after pinned management SSH is established. No application secrets or
+private host keys in images/seed ISOs. Attach/detach/delete seeds through owned,
+reconciled operations; avoid persistent shared build credentials.
+
+Initial SSH trust uses the domain-bound QEMU guest agent through libvirt, not the
+network. Broker implements only read-only guest-file open/read/close of two fixed
+paths: `/etc/ssh/ssh_host_ed25519_key.pub` and a fixed first-boot completion record
+emitted by the image. Bound sizes, handles, decoding and total deadlines; no
+caller-supplied path or raw guest-agent command. Completion identifies current
+generation; verify domain ownership before/after, stable full key and completed
+key generation. Persist the full pin once; later disagreement blocks access.
+Never re-pin after exposure/compromise. QGA data is guest-originated, appropriate
+for trusted first boot only, never independent scoring truth.
+
+### E. SSH/access is milestone 14's hard promotion gate
+
+Deliver a redacted diagnostic for each hop: member reachability/bastion host key;
+member public-key authentication; capability owner/expiry/generation; API callback;
+owned-target resolution; full guest pin; guest reachability; defender login key;
+PTY/exec/sudo; cast creation/registration/replay. Keep the four identities distinct
+in instructions: member key, bastion server key, guest login key, guest server key.
+Never suggest disabling SSH verification. The sole production pin comes from
+current broker evidence; remove fallback to copied known_hosts files.
+
+Readiness exercises actual bastion-origin pinned guest SSH with its actual UID/key,
+recording permissions and installed telemetry. A fixed harmless diagnostic uses
+only owned targets and cannot expose arbitrary destinations/commands. It does not
+impersonate a member: an actual SSH client must separately prove personal-key login,
+interactive/exec/resize/reconnect, sudo and browser replay of known synthetic text.
+Reject foreign/revoked/expired keys/capabilities and stale pins; end revokes and
+closes active access. Preserve opaque recording IDs, source times, bounded casts,
+missing-file/truncation visibility and a protected local API/bastion shared path.
+
+Ship a minimal usable install/access path in 14, not a throwaway boot probe. Its
+operator rehearsal is fresh launch -> SSH/sudo/reconnect/replay -> cleanup ->
+second fresh launch with different keys/domain identity and no manual key edits.
+Nested acceleration/isolation/stop are proved before that rehearsal; attacks stay
+disabled. Do not promote to 15 until the operator records this result. Developers
+skip manual checks and hand off the blocked promotion explicitly, not waive it.
+
+### F. Full practice behavior retained for milestone 15
+
+Both `mojang-web-01` and `mojang-web-db-01`: patched Ubuntu, fictional catalogue
+and twelve fixed purchase records; local-data web or genuine separate web/MySQL
+tiers. Preserve documented diagnostic flaw -> limited web-user -> guest-root
+maintenance flaw, and verifiers proving repairs preserve business services.
+Install systemd/auditd/shipper on every required guest and supervised containment
+inside attacker; prove real capture, delivery, permissions, spool rotation/replay/
+dedup/overflow/outage recovery. Host telemetry is forgeable, not automatic actor
+attribution. Publish scenario/rubric/image/seed versions and defender objectives.
+
+Snapshot approved options: practice/competition; 30/60/120 minutes; low/normal/high
+(60/30/15-second sequential action ceilings); injects on/off; network-entry or
+disclosed limited assumed-breach. Fixture acceleration/zero pacing is not a member
+production option. Launch returns a durable operation; Begin alone starts server
+clock, attacks/probes/injects. Ready expiry is 15 minutes; refresh never changes
+deadlines. End, expiry, failures and restart share fenced finalization: stop and
+confirm, capture trusted inputs/close casts, revoke, destroy, release only after
+all owned resources and obligations settle. Report inference cannot hold VMs.
+
+Probe business HTTP/content and authenticated read-only MySQL from the trusted
+appliance every 10 seconds with 5-second timeouts. Use maintained PyMySQL instead
+of the homegrown SQL wire protocol (justified locked dependency). Preserve
+cross-path integrity diagnostics without treating guest stdout as independent
+truth or counting multiple legs as extra availability checks. One scheduled result
+per service/generation, expected-slot coverage, up/down/unknown/missed, separate
+availability/inject/security results, zero-valid unscored, no invented combined
+grade. Probe transport/auth/loop/DB failures must be distinguished from service
+failure; stale/dead scorer interrupts within a documented bounded health window.
+
+Version restricted-account, web restoration, DB-data recovery and written-report
+injects, server-scaled release/deadline/points and deterministic technical checks.
+Bounded submissions have defined correct/incorrect/late/duplicate/advisory results;
+disabled injects produce no phantom total. Final security predicates are baseline-
+aware and generation-bound; errors/ambiguous evidence never pass.
+
+Retain sustained AI pressure until deadline, one command at a time, fixed owned
+attacker channel, bounded context/output/actions and verifier-only achievements.
+Shared gateway priority: hints, attacks, reports (no in-flight preemption). Three
+attempts maximum, 60-second call limits, 5/15-second retry delays, deadline-aware
+cancellation; exhausted recovery interrupts honestly. Actual endpoint capability/
+latency and useful attack behavior require operator proof. No hidden scripted
+attacker/foothold fallback. AAR/hints/written feedback are cited and advisory;
+deterministic reports remain available without the model after guest deletion.
+
+Complete browser builder, launch progress, SSH copy instructions, Begin, 2-second
+health/score/inject updates, submissions, hints, busy/recovery states, end, history
+and replay. Central API policy seals hidden red internals during competition
+across events, memory, reports, hints, exports and CLI. First-party defender casts
+and published scenario threat descriptions may remain visible as agreed; do not
+leak hidden red timeline details through their metadata. Test two separate users,
+logout/disable/revocation, foreign capabilities, reload and interrupted history.
+
+### G. Installation, migration, recovery and support
+
+One supported production OS: Ubuntu 24.04 LTS x86-64, distribution Python 3.12,
+compatible pinned libvirt/QEMU/native dependencies and locked app dependencies.
+Development's existing Python matrix remains unless separately revised. A
+versioned appliance manifest describes LAN/inner subnets, public/internal/ingest
+URLs, broker socket, image digests, resource/state budgets, model alias and optional
+backups. Secrets are local protected file references. Canonical renderers generate
+everything; reject duplicate/conflicting overrides, placeholders and mixed releases.
+Schema-version PVE->appliance conversion is explicit, never silent reinterpretation.
+
+New `deploy/appliance.py` is the canonical operator entry point: validate, plan,
+apply, status, doctor, upgrade and recovery subcommands. Fixed packaged operations,
+reviewed diff/confirmation before privileged effects; no arbitrary manifest shell.
+14 supplies a complete minimal installer for the access gate; 16 completes release
+bundle production, upgrades/export/import/backup and operator documentation using
+that same entry point. A prebuilt outer qcow2 distributor is not required: creating
+one ordinary Ubuntu VM and running the installer is the supported starting path.
+
+Install native packages/venv, users/groups, private directories, immutable release
+files, PostgreSQL owner/app roles and forward migrations, nginx/TLS/Next standalone
+assets, all service units, network rules, images and scoped capabilities. Generate
+secrets once; safely resume partial installation without rotating keys or erasing
+data. Bootstrap operator/member accounts and public keys locally; no private-key
+upload, public signup or normal-operation SQL administration. Fix migration resource
+lookup for installed packages. Startup orders storage/network/libvirt/DB/broker
+reconcile/controller/bastion/web; readiness includes worker/scheduler/scorer health.
+
+Expose operator diagnostics as installation/config, virtualization/network, guest
+access/capture, model, storage and recovery states with actionable codes. Bind
+evidence to release/config/image identity; a boolean alone cannot authorize attacks.
+No secrets in diagnostics, normal logs, manifests, recording metadata or reports.
+
+Existing service VMs 201/202/203 and any PVE guests require read-only operator
+inventory first; names/old notes establish neither existence nor ownership.
+Deploy the appliance alongside them. Provide a read-only export/import of closed
+history/accounts/recordings with integrity/reference checks and a forward schema
+upgrade; archive legacy infrastructure obligations separately. Never import PVE
+tokens, active capabilities, old VMIDs as live claims or active match state.
+Old resources must be reconciled by the operator's old authority before cutover.
+Do not delete old VMs/data/bridge or revoke infrastructure credentials automatically.
+Keep the old installation available for explicit rollback until approved retirement;
+rollback never rewinds a migrated DB or silently resumes attacks.
+
+Preserve evidence indefinitely; capacity blocks unsafe starts. Explicit offline
+export/purge requires scoped selection, checkpoint and confirmation, never runtime
+event-delete privileges. Implement optional scheduled backups of DB, recordings,
+manifests, protected trust/secret recovery material and broker ledger consistently
+while quiesced. Restore disconnected, invalidate capabilities, keep guests off,
+reconcile old obligations and require fresh authorization. Synthetic backup/restore
+tool tests are required; choosing a real destination and live restore proof remains
+optional/non-blocking and prominently unverified when absent. Outer snapshots are
+not a substitute for consistency or a claim that nested running state restores safely.
+
+### H. Acceptance and implementation discipline
+
+Three plans only, implemented sequentially on a user-selected non-default branch.
+Their checklists are internal coherent commit checkpoints; no subagents or new
+sessions unless requested. Each delivers tests of changed runtime contracts and
+records precise results; 16 is final packaging/release proof, not deferred testing.
+Do not mark requirements complete from implementer claims, source-string tests,
+HTTP 200s without results, environment attestations, skips or old totals.
+
+Extend `infra/dev/acceptance.py`: **new** `hypervisor` and `access` in 14, **new**
+`journey` in 15, **new** `appliance` aggregation in 16; strengthen existing
+`install` and `release`. `authority` covers the new Unix/UID/typed boundary;
+`hypervisor` uses actual libvirt/KVM, not libvirt's test driver; `access` uses
+actual SSH through installed services and reads replay bytes; `journey` exercises
+the full isolated product with a deterministic model fixture; `release` uses the
+operator-approved appliance and real model. A fixture is never advertised as AI
+exploitation success. `install` must run real clean install/rerun/reboot/populated
+upgrade/failure recovery, not trust `SR_INSTALL_VM_EVIDENCE=1`.
+
+Keep fast/selection/python/db/containment/packet/images/capture/frontend/browser/
+compose gates. Images and capture retain separate evidence. Port relevant PVE
+contract invariants to hypervisor/authority; legacy PVE tests can remain isolated
+historical compatibility coverage, not the appliance acceptance authority. 16's
+`appliance` gate runs the mandatory software set and emits revision/digest-bound
+results; live `release` is separate and never runs implicitly.
+
+Native KVM tests prove the adapter; the operator's actual PVE->Ubuntu->L2 proof
+establishes nesting. Required CI needs an adequate disposable worker with KVM;
+confirm availability/free allowance, otherwise record pending rather than a fake
+pass or paid runner. Existing image/capture jobs retain max 3 guests/6 GiB/60 min.
+New appliance fixtures cap at one 16-GiB outer VM containing at most 3 L2 guests,
+one run at a time and 90 minutes per job; account for host overhead/storage before
+launch. Reuse verified caches, never shared mutable run disks. Split gate jobs if
+these caps are exceeded. No host auditd/firewall/libvirt installation on a shared
+developer machine; use an explicitly disposable VM. No live attacks before real
+isolation/stop acceptance. Manual checks belong to the operator, not the model.
+
+Documentation references checked during planning (not hardware acceptance):
+[nested KVM](https://docs.kernel.org/virt/kvm/x86/running-nested-guests.html),
+[libvirt network isolation and host access](https://libvirt.org/formatnetwork.html),
+[QEMU guest-agent file operations](https://www.qemu.org/docs/master/interop/qemu-ga-ref.html).
+Implement against the appliance's pinned versions; web documentation alone does
+not prove that installed capabilities, security profiles or performance work.
+
+## Risks and explicitly unverified inputs (historical baseline; see reevaluation above)
 
 - Same physical host retains hypervisor/resource-contention risk even with no
   host-root credentials; validate isolation and keep host/guest software patched.

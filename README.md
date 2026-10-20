@@ -7,6 +7,14 @@ AI attacks, service scoring, timed injects, SSH replay and after-action feedback
 backend, CLI, frontend and safety/evidence repairs are foundations—not proof that
 the agreed competition workflow or deployment is finished.
 
+**Current direction (2026-10-20):** one Ubuntu/KVM appliance on Proxmox, with
+disposable nested full VMs and the existing external inference endpoint. The
+appliance holds no outer-Proxmox credentials. See the
+[current architecture](docs/ARCHITECTURE.md#ubuntu-kvm-appliance--2026-10-20) and
+[three-milestone completion sequence](docs/ROADMAP.md#current-completion-sequence--draft-2026-10-20).
+Implementation plans are drafts; actual member SSH is the first promotion gate.
+Older deployment/baseline prose below is historical, not the new installation path.
+
 ## Current project contract
 
 - [Agent workflow and safety rules](AGENTS.md)

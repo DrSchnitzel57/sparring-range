@@ -31,6 +31,22 @@ to investigate, not current instructions or proof of acceptance.
   03 and 04 share `.openchamber/plans/03-04-linux-guests-capture.md`, with
   separate acceptance gates and roadmap checkboxes. All other milestones remain
   separately planned. This does not authorize implementation or live testing.
+- On 2026-10-20 the user authorized drafting the full completion sequence together,
+  using the fewest manageable milestones, with no deadline-driven feature cuts.
+  Plans 14–16 are the proposed three-milestone sequence in the roadmap; they await
+  approval. This supersedes one-at-a-time *planning* for that sequence only, not
+  branch, implementation, safety, or live-operation restrictions. The user deferred
+  tests during this planning pass and cancelled the started fast baseline; do not
+  claim a new passing/failing baseline. Deployed member SSH remains unaccepted and
+  is the first promotion gate, regardless of historical pin-fix test results.
+- The user subsequently selected **one Ubuntu/KVM appliance with nested full VMs**
+  (2026-10-20). The architecture's appliance section supersedes the direct-PVE,
+  separate-broker-VM, remote-mTLS and per-VMID ACL design for the new release.
+  Plans 14–16 cover foundation/access, complete practice, and packaged release.
+  Retain the typed deployment boundary as a separate local OS service, worker
+  identity isolation, append-only evidence and fail-closed recovery. No outer
+  Proxmox credential enters the appliance. Plans are drafts pending approval;
+  architecture selection alone does not authorize implementation/live operations.
 - Implementation follows an agreed plan, with small commits, explicit decisions,
   and automated acceptance. Skip its manual checks; they belong to the operator.
   End the handoff with an acceptance-criterion PASS/FAIL table and nothing after.
@@ -45,11 +61,14 @@ to investigate, not current instructions or proof of acceptance.
   controller/owner-DB secrets, verifier keys, NAS credentials, or GPU devices.
 - Attacker and vulnerable targets are full VMs, not host-kernel-sharing LXCs.
   The existing inference LXC is inference-only and outside the attack network.
-- A deterministic private deployment boundary may use a restricted Proxmox
-  token for approved lab resources only. Never broaden privileges to get a green
-  test. No runtime host-shell or arbitrary host-firewall execution.
-- Operator-configured isolation denies range access to WAN, Proxmox management,
-  the model LXC, NAS, and unrelated workloads. Necessary control paths are narrowly
+- The appliance's deterministic private broker alone may use local libvirt for
+  approved inner full VMs; API/model/bastion/ingest cannot access libvirt or /dev/kvm.
+  Outer Proxmox remains operator-only. Old restricted-PVE tooling is legacy, not
+  a production fallback. Never broaden privileges to get a green test. No runtime
+  host-shell or arbitrary host-firewall execution; fixed appliance network rules
+  are installed by the operator on the dedicated appliance, never on outer PVE.
+- Operator-configured isolation denies range access to appliance management,
+  WAN, Proxmox management, the model LXC, NAS, and unrelated workloads. Necessary control paths are narrowly
   allowlisted. No attacks until real isolation and emergency-stop gates pass.
 - API is the business-logic front door. CLI/web are clients; migration and offline
   operator administration are explicit exceptions. Infrastructure credentials

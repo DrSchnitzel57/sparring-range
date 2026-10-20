@@ -1,5 +1,44 @@
 # Operator runbook and live acceptance gates
 
+## Current direction — Ubuntu/KVM appliance (2026-10-20)
+
+The user selected one Ubuntu appliance VM with nested full practice VMs. Read
+[the appliance architecture](ARCHITECTURE.md#ubuntu-kvm-appliance--2026-10-20)
+and [plans 14–16](ROADMAP.md#current-completion-sequence--draft-2026-10-20).
+Those plans are drafts, not a shipped appliance installer. **The commands below
+are historical direct-PVE deployment instructions, not appliance installation.**
+Their safety/evidence principles remain; replaced PVE mechanisms are mapped in
+the roadmap. No new passing test or live result is claimed by this planning pass.
+
+Operator checkpoints for the new release:
+
+1. Before milestone 14's host rehearsal, approve a disposable Ubuntu 24.04 VM,
+   resource/storage budget, LAN address and nested CPU exposure. Confirm KVM by
+   an actual inner boot; do not unload modules on a running Proxmox host.
+2. Run the milestone-14 installer/preflight inside that VM. Review its fixed
+   inner-network rules. It must never require an outer-PVE token or host SSH.
+3. With attacks disabled, prove guest denial of appliance administration, LAN,
+   model, NAS, WAN/DNS/IPv6 and outer management, with working authorized flows;
+   prove broker stop/read-back/control-loss and manual outer-VM power-off.
+4. Fresh launch, actual member SSH, sudo, exec/interactive/resize/reconnect,
+   synthetic recording replay, cleanup, second fresh launch. Record the exact
+   revision/config/images and user-visible outcomes. A ready flag cannot pass it.
+   This gate blocks promotion to milestone 15; deployed SSH is currently unproven.
+5. After milestone 15, validate the real model and complete both presets/modes/
+   start conditions with truthful service/inject changes. Milestone 16 requires
+   an operator and another member to complete the workflow unaided and reuse it.
+6. Inventory the old installation before cutover; preserve closed history,
+   recordings and trust material. Resolve old resources with the old operator
+   authority; never import old PVE claims/tokens as appliance runtime state.
+   Retire old VMs/bridge only by a separate explicit operator decision.
+
+Backing up to a real destination/restoring there remains optional; absence is
+visible. Normal restore must be disconnected/quiesced and never resume attacks.
+Each live action still requires operator approval; implementation agents deliver
+the fixtures and instructions and skip these manual checks.
+
+## Historical direct-PVE runbook
+
 Status: **planning runbook, not an accepted production installation guide**.
 Updated 2026-10-08; current application baseline `23de4f4` is failing.
 See [ARCHITECTURE.md](ARCHITECTURE.md), [ROADMAP.md](ROADMAP.md), and
@@ -389,7 +428,6 @@ do not become optional because development tests pass.
 Windows licensing/templates, Sysmon/WEC installed capture, Windows verification
 and access are later milestone-12 gates, not marked complete by Linux acceptance.
 
-<<<<<<< HEAD
 ## 10. Operator shell pitfalls (field notes 2026-10-15)
 
 Learned the hard way during the first production install. All of these
@@ -469,7 +507,6 @@ sessions die on keystroke while idling fine; (3) link flaps
 throttled auth; (5) client-side sleep, Wi-Fi roam, or VPN flap —
 correlate with continuous pings to each path before concluding
 anything about the host.
-=======
 ### Inter-VLAN transport is firewall-shaped, not broken cabling (2026-10-15)
 
 Service VMs on the management VLAN reach each other over L2, but anything
@@ -528,4 +565,3 @@ verification failed` on a first contact is unknown-key refusal, not
 evidence of compromise — `ssh-keyscan` the presented key, compare its
 fingerprint against the host's public half out-of-band, and only then
 pin it with `UserKnownHostsFile` (no TOFU).
->>>>>>> 5ff3cf0 (docs: first-production-install field notes, broker TLS/firewall discipline, live evidence)
