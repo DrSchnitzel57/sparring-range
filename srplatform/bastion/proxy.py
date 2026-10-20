@@ -205,30 +205,33 @@ class BastionProxy:
             "raw_ref": ref,
         })
         try:
-            known = s.bastion_targets_known_hosts or None
-            # Authoritative per-session pin (plan 13 phase 4): the deploy
-            # publishes the broker-pinned generation key as deployment
-            # evidence, and the token endpoint serves it back to this
-            # service-authenticated proxy. A pin that travels with the
-            # login can never go stale across relaunches the way copied
-            # files do. The local file remains only as a last resort when
-            # the deployment carries no pin (legacy); TOFU is never used.
-            # A malformed pin (truncated ref, corruption) is refused here,
-            # before any dial — see _deployment_known_hosts.
+            # ONE production pin source (milestone 14): the deployment serves
+            # the broker-pinned guest host key with the token, and the pin
+            # that travels with the login can never go stale across
+            # relaunches the way a copied file does.  The local known_hosts
+            # file is NOT a production fallback any more: a stale local file
+            # is exactly the trust path this design rejected, so in
+            # production a missing deployment pin is a refusal, not a
+            # downgrade to a file (and never TOFU).
             api_pin = (target.get("target_host_key") or "").strip() or None
             if api_pin:
                 print("[bastion] pin source: deployment evidence", flush=True)
                 known = _deployment_known_hosts(target)
-            elif isinstance(known, str):
-                print("[bastion] pin source: local file (no deployment pin)",
-                      flush=True)
-            # A bytes pin came from deployment evidence, not the filesystem:
-            # only file paths get an existence check.
-            if isinstance(known, str) and not os.path.exists(known):
-                known = None
-            if known is None and s.sr_env == "production":
-                raise RuntimeError("BASTION_TARGETS_KNOWN_HOSTS required in production — "
-                                   "refusing TOFU to range hosts")
+            elif s.sr_env == "production":
+                raise RuntimeError(
+                    "the deployment served no guest host-key pin — refusing to "
+                    "dial the range host on a local file or on TOFU")
+            else:
+                # Development only: a local known_hosts file may stand in for
+                # the deployment pin, and a missing one means TOFU in a
+                # non-production environment.
+                known = s.bastion_targets_known_hosts or None
+                if isinstance(known, str):
+                    if os.path.exists(known):
+                        print("[bastion] pin source: local file "
+                              "(no deployment pin)", flush=True)
+                    else:
+                        known = None
             # PILOT STEP 7: dial guests as the DEFENDER identity with the
             # bastion's own keypair (public half baked into the templates);
             # never the implicit root default.
