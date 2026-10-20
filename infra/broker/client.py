@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
+import socket
 import ssl
 import urllib.parse
 
@@ -46,9 +48,36 @@ class LocalTransport:
             raise BrokerUnavailable(f"broker internal error: {e}") from e
 
 
+class UnixHTTPConnection(http.client.HTTPConnection):
+    """HTTP/1.1 over a Unix stream socket.
+
+    The appliance has no TCP broker listener at all: the broker socket is a
+    local Unix socket in an operator-owned directory. The SERVER verifies the
+    peer UID with SO_PEERCRED before reading a request; this client does not
+    authenticate the server, so the socket directory must be root/broker-owned
+    and not world-writable.
+    """
+
+    def __init__(self, path: str, timeout: float):
+        super().__init__("localhost", timeout=timeout)
+        self.unix_path = path
+
+    def connect(self):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        try:
+            sock.connect(self.unix_path)
+        except OSError:
+            sock.close()
+            raise
+        self.sock = sock
+
+
 class HttpTransport:
-    """Mutual-TLS HTTPS transport. A missing/foreign client certificate
-    fails at the TLS handshake — before any request is sent."""
+    """Broker transport: mutual-TLS HTTPS in the legacy deployment, local
+    Unix socket (peer-UID authenticated) in the appliance. A missing/foreign
+    client certificate fails at the TLS handshake; a wrong peer UID fails
+    before the appliance server reads a request."""
 
     # Plan 13 phase 2: client/server/task deadlines are checked TOGETHER.
     # Every bound below exceeds the documented SERVER-side bound of the op
@@ -80,24 +109,42 @@ class HttpTransport:
         "vm_status", "inventory", "latch_status",
     })
 
-    def __init__(self, url: str, ca_file: str, cert_file: str, key_file: str,
-                 timeout: float = 30.0):
+    def __init__(self, url: str, ca_file: str = "", cert_file: str = "",
+                 key_file: str = "", timeout: float = 30.0):
         parts = urllib.parse.urlsplit(url)
-        if parts.scheme != "https":
-            raise BrokerRefused(f"broker_url must be https (mutual TLS), got {url!r}")
-        self.host, self.port = parts.hostname, parts.port or 8443
+        self.unix_path: str | None = None
+        self._ctx = None
+        if parts.scheme == "unix":
+            path = urllib.parse.unquote(parts.path)
+            if not path.startswith("/") or not path.endswith(".sock"):
+                raise BrokerRefused(
+                    f"broker unix URL must be unix:///<absolute>.sock, got {url!r}")
+            if parts.netloc not in ("", "localhost"):
+                raise BrokerRefused("broker unix URL must not name a remote host")
+            self.unix_path = path
+            if not os.path.exists(path):
+                raise BrokerUnavailable(f"broker Unix socket is missing: {path}")
+        elif parts.scheme == "https":
+            self.host, self.port = parts.hostname, parts.port or 8443
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = True
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            ctx.load_verify_locations(cafile=ca_file)
+            ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
+            self._ctx = ctx
+        else:
+            raise BrokerRefused(
+                f"broker_url must be https (mutual TLS) or a local unix "
+                f"socket, got {url!r}")
         self.timeout = timeout
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.check_hostname = True
-        ctx.verify_mode = ssl.CERT_REQUIRED
-        ctx.load_verify_locations(cafile=ca_file)
-        ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
-        self._ctx = ctx
 
     def _call_once(self, op: str, body: bytes):
-        conn = http.client.HTTPSConnection(
-            self.host, self.port,
-            timeout=self.OP_TIMEOUTS.get(op, self.timeout), context=self._ctx)
+        timeout = self.OP_TIMEOUTS.get(op, self.timeout)
+        if self.unix_path is not None:
+            conn = UnixHTTPConnection(self.unix_path, timeout)
+        else:
+            conn = http.client.HTTPSConnection(
+                self.host, self.port, timeout=timeout, context=self._ctx)
         try:
             conn.request("POST", f"/v1/{op}", body=body,
                          headers={"Content-Type": "application/json"})

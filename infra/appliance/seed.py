@@ -1,0 +1,187 @@
+"""Per-instance NoCloud seed for appliance guests.
+
+The golden image contains software and NO deployment keys.  Every clone gets
+a fresh ``instance-id``, its own hostname/address and only the public keys its
+role needs (runner→attacker, bastion→defender, management→root).  The seed
+also records the fixed first-boot completion marker the broker polls through
+QEMU guest agent; a merely running VM is never treated as ready.
+
+Only public keys and non-secret networking values are written here.  Private
+keys remain with their consuming service.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import uuid
+from dataclasses import dataclass
+
+import yaml
+
+from .manifest import ApplianceManifest, ImageSpec
+from infra.images.guest_seed import build_seed_iso, meta_data
+
+_MARKER_PATH = "/var/lib/sparring-range/first-boot-complete"
+
+
+def _role_access(role: str) -> dict[str, tuple[str, ...]]:
+    """Which manifest key role lands on which Unix account for a guest role."""
+    if role == "attacker":
+        return {"attacker": ("runner",)}
+    return {"defender": ("bastion",), "root": ("mgmt",)}
+
+
+@dataclass(frozen=True)
+class SeedInputs:
+    manifest: ApplianceManifest
+    image: ImageSpec
+    vmid: int
+    session_id: str
+    hostname: str
+    address: str
+    prefix: int
+    gateway: str | None = None       # fixture only; production is on-link
+    instance_id: str | None = None
+    fixture_dhcp: bool = False
+    fixture_http_port: int | None = None
+    api_ingest_url: str | None = None
+
+
+def _authorized_keys(manifest: ApplianceManifest, role: str) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for user, principals in _role_access(role).items():
+        lines: list[str] = []
+        for principal in principals:
+            if principal in manifest.access_keys:
+                key = manifest.public_key_for(principal).strip()
+                if key and key not in lines:
+                    lines.append(key)
+        if lines:
+            out[user] = lines
+    return out
+
+
+def render_user_data(inp: SeedInputs) -> str:
+    instance_id = inp.instance_id or f"sr-{inp.image.role}-{uuid.uuid4().hex[:12]}"
+    keys = _authorized_keys(inp.manifest, inp.image.role)
+    users = []
+    for user, lines in sorted(keys.items()):
+        entry = {"name": user, "shell": "/bin/bash",
+                 "ssh_authorized_keys": lines}
+        if user in ("defender", "attacker"):
+            entry["groups"] = ["sudo"]
+        users.append(entry)
+    # cloud-init would otherwise create the default 'ubuntu' user with its
+    # build-time key.  Listing users replaces the default set.
+    users.append({"name": "srshipper", "system": True, "groups": ["adm"],
+                  "shell": "/usr/sbin/nologin"})
+    doc: dict = {
+        "hostname": inp.hostname,
+        "manage_etc_hosts": True,
+        "disable_root": False,
+        "ssh_pwauth": False,
+        "package_update": False,
+        "package_upgrade": False,
+        "users": users,
+        "write_files": [
+            {"path": "/etc/sparring-range/role",
+             "content": inp.image.role + "\n"},
+            # A dedicated late unit makes readiness independent of whether a
+            # long-running cloud-init runcmd (package/service work) finishes.
+            # It is ordered after cloud-final, so users/keys/network are
+            # already applied, and it writes the same fixed marker the broker
+            # polls through QGA.
+            {"path": "/usr/local/sbin/sr-first-boot-complete",
+             "permissions": "0755",
+             "content": "#!/bin/sh\nset -eu\n"
+                        "install -d -m 0755 /var/lib/sparring-range\n"
+                        f"date -u +%FT%TZ > {_MARKER_PATH}\n"},
+            {"path": "/etc/systemd/system/sr-first-boot-complete.service",
+             "permissions": "0644",
+             "content": "[Unit]\nDescription=sparring-range first boot completion\n"
+                        "After=cloud-final.service\nWants=cloud-final.service\n"
+                        "[Service]\nType=oneshot\n"
+                        "ExecStart=/usr/local/sbin/sr-first-boot-complete\n"
+                        "[Install]\nWantedBy=multi-user.target\n"},
+        ],
+        # qemu-guest-agent is installed in the golden image but was not
+        # running when the image was built (no virtio channel existed then).
+        # Enable it in bootcmd, before network-online waits, so readiness and
+        # host-key reads never depend on cloud-init's later runcmd stage.
+        "bootcmd": [
+            "systemctl enable --now qemu-guest-agent.service ssh.service "
+            "2>/dev/null || true",
+            "systemctl enable sr-first-boot-complete.service "
+            "2>/dev/null || true",
+        ],
+        "runcmd": [
+            "systemctl enable --now ssh qemu-guest-agent auditd 2>/dev/null || true",
+            "install -d -m 0755 /var/lib/sparring-range",
+            f"date -u +%FT%TZ > {_MARKER_PATH}",
+        ],
+    }
+    if inp.fixture_dhcp:
+        # QEMU user networking: DHCP gives 10.0.2.15 and a gateway inside the
+        # synthetic network. This mode is for the live software gate only;
+        # the appliance installer never selects it for a production guest.
+        doc["write_files"].append({
+            "path": "/etc/netplan/99-sr-fixture.yaml",
+            "permissions": "0600",
+            "content": yaml.safe_dump({
+                "network": {"version": 2, "ethernets": {"range-nic": {
+                    "match": {"name": "en*"},
+                    "dhcp4": True, "dhcp6": False}}}},
+                sort_keys=False),
+        })
+        doc["runcmd"].insert(0, "netplan apply || true")
+    elif inp.gateway is None:
+        # Production range is on-link only: no default route exists, so a
+        # compromised guest cannot even attempt WAN or management egress.
+        doc["write_files"].append({
+            "path": "/etc/netplan/99-sr-range.yaml",
+            "permissions": "0600",
+            "content": yaml.safe_dump({
+                "network": {"version": 2, "ethernets": {"range-nic": {
+                    "match": {"name": "en*"},
+                    "addresses": [f"{inp.address}/{inp.prefix}"],
+                    "dhcp4": False, "dhcp6": False, "optional": True}}}},
+                sort_keys=False),
+        })
+        doc["runcmd"].insert(0, "netplan apply || true")
+    else:
+        doc["write_files"].append({
+            "path": "/etc/netplan/99-sr-fixture.yaml",
+            "permissions": "0600",
+            "content": yaml.safe_dump({
+                "network": {"version": 2, "ethernets": {"range-nic": {
+                    "match": {"name": "en*"},
+                    "addresses": [f"{inp.address}/{inp.prefix}"],
+                    "routes": [{"to": "default", "via": inp.gateway}],
+                    "dhcp4": False, "dhcp6": False, "optional": True}}}},
+                sort_keys=False),
+        })
+        doc["runcmd"].insert(0, "netplan apply || true")
+    if inp.api_ingest_url:
+        doc["write_files"].append({
+            "path": "/etc/sparring-range/shipper.conf",
+            "content": f"INGEST_URL={inp.api_ingest_url}\n"
+                       f"HOST_TAG={inp.hostname}\n",
+        })
+    if inp.fixture_http_port:
+        # Fixture-only: make nginx listen on the port QEMU forwards. The
+        # production image listens on 80 on the isolated bridge.
+        doc["runcmd"].append(
+            "sed -i 's/listen 80 default_server;/listen 80 default_server;/' "
+            "/etc/nginx/sites-enabled/default 2>/dev/null || true")
+    return "#cloud-config\n" + yaml.safe_dump(doc, sort_keys=False, width=4096)
+
+
+def build_seed(path: pathlib.Path, inp: SeedInputs) -> pathlib.Path:
+    instance_id = inp.instance_id or f"sr-{inp.image.role}-{uuid.uuid4().hex[:12]}"
+    user_data = render_user_data(inp)
+    meta = meta_data(instance_id, inp.hostname)
+    return build_seed_iso(path, user_data, meta)
+
+
+def marker_path() -> str:
+    return _MARKER_PATH

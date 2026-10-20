@@ -122,7 +122,6 @@ class BrokerService:
         pin time, never strand at dial time).
         """
         from .errors import BrokerUnavailable as _BU
-        from infra.proxmox_client import ProxmoxClient as _PC2
         try:
             done = self.pve.read_boot_marker(
                 node, int(vmid), timeout_s=self.agent_ready_timeout_s,
@@ -164,7 +163,11 @@ class BrokerService:
         and `HttpTransport.OP_TIMEOUTS["read_host_key"]` covers it.
         """
         from .errors import BrokerUnavailable as _BU
-        from infra.proxmox_client import ProxmoxClient as _PC2
+        key_path = getattr(self.pve, "GUEST_HOST_KEY_PATH", None)
+        if not key_path:
+            self.ledger.add_obligation("host-key-path-unconfigured", int(vmid),
+                                       "backend does not expose the fixed key path")
+            raise _BU(f"backend has no fixed guest host-key path for VMID {vmid}")
         self._await_first_boot(node, int(vmid))
         deadline = time.monotonic() + self.agent_ready_timeout_s
         prev = None
@@ -174,7 +177,7 @@ class BrokerService:
                 break  # window exhausted: issue NO further probe
             try:
                 cur = (self.pve.read_guest_file_when_ready(
-                    node, int(vmid), _PC2.GUEST_HOST_KEY_PATH,
+                    node, int(vmid), key_path,
                     timeout_s=remaining,
                     poll_s=self.agent_ready_poll_s) or "").strip() or None
             except Exception as e:  # noqa: BLE001 — uncertain, retain
