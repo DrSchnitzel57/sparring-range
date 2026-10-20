@@ -115,8 +115,27 @@ def render_user_data(inp: SeedInputs) -> str:
             # polls through QGA.
             {"path": "/usr/local/sbin/sr-first-boot-complete",
              "permissions": "0755",
+             # Readiness means "a member can actually connect": the script
+             # starts SSH and waits for the listener before the marker is
+             # published.  SSH must not be started earlier: cloud-init
+             # generates the host keys in the config stage, and sshd refuses
+             # to start without them.
              "content": "#!/bin/sh\nset -eu\n"
                         "install -d -m 0755 /var/lib/sparring-range\n"
+                        "systemctl start --no-block ssh.service "
+                        ">/dev/null 2>&1 || true\n"
+                        "i=0\n"
+                        "while [ \"$i\" -lt 60 ]; do\n"
+                        "  if command -v python3 >/dev/null 2>&1; then\n"
+                        "    python3 -c 'import socket;"
+                        "socket.create_connection((\"127.0.0.1\",22),1).close()'"
+                        " >/dev/null 2>&1 && break\n"
+                        "  else\n"
+                        "    sleep 1\n"
+                        "  fi\n"
+                        "  i=$((i+1))\n"
+                        "  sleep 1\n"
+                        "done\n"
                         f"date -u +%FT%TZ > {_MARKER_PATH}\n"},
             {"path": "/etc/systemd/system/sr-first-boot-complete.service",
              "permissions": "0644",
@@ -132,7 +151,8 @@ def render_user_data(inp: SeedInputs) -> str:
         # agent device, and a guest whose channel is not (yet) visible would
         # hang its whole cloud-init stage.  The unit is deliberately NOT
         # enabled: an enabled unit whose device never appears would block a
-        # later boot at multi-user.target.
+        # later boot at multi-user.target.  SSH is started as well — enabling
+        # it alone would leave the guest reachable only after a reboot.
         "bootcmd": [
             "systemctl enable ssh.service 2>/dev/null || true",
             "systemctl start --no-block qemu-guest-agent.service "
@@ -140,14 +160,13 @@ def render_user_data(inp: SeedInputs) -> str:
         ],
         "runcmd": [
             "install -d -m 0755 /var/lib/sparring-range",
-            # The marker is written FIRST and unconditionally: readiness must
-            # never be gated on a service that can block or fail.
-            f"date -u +%FT%TZ > {_MARKER_PATH}",
             "systemctl start --no-block qemu-guest-agent.service "
             "2>/dev/null || true",
             "systemctl enable auditd.service 2>/dev/null || true",
             "systemctl enable sr-first-boot-complete.service "
             "2>/dev/null || true",
+            # The marker is published last, and only once SSH is listening.
+            "/usr/local/sbin/sr-first-boot-complete",
         ],
     }
     # ONE netplan file, ONE interface key ("range-nic"), always static.

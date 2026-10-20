@@ -37,6 +37,88 @@ visible. Normal restore must be disconnected/quiesced and never resume attacks.
 Each live action still requires operator approval; implementation agents deliver
 the fixtures and instructions and skip these manual checks.
 
+## Appliance installation and the new acceptance layers (2026-10-20, branch `15`)
+
+These are the commands that actually exist in the tree today. They are the
+appliance counterpart of the historical direct-PVE section below, which stays
+historical.
+
+### Build the guest base image once (no root, no host changes)
+
+```bash
+# Pinned Ubuntu 24.04 cloud image is verified against the repository manifest.
+# The build boots it once, installs the guest agent, scrubs host keys and the
+# machine-id, cleans the cloud-init state and flattens the result.
+.venv/bin/python infra/images/appliance_base.py --cache-dir .cache/appliance
+```
+
+The output is `.cache/appliance/appliance-base.qcow2`. It is the ONLY guest
+image the appliance clones from; per-instance keys and addressing come from
+each clone's seed, never from the image. The base carries one netplan entry
+(`00-sr-base-dhcp.yaml`, interface key `range-nic`) so a guest has an address
+within seconds of boot; the per-instance seed writes the same interface key,
+so its static production configuration merges over the build-time fallback
+instead of colliding with it.
+
+### Validate, plan and apply the appliance
+
+```bash
+.venv/bin/python deploy/appliance.py validate --manifest /etc/sparring-range/appliance-manifest.json
+.venv/bin/python deploy/appliance.py plan     --manifest /etc/sparring-range/appliance-manifest.json
+.venv/bin/python deploy/appliance.py apply    --manifest /etc/sparring-range/appliance-manifest.json --dry-run
+.venv/bin/python deploy/appliance.py apply    --manifest /etc/sparring-range/appliance-manifest.json
+.venv/bin/python deploy/appliance.py status   --manifest /etc/sparring-range/appliance-manifest.json --json
+.venv/bin/python deploy/appliance.py doctor   --manifest /etc/sparring-range/appliance-manifest.json
+```
+
+`apply` needs root and creates the service identities (`srbroker`, `sringest`,
+`srworker`, plus `srrange`/`srbastion`), the fixed systemd units, the derived
+broker policy and the control-plane environment. It never regenerates an
+existing private key or capability: a rerun is idempotent, and a suspiciously
+short existing token is an error, not something to overwrite.
+
+### Recovery is local, explicit and evidence-bound
+
+```bash
+.venv/bin/python deploy/appliance.py recovery status    --manifest M
+.venv/bin/python deploy/appliance.py recovery reconcile --manifest M
+.venv/bin/python deploy/appliance.py recovery resolve   --manifest M \
+    --obligation 12 --evidence /root/evidence/oblig-12.json
+```
+
+`resolve` refuses unless the evidence file names that obligation and the
+backend is read AGAIN and no longer owns the resource. A timestamp or an
+operator assertion alone never releases a reservation.
+
+### The new acceptance layers
+
+```bash
+gate() { .venv/bin/python infra/dev/acceptance.py "$@"; }
+gate hypervisor   # real libvirt clone/start/QGA host key/ownership/destroy
+gate access       # real guest SSH, pinned target key, recorded .cast replay
+gate journey      # the INSTALLED appliance, both presets, real services
+```
+
+`hypervisor` and `access` need a base image
+(`SR_APPLIANCE_BASE_IMAGE`) and, for `hypervisor`, libvirt plus a working
+`/dev/kvm`; without nested KVM the gate fails closed unless the operator
+explicitly sets `SR_HYPERVISOR_ALLOW_TCG=1` for a clearly labeled
+software-emulation run. `journey` needs the installed appliance and two
+bearer tokens:
+
+```bash
+export SR_JOURNEY_BASE_URL=https://appliance.example.edu
+export SR_JOURNEY_OPERATOR_TOKEN=...      # operator bearer token
+export SR_JOURNEY_MEMBER_TOKEN=...        # the member who owns the sessions
+export SR_JOURNEY_SSH_KEY=/root/keys/member_ed25519
+export SR_JOURNEY_BASTION_KNOWN_HOSTS=/root/keys/known_hosts
+gate journey
+```
+
+The journey launches both Mojang presets, begins a match, reads the live view,
+replays the recorded session, scores, ends, and launches a second session to
+prove the range is reusable. It mutates only the sessions it creates.
+
 ## Historical direct-PVE runbook
 
 Status: **planning runbook, not an accepted production installation guide**.

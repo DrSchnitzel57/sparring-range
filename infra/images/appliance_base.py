@@ -93,12 +93,17 @@ def _user_data() -> str:
             "apt-get -qq update",
             "apt-get -qq install -y --no-install-recommends qemu-guest-agent",
             # The build marker is written ONLY when the guest agent is really
-            # present: a cloud-init runcmd does not abort on a failing
+            # usable: a cloud-init runcmd does not abort on a failing
             # command, so a check that is not part of the marker would be
             # silently ignored and the build would publish an image without
-            # the agent.
-            "command -v qemu-guest-agent > /dev/null && "
-            f"echo {BUILD_MARKER} > /dev/console",
+            # the agent.  The failure branch reports WHY on the console.
+            "echo SRDUMP-AGENT-CHECK > /dev/console",
+            "dpkg -L qemu-guest-agent 2>&1 | grep -E 'bin|sbin' > /dev/console",
+            "systemctl cat qemu-guest-agent.service 2>&1 | "
+            "grep -E '^ExecStart' > /dev/console",
+            "if systemctl cat qemu-guest-agent.service > /dev/null 2>&1; then "
+            f"echo {BUILD_MARKER} > /dev/console; "
+            "else echo SR-APPLIANCE-NO-AGENT > /dev/console; fi",
             "install -d -m 0755 /var/lib/sparring-range",
             "date -u +%FT%TZ > /var/lib/sparring-range/base-built",
             # The published image carries NO network configuration: every
@@ -107,8 +112,17 @@ def _user_data() -> str:
             # addressing (and the build's own DHCP file cannot leak into a
             # production guest).
             "rm -f /etc/netplan/*.yaml",
+            # The published image keeps a 32-zero-byte /etc/machine-id — the
+            # Ubuntu cloud-image convention.  A MISSING machine-id is not the
+            # same thing: systemd-networkd reads it while configuring a link
+            # (the DHCP client needs it for its IAID/DUID) and a missing file
+            # aborts the whole link, so even a STATIC address is never applied.
+            # systemd replaces the zeros with a fresh random id at boot, so
+            # every guest still gets its own instance identity.
+            "rm -f /var/lib/dbus/machine-id",
+            "dd if=/dev/zero of=/etc/machine-id bs=32 count=1 2>/dev/null",
+            "chmod 0444 /etc/machine-id",
             "rm -f /etc/ssh/ssh_host_*",
-            "rm -f /etc/machine-id /var/lib/dbus/machine-id",
             "cloud-init clean --logs --seed || true",
             "sync",
             "systemctl poweroff --no-block || poweroff",
@@ -170,8 +184,9 @@ def build(cache_dir: pathlib.Path, output: pathlib.Path, *, force: bool = False,
            "-nographic", "-serial", f"file:{serial}", "-no-reboot",
            "-display", "none", "-accel", "tcg,thread=multi"]
     print("$ " + " ".join(cmd), flush=True)
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL)
+    qemu_err = build_dir / "qemu.err"
+    with qemu_err.open("w") as errfh:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=errfh)
     started = time.monotonic()
     try:
         deadline = started + timeout_s
@@ -182,6 +197,10 @@ def build(cache_dir: pathlib.Path, output: pathlib.Path, *, force: bool = False,
                 text = ""
             if BUILD_MARKER in text:
                 break
+            if "SR-APPLIANCE-NO-AGENT" in text:
+                raise RuntimeError(
+                    "the guest agent is not installed in the built image:\n"
+                    + text[-2000:])
             if proc.poll() is not None:
                 raise RuntimeError(
                     f"base build guest exited {proc.returncode} before the "

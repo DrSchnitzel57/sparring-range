@@ -96,24 +96,34 @@ def _guest_seed(tmp_path: pathlib.Path, base: pathlib.Path):
 
 def _wait_ready(qga_sock: pathlib.Path, proc: subprocess.Popen,
                 timeout_s: float = 900) -> dict:
-    """Wait for the guest agent and the appliance readiness marker."""
+    """Wait for the guest agent and the appliance readiness marker.
+
+    ONE connection is held for the whole wait: a QEMU socket chardev carries
+    the guest's agent transport over the connected client, so opening and
+    dropping a connection per poll would disconnect the agent itself.
+    """
     deadline = time.monotonic() + timeout_s
     last = ""
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            raise AssertionError(f"QEMU exited {proc.returncode} before the "
-                                 f"guest was ready")
-        try:
-            with QgaClient(str(qga_sock), timeout=10) as agent:
+    agent = QgaClient(str(qga_sock), timeout=15)
+    try:
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise AssertionError(f"QEMU exited {proc.returncode} before the "
+                                     f"guest was ready")
+            try:
+                agent.connect()
                 marker = agent.read_file(marker_path())
                 if marker and marker.strip():
                     host_key = agent.read_file(HOST_KEY_PATH)
                     if host_key and host_key.strip():
                         return {"marker": marker.strip(),
                                 "host_key": host_key.strip()}
-        except Exception as exc:  # noqa: BLE001 — the agent is not up yet
-            last = str(exc)
-        time.sleep(5)
+            except Exception as exc:  # noqa: BLE001 — the agent is not up yet
+                last = str(exc)
+                agent.close()
+            time.sleep(5)
+    finally:
+        agent.close()
     raise AssertionError(f"guest never reported readiness: {last}")
 
 

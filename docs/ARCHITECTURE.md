@@ -531,6 +531,7 @@ Windows/AD, public hosting, browser terminals and extra scenarios remain later w
 | One canonical operator installer and a checksummed release bundle | Ad-hoc per-host shell repairs; two independently maintained install paths | Install, rerun, upgrade and recovery execute the same artifacts |
 | Fixed local isolated bridge plus appliance input/forward filtering | Libvirt default NAT, physical bridging, or relying only on missing guest routes | Guest root can add a route, and an isolated libvirt network still reaches its host |
 | Preserved historical records with explicit backend identity | Reinterpreting old PVE VMIDs as libvirt domains; maintaining two production backends | Keep history without carrying the old deployment system into the new product |
+| **Fresh installation: the appliance starts from an empty database** (2026-10-20, operator decision) | Importing the old PVE installation's history, sessions, accounts or casts into the appliance | The operator installs from scratch, so there is no old history to reconcile in the new database. The old installation and its history stay exactly where they are and are retired by the operator as a separate, explicit decision; nothing is imported, and no legacy branch is kept in the product code. The new deployments still record their own libvirt domain identity, because that is the new backend's own correctness contract, not a migration. |
 
 ### A. Topology, resources and outer-host responsibilities
 
@@ -864,6 +865,26 @@ Documentation references checked during planning (not hardware acceptance):
 [QEMU guest-agent file operations](https://www.qemu.org/docs/master/interop/qemu-ga-ref.html).
 Implement against the appliance's pinned versions; web documentation alone does
 not prove that installed capabilities, security profiles or performance work.
+
+### I. Milestone 15 implementation decisions (2026-10-20, branch `15`)
+
+The appliance design above was translated into running code on the user-selected
+branch. These are the decisions that changed the shape of the product, and why.
+
+| Chosen | Rejected | Why |
+|---|---|---|
+| The broker listens on a Unix socket and authenticates the caller with `SO_PEERCRED` (one permitted service UID) | Remote mutual TLS between two processes on one host; a bearer token on the socket | The kernel proves the caller's UID; a token would be a second, weaker identity to leak. Legacy mTLS stays available for the old path only. |
+| Production workers are started by a **separate-UID supervisor** that claims a durable queued run; the API only records heartbeats and outcomes | The API spawning the worker and owning a kill switch | A separate UID cannot be signalled by the API at all, so the "API can stop the worker" claim stops being aspirational. The assignment is durable, so a supervisor that dies mid-claim is reclaimable after the claim timeout and cannot strand a run. |
+| The supervisor capability is a file with a strict mode, compared with `hmac.compare_digest`; the API stores only the SHA-256 of a worker's one-shot run token | Passing the worker token in the assignment body and trusting the process environment alone | A leaked token must not become a durable capability, and a stale supervisor must not be able to act on a rotated token. |
+| The golden image carries ONE netplan entry whose interface key (`range-nic`) is the SAME key the per-instance seed writes | Two differently-keyed netplan files (one in the image, one per seed); relying on cloud-init `network-config` alone | Netplan merges by key, so the later seed file overrides the build-time DHCP fallback leaf by leaf. The cloud image disables cloud-init network rendering, so `network-config` alone is not sufficient; two different keys would define the same device twice. |
+| Readiness is a marker file read through the guest agent, not "the domain is running" | Treating a started VM as ready | A running kernel proves nothing about keys, users, network or services. The same fixed-path contract the production backend uses is what the test gate exercises. |
+| An obligation is released only after the backend is read AGAIN and no longer owns the resource | Timestamps, operator assertions, or a ledger edit | A stale or wrong evidence file must never release a reservation while the guest still exists. |
+| Controller MySQL reads go through locked PyMySQL while the existing integrity diagnostics stay | The hand-written wire protocol it replaces | A pinned, reviewed client removes protocol code we would otherwise own; the diagnostics (typed errors, integrity checks) are the valuable part and are retained. |
+| New acceptance layers `hypervisor`, `access` and `journey` fail closed when a prerequisite is missing, and the journey drives the INSTALLED appliance over HTTPS | A journey that runs against fakes and calls itself end-to-end | A fixture proves the harness, not the product. The journey layer refuses to run without a real appliance and real member credentials. |
+
+Not changed by this milestone: the outer Proxmox remains operator-only, the
+appliance holds no outer credential, guests stay on the isolated inner bridge,
+and no host firewall/auditd/host-shell capability was added to the product.
 
 ## Risks and explicitly unverified inputs (historical baseline; see reevaluation above)
 

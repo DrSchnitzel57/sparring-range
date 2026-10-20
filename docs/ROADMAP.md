@@ -22,18 +22,38 @@ Tests were deferred by the user; this planning pass supplies no new acceptance.
   fresh-launch → member SSH/sudo/reconnect/replay → cleanup → second-fresh-launch
   rehearsal with real nested KVM/isolation/stop. The user's deployed SSH has not
   worked; a ready flag cannot close it. No attacks are needed for this milestone.
+  *Status 2026-10-20 (branch `15`):* the software half exists — typed libvirt
+  broker behind a peer-UID Unix socket, manifest-derived policy, the operator
+  installer with evidence-bound recovery, a golden-image builder and the
+  `hypervisor`/`access` layers. The **promotion gate is still open**: nested KVM
+  is unavailable in this environment, so the operator's fresh-launch → member
+  SSH → replay → cleanup → second-launch rehearsal with real isolation and stop
+  evidence has not been produced.
 - [ ] **15 — Complete integrated individual practice.**
   [Plan](../.openchamber/plans/15-complete-practice-product.md).
   Complete both presets, durable lifecycle, honest service/inject/security results,
   sustained AI behavior under a distinct worker identity, browser/CLI authorization,
   reports and history. Reuse
   existing functionality; repair missing end-to-end behavior rather than rebuild.
+  *Status 2026-10-20 (branch `15`):* separate-UID worker dispatch, the appliance
+  installer, the controller MySQL client and the `hypervisor`/`access`/`journey`
+  layers are implemented. The `journey` layer requires the INSTALLED appliance, so
+  it cannot be closed in a developer environment; the real-model and human gates
+  stay open.
 - [ ] **16 — Installable appliance and qualified release.**
   [Plan](../.openchamber/plans/16-appliance-release.md).
   Finish the checksummed release bundle, upgrade/history-import/recovery tooling
   and operator guide; prove the complete software matrix at a pinned candidate,
   then collect operator/human acceptance. Backup destination/live restore remain
   optional. Runtime practice features and their tests are delivered in 15.
+- [ ] **17 — Appliance hand-off in the operator's own VM.**
+  [Plan](../.openchamber/plans/17-appliance-handoff.md).
+  Added 2026-10-20 at the user's request: deliver a deployable product the
+  operator can install and test in their own virtual machine. This is also
+  where milestone 14's promotion gate closes for real — nested KVM, isolation,
+  emergency stop and member SSH rehearsed on hardware instead of asserted.
+  It consumes 15 and 16; it does not replace them. **Deferred at the user's
+  instruction: 14, 15 and 16 are executed first, and 17 has not been started.**
 
 Three milestones are the minimum useful split: an accessible/recoverable platform,
 a complete practice product, then a qualified release. Each has internal coding
