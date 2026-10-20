@@ -36,7 +36,7 @@ import uuid
 REPO = pathlib.Path(__file__).resolve().parents[2]
 PY = sys.executable
 LAYERS = ("db", "containment", "packet", "authority", "browser", "live",
-          "images", "capture")
+          "images", "capture", "hypervisor", "access", "journey")
 COUNT_RE = re.compile(r"(\d+) (passed|failed|errors?|skipped|deselected)")
 
 
@@ -96,7 +96,8 @@ def audit_vulnerabilities(stdout: str, returncode: int) -> dict:
 def env_summary(extra: dict | None = None) -> str:
     keys = ("SR_PG_ADMIN_URL", "SR_REQUIRE_DB", "SR_REQUIRE_CONTAINMENT",
             "SR_REQUIRE_PACKET", "SR_REQUIRE_AUTHORITY", "SR_REQUIRE_BROWSER",
-            "SR_REQUIRE_IMAGES", "SR_REQUIRE_CAPTURE",
+            "SR_REQUIRE_IMAGES", "SR_REQUIRE_CAPTURE", "SR_REQUIRE_HYPERVISOR",
+            "SR_REQUIRE_ACCESS", "SR_REQUIRE_JOURNEY", "SR_APPLIANCE_BASE_IMAGE",
             "RUNNER_CGROUP_ROOT",
             "SR_E2E_API_PORT", "SR_E2E_WEB_PORT", "SR_COMPOSE_PROJECT")
     env = {k: os.environ.get(k, "") for k in keys if os.environ.get(k)}
@@ -193,7 +194,7 @@ def check_selection() -> None:
              f"{len(leaked)} integration tests in default selection, e.g. "
              f"{sorted(leaked)[:5]}")
     for layer in ("db", "containment", "packet", "authority", "browser",
-                  "images", "capture"):
+                  "images", "capture", "hypervisor", "access", "journey"):
         if not layer_ids[layer]:
             fail(f"layer {layer} non-empty", "layer selection is empty")
     ok("all tests classified",
@@ -1469,6 +1470,118 @@ def check_release() -> None:
        f"{counts.get('passed', 0)} passed, {counts.get('skipped', 0)} skipped")
 
 
+
+# -------------------------------------------------------------------------- #
+# hypervisor (14/15): real libvirt lifecycle, QGA readiness and ownership     #
+# -------------------------------------------------------------------------- #
+
+def _hypervisor_prereqs() -> list[str]:
+    missing = []
+    if not shutil.which("qemu-img"):
+        missing.append("qemu-img")
+    try:
+        import libvirt  # noqa: F401
+        import libvirt_qemu  # noqa: F401
+    except Exception:  # noqa: BLE001
+        missing.append("libvirt Python bindings (libvirt + libvirt_qemu)")
+    base = os.environ.get("SR_APPLIANCE_BASE_IMAGE", "").strip()
+    if not base or not pathlib.Path(base).is_file():
+        missing.append("SR_APPLIANCE_BASE_IMAGE (bootable Ubuntu qcow2)")
+    if not os.path.exists("/dev/kvm") and \
+            os.environ.get("SR_HYPERVISOR_ALLOW_TCG") != "1":
+        missing.append("/dev/kvm (nested KVM) or explicit SR_HYPERVISOR_ALLOW_TCG=1 "
+                       "for a LABELED software-emulation gate")
+    return missing
+
+
+def check_hypervisor() -> None:
+    missing = _hypervisor_prereqs()
+    if missing:
+        fail("hypervisor prerequisites (libvirt/KVM + Ubuntu base image)",
+             f"missing {missing} — required layer; install nested KVM and a "
+             "bootable appliance base image, or explicitly allow labeled TCG")
+    env = {"SR_REQUIRE_HYPERVISOR": "1",
+           "SR_APPLIANCE_BASE_IMAGE": os.environ.get("SR_APPLIANCE_BASE_IMAGE", ""),
+           "SR_HYPERVISOR_URI": os.environ.get("SR_HYPERVISOR_URI", "qemu:///session")}
+    for key in ("SR_HYPERVISOR_ALLOW_TCG", "SR_QEMU_IMG", "LD_LIBRARY_PATH",
+                "PYTHONPATH", "XDG_RUNTIME_DIR", "LIBVIRT_DEFAULT_URI"):
+        if os.environ.get(key):
+            env[key] = os.environ[key]
+    r, counts = pytest_run(["-m", "hypervisor"], env=env, timeout=3600)
+    require_selection(counts, "hypervisor")
+    if r.returncode != 0:
+        fail("real libvirt lifecycle/QGA/ownership/destroy",
+             f"exit {r.returncode}, counts {counts}:\n{r.stdout[-6000:]}")
+    ok("real libvirt clone/start/QGA host key/ownership/stop/destroy pass",
+       f"{counts.get('passed', 0)} passed, {counts.get('skipped', 0)} skipped; "
+       f"accelerator={os.environ.get('SR_HYPERVISOR_ALLOW_TCG') and 'explicit-TCG' or 'KVM'}")
+    _assert_no_owned_qemu_leftovers()
+
+
+# -------------------------------------------------------------------------- #
+# access (14/15): real guest SSH and recorded bastion replay                  #
+# -------------------------------------------------------------------------- #
+
+def check_access() -> None:
+    missing = _qemu_prereqs()
+    base = os.environ.get("SR_APPLIANCE_BASE_IMAGE", "").strip()
+    if not base or not pathlib.Path(base).is_file():
+        missing.append("SR_APPLIANCE_BASE_IMAGE (bootable Ubuntu qcow2)")
+    if not shutil.which("ssh-keygen"):
+        missing.append("ssh-keygen")
+    try:
+        import asyncssh  # noqa: F401
+    except Exception:  # noqa: BLE001
+        missing.append("asyncssh (bastion/client transport)")
+    if missing:
+        fail("access prerequisites (real guest SSH + recording bastion)",
+             f"missing {missing} — required layer; boot a real Ubuntu image "
+             "and install the SSH/asyncssh runtime")
+    env = {"SR_REQUIRE_ACCESS": "1", "SR_APPLIANCE_BASE_IMAGE": base}
+    if os.path.exists("/dev/kvm"):
+        env["SR_ACCESS_KVM"] = "1"
+    for key in ("SR_QEMU_KVM", "LD_LIBRARY_PATH", "PYTHONPATH"):
+        if os.environ.get(key):
+            env[key] = os.environ[key]
+    r, counts = pytest_run(["-m", "access"], env=env, timeout=3600)
+    require_selection(counts, "access")
+    if r.returncode != 0:
+        fail("real guest SSH + bastion cast replay",
+             f"exit {r.returncode}, counts {counts}:\n{r.stdout[-6000:]}")
+    ok("real guest SSH, pinned target key and .cast replay pass",
+       f"{counts.get('passed', 0)} passed, {counts.get('skipped', 0)} skipped")
+    _assert_no_owned_qemu_leftovers()
+
+
+# -------------------------------------------------------------------------- #
+# journey (15): installed appliance, real services, member workflow           #
+# -------------------------------------------------------------------------- #
+
+def check_journey() -> None:
+    required = ("SR_JOURNEY_BASE_URL", "SR_JOURNEY_OPERATOR_TOKEN",
+                "SR_JOURNEY_MEMBER_TOKEN")
+    missing = [k for k in required if not os.environ.get(k)]
+    if missing:
+        fail("journey prerequisites (installed appliance + authenticated members)",
+             f"missing {missing} — required live gate; point it at the installed "
+             "appliance and provide operator/member bearer tokens")
+    env = {"SR_REQUIRE_JOURNEY": "1"}
+    for key in ("SR_JOURNEY_BASE_URL", "SR_JOURNEY_OPERATOR_TOKEN",
+                "SR_JOURNEY_MEMBER_TOKEN", "SR_JOURNEY_SSH_KEY",
+                "SR_JOURNEY_BASTION_KNOWN_HOSTS",
+                "SR_JOURNEY_CA_FILE", "SR_JOURNEY_DURATION_MINUTES",
+                "SR_JOURNEY_PACE_SECONDS", "SR_JOURNEY_PRESET"):
+        if os.environ.get(key):
+            env[key] = os.environ[key]
+    r, counts = pytest_run(["-m", "journey"], env=env, timeout=7200)
+    require_selection(counts, "journey")
+    if r.returncode != 0:
+        fail("installed-appliance practice journey",
+             f"exit {r.returncode}, counts {counts}:\n{r.stdout[-8000:]}")
+    ok("installed-appliance journey (lifecycle/SSH/replay/history) passes",
+       f"{counts.get('passed', 0)} passed, {counts.get('skipped', 0)} skipped")
+
+
 CHECKS = {
     "selection": check_selection,
     "python": check_python,
@@ -1482,6 +1595,9 @@ CHECKS = {
     "browser": check_browser,
     "images": check_images,
     "capture": check_capture,
+    "hypervisor": check_hypervisor,
+    "access": check_access,
+    "journey": check_journey,
     "install": check_install,
     "release": check_release,
 }

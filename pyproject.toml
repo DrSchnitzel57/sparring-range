@@ -70,5 +70,8 @@ markers = [
     "live: operator live-infrastructure acceptance gate (never automatic)",
     "images: Mojang guest-image acceptance (paired 03+04 milestone 03; QEMU boot when available)",
     "capture: installed telemetry/capture acceptance (paired 03+04 milestone 04; QEMU boot when available)",
+    "hypervisor: real libvirt/KVM lifecycle and QGA readiness (appliance foundation)",
+    "access: real guest SSH and recorded bastion replay (appliance access)",
+    "journey: installed-appliance full practice journey (real guests, browser, labeled model fixture)",
 ]
-addopts = "-m 'not db and not containment and not packet and not authority and not browser and not live and not images and not capture'"
+addopts = "-m 'not db and not containment and not packet and not authority and not browser and not live and not images and not capture and not hypervisor and not access and not journey'"

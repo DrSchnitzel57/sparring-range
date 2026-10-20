@@ -65,6 +65,9 @@ REQUIRED_LAYER_ENV = {
     "live": "SR_REQUIRE_LIVE",
     "images": "SR_REQUIRE_IMAGES",
     "capture": "SR_REQUIRE_CAPTURE",
+    "hypervisor": "SR_REQUIRE_HYPERVISOR",
+    "access": "SR_REQUIRE_ACCESS",
+    "journey": "SR_REQUIRE_JOURNEY",
 }
 
 
