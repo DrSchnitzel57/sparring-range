@@ -45,6 +45,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from dataclasses import dataclass, field
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -62,8 +63,9 @@ DEFAULT_RUN = pathlib.Path("/run/sparring-range")
 
 UNITS = ("sr-appliance-broker.service", "sr-api.service",
          "sr-appliance-ingest.service", "sr-worker-supervisor.service",
-         "sr-bastion.service")
-GROUPS = ("srrange", "srbastion", "sr-broker-clients", "sringest", "srworker")
+         "sr-bastion.service", "sr-web.service")
+GROUPS = ("srrange", "srbastion", "sr-broker-clients", "sringest", "srworker",
+          "srweb")
 USERS = {
     # existing accepted identities: API/controller, bastion
     "srrange": ("srrange", ("sr-broker-clients", "srbastion")),
@@ -72,6 +74,7 @@ USERS = {
     "srbroker": ("sr-broker-clients", ()),
     "sringest": ("sringest", ()),
     "srworker": ("srworker", ()),
+    "srweb": ("srweb", ()),
 }
 
 
@@ -121,6 +124,7 @@ class Layout:
     units_dir: pathlib.Path = pathlib.Path("/etc/systemd/system")
     network_dir: pathlib.Path = pathlib.Path("/etc/systemd/network")
     nftables_dir: pathlib.Path = pathlib.Path("/etc/nftables.d")
+    nginx_dir: pathlib.Path = pathlib.Path("/etc/nginx/sites-available")
 
     @property
     def sandboxed(self) -> bool:
@@ -142,7 +146,8 @@ def default_layout(*, root: pathlib.Path = pathlib.Path("/"),
                   run=root / "run/sparring-range",
                   units_dir=root / "etc/systemd/system",
                   network_dir=root / "etc/systemd/network",
-                  nftables_dir=root / "etc/nftables.d")
+                  nftables_dir=root / "etc/nftables.d",
+                  nginx_dir=root / "etc/nginx/sites-available")
 
 
 def _atomic_write(path: pathlib.Path, content: str, mode: int,
@@ -237,6 +242,10 @@ def render_control_env(m: ApplianceManifest, *, etc: pathlib.Path = DEFAULT_ETC,
         ("SR_LLM_BASE_URL", m.model_base_url),
         ("SR_LLM_MODEL_RED", m.model_alias),
         ("SR_LLM_MODEL_COACH", m.model_alias),
+        # nginx routes /api/* to the API and everything else to Next; the
+        # web build bakes the same prefix, so server-side API clients must
+        # prepend it.
+        ("SR_API_ROUTE_PREFIX", "/api"),
         ("SR_RUNNER_TRANSPORT", "ssh"),
         # Fixed attacker management address inside the isolated range. The
         # broker injects the runner public key; the private key remains a
@@ -398,6 +407,81 @@ WantedBy=multi-user.target
 """
 
 
+def render_web_unit(lay: Layout) -> str:
+    """The Next.js frontend, served as its own service identity on loopback.
+
+    nginx terminates TLS and routes /api/* to the API; the frontend never
+    listens on the LAN and never holds an infrastructure credential.
+    """
+    return f"""[Unit]
+Description=sparring-range web frontend (Next.js, loopback only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=srweb
+Group=srweb
+WorkingDirectory={lay.prefix}/web
+EnvironmentFile=-{lay.etc}/control-plane.env
+Environment=PORT=3000
+Environment=HOSTNAME=127.0.0.1
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node {lay.prefix}/web/node_modules/next/dist/bin/next start -p 3000 -H 127.0.0.1
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths={lay.prefix}/web
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def render_nginx_site(m: ApplianceManifest, lay: Layout) -> str:
+    """The public HTTPS front door.
+
+    Only the public plane is exposed: the API under /api/ and the frontend
+    everywhere else.  The ingest listener is NOT proxied - it lives on the
+    isolated inner bridge and is reached by the guests only.
+    """
+    host = urllib.parse.urlsplit(m.public_url).hostname or "localhost"
+    return f"""# Rendered by deploy/appliance.py - do not hand-edit.
+server {{
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name {host};
+
+    ssl_certificate     {lay.etc}/tls/https.crt;
+    ssl_certificate_key {lay.etc}/tls/https.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header Referrer-Policy no-referrer always;
+
+    location /api/ {{
+        proxy_pass http://127.0.0.1:8000/api/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }}
+
+    location / {{
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }}
+}}
+"""
+
+
 def render_files(m: ApplianceManifest, *,
                  prefix: pathlib.Path = DEFAULT_PREFIX,
                  etc: pathlib.Path = DEFAULT_ETC,
@@ -433,6 +517,10 @@ def render_files(m: ApplianceManifest, *,
                      _unit_from_template("sr-api.service"), 0o644),
         RenderedFile(lay.units_dir / "sr-bastion.service",
                      _unit_from_template("sr-bastion.service"), 0o644),
+        RenderedFile(lay.units_dir / "sr-web.service",
+                     render_web_unit(lay), 0o644),
+        RenderedFile(lay.nginx_dir / "sparring-range.conf",
+                     render_nginx_site(m, lay), 0o644),
     ]
     actions = [
         "create groups: " + ", ".join(GROUPS),
@@ -440,8 +528,14 @@ def render_files(m: ApplianceManifest, *,
         "add srrange to sr-broker-clients and srbastion groups",
         "ensure state/images/recordings/secrets directories",
         "generate worker supervisor capability if absent (0600 srworker)",
-        "install libvirt/QEMU/postgresql/git/nftables/nginx prerequisites",
-        "run `alembic upgrade head` with the owner URL before starting API",
+        "install the pinned native packages (libvirt/QEMU, PostgreSQL, nginx, "
+        "nftables) — real appliances only",
+        "create the appliance venv from the locked requirements — real "
+        "appliances only",
+        "create the database roles and run `alembic upgrade head` as the owner "
+        "— real appliances only",
+        "provision the TLS material and onboard the member keys — real "
+        "appliances only",
         "daemon-reload; enable --now " + " ".join(UNITS),
         "apply fixed networkd bridge and nftables rules once; never at runtime",
     ]
@@ -468,7 +562,8 @@ class Runner:
     def __init__(self, *, dry_run: bool = False):
         self.dry_run = dry_run
 
-    def __call__(self, *cmd: str, check: bool = True) -> subprocess.CompletedProcess:
+    def __call__(self, *cmd: str, check: bool = True,
+                env: dict | None = None) -> subprocess.CompletedProcess:
         printable = " ".join(str(c) for c in cmd)
         # Progress belongs on stderr: stdout carries the machine-readable
         # result of the command.
@@ -476,7 +571,9 @@ class Runner:
               flush=True)
         if self.dry_run:
             return subprocess.CompletedProcess(list(cmd), 0, "", "")
-        r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True)
+        environ = {**os.environ, **(env or {})}
+        r = subprocess.run([str(c) for c in cmd], capture_output=True,
+                           text=True, env=environ)
         if check and r.returncode != 0:
             raise InstallError(f"{printable} failed ({r.returncode}): "
                                f"{(r.stderr or r.stdout)[-800:]}")
@@ -618,6 +715,36 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
                 run("usermod", "-a", "-G", extra, user, check=False)
     _ensure_dirs(m, run, lay)
     token_action = _ensure_supervisor_token(lay.etc, run, lay)
+    services: dict = {}
+    if not lay.sandboxed and not dry_run:
+        # The REAL service steps.  A sandbox install renders the same files
+        # and proves the sequences, but it never pretends the services ran.
+        from deploy import appliance_services as svc
+        source = ROOT
+        if not (source / "requirements.lock").is_file():
+            raise InstallError(f"missing {source / 'requirements.lock'}")
+        services["native_packages"] = svc.ensure_native_dependencies(run)
+        services["venv"] = str(svc.ensure_venv(
+            run, prefix=lay.prefix, source=source))
+        services["database"] = svc.ensure_database(
+            run, prefix=lay.prefix, env_file=lay.etc / "control-plane.env")
+        services["tls"] = svc.ensure_tls(
+            run, etc=lay.etc, public_ip=m.network.lan_address or "127.0.0.1")
+        member_keys = []
+        for role in ("runner", "bastion", "mgmt"):
+            try:
+                member_keys.append(m.public_key_for(role))
+            except Exception:  # noqa: BLE001 — a missing role key is reported
+                continue
+        services["onboarding"] = svc.onboard_operator(
+            run, etc=lay.etc, authorized_keys=member_keys)
+        services["web"] = svc.ensure_web_build(run, source=source)
+        # the public front door: enable the rendered site and reload nginx
+        run("ln", "-sfn", str(lay.nginx_dir / "sparring-range.conf"),
+            str(lay.nginx_dir.parent / "sites-enabled/sparring-range.conf"),
+            check=False)
+        run("nginx", "-t", check=False)
+        run("systemctl", "reload", "nginx", check=False)
     changed = _write_files(plan.files, run, lay)
     receipt = _receipt(m, plan, lay)
     if not dry_run:
@@ -632,7 +759,7 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
         for unit in plan.units:
             run("systemctl", "enable", unit, check=False)
     return {"changed": changed, "supervisor_token": token_action,
-            "dry_run": dry_run}
+            "services": services, "dry_run": dry_run}
 
 
 # --------------------------------------------------------------------------- #
