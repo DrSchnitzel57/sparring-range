@@ -512,6 +512,13 @@ class LibvirtBackend:
             raise BackendUnavailable(f"guest agent read failed: {msg}") from exc
 
     def _qga_read(self, dom, path: str, timeout_s: float = 10.0) -> str | None:
+        """Read one fixed path through the guest agent.
+
+        Two protocol details matter and are easy to get wrong: the handle
+        returned by ``guest-file-open`` IS the ``return`` value (an integer,
+        not an object with a "handle" key), and the read payload is named
+        ``buf-b64`` by current agents (``buf`` by older ones).
+        """
         opened = self._qga(dom, json.dumps({
             "execute": "guest-file-open",
             "arguments": {"path": path, "mode": "r"}}), timeout_s)
@@ -519,10 +526,10 @@ class LibvirtBackend:
             return None
         try:
             obj = json.loads(opened)
-            handle = obj.get("return")
-            if handle is None:
-                return None
-        except (json.JSONDecodeError, AttributeError):
+        except json.JSONDecodeError:
+            return None
+        handle = obj.get("return") if isinstance(obj, dict) else None
+        if not isinstance(handle, int):
             return None
         chunks = []
         try:
@@ -536,9 +543,10 @@ class LibvirtBackend:
                 ret = obj.get("return")
                 if not isinstance(ret, dict):
                     return None
+                buf = ret.get("buf-b64") or ret.get("buf") or ""
                 try:
-                    chunk = base64.b64decode(ret.get("buf", ""),
-                                             validate=False).decode("utf-8", "replace")
+                    chunk = base64.b64decode(buf, validate=False).decode(
+                        "utf-8", "replace")
                 except Exception:
                     return None
                 chunks.append(chunk)
