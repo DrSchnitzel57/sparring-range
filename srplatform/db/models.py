@@ -224,6 +224,12 @@ class Run(Base):
     # this while the child runs. A stale value is visible evidence for
     # reconciliation; it never authorizes an API-side kill across UIDs.
     worker_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The SUPERVISOR's own claim credential (hash). Distinct from
+    # ``worker_token`` (the worker's one-shot run capability): every
+    # supervisor callback is fenced by this, so an obsolete claimant whose
+    # claim was already reclaimed and rotated cannot assign, heartbeat or
+    # overwrite a terminal state.
+    worker_claim_token: Mapped[str | None] = mapped_column(Text)
     result: Mapped[dict | None] = mapped_column(JSONB)
     error: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

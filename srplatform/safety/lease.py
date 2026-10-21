@@ -39,7 +39,7 @@ def control_is_active() -> bool | None:
 class ControlHeartbeat:
     def __init__(self, broker, *, interval_s: float = 5.0,
                  active_check=control_is_active, holder: str = "api-control",
-                 max_unverified_s: float = 60.0,
+                 max_unverified_s: float = 60.0, guard=None,
                  monotonic=time.monotonic):
         self.broker = broker
         self.interval_s = interval_s
@@ -47,6 +47,9 @@ class ControlHeartbeat:
         self.holder = holder
         self.max_unverified_s = max_unverified_s
         self._monotonic = monotonic
+        # Optional guard: while it is false this process must not act as the
+        # control plane (it lost the controller lock to another process).
+        self.guard = guard
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.last_error: str | None = None
@@ -55,6 +58,15 @@ class ControlHeartbeat:
 
     def tick(self) -> bool:
         """One renewal cycle. Returns True when a renewal was sent."""
+        if self.guard is not None:
+            try:
+                if not self.guard():
+                    self.last_error = ("control ownership was lost — "
+                                       "renewals withheld")
+                    return False
+            except Exception as e:  # noqa: BLE001 - an exploding guard is a loss
+                self.last_error = f"control ownership check raised: {e}"
+                return False
         try:
             active = self.active_check()
         except Exception as e:  # noqa: BLE001 — an exploding check is unverified

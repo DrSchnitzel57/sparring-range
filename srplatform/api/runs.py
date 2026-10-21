@@ -395,10 +395,15 @@ def start_run(db: Session, session_id, scenario_id: str) -> Run:
 def claim_run(db: Session, claim_timeout_s: int = 120):
     """Atomically claim one queued run for the separate-UID supervisor.
 
+    Two credentials come out of a claim:
+
+    * the WORKER's one-shot run capability (handed to the child), and
+    * the SUPERVISOR's claim credential, which fences every later callback.
+
     A queued row with no token is unclaimed. A row whose token was set but
     whose process never registered is reclaimable after ``claim_timeout_s``
-    (a supervisor may have died between claim and assign); the old token is
-    replaced, so a late supervisor cannot assign with stale authority.
+    (a supervisor may have died between claim and assign); BOTH credentials
+    are replaced, so an obsolete claimant cannot act with stale authority.
     """
     if get_supervisor().latch_status()["latched"]:
         db.rollback()
@@ -417,23 +422,41 @@ def claim_run(db: Session, claim_timeout_s: int = 120):
         db.rollback()
         return None
     token = secrets.token_urlsafe(32)
+    claim_token = secrets.token_urlsafe(32)
     run.worker_token = hashlib.sha256(token.encode()).hexdigest()
+    run.worker_claim_token = hashlib.sha256(claim_token.encode()).hexdigest()
     run.started_at = now
     run.worker_heartbeat_at = now
     db.commit()
-    return run, token
+    return run, token, claim_token
+
+
+def _claim_matches(row_claim_hash: str | None, claim_token: str | None) -> bool:
+    """Fence a supervisor callback by its claim credential."""
+    if not claim_token or not row_claim_hash:
+        return False
+    return hashlib.sha256(claim_token.encode()).hexdigest() == row_claim_hash
 
 
 def assign_run(db: Session, run_id, pid: int, pgid: int,
-               pgid_pstart: int | None) -> bool:
-    """Record the supervisor-owned process group. Only a claimed queued run
-    can be assigned; a concurrent stop/latch transition wins, and the
-    supervisor must then kill its child."""
+               pgid_pstart: int | None, claim_token: str | None = None) -> bool:
+    """Record the supervisor-owned process group.
+
+    Fenced by the supervisor's claim credential: a claimant whose claim was
+    already reclaimed (and whose credential therefore rotated) is refused and
+    must kill its own child.  Only a claimed queued run can be assigned; a
+    concurrent stop/latch transition wins.
+    """
     now = _now()
+    run = db.get(Run, run_id)
+    if run is None or not _claim_matches(run.worker_claim_token, claim_token):
+        db.rollback()
+        return False
     res = db.execute(
         update(Run)
         .where(Run.run_id == run_id, Run.status == "queued",
-               Run.worker_token.is_not(None))
+               Run.worker_token.is_not(None),
+               Run.worker_claim_token == run.worker_claim_token)
         .values(status="running", pid=int(pid), pgid=int(pgid),
                 pgid_pstart=pgid_pstart, started_at=now,
                 worker_heartbeat_at=now))
@@ -441,39 +464,83 @@ def assign_run(db: Session, run_id, pid: int, pgid: int,
     return bool(res.rowcount)
 
 
-def heartbeat_run(db: Session, run_id) -> bool:
+def heartbeat_run(db: Session, run_id,
+                 claim_token: str | None = None) -> bool:
+    """Renew the supervisor's heartbeat.
+
+    Fenced by the claim credential, and it answers whether the supervisor
+    must STOP: a run the controller has marked for stopping is reported back
+    so the supervisor (the only party that may signal a foreign-UID child)
+    can terminate it.
+    """
+    run = db.get(Run, run_id)
+    if run is None or not _claim_matches(run.worker_claim_token, claim_token):
+        db.rollback()
+        return False
+    # A run the controller has marked for stopping still accepts the
+    # heartbeat: the supervisor must learn that it has to stop the child.
+    if run.status not in ("running", "stopping"):
+        db.rollback()
+        return False
     res = db.execute(update(Run)
-                     .where(Run.run_id == run_id, Run.status == "running")
+                     .where(Run.run_id == run_id,
+                            Run.status.in_(("running", "stopping")),
+                            Run.worker_claim_token == run.worker_claim_token)
                      .values(worker_heartbeat_at=_now()))
     db.commit()
     return bool(res.rowcount)
 
 
-def worker_failed(db: Session, run_id, reason: str) -> dict:
+def supervisor_stop_requested(db: Session, run_id) -> bool:
+    """True when the controller wants this run's worker stopped."""
+    run = db.get(Run, run_id)
+    return bool(run is not None and run.status == "stopping")
+
+
+def worker_failed(db: Session, run_id, reason: str,
+                  claim_token: str | None = None) -> dict:
     """The supervisor confirmed the child group is gone; resolve the run
-    honestly. Remote operations that cannot be confirmed remain
-    'cancel-unknown' and keep the reservation."""
+    honestly.
+
+    Fenced by the supervisor's claim credential (an obsolete claimant cannot
+    report anything) and the terminal transition is GUARDED: only a run that
+    is still 'running' may become 'failed'/'cancelled', so a report that
+    races a confirmed completion can never overwrite the completion.
+    Remote operations that cannot be confirmed remain 'cancel-unknown' and
+    keep the reservation.
+    """
     run = db.get(Run, run_id)
     if run is None:
         return {"ok": False, "detail": "unknown run"}
+    if not _claim_matches(run.worker_claim_token, claim_token):
+        db.rollback()
+        return {"ok": False, "detail": "claim credential does not match — "
+                                        "refused (obsolete claimant)"}
     if run.status in TERMINAL:
         return {"ok": True, "detail": f"run already {run.status}"}
     cancel = cancel_remote_operations(db, run)
     ok = bool(cancel.get("ok"))
     reason = (reason or "worker exited")[:1000]
+    stopped = run.status == "stopping"
+    terminal = "cancelled" if stopped else "failed"
+    outcome = "canceled" if stopped else "worker_failure"
     if ok:
         wrote = guarded_terminal_update(
             db, run.run_id,
-            {"status": "failed", "outcome": "worker_failure", "error": reason,
+            {"status": terminal, "outcome": outcome, "error": reason,
              "ended_at": _now(), "worker_token": None,
-             "worker_heartbeat_at": _now()})
+             "worker_claim_token": None,
+             "worker_heartbeat_at": _now()},
+            extra_where=(Run.status.in_(("running", "stopping")),))
         if wrote == 0:
             ok = False
     if not ok:
-        db.execute(update(Run).where(Run.run_id == run.run_id)
+        db.execute(update(Run).where(Run.run_id == run.run_id,
+                                     Run.status.not_in(TERMINAL))
                    .values(status="cancel-unknown", outcome="worker_failure",
                            error=(reason + " — cessation UNCONFIRMED")[:1000],
-                           worker_token=None, worker_heartbeat_at=_now()))
+                           worker_token=None, worker_claim_token=None,
+                           worker_heartbeat_at=_now()))
         db.commit()
     return {"ok": ok, "detail": "worker failure recorded" if ok else
             "worker exit recorded; remote cessation UNCONFIRMED"}
@@ -571,7 +638,50 @@ def _watch(proc: subprocess.Popen, run_id: str) -> None:
 
 
 # ------------------------------------------------------------------- stop ----
-def stop_run(db: Session, run_id, runner=None) -> dict:
+def _cancel_unstarted(db: Session, run) -> dict:
+    """Resolve a queued run that never started anything.
+
+    No process exists, so there is nothing to kill and no remote operation to
+    cancel: the run becomes terminal immediately and keeps no obligation.
+    """
+    res = db.execute(
+        update(Run)
+        .where(Run.run_id == run.run_id,
+               Run.status.in_(("queued", "stopping")))
+        .values(status="cancelled", outcome="canceled", ended_at=_now(),
+                worker_token=None, worker_claim_token=None,
+                error="stopped before it started"))
+    db.commit()
+    if res.rowcount:
+        return {"ok": True, "status": "cancelled",
+                "detail": "the run never started; nothing had to be stopped"}
+    return {"ok": False, "status": "unknown",
+            "detail": "the run changed state while it was being stopped"}
+
+
+def _await_supervisor_stop(db: Session, run_id, timeout_s: float = 45.0) -> dict:
+    """Wait for the supervisor to confirm the worker's cessation.
+
+    The supervisor owns the child (it is another UID) and reports the
+    outcome; until that report arrives the obligation stands and the result
+    is NOT a success.
+    """
+    deadline = time.monotonic() + max(1.0, timeout_s)
+    run = db.get(Run, run_id)
+    while time.monotonic() < deadline:
+        db.refresh(run)
+        if run.status in TERMINAL:
+            return {"ok": True, "status": run.status,
+                    "detail": "the supervisor confirmed the cessation"}
+        time.sleep(0.5)
+    return {"ok": False, "status": "stopping",
+            "detail": "the supervisor was asked to stop the worker; the "
+                      "cessation is NOT confirmed yet — the obligation is "
+                      "retained"}
+
+
+def stop_run(db: Session, run_id, runner=None,
+             supervisor_wait_s: float = 45.0) -> dict:
     """Authoritative stop (audit T01/T02): the run becomes 'cancelled' ONLY
     when the worker group is confirmed dead AND every remote operation is
     confirmed gone. A failed kill never sets cancelled; 'stopping' is an
@@ -623,9 +733,24 @@ def stop_run(db: Session, run_id, runner=None) -> dict:
             return {"ok": True, "status": run.status,
                     "detail": "spawner completed the termination"}
         if not run.pgid:
-            return {"ok": False, "status": run.status,
-                    "detail": "worker not yet registered; the spawner or startup "
-                              "recovery retains the termination obligation — NOT confirmed"}
+            if run.worker_claim_token:
+                # A supervisor owns this claim: it is the only party that may
+                # signal the child. Ask it and wait for its report.
+                return _await_supervisor_stop(db, run_id,
+                                              timeout_s=supervisor_wait_s)
+            # NOTHING was ever started for this run (no spawner, no
+            # supervisor): there is no process to stop, so the run resolves
+            # now. Leaving it in 'stopping' would strand it forever — the
+            # supervisor only claims 'queued' rows, so it would never be
+            # claimed and never finish.
+            return _cancel_unstarted(db, run)
+
+    if run.worker_claim_token and not was_queued:
+        # The worker belongs to a DIFFERENT UID (the supervisor's child). The
+        # API may not signal it, and pretending otherwise would report a
+        # cessation it cannot confirm. The supervisor is told through the
+        # heartbeat and reports back; the obligation stays until it does.
+        return _await_supervisor_stop(db, run_id, timeout_s=supervisor_wait_s)
 
     # 1. LOCAL containment: kill the worker's process group, confirmed.
     group_res = (run_registry.terminate_group(run.pgid, expected_pstart=run.pgid_pstart)

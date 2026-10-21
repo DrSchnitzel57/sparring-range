@@ -177,8 +177,15 @@ def readyz():
     # that could not take the controller lock, or whose startup duties
     # failed, must not look healthy.
     startup_issues = list(getattr(app.state, "startup_issues", []) or [])
+    lock = getattr(app.state, "controller_lock", None)
     controller = bool(getattr(app.state, "controller", False))
     controller_detail = getattr(app.state, "controller_detail", "")
+    if lock is not None:
+        # Ownership is a LIVE fact: a lock whose session died is not
+        # ownership, and the process must stop acting as the controller.
+        controller = controller and lock.held
+        if not lock.held and lock.detail:
+            controller_detail = lock.detail
     issues.extend(startup_issues)
     if not controller and controller_detail:
         issues.append(f"controller: {controller_detail}")
@@ -1256,10 +1263,19 @@ class AssignIn(BaseModel):
     pid: int = Field(gt=1)
     pgid: int = Field(gt=1)
     pgid_pstart: int | None = None
+    # The supervisor's CLAIM credential: it fences every callback, so an
+    # obsolete claimant (whose claim was reclaimed and rotated) is refused.
+    claim_token: str = Field(min_length=16, max_length=200)
 
 
 class WorkerFailedIn(BaseModel):
     reason: str = Field(default="worker exited", max_length=1000)
+    claim_token: str = Field(min_length=16, max_length=200)
+
+
+class SupervisorClaimIn(BaseModel):
+    """The supervisor's claim credential, presented on every callback."""
+    claim_token: str = Field(min_length=16, max_length=200)
 
 
 @app.post("/internal/worker/claim")
@@ -1273,13 +1289,14 @@ def supervisor_claim(
     claimed = runs_svc.claim_run(db, s.worker_claim_timeout_s)
     if not claimed:
         return {"assignment": None}
-    run, token = claimed
+    run, token, claim_token = claimed
     from srplatform.db.models import MatchModel
     env = runs_svc._worker_env(s, token, run.session_id, run.scenario_id, run,
                                match=db.get(MatchModel, run.session_id))
     return {"assignment": {"run_id": str(run.run_id),
                            "session_id": str(run.session_id),
                            "scenario_id": run.scenario_id,
+                           "claim_token": claim_token,
                            "env": env}}
 
 
@@ -1289,19 +1306,24 @@ def supervisor_assign(run_id: uuid.UUID, body: AssignIn,
                       db: DbSession = None):
     _require_supervisor(x_worker_supervisor_token)
     if not runs_svc.assign_run(db, run_id, body.pid, body.pgid,
-                               body.pgid_pstart):
-        raise HTTPException(409, "run is not a claimed queued assignment")
+                               body.pgid_pstart, body.claim_token):
+        raise HTTPException(409, "run is not a claimed queued assignment for "
+                                "this claim credential")
     return {"ok": True}
 
 
 @app.post("/internal/worker/{run_id}/heartbeat")
 def supervisor_heartbeat(run_id: uuid.UUID,
+                         body: SupervisorClaimIn,
                          x_worker_supervisor_token: str | None = Header(default=None),
                          db: DbSession = None):
     _require_supervisor(x_worker_supervisor_token)
-    if not runs_svc.heartbeat_run(db, run_id):
-        raise HTTPException(409, "run is not running")
-    return {"ok": True}
+    if not runs_svc.heartbeat_run(db, run_id, body.claim_token):
+        raise HTTPException(409, "run is not running for this claim credential")
+    # The supervisor is the only party that may signal a foreign-UID child,
+    # so the stop request travels back to it on the heartbeat.
+    return {"ok": True,
+            "stop": runs_svc.supervisor_stop_requested(db, run_id)}
 
 
 @app.post("/internal/worker/{run_id}/failed")
@@ -1309,7 +1331,7 @@ def supervisor_failed(run_id: uuid.UUID, body: WorkerFailedIn,
                       x_worker_supervisor_token: str | None = Header(default=None),
                       db: DbSession = None):
     _require_supervisor(x_worker_supervisor_token)
-    return runs_svc.worker_failed(db, run_id, body.reason)
+    return runs_svc.worker_failed(db, run_id, body.reason, body.claim_token)
 
 
 @app.post("/internal/runs/{run_id}/complete")
@@ -1630,18 +1652,36 @@ def _apply_competition_filter(db, sess, p, ev: dict) -> dict:
 def killswitch(p: Principal = Depends(operator)):
     from sqlalchemy import select as sa_select
     extra = []
+    supervisor_runs = []
     try:
         with db() as s:
             for r in s.execute(sa_select(Run).where(
                     Run.status.in_(runs_svc.ACTIVE))).scalars():
+                if r.worker_claim_token:
+                    # The worker belongs to ANOTHER UID (the supervisor's
+                    # child): the API may not signal it, and a failed local
+                    # kill would report a cessation it cannot confirm. The
+                    # run is marked stopping instead, and the supervisor
+                    # terminates its child and reports back.
+                    supervisor_runs.append(str(r.run_id))
+                    continue
                 if r.pgid:
                     extra.append((str(r.run_id), int(r.pgid), r.pgid_pstart))
+            if supervisor_runs:
+                s.execute(update(Run)
+                          .where(Run.run_id.in_(supervisor_runs))
+                          .values(status="stopping"))
+                s.commit()
     except Exception:
         pass  # the latch still engages; the DB problem is visible in the result below
     # recovered groups are PASSED TO THE KILL (audit R03) — reporting them as
     # "recovered_groups" without terminating them was the fail-open bug.
     result = get_supervisor().engage(reason=f"killswitch by {p.username}",
                                      extra_groups=extra)
+    if supervisor_runs:
+        # honest reporting: these workers were NOT killed by this process
+        result["supervisor_stop_requested"] = supervisor_runs
+        result.setdefault("detail", "")
     # REMOTE containment (audit T01): killing local workers proves nothing
     # about commands already dispatched to the isolated runner. Every active
     # remote operation is cancelled through the control channel and the
@@ -2100,6 +2140,7 @@ def _startup():
         return
     app.state.controller = True
     app.state.controller_detail = lock.detail
+    lock.monitor()
     try:
         runs_svc.reconcile_on_startup()
     except Exception as exc:  # noqa: BLE001 - reported, never hidden
@@ -2127,9 +2168,14 @@ def _startup():
                 pass  # unconfigured broker: readiness reports it; killswitch
                 # still latches + reports the layer honestly
         s = get_settings()
-        if s.broker_url and sup.broker is not None:
+        # The control lease must be armed for BOTH deployments: the legacy
+        # mutual-TLS broker AND the appliance's Unix-socket broker. Leaving
+        # the lease unarmed means a control loss (the API dies) never stops
+        # the range - exactly the failure the lease exists to prevent.
+        if (s.broker_url or s.broker_socket) and sup.broker is not None:
             from srplatform.safety.lease import ControlHeartbeat
-            hb = ControlHeartbeat(sup.broker, interval_s=s.broker_heartbeat_s)
+            hb = ControlHeartbeat(sup.broker, interval_s=s.broker_heartbeat_s,
+                                  guard=lambda: bool(lock.held) if lock else True)
             hb.start()
             app.state.control_heartbeat = hb
     except Exception:

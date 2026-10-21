@@ -61,6 +61,10 @@ class Supervisor:
         self.stop = threading.Event()
         self.child: subprocess.Popen | None = None
         self.run_id: str | None = None
+        # The claim credential for the run this supervisor currently owns.
+        # It fences every callback: if the controller reclaimed the run, the
+        # credential is rotated and this supervisor's authority is gone.
+        self.claim_token: str | None = None
 
     def _terminate_child(self, grace_s: float = 8.0) -> str:
         proc = self.child
@@ -86,21 +90,74 @@ class Supervisor:
                 return "child group termination UNCONFIRMED"
             return "child group killed"
 
+    def _report(self, client, reason: str) -> None:
+        """Tell the controller that the child is gone.
+
+        The report is best effort: a stale credential is refused (the
+        controller has moved on) and that refusal is the correct outcome.
+        """
+        if not self.run_id:
+            return
+        try:
+            _post(client,
+                  f"{self.api}/internal/worker/{self.run_id}/failed",
+                  self.headers,
+                  {"reason": reason,
+                   "claim_token": self.claim_token or ""})
+        except Exception as exc:  # noqa: BLE001 — the report is best effort
+            print(f"[supervisor] failure report refused: {exc}",
+                  file=sys.stderr, flush=True)
+
     def _beat(self, done: threading.Event) -> None:
         with httpx.Client() as client:
             while not done.wait(self.heartbeat_s):
                 if not self.run_id:
                     continue
                 try:
-                    _post(client,
-                          f"{self.api}/internal/worker/{self.run_id}/heartbeat",
-                          self.headers)
+                    reply = _post(client,
+                                  f"{self.api}/internal/worker/"
+                                  f"{self.run_id}/heartbeat",
+                                  self.headers,
+                                  {"claim_token": self.claim_token or ""})
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code == 409:
+                        # The controller no longer recognises this claim: the
+                        # run was stopped, reclaimed or completed by someone
+                        # else. This supervisor has NO authority over the
+                        # child any more, so it must not keep it running.
+                        print("[supervisor] claim refused — terminating the "
+                              "child (the authority is gone)",
+                              file=sys.stderr, flush=True)
+                        self._terminate_child()
+                        self._report(client, "the controller no longer "
+                                           "recognises this claim")
+                        self.run_id = None
+                        self.claim_token = None
+                        return
+                    print(f"[supervisor] heartbeat failed: {exc}",
+                          file=sys.stderr, flush=True)
+                    # A missing heartbeat is not a stop signal; the API and
+                    # operator can see staleness. Keep trying while the child
+                    # is alive so a transient API restart does not orphan it.
+                    continue
                 except Exception as exc:  # noqa: BLE001
                     print(f"[supervisor] heartbeat failed: {exc}",
                           file=sys.stderr, flush=True)
                     # A missing heartbeat is not a stop signal; the API and
                     # operator can see staleness. Keep trying while the child
                     # is alive so a transient API restart does not orphan it.
+                    continue
+                if isinstance(reply, dict) and reply.get("stop"):
+                    # The controller asked for this worker to stop.  The
+                    # supervisor is the ONLY party that may signal a
+                    # foreign-UID child, so the request comes back here.
+                    print("[supervisor] stop requested by the controller",
+                          file=sys.stderr, flush=True)
+                    self._terminate_child()
+                    self._report(client, "stopped at the controller's request")
+                    self.run_id = None
+                    self.claim_token = None
+                    return
 
     def run(self) -> int:
         with httpx.Client() as client:
@@ -118,6 +175,7 @@ class Supervisor:
                     self.stop.wait(self.poll_s)
                     continue
                 self.run_id = assignment["run_id"]
+                self.claim_token = assignment.get("claim_token")
                 env = dict(assignment.get("env") or {})
                 # The child gets ONLY this serialized environment. Never
                 # inherit the supervisor's own token or controller secrets.
@@ -133,8 +191,10 @@ class Supervisor:
                     _post(client,
                           f"{self.api}/internal/worker/{self.run_id}/failed",
                           self.headers,
-                          {"reason": f"worker spawn failed: {exc}"})
+                          {"reason": f"worker spawn failed: {exc}",
+                           "claim_token": self.claim_token or ""})
                     self.run_id = None
+                    self.claim_token = None
                     continue
                 pgid = os.getpgid(self.child.pid)
                 try:
@@ -142,7 +202,8 @@ class Supervisor:
                           f"{self.api}/internal/worker/{self.run_id}/assign",
                           self.headers,
                           {"pid": self.child.pid, "pgid": pgid,
-                           "pgid_pstart": _pstart(self.child.pid)})
+                           "pgid_pstart": _pstart(self.child.pid),
+                           "claim_token": self.claim_token or ""})
                 except Exception as exc:  # noqa: BLE001
                     print(f"[supervisor] assign refused: {exc}",
                           file=sys.stderr, flush=True)
@@ -155,6 +216,7 @@ class Supervisor:
                     except Exception:  # noqa: BLE001
                         pass
                     self.run_id = None
+                    self.claim_token = None
                     self.child = None
                     continue
                 done = threading.Event()

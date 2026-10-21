@@ -91,6 +91,40 @@ class ControllerLock:
                 pass
             return False
 
+    @property
+    def held(self) -> bool:
+        """True only while this process really owns the lock.
+
+        A lock whose session died is NOT ownership: another controller may
+        already hold it, so the duties must stop and the readiness report
+        must say so.
+        """
+        if not self.acquired or self.connection is None:
+            return False
+        try:
+            return not self.connection.closed
+        except Exception:  # noqa: BLE001 - an unreadable connection is a loss
+            return False
+
+    def monitor(self, interval_s: float = 5.0) -> threading.Thread:
+        """Watch the lock's session and drop the ownership when it dies."""
+        def loop():
+            while not self._stop.wait(interval_s):
+                if not self.acquired:
+                    return
+                try:
+                    with self.connection.cursor() as cur:
+                        cur.execute("SELECT 1")
+                    self.connection.rollback()
+                except Exception as exc:  # noqa: BLE001
+                    self.acquired = False
+                    self.detail = (f"the lock session died ({type(exc).__name__}: "
+                                   f"{exc}) — controller ownership was lost")
+                    return
+        thread = threading.Thread(target=loop, daemon=True)
+        thread.start()
+        return thread
+
     def release(self) -> None:
         if self.connection is not None:
             try:
