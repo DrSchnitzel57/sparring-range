@@ -260,10 +260,72 @@ class BastionProxy:
                     process.stderr.write(result.stderr or "")
                     process.exit(result.exit_status if result.exit_status is not None else 0)
                 else:
+                    # send_eof=False: the guest's shell must keep its stdin
+                    # OPEN.  asyncssh's create_process() sends EOF on the
+                    # remote stdin by default, which makes the guest's login
+                    # shell exit immediately - the member's interactive
+                    # session then dies before they can type a command.
                     remote = await real.create_process(term_type="xterm-256color",
-                                                       term_size=(width, height))
-                    copy_out = asyncio.create_task(self._tee(remote.stdout, process.stdout, cast, "o"))
-                    copy_in = asyncio.create_task(self._tee(process.stdin, remote.stdin, cast, "i"))
+                                                       term_size=(width, height),
+                                                       send_eof=False)
+                    # A member's keystrokes must not be typed into a shell
+                    # that does not exist yet: the guest's login process
+                    # swallows input that arrives before the prompt, and a
+                    # login process that receives stray input can end the
+                    # session outright.  The member's input is therefore held
+                    # until the guest has produced its first output (the
+                    # shell is up), with a bounded wait so a silent target
+                    # still receives input.
+                    shell_ready = asyncio.Event()
+
+                    async def _tee_in(reader, writer, cast, direction):
+                        while True:
+                            try:
+                                data = await reader.read(4096)
+                            except asyncssh.TerminalSizeChanged as exc:
+                                # The member resized the terminal.  asyncssh
+                                # delivers a window change as an exception
+                                # from the read, so it must be handled here:
+                                # the resize is recorded AND passed on to the
+                                # guest, otherwise the recorded session and
+                                # the live guest disagree about the geometry.
+                                width, height = exc.term_size[0], \
+                                    exc.term_size[1]
+                                cast.resize(width, height)
+                                try:
+                                    remote.change_terminal_size(width, height)
+                                except Exception:  # noqa: BLE001
+                                    pass
+                                continue
+                            if not data:
+                                break
+                            try:
+                                await asyncio.wait_for(shell_ready.wait(),
+                                                       timeout=30)
+                            except asyncio.TimeoutError:
+                                pass
+                            cast.write(direction, data)
+                            writer.write(data)
+                            await writer.drain()
+
+                    async def _tee_out(reader, writer, cast, direction):
+                        while True:
+                            try:
+                                data = await reader.read(4096)
+                            except asyncssh.TerminalSizeChanged as exc:
+                                cast.resize(exc.term_size[0], exc.term_size[1])
+                                continue
+                            if not data:
+                                break
+                            shell_ready.set()
+                            cast.write(direction, data)
+                            writer.write(data)
+                            await writer.drain()
+
+                    copy_out = asyncio.create_task(
+                        _tee_out(remote.stdout, process.stdout, cast, "o"))
+                    copy_in = asyncio.create_task(
+                        _tee_in(process.stdin, remote.stdin, cast, "i"))
                     done, pending = await asyncio.wait({copy_out, copy_in},
                                                        return_when=asyncio.FIRST_COMPLETED)
                     for t in pending:

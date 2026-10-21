@@ -1,5 +1,65 @@
 # Current findings and validation evidence
 
+## Milestone 15 implementation evidence — 2026-10-20/21, branch `15`
+
+**Environment (stated so no result is over-read):** Debian 13 (trixie)
+container, 4 CPUs, 16 GiB RAM, **no `/dev/kvm`**, no root, no installed
+appliance, and an unprivileged libvirt session assembled from extracted
+Debian packages. Every guest boot below is **software emulation (TCG)** and is
+labelled as such. **None of this is nested-KVM acceptance**: milestone 14's
+promotion gate (real nested KVM, isolation, stop, member SSH rehearsal) stays
+open for the operator.
+
+| Command (from the repository root) | Result |
+|---|---|
+| `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD .venv/bin/python -m pytest -q -ra -p no:cacheprovider` | **386 passed, 0 failed, 0 skipped**, 254 deselected (~52 s) |
+| `.venv/bin/python infra/dev/acceptance.py selection` | **PASS** — 638 tests classified, fast default 386 passed / 0 skipped |
+| `… acceptance.py python` | **PASS** — fresh locked install, dependency check, 4 entrypoint imports |
+| `… acceptance.py db` | **PASS** — 172 db tests against a disposable PostgreSQL 16 container. Two failures were found and fixed: a spawn-race regression introduced in this milestone (the queued-run credential held a row lock across the spawn window, turning an unconfirmed queued stop into a confirmed kill) and a stale migration-head assertion |
+| `… acceptance.py authority` | **PASS** — 25 broker boundary/durability/cessation tests |
+| `… acceptance.py install` | **PASS** — the **real** appliance install sequences in a sandbox root: clean install, rerun (0 files changed, capability preserved byte for byte), reboot (runtime restored, data and keys preserved), populated upgrade, drift detected and repaired, foreign file untouched. The previous `SR_INSTALL_VM_EVIDENCE=1` environment attestation is **removed** |
+| `… acceptance.py hypervisor` | **PASS** (122 s) — real libvirt: clone → start → guest-agent readiness marker → host-key read → ownership identity (a foreign installation is refused) → stop → destroy, and a repeated destroy of an absent guest is idempotent. Accelerator: explicit TCG |
+| `… acceptance.py access` | **PASS** (≈130 s) — a real Ubuntu guest: guest-agent readiness marker and fixed host-key path read through the agent, real SSH with the role key, the **real recording bastion** writing `.cast` bytes, `sudo` for the management identity (and not for the attack identity), an interactive PTY **with a recorded terminal resize**, a reconnect to the same guest, and the refusal of an unauthorized key |
+| `… acceptance.py images` | **FAIL** — the role-image **builds** miss the 1500 s serial-marker timeout under software emulation (the preserved serial logs show `apt` still fetching packages). This is an emulation-speed limit, not an image defect; it needs a KVM runner |
+| `… acceptance.py capture` | not run — it depends on the image builds above |
+| `… acceptance.py containment` / `packet` | not runnable here: they need cgroup delegation, root and `nft` |
+| `… acceptance.py journey` | requires the **installed** appliance with operator/member tokens; it fails closed here by design |
+| `… acceptance.py frontend` / `browser` / `compose` | not re-run in this pass |
+
+**Defects this milestone found and fixed** (each with a regression test, each
+found by inspecting a running guest rather than by reading code):
+
+1. The guest agent was enabled in the base image, so the boot blocked on a
+   device that never appears.
+2. `systemctl --now` inside a cloud-init bootcmd hung the whole init stage
+   (it waits for the agent device). The agent is now started with
+   `--no-block` and is never *enabled*, so a later boot cannot block either.
+3. The base image had **no machine-id**, so `systemd-networkd` could not
+   configure even its DHCPv6 client and the link went to `failed` — the
+   static address was never applied. The image now ships the cloud-image
+   convention (a 32-zero-byte machine-id that systemd replaces per boot).
+4. `sshd` was started before cloud-init generated the host keys, so the
+   member's SSH never came up. Readiness now means "SSH is listening".
+5. The guest-agent replies were read with the wrong protocol shape (the
+   handle is the `return` value; the payload key is `buf-b64`), so the
+   host-key read always came back empty.
+6. A qcow2 overlay smaller than its backing image truncated the partition
+   table and the guest dropped to an initramfs shell.
+7. The bastion still accepted a **stale local known_hosts file** as a
+   production fallback; production now refuses to dial without a
+   deployment-served pin.
+8. The cloud image's MOTD scripts run on every interactive login (one of them
+   collects system information over the network), so an interactive member
+   shell took minutes to appear — which looks exactly like a broken bastion.
+   The appliance guest prints no MOTD.
+9. The installed-migration lookup assumed a source checkout next to the
+   working directory; it now follows the installed package.
+
+**Still open and not claimed by this milestone:** nested-KVM promotion, the
+isolation/emergency-stop rehearsal, the real-model and human gates, the
+`images`/`capture` builds on a KVM runner, the browser/compose gates, and the
+`journey` gate against an installed appliance.
+
 ## Current planning assessment — 2026-10-20
 
 Source-inspected at `933f6a1`, clean `master`, equal to `origin/master`.

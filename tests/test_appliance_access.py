@@ -142,7 +142,8 @@ class _Collector(asyncssh.SSHClientSession):
         self.output = ""
         self.status = None
 
-    def data_received(self, data):
+    def data_received(self, data, datatype=None):
+        # asyncssh >= 2.24 passes the datatype as a second argument.
         self.output += data
 
     def exit_status_received(self, status):
@@ -152,7 +153,7 @@ class _Collector(asyncssh.SSHClientSession):
 async def _ssh_and_record(m: ApplianceManifest, port: int, runner_key: pathlib.Path,
                           member_key: pathlib.Path, recordings: pathlib.Path,
                           known_hosts: pathlib.Path, defender_key: pathlib.Path,
-                          stranger_key: pathlib.Path):
+                          stranger_key: pathlib.Path, member_pub: pathlib.Path):
     deadline = time.monotonic() + 600
     last = None
     known_key = None
@@ -205,9 +206,16 @@ async def _ssh_and_record(m: ApplianceManifest, port: int, runner_key: pathlib.P
         return "rec-access"
 
     host_key = recordings / "bastion_host_key"
+    # The product's real key check: the member's PUBLIC key in the bastion's
+    # authorized_keys file.  An unauthorized key must be refused.
+    authorized = recordings / "authorized_keys"
+    authorized.write_text("member "
+                          + pathlib.Path(member_pub).read_text().strip()
+                          + "\n")
+    os.environ["SR_BASTION_AUTHORIZED_KEYS_FILE"] = str(authorized)
+    get_settings.cache_clear()
     proxy = BastionProxy(resolve, sink, register, recordings_dir=recordings,
-                         host_key_path=host_key,
-                         authorized_keys=lambda username, _key: username == "member")
+                         host_key_path=host_key)
     await proxy.start("127.0.0.1", 0)
     bastion_port = proxy._server.sockets[0].getsockname()[1]  # noqa: SLF001
     try:
@@ -230,16 +238,18 @@ async def _ssh_and_record(m: ApplianceManifest, port: int, runner_key: pathlib.P
             channel, _session = await conn.create_session(
                 lambda: collector, term_type="xterm-256color",
                 term_size=(80, 24))
-            # A real terminal types into a shell that may still be starting:
-            # input sent before the shell exists is swallowed by the login
-            # process, and a PTY holds a partial line.  The proof therefore
+            # A real terminal waits for the prompt: input sent before the
+            # guest's shell exists is swallowed by the login process.  The
+            # proof therefore waits for the guest's first output and then
             # keeps the command going until the shell answers it.
             marker = "SR-INTERACTIVE-OK"
-            deadline = time.monotonic() + 180
+            deadline = time.monotonic() + 240
             resized = False
+            started = time.monotonic()
             while time.monotonic() < deadline and marker not in collector.output:
-                channel.write(f"echo {marker}\n")
-                await asyncio.sleep(3)
+                if time.monotonic() - started > 20:
+                    channel.write(f"echo {marker}\n")
+                await asyncio.sleep(2)
                 if not resized:
                     # A real terminal resize must reach the recording as a
                     # resize frame.
@@ -286,8 +296,11 @@ async def _ssh_and_record(m: ApplianceManifest, port: int, runner_key: pathlib.P
         assert header["session_id"] == "access-session"
         for line in lines[1:]:
             frames.append(json.loads(line))
-    assert any(f[1] == "r" for f in frames), "no terminal resize was recorded"
-    output = "".join(f[2] for f in frames if f[1] == "o")
+    # cast frames: data frames are [delay, "o"|"i", text]; a resize frame is
+    # [width, height, "r"].
+    resized = any(len(f) == 3 and f[2] == "r" for f in frames)
+    assert resized, f"no terminal resize was recorded: {frames[:6]}"
+    output = "".join(f[2] for f in frames if len(f) == 3 and f[1] == "o")
     assert "mojang-web-local" in output, output
     assert any(e["action_type"] == "bastion_session_start" for e in events)
     assert any(e["action_type"] == "command" for e in events)
@@ -349,7 +362,8 @@ def test_real_guest_ssh_and_bastion_cast_replay(tmp_path):
         assert sudo_plain != "0", "the defender must not BE root without sudo"
         out = asyncio.run(_ssh_and_record(m, port, defender_key,
                                           member_key, recordings, known,
-                                          defender_key, stranger_key))
+                                          defender_key, stranger_key,
+                                          tmp_path / "member.pub"))
         assert "ssh-" in out["target_key"]
         print("access accelerator:", "kvm" if use_kvm else "tcg",
               "marker:", ready["marker"], "cast:", out["cast"],
