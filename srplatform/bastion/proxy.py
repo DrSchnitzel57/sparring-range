@@ -268,16 +268,6 @@ class BastionProxy:
                     remote = await real.create_process(term_type="xterm-256color",
                                                        term_size=(width, height),
                                                        send_eof=False)
-                    # A member's keystrokes must not be typed into a shell
-                    # that does not exist yet: the guest's login process
-                    # swallows input that arrives before the prompt, and a
-                    # login process that receives stray input can end the
-                    # session outright.  The member's input is therefore held
-                    # until the guest has produced its first output (the
-                    # shell is up), with a bounded wait so a silent target
-                    # still receives input.
-                    shell_ready = asyncio.Event()
-
                     async def _tee_in(reader, writer, cast, direction):
                         while True:
                             try:
@@ -299,11 +289,6 @@ class BastionProxy:
                                 continue
                             if not data:
                                 break
-                            try:
-                                await asyncio.wait_for(shell_ready.wait(),
-                                                       timeout=30)
-                            except asyncio.TimeoutError:
-                                pass
                             cast.write(direction, data)
                             writer.write(data)
                             await writer.drain()
@@ -317,7 +302,6 @@ class BastionProxy:
                                 continue
                             if not data:
                                 break
-                            shell_ready.set()
                             cast.write(direction, data)
                             writer.write(data)
                             await writer.drain()
