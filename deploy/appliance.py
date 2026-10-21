@@ -65,21 +65,29 @@ UNITS = ("sr-appliance-broker.service", "sr-api.service",
          "sr-appliance-ingest.service", "sr-worker-supervisor.service",
          "sr-bastion.service", "sr-web.service")
 GROUPS = ("srrange", "srbastion", "sr-broker-clients", "sringest", "srworker",
-          "srweb")
+          "srweb", "sr-secrets")
 USERS = {
     # existing accepted identities: API/controller, bastion
-    "srrange": ("srrange", ("sr-broker-clients", "srbastion")),
+    # srrange is in sr-secrets: it must READ the worker-supervisor
+    # capability it validates, and the supervisor must read its own copy.
+    "srrange": ("srrange", ("sr-broker-clients", "srbastion", "sr-secrets")),
     "srbastion": ("srbastion", ()),
     # appliance-only identities
     "srbroker": ("sr-broker-clients", ()),
     "sringest": ("sringest", ()),
-    "srworker": ("srworker", ()),
+    "srworker": ("srworker", ("sr-secrets",)),
     "srweb": ("srweb", ()),
 }
 
 
 class InstallError(RuntimeError):
     pass
+
+
+# The secrets directory: traversable by the identities that hold a
+# credential in it (the API and the worker supervisor), never by the rest.
+SECRET_DIR_MODE = 0o750
+SECRET_DIR_GROUP = "sr-secrets"
 
 
 # --------------------------------------------------------------------------- #
@@ -217,7 +225,9 @@ def render_control_env(m: ApplianceManifest, *, etc: pathlib.Path = DEFAULT_ETC,
         ("SR_API_BASE_URL", m.public_url),
         ("SR_INTERNAL_API_URL", m.internal_url),
         ("SR_TELEMETRY_INGEST_URL", m.ingest_url),
-        ("SR_TELEMETRY_CA_FILE", str(etc / "tls/ingest-ca.crt")),
+        # The ingest server certificate is issued by the API CA, so that is
+        # the trust anchor the guests are enrolled with.
+        ("SR_TELEMETRY_CA_FILE", str(etc / "tls/api-ca.crt")),
         ("SR_API_TLS_CA_FILE", str(etc / "tls/api-ca.crt")),
         ("SR_RECORDINGS_DIR", m.recordings_dir),
         ("SR_SAFETY_STATE_FILE", str(pathlib.Path(m.state_dir) / "safety_state.json")),
@@ -225,6 +235,9 @@ def render_control_env(m: ApplianceManifest, *, etc: pathlib.Path = DEFAULT_ETC,
         ("SR_BASTION_AUTHORIZED_KEYS_FILE", str(etc / "ssh/authorized_keys")),
         ("SR_BASTION_TARGETS_KNOWN_HOSTS", str(etc / "known_hosts/range_hosts")),
         ("SR_RANGE_BRIDGE", m.network.range_bridge),
+        # The appliance's inner range is a plain isolated bridge: no VLAN tag
+        # (the broker policy accepts exactly one NIC specification).
+        ("SR_RANGE_VLAN", "0"),
         ("SR_RANGE_CIDR", str(m.network.range_cidr)),
         ("SR_RANGE_GATEWAY", str(m.network.range_gateway)),
         ("SR_CONTROLLER_RANGE_IP", str(m.network.controller_range_ip)),
@@ -256,6 +269,10 @@ def render_control_env(m: ApplianceManifest, *, etc: pathlib.Path = DEFAULT_ETC,
         ("SR_VERIFIER_SSH_KEY_PATH", str(etc / "secrets/verifier_key")),
         ("SR_VERIFIER_SSH_KNOWN_HOSTS", str(etc / "known_hosts/range_hosts")),
         ("SR_BASTION_CLIENT_KEY_PATH", str(etc / "ssh/bastion_client_ed25519")),
+        # The match scheduler (ready expiry, deadline cleanup, startup
+        # reconciliation) is part of a working appliance, not an option.
+        ("SR_MATCH_SCHEDULER_ENABLED", "1"),
+        ("SR_MATCH_SCHEDULER_INTERVAL_S", "15"),
         ("SR_WORKER_POLL_S", "2"),
         ("SR_WORKER_HEARTBEAT_S", "5"),
         ("SR_WORKER_CLAIM_TIMEOUT_S", "120"),
@@ -278,8 +295,14 @@ def render_supervisor_env(m: ApplianceManifest,
                           prefix: pathlib.Path = DEFAULT_PREFIX) -> str:
     return _env_lines([
         ("SR_API_BASE", m.internal_url),
+        # The supervisor reads its OWN 0600 copy: the capability is never
+        # shared through a group-readable file.
         ("SR_WORKER_SUPERVISOR_TOKEN_FILE",
-         str(etc / "secrets/worker-supervisor.token")),
+         str(etc / "secrets/worker-supervisor.token.srworker")),
+        # The match scheduler (ready expiry, deadline cleanup, startup
+        # reconciliation) is part of a working appliance, not an option.
+        ("SR_MATCH_SCHEDULER_ENABLED", "1"),
+        ("SR_MATCH_SCHEDULER_INTERVAL_S", "15"),
         ("SR_WORKER_POLL_S", "2"),
         ("SR_WORKER_HEARTBEAT_S", "5"),
         ("PYTHONPATH", str(prefix)),
@@ -465,8 +488,10 @@ server {{
     add_header X-Frame-Options SAMEORIGIN always;
     add_header Referrer-Policy no-referrer always;
 
+    # The API's routes are UNPREFIXED (/auth/login, /sessions, ...). The
+    # /api prefix is the public path the clients use, so it is STRIPPED here.
     location /api/ {{
-        proxy_pass http://127.0.0.1:8000/api/;
+        proxy_pass http://127.0.0.1:8000/;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
@@ -563,7 +588,8 @@ class Runner:
         self.dry_run = dry_run
 
     def __call__(self, *cmd: str, check: bool = True,
-                env: dict | None = None) -> subprocess.CompletedProcess:
+                env: dict | None = None,
+                cwd: str | None = None) -> subprocess.CompletedProcess:
         printable = " ".join(str(c) for c in cmd)
         # Progress belongs on stderr: stdout carries the machine-readable
         # result of the command.
@@ -573,7 +599,7 @@ class Runner:
             return subprocess.CompletedProcess(list(cmd), 0, "", "")
         environ = {**os.environ, **(env or {})}
         r = subprocess.run([str(c) for c in cmd], capture_output=True,
-                           text=True, env=environ)
+                           text=True, env=environ, cwd=cwd)
         if check and r.returncode != 0:
             raise InstallError(f"{printable} failed ({r.returncode}): "
                                f"{(r.stderr or r.stdout)[-800:]}")
@@ -609,7 +635,11 @@ def _ensure_dirs(m: ApplianceManifest, run: Runner, lay: Layout) -> None:
             (pathlib.Path(m.state_dir), 0o750, "srrange", "srrange"),
             (pathlib.Path(m.images_dir), 0o755, "root", "root"),
             (pathlib.Path(m.recordings_dir), 0o750, "srbastion", "srbastion"),
-            (pathlib.Path(m.secrets_dir), 0o700, "root", "root"),
+            # The secrets directory is traversable by the two identities
+            # that hold a credential in it (the API and the supervisor);
+            # every file inside keeps its own 0600 ownership.
+            (pathlib.Path(m.secrets_dir), SECRET_DIR_MODE, "root",
+             SECRET_DIR_GROUP),
             (pathlib.Path(m.broker_ledger).parent, 0o750, "srbroker",
              "sr-broker-clients"),
             (lay.run, 0o750, "srbroker", "sr-broker-clients"),
@@ -647,22 +677,65 @@ def _write_files(files: list[RenderedFile], run: Runner,
 
 
 def _ensure_supervisor_token(etc: pathlib.Path, run: Runner,
-                             lay: Layout) -> str:
-    path = etc / "secrets/worker-supervisor.token"
-    if path.exists():
-        text = path.read_text().strip()
-        if len(text) < 32:
-            raise InstallError(f"existing {path} is too short; rotate it "
+                             lay: Layout) -> dict:
+    """Provision the worker-supervisor capability.
+
+    The capability is a SECRET and the production settings refuse a
+    group- or world-readable token file, so it cannot be shared through one
+    file: the API and the supervisor each get their OWN 0600 copy of the
+    SAME value (the API must compare what it is given, the supervisor must
+    present what it holds).  An existing installation is never re-keyed.
+    """
+    api_path = etc / "secrets/worker-supervisor.token"
+    worker_path = etc / "secrets/worker-supervisor.token.srworker"
+    existing = [p for p in (api_path, worker_path) if p.exists()]
+    if existing:
+        values = {p.read_text().strip() for p in existing}
+        if any(len(v) < 32 for v in values):
+            raise InstallError(f"existing {api_path} is too short; rotate it "
                                "explicitly rather than silently replacing it")
+        if len(values) != 1:
+            raise InstallError(
+                f"the supervisor capability copies disagree "
+                f"({api_path} vs {worker_path}) — restore one of them "
+                "instead of letting the installer choose")
+        token = values.pop()
+        _atomic_write(api_path, token + "\n", 0o600,
+                      os.getuid() if lay.sandboxed else _ids("srrange")[0],
+                      os.getuid() if lay.sandboxed else _ids("srrange")[1])
+        _atomic_write(worker_path, token + "\n", 0o600,
+                      os.getuid() if lay.sandboxed else _ids("srworker")[0],
+                      os.getuid() if lay.sandboxed else _ids("srworker")[1])
         return "preserved"
     if run.dry_run:
-        print(f"DRY: generate {path} (0600 srworker)", file=sys.stderr)
+        print(f"DRY: generate {api_path} + {worker_path} (0600 each)",
+              file=sys.stderr)
         return "would create"
-    path.parent.mkdir(parents=True, exist_ok=True)
     token = secrets.token_urlsafe(48)
-    uid = os.getuid() if lay.sandboxed else _ids("srworker")[0]
-    _atomic_write(path, token + "\n", 0o600, uid, uid)
+    api_path.parent.mkdir(parents=True, exist_ok=True)
+    if lay.sandboxed:
+        api_uid = api_gid = worker_uid = worker_gid = os.getuid()
+    else:
+        api_uid, api_gid = _ids("srrange")
+        worker_uid, worker_gid = _ids("srworker")
+    _atomic_write(api_path, token + "\n", 0o600, api_uid, api_gid)
+    _atomic_write(worker_path, token + "\n", 0o600, worker_uid, worker_gid)
     return "created"
+
+
+def _ingest_sans(m: ApplianceManifest) -> str:
+    """The SANs the guest-facing ingest certificate must carry.
+
+    The guests reach the ingest listener on the isolated range by IP; the
+    public name is added when the installation has one.  Without these the
+    bootstrap script SKIPS the ingest certificate and the guests can never
+    enroll.
+    """
+    sans = [f"IP:{m.network.ingest_address}"]
+    host = urllib.parse.urlsplit(m.public_url).hostname
+    if host and not host.replace(".", "").isdigit():
+        sans.append(f"DNS:{host}")
+    return " ".join(sans)
 
 
 def _receipt(m: ApplianceManifest, plan: Plan, lay: Layout) -> dict:
@@ -702,10 +775,6 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
     if not dry_run and not lay.sandboxed and os.geteuid() != 0:
         raise InstallError("apply requires root (use --dry-run for a plan, "
                            "or --system-root for a sandbox installation)")
-    if not dry_run and not lay.sandboxed \
-            and not (lay.prefix / ".venv/bin/python").exists():
-        raise InstallError(f"appliance venv missing at {lay.prefix}/.venv; "
-                           "install the locked project first")
     if not lay.sandboxed:
         for g in GROUPS:
             _ensure_group(g, run)
@@ -715,6 +784,15 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
                 run("usermod", "-a", "-G", extra, user, check=False)
     _ensure_dirs(m, run, lay)
     token_action = _ensure_supervisor_token(lay.etc, run, lay)
+    if not lay.sandboxed and not dry_run:
+        # The operator's runtime environment is read by the API, the ingest
+        # listener and the bastion: it must be readable by them and by
+        # nobody else. Its CONTENT is the operator's; only the ownership
+        # and the mode are the installer's business.
+        runtime_env = lay.etc / "control-plane.env"
+        if runtime_env.is_file():
+            run("chown", "root:srrange", str(runtime_env), check=False)
+            run("chmod", "0640", str(runtime_env), check=False)
     services: dict = {}
     if not lay.sandboxed and not dry_run:
         # The REAL service steps.  A sandbox install renders the same files
@@ -729,16 +807,23 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
         services["database"] = svc.ensure_database(
             run, prefix=lay.prefix, env_file=lay.etc / "control-plane.env")
         services["tls"] = svc.ensure_tls(
-            run, etc=lay.etc, public_ip=m.network.lan_address or "127.0.0.1")
+            run, etc=lay.etc, public_ip=m.network.lan_address or "127.0.0.1",
+            ingest_sans=_ingest_sans(m))
+        # The member's PUBLIC keys are written for the recording bastion in
+        # the bastion's own format: "<username> <public-key>".  The username
+        # is the login the member uses on the bastion.
         member_keys = []
         for role in ("runner", "bastion", "mgmt"):
             try:
-                member_keys.append(m.public_key_for(role))
+                member_keys.append((role, m.public_key_for(role)))
             except Exception:  # noqa: BLE001 — a missing role key is reported
                 continue
         services["onboarding"] = svc.onboard_operator(
             run, etc=lay.etc, authorized_keys=member_keys)
-        services["web"] = svc.ensure_web_build(run, source=source)
+        services["service_keys"] = svc.ensure_service_keys(
+            run, etc=lay.etc, sandboxed=lay.sandboxed)
+        services["web"] = svc.ensure_web_build(run, source=source,
+                                               public_url=m.public_url)
         # the public front door: enable the rendered site and reload nginx
         run("ln", "-sfn", str(lay.nginx_dir / "sparring-range.conf"),
             str(lay.nginx_dir.parent / "sites-enabled/sparring-range.conf"),

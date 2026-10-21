@@ -31,6 +31,8 @@ HOSTNAME="sr-appliance"
 KEYS_DIR="/etc/sparring-range/keys"
 SECRETS_DIR="/etc/sparring-range/secrets"
 MANIFEST="/etc/sparring-range/appliance-manifest.json"
+DB_HOST="127.0.0.1"
+DB_NAME="sparring_range"
 PYTHON="${SR_PYTHON:-python3}"
 
 usage() {
@@ -47,7 +49,8 @@ while [ $# -gt 0 ]; do
     --public-url) PUBLIC_URL="$2"; shift 2;;
     --internal-url) INTERNAL_URL="$2"; shift 2;;
     --ingest-url) INGEST_URL="$2"; shift 2;;
-    --range-bridge) RANGE_BRIDGE="$2"; shift 2;;
+  --db-host) DB_HOST="$2"; shift 2;;
+    --bridge) RANGE_BRIDGE="$2"; shift 2;;
     --hostname) HOSTNAME="$2"; shift 2;;
     --model-base-url) MODEL_BASE_URL="$2"; shift 2;;
     --model-alias) MODEL_ALIAS="$2"; shift 2;;
@@ -63,14 +66,15 @@ done
 [ -n "$BUNDLE" ] && [ -n "$INSTALLATION_ID" ] && [ -n "$LAN_ADDRESS" ] && \
   [ -n "$RANGE_CIDR" ] && [ -n "$PUBLIC_URL" ] || usage
 
+BUNDLE="$(cd "$BUNDLE" && pwd)"
 cd "$BUNDLE"
 
 say() { printf '\n== %s\n' "$*"; }
 
-say "1/6 verify the bundle"
+say "1/7 verify the bundle"
 "$PYTHON" deploy/bundle.py verify .
 
-say "2/6 prepare the operator's keys and secrets"
+say "2/7 prepare the operator's keys and secrets"
 install -d -m 0750 "$KEYS_DIR"
 install -d -m 0700 "$SECRETS_DIR"
 for role in runner bastion mgmt; do
@@ -83,8 +87,34 @@ if [ ! -f "$SECRETS_DIR/model.key" ]; then
   install -m 0600 /dev/null "$SECRETS_DIR/model.key"
   echo "  created $SECRETS_DIR/model.key - put the model credential in it"
 fi
+# The SCHEMA OWNER credential and the RUNTIME credential are separate files.
+# The owner URL is used ONLY to run the migrations and lives in a root-only
+# file that no service loads; the runtime URL goes into the env the API,
+# the ingest listener and the bastion load.  Never put the owner URL in
+# control-plane.env: every service would then hold the schema owner.
+install -d -m 0750 "$SECRETS_DIR"
+if [ ! -f "$SECRETS_DIR/db-owner.env" ]; then
+  OWNER_PW="$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)"
+  umask 077
+  printf 'SR_POSTGRES_URL_OWNER=postgresql+psycopg2://sr_owner:%s@%s:5432/%s\n' \
+    "$OWNER_PW" "$DB_HOST" "$DB_NAME" > "$SECRETS_DIR/db-owner.env"
+  chmod 0600 "$SECRETS_DIR/db-owner.env"
+  echo "  created $SECRETS_DIR/db-owner.env (schema owner; 0600, root only)"
+fi
+if [ ! -f /etc/sparring-range/control-plane.env ]; then
+  APP_PW="$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)"
+  umask 027
+  printf '# Runtime environment for the API, the ingest listener and the bastion.\n'
+  printf '# The schema OWNER credential is NOT here: it lives in %s.\n' \
+    "$SECRETS_DIR/db-owner.env"
+  printf 'SR_POSTGRES_URL=postgresql+psycopg2://sr_app:%s@%s:5432/%s\n' \
+    "$APP_PW" "$DB_HOST" "$DB_NAME" > /etc/sparring-range/control-plane.env
+  chmod 0640 /etc/sparring-range/control-plane.env
+  chgrp srrange /etc/sparring-range/control-plane.env 2>/dev/null || true
+  echo "  created /etc/sparring-range/control-plane.env (runtime role only)"
+fi
 
-say "3/6 render the operator manifest from the bundle"
+say "3/7 render the operator manifest from the bundle"
 [ -n "$INTERNAL_URL" ] || INTERNAL_URL="http://127.0.0.1:8000"
 if [ -z "$INGEST_URL" ]; then
   INGEST_URL="https://$(printf '%s' "$RANGE_CIDR" | awk -F. '{print $1"."$2"."$3".1"}'):8443"
@@ -101,10 +131,10 @@ fi
   --model-api-key-file "$SECRETS_DIR/model.key" \
   --model-base-url "$MODEL_BASE_URL" --model-alias "$MODEL_ALIAS"
 
-say "4/6 plan the installation"
+say "4/7 plan the installation"
 "$PYTHON" deploy/appliance.py plan --manifest "$MANIFEST"
 
-say "5/6 apply the installation"
+say "5/7 apply the installation"
 if [ "$(id -u)" != "0" ]; then
   echo "apply needs root: re-run this step with sudo" >&2
   exit 1

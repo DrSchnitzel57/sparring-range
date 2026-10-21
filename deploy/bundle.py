@@ -159,7 +159,8 @@ def build(output: pathlib.Path, *, base_image: pathlib.Path,
     # 1. the application (source + locked dependencies + tests)
     for rel, path in _iter_app_files(app_dir):
         if rel.parts[0] in ("docs", "deploy", "scenarios", "srplatform",
-                            "rangectl", "infra", "tests", "web") or \
+                            "rangectl", "infra", "tests", "web", "audit",
+                            "verifiers", "telemetry") or \
                 rel.parts[0] in ("pyproject.toml", "requirements.lock",
                                  "alembic.ini", "README.md", "AGENTS.md"):
             add(path, str(rel))
@@ -253,7 +254,9 @@ def render_manifest(bundle: pathlib.Path, out: pathlib.Path, *,
     own parameters.  The operator never edits the manifest by hand."""
     import ipaddress
 
-    bundle = pathlib.Path(bundle)
+    # The image paths in the manifest MUST be absolute: the installer copies
+    # them from an absolute location and a relative path is refused.
+    bundle = pathlib.Path(bundle).resolve()
     manifest = json.loads((bundle / MANIFEST_NAME).read_text())
     images_meta = manifest.get("images") or {}
     base = images_meta.get("appliance-base")
@@ -273,15 +276,27 @@ def render_manifest(bundle: pathlib.Path, out: pathlib.Path, *,
                 "sha256": _sha256(path), "size_bytes": path.stat().st_size,
                 "disk_gb": disk_gb, "memory_mb": memory_mb, "vcpus": vcpus}
 
-    images = {
-        "attacker": image_entry(base["path"], 9005, 12, 2048, 2),
-        "mojang-web-local": image_entry(base["path"], 9011, 16, 2048, 2),
-        "mojang-web-db": image_entry(base["path"], 9012, 16, 2048, 2),
-    }
-    for role, meta in sorted(images_meta.items()):
-        if role == "appliance-base":
-            continue
-        images[role] = image_entry(meta["path"], 9013, 16, 2048, 2)
+    # Every role MUST have its OWN artifact: the base image is a bare Ubuntu
+    # and the practice product (the web/db services, the shipped payload) is
+    # baked into the role images.  Falling back to the base would ship guests
+    # that cannot run the scenario, so the renderer refuses instead.
+    from infra.images.specs import GUEST_BUDGETS
+
+    role_meta = {role: meta for role, meta in images_meta.items()
+                 if role != "appliance-base"}
+    missing = [role for role in sorted(GUEST_BUDGETS) if role not in role_meta]
+    if missing:
+        raise BundleError(
+            "the bundle carries no role image for: "
+            + ", ".join(missing)
+            + " — the shipped guests would be a bare Ubuntu without the "
+              "practice product. Build the role images and rebuild the bundle "
+              "(deploy/bundle.py build --role-image ROLE=PATH ...).")
+    images = {}
+    for role, budget in sorted(GUEST_BUDGETS.items()):
+        images[role] = image_entry(
+            role_meta[role]["path"], budget["template_vmid"],
+            budget["disk_gb"], budget["memory_mb"], budget["vcpus"])
 
     raw = {
         "schema_version": 1,
@@ -379,10 +394,18 @@ def main(argv: list[str] | None = None) -> int:
             manifest = build(pathlib.Path(args.output),
                              base_image=pathlib.Path(args.base_image),
                              role_images=role_images)
+            from infra.images.specs import GUEST_BUDGETS
+            carried = set(manifest["images"])
+            missing = [role for role in sorted(GUEST_BUDGETS)
+                       if role not in carried]
             print(json.dumps({"bundle": args.output,
                               "revision": manifest["revision"],
                               "files": len(manifest["files"]),
-                              "images": sorted(manifest["images"])},
+                              "images": sorted(manifest["images"]),
+                              # loud, not fatal here: `manifest` refuses to
+                              # render an appliance from a bundle that lacks
+                              # the role artifacts.
+                              "roles_missing": missing},
                              indent=2, sort_keys=True))
         elif args.cmd == "verify":
             result = verify(pathlib.Path(args.bundle))

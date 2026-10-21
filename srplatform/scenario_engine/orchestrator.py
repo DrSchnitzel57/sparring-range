@@ -781,7 +781,17 @@ def current_lease(db: Session) -> dict | None:
 
 # ------------------------------------------------------------------ deploy ---
 def _net_spec(s) -> str:
-    return f"virtio,bridge={s.range_bridge},tag={s.range_vlan}"
+    """The guest NIC specification.
+
+    A VLAN tag is only used where the deployment actually has one: the
+    appliance's inner range is a plain isolated bridge, and the broker
+    policy accepts exactly one NIC specification, so emitting a tag that the
+    policy refuses would break every deployment.
+    """
+    vlan = getattr(s, "range_vlan", None)
+    if vlan in (None, 0, "", "0"):
+        return f"virtio,bridge={s.range_bridge}"
+    return f"virtio,bridge={s.range_bridge},tag={vlan}"
 
 
 def _pin_host_key(broker, db: Session, session_id, dep: Deployment,

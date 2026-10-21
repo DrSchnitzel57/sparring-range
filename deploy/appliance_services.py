@@ -76,111 +76,253 @@ def _read_env_file(path: pathlib.Path) -> dict[str, str]:
 
 
 def ensure_database(run, *, prefix: pathlib.Path, env_file: pathlib.Path,
+                    owner_env_file: pathlib.Path | None = None,
                     app_role: str = "sr_app") -> dict:
     """Create the database roles and run the forward migrations as the owner.
 
-    The OWNER role owns the schema; the APP role is DML-only (migration 0016
-    installs the standing grants).  The owner URL is the operator's secret and
-    is never rendered into a generated file.
+    The SCHEMA OWNER credential is deliberately separate from the runtime
+    credential: the API, the ingest listener, the bastion and the web service
+    all load the operator's ``control-plane.env``, so an owner URL there
+    would hand the schema owner to every service.  The owner URL therefore
+    lives in its own root-only file (or the environment of a manual run) and
+    is used here and nowhere else.
+
+    The URL is parsed, never split on "/" (that would put the credentials
+    into the "database name"), and it never appears in a command line or a
+    log: it is passed to Alembic through the ENVIRONMENT.
     """
-    values = _read_env_file(env_file)
-    owner_url = os.environ.get("SR_POSTGRES_URL_OWNER") or values.get(
-        "SR_POSTGRES_URL_OWNER", "")
+    owner_env_file = owner_env_file or (env_file.parent / "secrets" /
+                                        "db-owner.env")
+    owner_values = _read_env_file(owner_env_file)
+    owner_url = os.environ.get("SR_POSTGRES_URL_OWNER") or \
+        owner_values.get("SR_POSTGRES_URL_OWNER") or \
+        owner_values.get("POSTGRES_URL_OWNER")
     if not owner_url:
         raise RuntimeError(
-            "SR_POSTGRES_URL_OWNER is required to migrate the appliance "
-            "database (put it in the operator's control-plane.env)")
-    app_url = os.environ.get("SR_POSTGRES_URL") or values.get("SR_POSTGRES_URL", "")
-    database = "sparring_range"
-    if "/" in owner_url:
-        tail = owner_url.split("/", 1)[1]
-        database = tail.split("?", 1)[0]
+            f"no schema-owner database URL: put SR_POSTGRES_URL_OWNER in "
+            f"{owner_env_file} (0600, root only). It is used ONLY to run the "
+            f"migrations and is never written into a file a service loads.")
+    owner = _parse_url(owner_url)
+    database = owner["database"]
+    app_url = os.environ.get("SR_POSTGRES_URL") or \
+        _read_env_file(env_file).get("SR_POSTGRES_URL")
+    app = _parse_url(app_url) if app_url else None
 
-    # Roles and the database: idempotent, and never a password in a log.
-    run("su", "postgres", "-c",
-        f"psql -v ON_ERROR_STOP=1 -d postgres -tAc \"SELECT 1 FROM pg_roles "
-        f"WHERE rolname='{app_role}'\" | grep -q 1 || psql -v ON_ERROR_STOP=1 "
-        f"-d postgres -c \"CREATE ROLE {app_role} LOGIN\"",
-        check=False)
-    run("su", "postgres", "-c",
-        f"psql -v ON_ERROR_STOP=1 -d postgres -tAc \"SELECT 1 FROM pg_database "
-        f"WHERE datname='{database}'\" | grep -q 1 || psql -v ON_ERROR_STOP=1 "
-        f"-d postgres -c \"CREATE DATABASE {database} OWNER "
-        f"{_owner_role(owner_url)}\"",
-        check=False)
-    # Forward migrations, always as the owner.
+    # Roles: the owner owns the schema, the app role is DML-only (the
+    # standing grants are installed by the migrations themselves).
+    _psql_as_postgres(run, [
+        f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname="
+        f"'{owner['user']}') THEN CREATE ROLE {owner['user']} LOGIN "
+        f"PASSWORD '{owner['password']}'; END IF; END $$;"])
+    if app and app["user"] != owner["user"]:
+        _psql_as_postgres(run, [
+            f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname="
+            f"'{app['user']}') THEN CREATE ROLE {app['user']} LOGIN "
+            f"PASSWORD '{app['password']}'; END IF; END $$;"])
+    _psql_as_postgres(run, [
+        f"SELECT 'CREATE DATABASE {database} OWNER {owner['user']}' "
+        f"WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname="
+        f"'{database}')\\gexec"])
+
+    # Forward migrations, always as the owner, always through the environment.
     alembic = prefix / ".venv/bin/alembic"
     if not alembic.exists():
         raise RuntimeError(f"missing {alembic} — the venv must exist before "
                            "the migrations run")
     run(str(alembic), "upgrade", "head",
-        env={"SR_POSTGRES_URL_OWNER": owner_url,
-             "SR_POSTGRES_URL": app_url or owner_url,
+        env={"POSTGRES_URL_OWNER": owner_url,
              "DB_APP_ROLE": app_role,
              "PATH": os.environ.get("PATH", "/usr/bin:/bin")})
-    return {"database": database, "app_role": app_role,
-            "migrated_with_owner_url": True}
+    return {"database": database, "owner_role": owner["user"],
+            "app_role": app_role, "migrated_with_owner_url": True,
+            "owner_url_file": str(owner_env_file)}
 
 
-def _owner_role(url: str) -> str:
-    """The role name inside a SQLAlchemy URL (no password ever leaves here)."""
-    tail = url.split("://", 1)[-1]
-    userinfo = tail.split("@", 1)[0]
-    return userinfo.split(":", 1)[0] or "sr_owner"
+def _parse_url(url: str) -> dict:
+    """Parse a SQLAlchemy/psycopg URL into its parts (never logged)."""
+    import urllib.parse
+
+    parsed = urllib.parse.urlsplit(url.replace("postgresql+psycopg2://",
+                                               "postgresql://", 1))
+    if not parsed.hostname:
+        raise RuntimeError("the database URL has no host")
+    return {"user": parsed.username or "",
+            "password": parsed.password or "",
+            "host": parsed.hostname,
+            "port": parsed.port or 5432,
+            "database": (parsed.path or "/").lstrip("/") or "sparring_range"}
 
 
-def ensure_tls(run, *, etc: pathlib.Path, public_ip: str) -> dict:
+def _psql_as_postgres(run, statements: list[str]) -> None:
+    """Run SQL as the local postgres superuser.
+
+    The SQL goes through a 0600 temporary file, never a command line: it
+    contains the role password and quotes that would not survive a shell.
+    The local peer authentication is used, so no superuser password exists.
+    """
+    import tempfile
+
+    for statement in statements:
+        fd, name = tempfile.mkstemp(prefix="sr-sql-", suffix=".sql")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(statement.rstrip().rstrip(";") + ";\n")
+            os.chmod(name, 0o600)
+            run("su", "postgres", "-c",
+                "psql -v ON_ERROR_STOP=1 -d postgres -f "
+                + shlex.quote(name), check=False)
+        finally:
+            try:
+                os.unlink(name)
+            except OSError:
+                pass
+
+
+def ensure_tls(run, *, etc: pathlib.Path, public_ip: str,
+               ingest_sans: str = "") -> dict:
     """Provision the TLS material for the public and ingest planes.
 
     The existing bootstrap script owns generation: it never regenerates an
     existing identity, and the CA signing key stays root-only.
+
+    ``ingest_sans`` is REQUIRED: without it the bootstrap script skips the
+    guest-facing ingest certificate, and the guests can never enroll (the
+    script says so and continues).
     """
     tls_dir = etc / "tls"
     ssh_dir = etc / "ssh"
     tls_dir.mkdir(parents=True, exist_ok=True)
     ssh_dir.mkdir(parents=True, exist_ok=True)
+    if not ingest_sans.strip():
+        raise RuntimeError(
+            "no INGEST_SANS: the guest-facing ingest certificate would be "
+            "skipped and the guests could never enroll")
     env = {
         "SR_TLS_DIR": str(tls_dir),
         "SR_SSH_DIR": str(ssh_dir),
         "SR_SSH_GROUP": "srbastion",
         "HTTPS_IP": public_ip,
+        "INGEST_SANS": ingest_sans,
         "SR_TLS_ROTATE": "0",
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
     }
     run("bash", str(_bootstrap_script()), env=env)
-    return {"tls_dir": str(tls_dir), "ssh_dir": str(ssh_dir)}
+    return {"tls_dir": str(tls_dir), "ssh_dir": str(ssh_dir),
+            "ingest_sans": ingest_sans}
 
 
 def _bootstrap_script() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parent / "bootstrap_tls.sh"
 
 
-def onboard_operator(run, *, etc: pathlib.Path, authorized_keys: list[str]) -> dict:
+def onboard_operator(run, *, etc: pathlib.Path,
+                     authorized_keys: list) -> dict:
     """Install the member's public keys for the recording bastion.
 
+    The bastion's loader expects ``<username> <public-key>`` lines: it maps
+    a login name to the keys it accepts.  A bare key line would be read as
+    the username "ssh-ed25519" and no member could ever authenticate.
+
     Only PUBLIC keys are written; the private halves stay with their owner.
+    ``authorized_keys`` is a list of ``(username, public_key)`` pairs.
     """
     target = etc / "ssh" / "authorized_keys"
     existing = []
     if target.is_file():
         existing = [ln for ln in target.read_text().splitlines() if ln.strip()]
     merged = list(existing)
-    for key in authorized_keys:
-        key = key.strip()
-        if key and key not in merged:
-            merged.append(key)
+    seen = set(merged)
+    for item in authorized_keys:
+        if isinstance(item, str):  # a bare key: refuse, do not guess
+            raise RuntimeError(
+                "the bastion needs '<username> <public-key>' lines; a bare "
+                "key would be registered under the username 'ssh-ed25519'")
+        username, key = item
+        username = str(username).strip()
+        key = str(key).strip()
+        if not username or not key:
+            continue
+        line = f"{username} {key}"
+        if line not in seen:
+            merged.append(line)
+            seen.add(line)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("\n".join(merged) + ("\n" if merged else ""))
     run("chmod", "0640", str(target))
     run("chown", "root:srbastion", str(target))
-    return {"authorized_keys": len(merged), "path": str(target)}
+    return {"authorized_keys": len(merged), "path": str(target),
+            "users": sorted({ln.split(" ", 1)[0] for ln in merged})}
 
 
-def ensure_web_build(run, *, source: pathlib.Path) -> dict:
+# The appliance's own MACHINE credentials: the key pairs the services
+# present on the isolated range.  The operator's keys are a different thing
+# (their public halves are baked into the templates; the private halves stay
+# with their owner) and are never written here.
+SERVICE_KEYS = (
+    # (name, relative path, owning user, owning group, comment)
+    ("runner", "secrets/worker_runner_key", "srworker", "srworker",
+     "sparring-range-runner"),
+    ("verifier", "secrets/verifier_key", "srrange", "srrange",
+     "sparring-range-verifier"),
+    ("bastion-client", "ssh/bastion_client_ed25519", "srbastion", "srbastion",
+     "sparring-range-bastion-client"),
+)
+
+
+def ensure_service_keys(run, *, etc: pathlib.Path,
+                        sandboxed: bool = False) -> dict:
+    """Provision the machine key pairs the services use on the range.
+
+    Each key belongs to the identity that USES it: the runner key is read by
+    the worker (srworker), the verifier key by the API (srrange), the bastion
+    dial key by the bastion (srbastion).  The files stay 0600 and the PUBLIC
+    halves are reported, because the guest templates must be built with those
+    public halves — a key the guests do not accept is not a working key.
+
+    An existing key is never replaced: the installer preserves it (and its
+    ownership) so a rerun cannot break a live installation.
+    """
+    import grp as _grp
+    import pwd as _pwd
+
+    out: dict = {}
+    for name, rel, owner, group, comment in SERVICE_KEYS:
+        path = etc / rel
+        created = False
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", comment,
+                "-f", str(path))
+            created = True
+        try:
+            uid = _pwd.getpwnam(owner).pw_uid
+            gid = _grp.getgrnam(group).gr_gid
+        except KeyError:
+            uid = gid = -1
+        if uid >= 0 and not sandboxed:
+            run("chown", f"{uid}:{gid}", str(path), check=False)
+        run("chmod", "0600", str(path), check=False)
+        public = ""
+        pub_path = pathlib.Path(str(path) + ".pub")
+        if pub_path.is_file():
+            public = pub_path.read_text().strip()
+            run("chmod", "0644", str(pub_path), check=False)
+        out[name] = {"path": str(path), "owner": owner, "group": group,
+                     "created": created, "public": public}
+    return out
+
+
+def ensure_web_build(run, *, source: pathlib.Path,
+                     public_url: str = "") -> dict:
     """Build the frontend from its LOCKED dependencies.
 
     Next 16 needs a recent Node; the installer refuses an old runtime instead
     of building something that cannot start.
+
+    ``NEXT_PUBLIC_API_URL`` is BAKED INTO the bundle at build time: without
+    it the browser would talk to http://localhost:8000 — the operator's own
+    machine, not the appliance.  The public URL carries the /api prefix that
+    nginx strips again.
     """
     web = source / "web"
     lock = web / "package-lock.json"
@@ -194,9 +336,16 @@ def ensure_web_build(run, *, source: pathlib.Path) -> dict:
     if version < (20, 9):
         raise RuntimeError(f"node {version[0]}.{version[1]} is too old — the "
                            "frontend needs Node 20.9 or newer")
-    run("npm", "ci", cwd=str(web))
-    run("npm", "run", "build", cwd=str(web))
-    return {"node": ".".join(str(v) for v in version), "lock": str(lock)}
+    api_url = ""
+    if public_url:
+        api_url = public_url.rstrip("/") + "/api"
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    if api_url:
+        env["NEXT_PUBLIC_API_URL"] = api_url
+    run("npm", "ci", cwd=str(web), env=env)
+    run("npm", "run", "build", cwd=str(web), env=env)
+    return {"node": ".".join(str(v) for v in version), "lock": str(lock),
+            "next_public_api_url": api_url}
 
 
 def _node_version() -> tuple[int, int] | None:
