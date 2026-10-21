@@ -120,10 +120,12 @@ def ensure_database(run, *, prefix: pathlib.Path, env_file: pathlib.Path,
             f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname="
             f"'{app['user']}') THEN CREATE ROLE {app['user']} LOGIN "
             f"PASSWORD '{app['password']}'; END IF; END $$;"])
+    # \gexec must not be followed by a semicolon: it is a psql
+    # meta-command, not SQL.
     _psql_as_postgres(run, [
         f"SELECT 'CREATE DATABASE {database} OWNER {owner['user']}' "
         f"WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname="
-        f"'{database}')\\gexec"])
+        f"'{database}')\n\\gexec"])
 
     # Forward migrations, always as the owner, always through the environment.
     alembic = prefix / ".venv/bin/alembic"
@@ -157,21 +159,42 @@ def _parse_url(url: str) -> dict:
 def _psql_as_postgres(run, statements: list[str]) -> None:
     """Run SQL as the local postgres superuser.
 
-    The SQL goes through a 0600 temporary file, never a command line: it
-    contains the role password and quotes that would not survive a shell.
-    The local peer authentication is used, so no superuser password exists.
+    The SQL goes through a temporary file, never a command line: it contains
+    the role password and quotes that would not survive a shell.  The file is
+    owned by the postgres user and 0600, because psql runs AS postgres: a
+    root-only file would be unreadable and the statement would silently do
+    nothing.
+
+    The statements are written EXACTLY as given: appending a semicolon would
+    turn a psql meta-command (\\gexec) into invalid input.
+
+    A failing statement is an error, never a warning: the installation must
+    not continue with roles that were never created.
     """
+    import pwd as _pwd
     import tempfile
 
+    try:
+        pg = _pwd.getpwnam("postgres")
+    except KeyError:
+        pg = None
     for statement in statements:
         fd, name = tempfile.mkstemp(prefix="sr-sql-", suffix=".sql")
         try:
             with os.fdopen(fd, "w") as fh:
-                fh.write(statement.rstrip().rstrip(";") + ";\n")
+                fh.write(statement if statement.endswith("\n")
+                         else statement + "\n")
             os.chmod(name, 0o600)
+            if pg is not None:
+                try:
+                    os.chown(name, pg.pw_uid, pg.pw_gid)
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"cannot hand the SQL file to the postgres user: "
+                        f"{exc}") from exc
             run("su", "postgres", "-c",
                 "psql -v ON_ERROR_STOP=1 -d postgres -f "
-                + shlex.quote(name), check=False)
+                + shlex.quote(name), check=True)
         finally:
             try:
                 os.unlink(name)
@@ -283,15 +306,23 @@ def _public_line(path) -> str:
 
 
 def _public_half(private_path) -> str:
-    """The public half that belongs to a private key file."""
+    """The public half that belongs to a private key file.
+
+    The private key is the authority: ``ssh-keygen -y`` derives the public
+    half from it.  A ``.pub`` file next to it is only a hint — it can
+    belong to a DIFFERENT key, and believing it would install a pair the
+    guests refuse.
+    """
+    out = subprocess.run(["ssh-keygen", "-y", "-f", str(private_path)],
+                         capture_output=True, text=True, timeout=30)
+    if out.returncode == 0 and out.stdout.strip():
+        parts = out.stdout.strip().split()
+        if len(parts) > 1:
+            return parts[1]
     pub = pathlib.Path(str(private_path) + ".pub")
     if pub.is_file():
         return _public_line(pub)
-    out = subprocess.run(["ssh-keygen", "-y", "-f", str(private_path)],
-                         capture_output=True, text=True, timeout=30)
-    if out.returncode != 0:
-        return ""
-    return out.stdout.strip().split()[1] if out.stdout.strip() else ""
+    return ""
 
 
 def ensure_service_keys(run, *, etc: pathlib.Path,
@@ -323,8 +354,18 @@ def ensure_service_keys(run, *, etc: pathlib.Path,
         path = etc / rel
         created = False
         source = ""
-        if not path.exists():
-            public = (access_keys or {}).get(principal)
+        public = (access_keys or {}).get(principal)
+        expected = _public_line(public) if public else ""
+        if path.exists():
+            # A RERUN must validate what is already installed: a key that
+            # was copied by an earlier, failed run must not be accepted
+            # because the file exists.
+            installed = _public_half(path)
+            if expected and installed and installed != expected:
+                raise RuntimeError(
+                    f"{path} is not the private half of {public}: the guest "
+                    "templates would refuse it")
+        else:
             private = None
             if public:
                 stem = str(public)[:-4] if str(public).endswith(".pub") \
@@ -333,19 +374,18 @@ def ensure_service_keys(run, *, etc: pathlib.Path,
                 if candidate.is_file():
                     private = candidate
             if private is not None:
+                # The private half must belong to the public half the
+                # templates have baked in — CHECKED BEFORE THE COPY, so a
+                # mismatched pair never reaches the appliance.
+                offered = _public_half(private)
+                if expected and offered and offered != expected:
+                    raise RuntimeError(
+                        f"{private} is not the private half of {public}: the "
+                        "guest templates would refuse it")
                 path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(private, path)
                 os.chmod(path, 0o600)
                 source = str(private)
-                # The private half must belong to the public half the
-                # templates have baked in: a mismatched pair would be
-                # refused by every guest.
-                installed = _public_half(path)
-                expected = _public_line(public)
-                if installed and expected and installed != expected:
-                    raise RuntimeError(
-                        f"{private} is not the private half of {public}: the "
-                        "guest templates would refuse it")
             else:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C",

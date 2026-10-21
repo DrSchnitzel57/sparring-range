@@ -28,8 +28,13 @@ from .errors import ManifestError
 SCHEMA_VERSION = 1
 _SCHEMA_KEYS = {
     "schema_version", "installation_id", "appliance", "network", "urls",
-    "broker", "paths", "images", "access_keys", "model", "budgets", "backup",
+    "broker", "paths", "images", "access_keys", "member_keys", "model",
+    "budgets", "backup",
 }
+# The login name a MEMBER uses on the recording bastion.  The bastion's
+# token login resolves the session owner's username, so a key registered
+# under a machine role ("runner") would never authenticate a person.
+_MEMBER_RE = re.compile(r"^[a-z][a-z0-9._-]{1,31}$")
 _ROLE_RE = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
 _BRIDGE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
 _HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
@@ -195,6 +200,9 @@ class ApplianceManifest:
     model_api_key_file: str
     backup_enabled: bool = False
     backup_destination: str | None = None
+    # username -> public key path: the members who may log in on the
+    # recording bastion.
+    member_keys: Mapping[str, str] = field(default_factory=dict)
     source: str = "<dict>"
     raw: dict = field(default_factory=dict, repr=False, compare=False)
 
@@ -384,6 +392,24 @@ class ApplianceManifest:
         if sum(i.disk_gb for i in images.values()) > budgets.max_disk_gb:
             raise _bad("image disk totals exceed budgets.max_disk_gb")
 
+        # The MEMBERS' public keys, by the username they log in with. The
+        # machine roles in access_keys are baked into the guest templates;
+        # they are NOT logins.
+        member_raw = raw.get("member_keys")
+        member_keys: dict[str, str] = {}
+        if member_raw is not None:
+            if not isinstance(member_raw, dict):
+                raise _bad("member_keys must be an object")
+            for username, value in member_raw.items():
+                user = str(username)
+                if not _MEMBER_RE.fullmatch(user):
+                    raise _bad(f"member_keys.{username} is not a valid "
+                               "username (lower-case, 2-32 characters)")
+                if not isinstance(value, str) or not value:
+                    raise _bad(f"member_keys.{username} must be a path to a "
+                               "public key")
+                member_keys[user] = _abs_path(value, f"member_keys.{username}")
+
         backup = _need_obj(raw, "backup", required=False)
         _closed(backup, {"enabled", "destination"}, "backup")
         enabled = bool(backup.get("enabled", False))
@@ -408,7 +434,8 @@ class ApplianceManifest:
             secrets_dir=secrets, public_url=public, internal_url=internal,
             ingest_url=ingest_url, model_base_url=base_url, model_alias=alias,
             model_api_key_file=api_key_file, backup_enabled=enabled,
-            backup_destination=dest, source=source, raw=raw)
+            backup_destination=dest, member_keys=member_keys,
+            source=source, raw=raw)
         manifest.check_key_material()
         return manifest
 
@@ -429,6 +456,19 @@ class ApplianceManifest:
             if not lines or not (lines[0].startswith(("ssh-", "ecdsa-", "sk-"))
                                  or lines[0].startswith("restrict ")):
                 raise _bad(f"access_keys.{role} is not an OpenSSH public key")
+        for username, path in self.member_keys.items():
+            p = pathlib.Path(path)
+            if not p.is_file():
+                raise _bad(f"member_keys.{username} file is missing: {p}")
+            try:
+                text = p.read_text()
+            except OSError as exc:
+                raise _bad(f"member_keys.{username} unreadable: {exc}") from exc
+            if "PRIVATE KEY" in text:
+                raise _bad(f"member_keys.{username} must be a PUBLIC key")
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            if not lines or not lines[0].startswith(("ssh-", "ecdsa-", "sk-")):
+                raise _bad(f"member_keys.{username} is not an OpenSSH public key")
         model_key = pathlib.Path(self.model_api_key_file)
         if not model_key.is_file():
             raise _bad(f"model.api_key_file is missing: {model_key}")
@@ -450,6 +490,16 @@ class ApplianceManifest:
             return self.images[role]
         except KeyError as exc:
             raise _bad(f"unknown image role {role!r}") from exc
+
+    def member_public_keys(self) -> dict[str, str]:
+        """{username: public key line} for the members who may log in."""
+        out: dict[str, str] = {}
+        for username, path in self.member_keys.items():
+            try:
+                out[username] = pathlib.Path(path).read_text().strip()
+            except OSError as exc:
+                raise _bad(f"member_keys.{username} unreadable: {exc}") from exc
+        return out
 
     def public_key_for(self, role: str) -> str:
         if role not in self.access_keys:

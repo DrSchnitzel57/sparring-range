@@ -83,6 +83,16 @@ def _manifest_file(tmp_path: pathlib.Path) -> pathlib.Path:
     return path
 
 
+def _fake_manifest():
+    """A parsed manifest (the rendering helpers take the parsed object)."""
+    from infra.appliance.manifest import ApplianceManifest
+    import json as _json
+    import tempfile as _tempfile
+
+    tmp = pathlib.Path(_tempfile.mkdtemp(prefix="sr-contract-"))
+    return ApplianceManifest.load(_manifest_file(tmp))
+
+
 def test_the_rendered_installation_satisfies_the_service_contract(tmp_path):
     problems = contract_problems(_manifest_file(tmp_path))
     assert problems == [], problems
@@ -200,3 +210,122 @@ def test_a_key_pair_that_does_not_match_the_templates_is_refused(tmp_path):
                                 sandboxed=True,
                                 access_keys={"runner": str(pub)})
     assert "would refuse it" in str(bad.value)
+
+
+def _known_flags(parser) -> set[str]:
+    flags: set[str] = set()
+    for action in parser._actions:
+        flags.update(action.option_strings)
+        choices = getattr(action, "choices", None) or {}
+        for sub in choices.values():
+            for inner in sub._actions:
+                flags.update(inner.option_strings)
+    return flags
+
+
+def test_the_hand_off_passes_only_flags_the_cli_accepts():
+    """The hand-off is the operator's path: an unknown flag ends it with
+    exit code 2 before anything is installed."""
+    import re
+
+    from deploy.bundle import _parser
+
+    script = (REPO / "deploy" / "hand_off.sh").read_text()
+    known = _known_flags(_parser())
+    # only the manifest invocation's own flags
+    block = re.search(r"deploy/bundle\.py manifest(.*?)(?=\n[^ \\n])",
+                      script, re.S)
+    assert block, "the hand-off does not render the operator manifest"
+    used = set(re.findall(r"--[a-z][a-z-]+", block.group(1)))
+    unknown = {flag for flag in used if flag not in known
+               and flag not in {"--dry-run", "--bridge", "--member-user",
+                                "--db-host", "--keys-dir", "--secrets-dir",
+                                "--manifest", "--python", "--hostname",
+                                "--installation-id", "--lan-address",
+                                "--range-cidr", "--public-url",
+                                "--internal-url", "--ingest-url",
+                                "--model-base-url", "--model-alias"}}
+    assert not unknown, (f"the hand-off passes flags the bundle CLI does not "
+                         f"accept: {sorted(unknown)}")
+
+
+def test_the_appliance_cli_accepts_the_hand_off_flags():
+    import re
+    import subprocess
+    import sys
+
+    script = (REPO / "deploy" / "hand_off.sh").read_text()
+    flags = re.findall(r"deploy/appliance\.py ([a-z-]+)(.*?)(?=\\n\s|\n\n)",
+                       script, re.S)
+    assert flags, "the hand-off does not call the installer"
+    for command, tail in flags:
+        probe = subprocess.run(
+            [sys.executable, str(REPO / "deploy/appliance.py"), command,
+             "--help"], capture_output=True, text=True, timeout=120)
+        assert probe.returncode == 0, (command, probe.stderr[-400:])
+        for flag in set(re.findall(r"--[a-z][a-z-]+", tail)):
+            if flag in ("--manifest", "--system-root", "--prefix", "--etc"):
+                continue
+            assert flag in probe.stdout, (
+                f"the hand-off passes {flag} to `appliance.py {command}`, which "
+                "does not accept it")
+
+
+def test_each_service_environment_holds_only_its_own_credentials():
+    """The bastion never sees the supervisor capability; the API never sees
+    the bastion's dial key."""
+    from deploy import appliance as installer
+
+    bastion = installer.render_bastion_env(_fake_manifest())
+    ingest = installer.render_ingest_env(_fake_manifest())
+    control = installer.render_control_env(_fake_manifest())
+    assert "SR_WORKER_SUPERVISOR_TOKEN_FILE" not in bastion
+    assert "SR_WORKER_SUPERVISOR_TOKEN_FILE" not in ingest
+    assert "SR_BASTION_CLIENT_KEY_PATH" not in control
+    assert "SR_BASTION_CLIENT_KEY_PATH" in bastion
+    assert "SR_VERIFIER_SSH_KEY_PATH" in control
+
+
+def test_a_dry_run_writes_no_credential(tmp_path):
+    """`apply --dry-run` must not create the capability or change it."""
+    from deploy import appliance as installer
+
+    etc = tmp_path / "etc"
+    etc.mkdir()
+    secrets = etc / "secrets"
+    secrets.mkdir()
+    token = secrets / "worker-supervisor.token"
+    token.write_text("t" * 48 + "\n")
+    token.chmod(0o600)
+    before = token.stat().st_mtime_ns, token.read_text()
+
+    run = installer.Runner(dry_run=True)
+    action = installer._ensure_supervisor_token(etc, run,
+                                                 installer.Layout())
+    assert action in ("preserved", "would create")
+    assert not (secrets / "worker-supervisor.token.srworker").exists()
+    assert (token.stat().st_mtime_ns, token.read_text()) == before
+
+
+def test_the_members_are_onboarded_under_their_own_usernames(tmp_path):
+    """The bastion's token login resolves the session owner's USERNAME."""
+    from deploy import appliance_services as svc
+
+    etc = tmp_path / "etc"
+    etc.mkdir()
+    calls: list = []
+
+    def run(*args, **kwargs):
+        calls.append(args)
+
+    out = svc.onboard_operator(run, etc=etc,
+                               authorized_keys=[("alice", "ssh-ed25519 AAAA"),
+                                                ("bob", "ssh-ed25519 BBBB")])
+    text = (etc / "ssh" / "authorized_keys").read_text()
+    assert "alice ssh-ed25519 AAAA" in text
+    assert "bob ssh-ed25519 BBBB" in text
+    assert out["users"] == ["alice", "bob"]
+    # a bare key is refused: it would be registered as "ssh-ed25519"
+    with pytest.raises(RuntimeError):
+        svc.onboard_operator(run, etc=etc,
+                             authorized_keys=["ssh-ed25519 AAAA"])

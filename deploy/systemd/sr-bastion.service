@@ -6,10 +6,11 @@ After=network-online.target sr-api.service
 Type=exec
 User=srbastion
 Group=srbastion
-EnvironmentFile=/etc/sparring-range/control-plane.derived.env
-# Operator secrets and overrides load second (optional so pre-derivation
-# installs keep working); manifest-derived facts above, secrets below.
-EnvironmentFile=-/etc/sparring-range/control-plane.env
+# The bastion loads ONLY its own environment: the API it reports to, the
+# member's authorized keys, its own host key and the key it presents to the
+# practice guests.  It never loads the controller's environment (the
+# worker-supervisor capability) and never the database credential.
+EnvironmentFile=/etc/sparring-range/control-plane.bastion.env
 WorkingDirectory=/opt/sparring-range
 ExecStart=/opt/sparring-range/.venv/bin/python -m srplatform.bastion.proxy
 Restart=always

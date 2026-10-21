@@ -139,6 +139,52 @@ def _scan_for_secrets(rel: str, data: bytes) -> str | None:
     return None
 
 
+def _qemu_img(*args: str) -> str:
+    """Run qemu-img and return its output (the release needs it)."""
+    if shutil.which("qemu-img") is None:
+        raise BundleError("qemu-img is required to build a release bundle: "
+                          "the shipped images are validated (and flattened) "
+                          "with it")
+    r = subprocess.run(["qemu-img", *args], capture_output=True, text=True,
+                       timeout=3600)
+    if r.returncode != 0:
+        raise BundleError(f"qemu-img {' '.join(args)} failed: "
+                          f"{(r.stderr or r.stdout)[-400:]}")
+    return r.stdout
+
+
+def _image_info(path: pathlib.Path) -> dict:
+    try:
+        return json.loads(_qemu_img("info", "--output=json", str(path)))
+    except json.JSONDecodeError as exc:
+        raise BundleError(f"{path} is not a readable qcow2 image: {exc}") from exc
+
+
+def _add_image(src: pathlib.Path, dst: pathlib.Path) -> None:
+    """Put a SELF-CONTAINED image into the bundle.
+
+    A qcow2 overlay whose backing file lives in the build machine's temp
+    directory is broken the moment it is copied: the backing file is gone
+    and the image cannot be opened. The bundle therefore flattens such an
+    image and verifies that what it ships has no backing file at all — a
+    released artifact must not depend on anything outside itself.
+    """
+    info = _image_info(src)
+    if info.get("backing-filename"):
+        _qemu_img("convert", "-O", "qcow2", str(src), str(dst))
+    else:
+        shutil.copyfile(src, dst)
+    shipped = _image_info(dst)
+    if shipped.get("backing-filename"):
+        raise BundleError(f"{dst} still has a backing file "
+                          f"({shipped.get('backing-filename')})")
+    chain = _qemu_img("info", "--backing-chain", str(dst))
+    images = [ln for ln in chain.splitlines() if ln.startswith("image:")]
+    if len(images) != 1:
+        raise BundleError(f"{dst} has a backing chain of {len(images)} "
+                          "images; a released image must stand alone")
+
+
 def build(output: pathlib.Path, *, base_image: pathlib.Path,
           role_images: dict[str, pathlib.Path], app_dir: pathlib.Path = REPO,
           guest_agent_available: bool = True) -> dict:
@@ -164,20 +210,28 @@ def build(output: pathlib.Path, *, base_image: pathlib.Path,
                 rel.parts[0] in ("pyproject.toml", "requirements.lock",
                                  "alembic.ini", "README.md", "AGENTS.md"):
             add(path, str(rel))
-    # 2. the guest base images
+    # 2. the guest base images — self-contained, verified
     images = {}
     if base_image.is_file():
-        add(base_image, f"images/{base_image.name}")
-        images["appliance-base"] = {"path": f"images/{base_image.name}",
-                                    "sha256": files[f"images/{base_image.name}"]["sha256"],
-                                    "bytes": base_image.stat().st_size}
+        rel = f"images/{base_image.name}"
+        dst = output / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        _add_image(base_image, dst)
+        os.chmod(dst, 0o644)
+        files[rel] = {"sha256": _sha256(dst), "bytes": dst.stat().st_size}
+        images["appliance-base"] = {"path": rel, "sha256": files[rel]["sha256"],
+                                    "bytes": files[rel]["bytes"]}
     for role, path in sorted(role_images.items()):
         if not path.is_file():
             raise BundleError(f"role image missing: {path}")
-        add(path, f"images/{path.name}")
-        images[role] = {"path": f"images/{path.name}",
-                         "sha256": files[f"images/{path.name}"]["sha256"],
-                         "bytes": path.stat().st_size}
+        rel = f"images/{path.name}"
+        dst = output / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        _add_image(path, dst)
+        os.chmod(dst, 0o644)
+        files[rel] = {"sha256": _sha256(dst), "bytes": dst.stat().st_size}
+        images[role] = {"path": rel, "sha256": files[rel]["sha256"],
+                        "bytes": files[rel]["bytes"]}
     if not guest_agent_available:
         raise BundleError("the guest agent is not available in the base image")
 
@@ -223,6 +277,24 @@ def verify(bundle: pathlib.Path) -> dict:
         secret = _scan_for_secrets(rel, path.read_bytes())
         if secret:
             problems.append(secret)
+    # the shipped images must stand alone: an image that depends on a file
+    # outside the bundle cannot be installed on the operator's machine.
+    for rel, meta in sorted((manifest.get("images") or {}).items()):
+        path = bundle / meta["path"]
+        if not path.is_file():
+            problems.append(f"missing image: {meta['path']}")
+            continue
+        if shutil.which("qemu-img") is None:
+            continue
+        try:
+            info = json.loads(_qemu_img("info", "--output=json", str(path)))
+        except BundleError as exc:
+            problems.append(f"{meta['path']}: {exc}")
+            continue
+        if info.get("backing-filename"):
+            problems.append(f"{meta['path']} depends on "
+                            f"{info['backing-filename']}, which is outside the "
+                            "bundle")
     # a file that is not in the manifest is drift too
     for path in sorted(bundle.rglob("*")):
         if path.is_file() and path.name != MANIFEST_NAME:
@@ -244,6 +316,7 @@ def render_manifest(bundle: pathlib.Path, out: pathlib.Path, *,
                      ingest_address: str | None = None,
                      ingest_port: int = 8443, management_cidr: str = "10.0.0.0/24",
                      access_keys: dict[str, str] | None = None,
+                     member_keys: dict[str, str] | None = None,
                      model_base_url: str = "http://127.0.0.1:8001/v1",
                      model_alias: str = "sr-model",
                      model_api_key_file: str = "/etc/sparring-range/secrets/model.key",
@@ -328,6 +401,10 @@ def render_manifest(bundle: pathlib.Path, out: pathlib.Path, *,
             "bastion": "/etc/sparring-range/keys/bastion.pub",
             "mgmt": "/etc/sparring-range/keys/mgmt.pub",
         },
+        # The MEMBERS' public keys, by the username they log in with on the
+        # recording bastion. The machine roles above are baked into the
+        # guest templates; they are not logins.
+        "member_keys": dict(sorted((member_keys or {}).items())),
         "model": {"base_url": model_base_url, "alias": model_alias,
                   "api_key_file": model_api_key_file},
         "budgets": {"max_guests": max_guests, "max_vcpus": max_vcpus,
@@ -344,7 +421,8 @@ def render_manifest(bundle: pathlib.Path, out: pathlib.Path, *,
             "images": sorted(parsed.images)}
 
 
-def main(argv: list[str] | None = None) -> int:
+def _parser() -> argparse.ArgumentParser:
+    """The CLI's parser (so a caller can check the flags it accepts)."""
     ap = argparse.ArgumentParser(prog="deploy/bundle.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -377,11 +455,18 @@ def main(argv: list[str] | None = None) -> int:
     pm.add_argument("--management-cidr", default="10.0.0.0/24")
     pm.add_argument("--access-key", action="append", default=[],
                     metavar="ROLE=PATH")
+    pm.add_argument("--member-key", action="append", default=[],
+                    metavar="USERNAME=PATH")
     pm.add_argument("--model-base-url", default="http://127.0.0.1:8001/v1")
     pm.add_argument("--model-alias", default="sr-model")
     pm.add_argument("--model-api-key-file",
                     default="/etc/sparring-range/secrets/model.key")
 
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = _parser()
     args = ap.parse_args(argv)
     try:
         if args.cmd == "build":
@@ -417,6 +502,13 @@ def main(argv: list[str] | None = None) -> int:
             for item in args.access_key:
                 role, _, path = item.partition("=")
                 keys[role] = path
+            members = {}
+            for item in args.member_key:
+                username, _, path = item.partition("=")
+                if not path:
+                    raise BundleError(f"--member-key must be USERNAME=PATH: "
+                                      f"{item!r}")
+                members[username] = path
             out = render_manifest(
                 pathlib.Path(args.bundle), pathlib.Path(args.out),
                 installation_id=args.installation_id,
@@ -430,7 +522,7 @@ def main(argv: list[str] | None = None) -> int:
                 ingest_address=args.ingest_address,
                 ingest_port=args.ingest_port,
                 management_cidr=args.management_cidr,
-                access_keys=keys or None,
+                access_keys=keys or None, member_keys=members or None,
                 model_base_url=args.model_base_url,
                 model_alias=args.model_alias,
                 model_api_key_file=args.model_api_key_file)

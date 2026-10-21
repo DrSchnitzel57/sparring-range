@@ -33,6 +33,7 @@ SECRETS_DIR="/etc/sparring-range/secrets"
 MANIFEST="/etc/sparring-range/appliance-manifest.json"
 DB_HOST="127.0.0.1"
 DB_NAME="sparring_range"
+MEMBER_USER="member"
 PYTHON="${SR_PYTHON:-python3}"
 
 usage() {
@@ -55,6 +56,7 @@ while [ $# -gt 0 ]; do
     --model-base-url) MODEL_BASE_URL="$2"; shift 2;;
     --model-alias) MODEL_ALIAS="$2"; shift 2;;
     --keys-dir) KEYS_DIR="$2"; shift 2;;
+  --member-user) MEMBER_USER="$2"; shift 2;;
     --secrets-dir) SECRETS_DIR="$2"; shift 2;;
     --manifest) MANIFEST="$2"; shift 2;;
     --python) PYTHON="$2"; shift 2;;
@@ -83,6 +85,14 @@ for role in runner bastion mgmt; do
     echo "  generated $KEYS_DIR/$role (keep the PRIVATE half safe)"
   fi
 done
+# The MEMBER's own key pair: the recording bastion authenticates the
+# person by this login name, and the member's SSH rehearsal uses the
+# private half.
+if [ ! -f "$KEYS_DIR/$MEMBER_USER" ]; then
+  ssh-keygen -q -t ed25519 -N '' -f "$KEYS_DIR/$MEMBER_USER"
+  echo "  generated $KEYS_DIR/$MEMBER_USER (the member's login '$MEMBER_USER';"
+  echo "  keep the PRIVATE half safe — it is the member's SSH key)"
+fi
 if [ ! -f "$SECRETS_DIR/model.key" ]; then
   install -m 0600 /dev/null "$SECRETS_DIR/model.key"
   echo "  created $SECRETS_DIR/model.key - put the model credential in it"
@@ -123,11 +133,12 @@ fi
   --installation-id "$INSTALLATION_ID" \
   --lan-address "$LAN_ADDRESS" --range-cidr "$RANGE_CIDR" \
   --public-url "$PUBLIC_URL" --internal-url "$INTERNAL_URL" \
-  --ingest-url "$INGEST_URL" --range-bridge "$RANGE_BRIDGE" \
+  --ingest-url "$INGEST_URL" --bridge "$RANGE_BRIDGE" \
   --hostname "$HOSTNAME" \
   --access-key "runner=$KEYS_DIR/runner.pub" \
   --access-key "bastion=$KEYS_DIR/bastion.pub" \
   --access-key "mgmt=$KEYS_DIR/mgmt.pub" \
+  --member-key "$MEMBER_USER=$KEYS_DIR/$MEMBER_USER.pub" \
   --model-api-key-file "$SECRETS_DIR/model.key" \
   --model-base-url "$MODEL_BASE_URL" --model-alias "$MODEL_ALIAS"
 

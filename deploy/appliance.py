@@ -268,7 +268,6 @@ def render_control_env(m: ApplianceManifest, *, etc: pathlib.Path = DEFAULT_ETC,
         ("SR_RUNNER_SSH_KNOWN_HOSTS", str(etc / "known_hosts/range_hosts")),
         ("SR_VERIFIER_SSH_KEY_PATH", str(etc / "secrets/verifier_key")),
         ("SR_VERIFIER_SSH_KNOWN_HOSTS", str(etc / "known_hosts/range_hosts")),
-        ("SR_BASTION_CLIENT_KEY_PATH", str(etc / "ssh/bastion_client_ed25519")),
         # The match scheduler (ready expiry, deadline cleanup, startup
         # reconciliation) is part of a working appliance, not an option.
         ("SR_MATCH_SCHEDULER_ENABLED", "1"),
@@ -309,6 +308,45 @@ def render_supervisor_env(m: ApplianceManifest,
     ])
 
 
+def render_bastion_env(m: ApplianceManifest, *,
+                       etc: pathlib.Path = DEFAULT_ETC,
+                       prefix: pathlib.Path = DEFAULT_PREFIX) -> str:
+    """The recording bastion's environment.
+
+    The bastion holds ONLY what it uses: the API it reports to and its trust
+    anchor, the member's authorized keys, its own host key and the key it
+    presents when it dials the practice guests.  It never sees the
+    worker-supervisor capability (the API's credential) and never sees the
+    database credential.
+    """
+    return _env_lines([
+        ("SR_ENV", "production"),
+        ("SR_API_BASE_URL", m.public_url),
+        ("SR_API_ROUTE_PREFIX", "/api"),
+        ("SR_API_TLS_CA_FILE", str(etc / "tls/api-ca.crt")),
+        ("SR_BASTION_AUTHORIZED_KEYS_FILE", str(etc / "ssh/authorized_keys")),
+        ("SR_BASTION_HOST_KEY_PATH", str(etc / "ssh/bastion_ed25519")),
+        ("SR_BASTION_CLIENT_KEY_PATH", str(etc / "ssh/bastion_client_ed25519")),
+        ("SR_BASTION_TARGETS_KNOWN_HOSTS", str(etc / "known_hosts/range_hosts")),
+        ("SR_RECORDINGS_DIR", m.recordings_dir),
+    ])
+
+
+def render_ingest_env(m: ApplianceManifest, *,
+                      etc: pathlib.Path = DEFAULT_ETC,
+                      prefix: pathlib.Path = DEFAULT_PREFIX) -> str:
+    """The guest-facing ingest listener's environment.
+
+    The listener terminates TLS with the provisioned ingest certificate and
+    writes telemetry.  It holds no supervisor capability and no bastion key.
+    """
+    return _env_lines([
+        ("SR_ENV", "production"),
+        ("SR_TELEMETRY_CA_FILE", str(etc / "tls/api-ca.crt")),
+        ("SR_API_TLS_CA_FILE", str(etc / "tls/api-ca.crt")),
+    ])
+
+
 def render_policy(m: ApplianceManifest) -> str:
     policy = AppliancePolicy.from_manifest(m)
     raw = {
@@ -331,7 +369,15 @@ def render_policy(m: ApplianceManifest) -> str:
 
 def _unit_from_template(name: str, *, user: str | None = None,
                         group: str | None = None,
-                        extra: str = "") -> str:
+                        extra: str = "",
+                        env_files: list[str] | None = None) -> str:
+    """Render a systemd unit from its template.
+
+    ``env_files`` REPLACES the template's EnvironmentFile lines: a service
+    must load exactly the environment that belongs to it, never the
+    controller's (a credential it cannot read would stop it, and a
+    credential it can read is a credential it should not hold).
+    """
     text = (ROOT / "deploy" / "systemd" / name).read_text()
     if user:
         import re
@@ -339,6 +385,19 @@ def _unit_from_template(name: str, *, user: str | None = None,
     if group:
         import re
         text = re.sub(r"^Group=.*$", f"Group={group}", text, flags=re.M)
+    if env_files is not None:
+        lines = [ln for ln in text.splitlines()
+                 if not ln.startswith("EnvironmentFile=")]
+        # the environment files go where the template had them: right after
+        # the last Environment= line, or after the [Service] header.
+        idx = max((i for i, ln in enumerate(lines)
+                   if ln.startswith("Environment=")), default=None)
+        if idx is None:
+            idx = max((i for i, ln in enumerate(lines)
+                       if ln.startswith("[Service]")), default=0)
+        for offset, env_file in enumerate(env_files):
+            lines.insert(idx + 1 + offset, f"EnvironmentFile={env_file}")
+        text = "\n".join(lines) + "\n"
     if extra:
         # Insert additional Environment lines after the last EnvironmentFile.
         lines = text.splitlines()
@@ -408,9 +467,10 @@ Requires=postgresql.service
 Type=exec
 User=sringest
 Group=sringest
-EnvironmentFile={etc}/control-plane.derived.env
+EnvironmentFile={etc}/control-plane.ingest.env
 EnvironmentFile=-{etc}/control-plane.env
 Environment=SR_API_INGEST_ONLY=1
+Environment=SR_PROCESS_ROLE=ingest
 WorkingDirectory={prefix}
 ExecStart={prefix}/.venv/bin/uvicorn srplatform.api.app:app \\
   --host {m.network.controller_range_ip} --port {m.network.ingest_port} \\
@@ -522,6 +582,12 @@ def render_files(m: ApplianceManifest, *,
         RenderedFile(lay.etc / "broker.env",
                      render_broker_env(m, etc=lay.etc),
                      0o640, "root", "sr-broker-clients"),
+        RenderedFile(lay.etc / "control-plane.bastion.env",
+                     render_bastion_env(m, etc=lay.etc, prefix=lay.prefix),
+                     0o640, "root", "srbastion"),
+        RenderedFile(lay.etc / "control-plane.ingest.env",
+                     render_ingest_env(m, etc=lay.etc, prefix=lay.prefix),
+                     0o640, "root", "sringest"),
         RenderedFile(lay.etc / "worker-supervisor.env",
                      render_supervisor_env(m, etc=lay.etc, prefix=lay.prefix),
                      0o640, "root", "srworker"),
@@ -541,7 +607,11 @@ def render_files(m: ApplianceManifest, *,
         RenderedFile(lay.units_dir / "sr-api.service",
                      _unit_from_template("sr-api.service"), 0o644),
         RenderedFile(lay.units_dir / "sr-bastion.service",
-                     _unit_from_template("sr-bastion.service"), 0o644),
+                     _unit_from_template(
+                         "sr-bastion.service",
+                         env_files=[str(lay.etc / "control-plane.bastion.env")],
+                         extra="Environment=SR_PROCESS_ROLE=bastion"),
+                     0o644),
         RenderedFile(lay.units_dir / "sr-web.service",
                      render_web_unit(lay), 0o644),
         RenderedFile(lay.nginx_dir / "sparring-range.conf",
@@ -688,6 +758,12 @@ def _ensure_supervisor_token(etc: pathlib.Path, run: Runner,
     """
     api_path = etc / "secrets/worker-supervisor.token"
     worker_path = etc / "secrets/worker-supervisor.token.srworker"
+    if run.dry_run:
+        # A DRY RUN MUST NOT WRITE: not the capability, not its ownership,
+        # not the supervisor's copy.
+        print(f"DRY: provision {api_path} + {worker_path} (0600 each)",
+              file=sys.stderr)
+        return "would create" if not api_path.exists() else "preserved"
     existing = [p for p in (api_path, worker_path) if p.exists()]
     if existing:
         values = {p.read_text().strip() for p in existing}
@@ -707,10 +783,6 @@ def _ensure_supervisor_token(etc: pathlib.Path, run: Runner,
                       os.getuid() if lay.sandboxed else _ids("srworker")[0],
                       os.getuid() if lay.sandboxed else _ids("srworker")[1])
         return "preserved"
-    if run.dry_run:
-        print(f"DRY: generate {api_path} + {worker_path} (0600 each)",
-              file=sys.stderr)
-        return "would create"
     token = secrets.token_urlsafe(48)
     api_path.parent.mkdir(parents=True, exist_ok=True)
     if lay.sandboxed:
@@ -809,15 +881,13 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
         services["tls"] = svc.ensure_tls(
             run, etc=lay.etc, public_ip=m.network.lan_address or "127.0.0.1",
             ingest_sans=_ingest_sans(m))
-        # The member's PUBLIC keys are written for the recording bastion in
+        # The MEMBERS' public keys are written for the recording bastion in
         # the bastion's own format: "<username> <public-key>".  The username
-        # is the login the member uses on the bastion.
-        member_keys = []
-        for role in ("runner", "bastion", "mgmt"):
-            try:
-                member_keys.append((role, m.public_key_for(role)))
-            except Exception:  # noqa: BLE001 — a missing role key is reported
-                continue
+        # is the login the member uses: the bastion's token login resolves
+        # the session owner's username, so a key registered under a machine
+        # role ("runner") would never authenticate a person.
+        member_keys = [(username, key)
+                       for username, key in m.member_public_keys().items()]
         services["onboarding"] = svc.onboard_operator(
             run, etc=lay.etc, authorized_keys=member_keys)
         services["service_keys"] = svc.ensure_service_keys(

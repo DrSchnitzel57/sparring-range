@@ -329,13 +329,22 @@ def process_role() -> str:
 
 def validate_production(s: Settings, role: str = "controller") -> None:
     """Fail CLOSED on misconfiguration in production mode (F23). Validation is
-    ROLE-SCOPED (audit N04): the worker is validated on exactly the capability
-    it holds (API + model + runner channel), never on controller-only secrets
-    it must not possess (Proxmox token, owner DB, bastion pins)."""
+    ROLE-SCOPED (audit N04): every role is validated on exactly the
+    capability it holds, never on a credential it must not possess.
+
+    The roles are: the controller (the API), the worker, the broker, the
+    recording bastion and the guest-facing ingest listener. The bastion
+    never sees the worker-supervisor capability and the API never sees the
+    bastion's dial key: each service validates — and reads — only its own.
+    """
     problems = []
+    if role not in ("controller", "worker", "broker", "bastion", "ingest"):
+        raise RuntimeError(f"unknown SR_PROCESS_ROLE {role!r}")
     if s.worker_dispatch not in ("inline", "supervisor"):
         problems.append("worker_dispatch must be 'inline' or 'supervisor'")
-    if s.worker_dispatch == "supervisor":
+    # The worker-supervisor capability is the CONTROLLER's: it validates the
+    # supervisor's callbacks. No other role may require (or read) it.
+    if s.worker_dispatch == "supervisor" and role == "controller":
         if not s.worker_supervisor_token_file:
             problems.append("worker_supervisor_token_file required for "
                             "supervisor dispatch")
@@ -395,6 +404,51 @@ def validate_production(s: Settings, role: str = "controller") -> None:
             raise RuntimeError("production BROKER config invalid:\n  - "
                                + "\n  - ".join(problems))
         return
+    if role == "bastion":
+        # The recording bastion: it dials the practice guests with its own
+        # key and reports to the API over the public TLS. It holds NO
+        # supervisor capability, NO verifier key and NO database credential.
+        if not s.api_base_url:
+            problems.append("api_base_url missing (the bastion reports the "
+                            "recording through the API)")
+        if s.api_base_url.startswith("https://") and not s.api_tls_ca_file:
+            problems.append("api_tls_ca_file missing (the bastion talks to the "
+                            "API over TLS and must verify it)")
+        if not s.bastion_authorized_keys_file:
+            problems.append("bastion_authorized_keys_file missing (the member "
+                            "cannot authenticate without it)")
+        if not s.bastion_host_key_path:
+            problems.append("bastion_host_key_path missing (the guests pin "
+                            "the bastion's host key)")
+        if not s.bastion_client_key_path:
+            problems.append("bastion_client_key_path missing (the bastion "
+                            "presents it when it dials the guests)")
+        if s.bastion_client_key_path:
+            try:
+                check_private_key(s.bastion_client_key_path,
+                                  "bastion client key")
+            except ValueError as e:
+                problems.append(str(e))
+        if s.bastion_targets_known_hosts == "":
+            problems.append("bastion_targets_known_hosts required (no TOFU to "
+                            "range hosts)")
+        if problems:
+            raise RuntimeError("production BASTION config invalid:\n  - "
+                               + "\n  - ".join(problems))
+        return
+    if role == "ingest":
+        # The guest-facing ingest listener: it terminates TLS with the
+        # provisioned ingest certificate and writes telemetry. It holds no
+        # supervisor capability and no bastion key.
+        if not s.telemetry_ca_file:
+            problems.append("telemetry_ca_file missing (the guests' trust "
+                            "anchor)")
+        if "CHANGE_ME" in s.postgres_url:
+            problems.append("database credentials are placeholders")
+        if problems:
+            raise RuntimeError("production INGEST config invalid:\n  - "
+                               + "\n  - ".join(problems))
+        return
     if role != "controller":
         raise RuntimeError(f"unknown SR_PROCESS_ROLE {role!r}")
     # Controller (API): PVE credentials are BROKER-ONLY (milestone 02).
@@ -446,13 +500,11 @@ def validate_production(s: Settings, role: str = "controller") -> None:
     # a corrupt key must fail at startup, not mid-enrollment; the returned
     # fingerprint is what deployment compares against the role build
     # manifest's baked PUBLIC key fingerprints.
-    for label, path in (("verifier key", s.verifier_ssh_key_path),
-                        ("bastion client key", s.bastion_client_key_path)):
-        if path:
-            try:
-                check_private_key(path, label)
-            except ValueError as e:
-                problems.append(str(e))
+    if s.verifier_ssh_key_path:
+        try:
+            check_private_key(s.verifier_ssh_key_path, "verifier key")
+        except ValueError as e:
+            problems.append(str(e))
     if problems:
         raise RuntimeError("production config invalid:\n  - " + "\n  - ".join(problems))
 

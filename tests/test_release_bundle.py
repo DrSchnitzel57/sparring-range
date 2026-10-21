@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import shutil
 import subprocess
 import sys
 
@@ -15,7 +16,15 @@ from deploy import bundle as bundle_mod  # noqa: E402
 
 
 def _fake_image(path: pathlib.Path, size: int = 4096) -> pathlib.Path:
-    path.write_bytes(b"qcow-image" * (size // 9))
+    """A REAL (tiny) qcow2 image.
+
+    The bundle validates every image it ships — a released image must be a
+    readable, self-contained qcow2 — so the tests use real images.
+    """
+    if shutil.which("qemu-img") is None:
+        pytest.skip("qemu-img is required to build a release bundle")
+    subprocess.run(["qemu-img", "create", "-f", "qcow2", str(path), "8M"],
+                   check=True, capture_output=True)
     return path
 
 

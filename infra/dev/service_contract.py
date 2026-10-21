@@ -33,11 +33,14 @@ BOOTSTRAP_TLS_OUTPUTS = {
     "https.crt", "https.key", "ingest-server.crt", "ingest-server.key",
 }
 
-# The private key each service reads, and the identity that owns it.
+# The private key each service reads, the identity that owns it, and the
+# environment that names it.  A credential belongs to ONE service: the
+# bastion's dial key is in the bastion's environment, the verifier key in
+# the controller's.
 KEY_OWNERS = {
-    "SR_RUNNER_SSH_KEY_PATH": "srworker",
-    "SR_VERIFIER_SSH_KEY_PATH": "srrange",
-    "SR_BASTION_CLIENT_KEY_PATH": "srbastion",
+    "SR_RUNNER_SSH_KEY_PATH": ("srworker", "control-plane.derived.env"),
+    "SR_VERIFIER_SSH_KEY_PATH": ("srrange", "control-plane.derived.env"),
+    "SR_BASTION_CLIENT_KEY_PATH": ("srbastion", "control-plane.bastion.env"),
 }
 
 
@@ -132,16 +135,18 @@ def contract_problems(manifest: pathlib.Path) -> list[str]:
         elif pathlib.Path(token_path).name != "worker-supervisor.token":
             problems.append(f"the API reads {token_path}, which is not the "
                             "API's own copy of the capability")
-        for key, owner in KEY_OWNERS.items():
-            path = values.get(key, "")
-            if not path:
-                problems.append(f"the derived environment names no {key}")
-                continue
-            expected = [rel for _name, rel, own, _g, _c, _principal in
-                        SERVICE_KEYS if own == owner]
-            if not any(path.endswith(rel) for rel in expected):
-                problems.append(f"{key} names {path}, which no service "
-                                f"provisions for {owner}")
+    for key, (owner, env_name) in KEY_OWNERS.items():
+        values = _parse_env((by_name.get(env_name).content
+                             if by_name.get(env_name) else ""))
+        path = values.get(key, "")
+        if not path:
+            problems.append(f"{env_name} names no {key}")
+            continue
+        expected = [rel for _name, rel, own, _g, _c, _principal in
+                    SERVICE_KEYS if own == owner]
+        if not any(path.endswith(rel) for rel in expected):
+            problems.append(f"{key} names {path}, which no service "
+                            f"provisions for {owner}")
         # the trust anchor must be a certificate the bootstrap creates
         for key in ("SR_TELEMETRY_CA_FILE", "SR_API_TLS_CA_FILE"):
             path = values.get(key, "")
