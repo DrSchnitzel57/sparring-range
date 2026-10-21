@@ -1510,6 +1510,13 @@ def _hypervisor_prereqs() -> list[str]:
             os.environ.get("SR_HYPERVISOR_ALLOW_TCG") != "1":
         missing.append("/dev/kvm (nested KVM) or explicit SR_HYPERVISOR_ALLOW_TCG=1 "
                        "for a LABELED software-emulation gate")
+    if missing and not os.environ.get("LIBVIRT_DRIVER_DIR"):
+        # An unprivileged libvirt needs its own driver directory and its
+        # runtime dir; without them the import fails and the reason is
+        # invisible.
+        missing.append("an unprivileged libvirt environment "
+                       "(LD_LIBRARY_PATH, PYTHONPATH, LIBVIRT_DRIVER_DIR, "
+                       "XDG_RUNTIME_DIR) or a system libvirt")
     return missing
 
 
