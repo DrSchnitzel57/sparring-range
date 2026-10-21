@@ -181,6 +181,10 @@ green and infrastructure-free.
 
 ### Milestone 15 implementation baseline (2026-10-21, branch `15`)
 
+Reviewer entry point: **docs/HANDOFF-15.md** — the plan/commit map, the exact
+verification commands, what is claimed versus what is not, and the places a
+critical reviewer should look hardest.
+
 Reproduced on the branch, in a Debian 13 container with **no `/dev/kvm`**, no
 root and no installed appliance. Guest boots are software emulation and are
 labelled as such; they are **not** nested-KVM acceptance.
