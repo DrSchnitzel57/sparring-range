@@ -179,6 +179,25 @@ fresh uv `.venv`, Python 3.13.5):
 These are the plan-13 starting failures to repair; the fast default remains
 green and infrastructure-free.
 
+### Milestone 15 review round (2026-10-21, branch `15`)
+
+After the independent review (**VERDICT: FIX**) every reproduced finding was
+fixed on the branch. The fast default is now **413 passed, 0 failed, 0
+skipped** (261 deselected, 4 warnings, ~65 s) and the gates pass:
+`selection`, `python`, `db` (177), `authority` (25), `containment` (21),
+`install` (the real sequences **plus** the new managed-service contract
+check), `hypervisor` (2, needs `sh .cache/libvirt-debs/start-session.sh`
+first), `access`, `images` (18 passed / 1 skipped), `bundle` (the role
+artifacts are carried), `frontend`, `browser`, `compose`. The aggregate now
+ATTEMPTS the two operator gates and reports them pending with the exact
+prerequisite: `packet` needs root + `nft`, `journey` needs the installed
+appliance with the member's SSH key, the pinned bastion host key and the
+browser login.
+
+The release bundle in `.cache/bundle/sparring-range-appliance` carries the
+appliance base **and the three role images** (306 files, 4 images); rebuild
+it with `deploy/bundle.py build --base-image ... --role-image ROLE=PATH`.
+
 ### Milestone 15 implementation baseline (2026-10-21, branch `15`)
 
 Reviewer entry point: **docs/HANDOFF-15.md** — the plan/commit map, the exact

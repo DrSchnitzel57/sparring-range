@@ -44,6 +44,16 @@ Tests were deferred by the user; this planning pass supplies no new acceptance.
   be closed in a developer environment; the real-model and human gates stay open,
   and `images`/`capture` need a KVM runner (their image builds exceed the
   serial-marker timeout under software emulation).
+  *Status 2026-10-21 (review round, branch `15`):* an independent review
+  returned **VERDICT: FIX**. Its findings are fixed: the supervisor's
+  callbacks are fenced by their own claim credential, the API no longer
+  signals a worker in another UID, the controller stops acting when its lock
+  dies, the schema-owner credential no longer travels in a runtime
+  environment, the TLS artifacts and the credential ownership are complete,
+  the bundle carries the role artifacts, and the aggregate attempts the
+  operator gates instead of omitting them. The evidence is in
+  `docs/FINDINGS_CHECKLIST.md` ("Review round") and the reviewer's map is in
+  `docs/HANDOFF-15.md`.
 - [ ] **16 — Installable appliance and qualified release.**
   [Plan](../.openchamber/plans/16-appliance-release.md).
   Finish the checksummed release bundle, upgrade/history-import/recovery tooling

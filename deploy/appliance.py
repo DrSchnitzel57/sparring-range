@@ -677,7 +677,7 @@ def _write_files(files: list[RenderedFile], run: Runner,
 
 
 def _ensure_supervisor_token(etc: pathlib.Path, run: Runner,
-                             lay: Layout) -> dict:
+                             lay: Layout) -> str:
     """Provision the worker-supervisor capability.
 
     The capability is a SECRET and the production settings refuse a
