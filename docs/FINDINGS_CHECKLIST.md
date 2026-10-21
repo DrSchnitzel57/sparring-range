@@ -2,6 +2,10 @@
 
 ## Milestone 15 implementation evidence — 2026-10-20/21, branch `15`
 
+> Reviewer handoff (read this first): [docs/HANDOFF-15.md](HANDOFF-15.md) —
+> the plan map, the commit map, the exact verification commands, what is
+> claimed versus what is not, and where a critical reviewer should look.
+
 **Environment (stated so no result is over-read):** Debian 13 (trixie)
 container, 4 CPUs, 16 GiB RAM, **no `/dev/kvm`**, no root, no installed
 appliance, and an unprivileged libvirt session assembled from extracted
