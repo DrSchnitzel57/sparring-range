@@ -1687,6 +1687,61 @@ def check_bundle() -> None:
         _sh.rmtree(tmp, ignore_errors=True)
 
 
+# -------------------------------------------------------------------------- #
+# appliance (16): the aggregate software gate at a pinned candidate         #
+# -------------------------------------------------------------------------- #
+
+APPLIANCE_GATES = ("selection", "python", "db", "authority", "install",
+                   "hypervisor", "containment", "images", "capture", "access",
+                   "frontend", "browser", "compose", "bundle")
+
+
+def check_appliance() -> None:
+    """Run every software gate of the appliance release, in order.
+
+    Each gate is the SAME gate the operator runs on its own, so the aggregate
+    cannot accept anything the individual gates would refuse.  The revision
+    and the digests are recorded with the result, so an evidence file is
+    always bound to what was actually tested.  The live release gate is NOT
+    part of this: it never runs implicitly.
+    """
+    import subprocess
+
+    revision = "unknown"
+    try:
+        revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO,
+                                  capture_output=True, text=True,
+                                  timeout=30).stdout.strip() or "unknown"
+    except Exception:  # noqa: BLE001 — the label is best effort
+        pass
+    digests = {}
+    base = os.environ.get("SR_APPLIANCE_BASE_IMAGE", "").strip()
+    if base and pathlib.Path(base).is_file():
+        import hashlib
+
+        h = hashlib.sha256()
+        with open(base, "rb") as fh:
+            for chunk in iter(lambda: fh.read(4 * 1024 * 1024), b""):
+                h.update(chunk)
+        digests["appliance-base"] = h.hexdigest()
+    results = {}
+    for gate in APPLIANCE_GATES:
+        print(f"\n--- appliance gate: {gate}")
+        try:
+            CHECKS[gate]()
+        except Failed:
+            results[gate] = "failed"
+            raise
+        results[gate] = "passed"
+    receipt = {"revision": revision, "digests": digests, "gates": results}
+    out = pathlib.Path(os.environ.get("SR_APPLIANCE_RECEIPT", "")) if \
+        os.environ.get("SR_APPLIANCE_RECEIPT") else None
+    if out:
+        out.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+    ok("appliance software matrix", f"{len(results)} gates passed at "
+                                   f"{revision[:12]}")
+
+
 CHECKS = {
     "selection": check_selection,
     "python": check_python,
@@ -1705,6 +1760,7 @@ CHECKS = {
     "journey": check_journey,
     "install": check_install,
     "bundle": check_bundle,
+    "appliance": check_appliance,
     "release": check_release,
 }
 
