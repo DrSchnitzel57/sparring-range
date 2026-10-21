@@ -48,6 +48,15 @@ class Failed(Exception):
     pass
 
 
+class PrerequisiteMissing(Failed):
+    """A gate that could not run because the ENVIRONMENT lacks something.
+
+    It is NOT a pass and NOT a product failure: the release matrix reports
+    it as pending with the exact missing prerequisite, so a gate can never
+    be quietly dropped from the aggregate.
+    """
+
+
 AUDIT_SEVERITIES = ("info", "low", "moderate", "high", "critical")
 
 
@@ -168,6 +177,12 @@ def ok(name: str, detail: str = "") -> None:
 def fail(name: str, detail: str = "") -> None:
     print(f"[FAIL] {name}" + (f" — {detail}" if detail else ""))
     raise Failed(name)
+
+
+def prereq_fail(name: str, detail: str = "") -> None:
+    """The gate did not run: the ENVIRONMENT lacks a prerequisite."""
+    print(f"[PENDING] {name}" + (f" — {detail}" if detail else ""))
+    raise PrerequisiteMissing(f"{name}: {detail}" if detail else name)
 
 
 # -------------------------------------------------------------------------- #
@@ -614,9 +629,10 @@ def check_packet() -> None:
                                  ("nft", bool(shutil.which("nft"))),
                                  ("ip", bool(shutil.which("ip")))) if not have]
     if missing:
-        fail("packet prerequisites (root + nft + iproute2)",
-             f"missing {missing} — required layer; run in the approved CI packet "
-             "job (rules only inside disposable netns, never host namespaces)")
+        prereq_fail("packet prerequisites (root + nft + iproute2)",
+                    f"missing {missing} — required layer; run in the approved CI "
+                    "packet job (rules only inside disposable netns, never host "
+                    "namespaces)")
     r, counts = pytest_run(["-m", "packet"], env={"SR_REQUIRE_PACKET": "1"},
                            timeout=1800)
     if r.returncode != 0:
@@ -1585,16 +1601,19 @@ def check_access() -> None:
 
 def check_journey() -> None:
     required = ("SR_JOURNEY_BASE_URL", "SR_JOURNEY_OPERATOR_TOKEN",
-                "SR_JOURNEY_MEMBER_TOKEN")
+                "SR_JOURNEY_MEMBER_TOKEN", "SR_JOURNEY_SSH_KEY",
+                "SR_JOURNEY_BASTION_KNOWN_HOSTS", "SR_JOURNEY_BROWSER_URL",
+                "SR_JOURNEY_BROWSER_USER", "SR_JOURNEY_BROWSER_PASSWORD")
     missing = [k for k in required if not os.environ.get(k)]
     if missing:
-        fail("journey prerequisites (installed appliance + authenticated members)",
-             f"missing {missing} — required live gate; point it at the installed "
-             "appliance and provide operator/member bearer tokens")
+        prereq_fail("journey prerequisites (installed appliance + authenticated members)",
+                    f"missing {missing} — required live gate; point it at the "
+                    "installed appliance and provide operator/member bearer tokens")
     env = {"SR_REQUIRE_JOURNEY": "1"}
     for key in ("SR_JOURNEY_BASE_URL", "SR_JOURNEY_OPERATOR_TOKEN",
                 "SR_JOURNEY_MEMBER_TOKEN", "SR_JOURNEY_SSH_KEY",
-                "SR_JOURNEY_BASTION_KNOWN_HOSTS",
+                "SR_JOURNEY_BASTION_KNOWN_HOSTS", "SR_JOURNEY_BROWSER_URL",
+                "SR_JOURNEY_BROWSER_USER", "SR_JOURNEY_BROWSER_PASSWORD",
                 "SR_JOURNEY_CA_FILE", "SR_JOURNEY_DURATION_MINUTES",
                 "SR_JOURNEY_PACE_SECONDS", "SR_JOURNEY_PRESET"):
         if os.environ.get(key):
@@ -1702,6 +1721,14 @@ APPLIANCE_GATES = ("selection", "python", "db", "authority", "install",
                    "hypervisor", "containment", "images", "capture", "access",
                    "frontend", "browser", "compose", "bundle")
 
+# The gates that need the OPERATOR's machine: root + nft for the packet
+# layer, the INSTALLED appliance with operator/member tokens for the
+# journey.  They are part of the release, so the aggregate ATTEMPTS them and
+# reports the outcome: a missing prerequisite is reported as pending with
+# its exact reason, and any real failure fails the aggregate.  Dropping them
+# from the list would make the aggregate silently weaker than the release.
+APPLIANCE_ENV_GATES = ("packet", "journey")
+
 
 def check_appliance() -> None:
     """Run every software gate of the appliance release, in order.
@@ -1732,6 +1759,7 @@ def check_appliance() -> None:
                 h.update(chunk)
         digests["appliance-base"] = h.hexdigest()
     results = {}
+    pending = {}
     for gate in APPLIANCE_GATES:
         print(f"\n--- appliance gate: {gate}")
         try:
@@ -1740,15 +1768,31 @@ def check_appliance() -> None:
             results[gate] = "failed"
             raise
         results[gate] = "passed"
-    receipt = {"revision": revision, "digests": digests, "gates": results}
+    for gate in APPLIANCE_ENV_GATES:
+        print(f"\n--- appliance operator gate: {gate}")
+        try:
+            CHECKS[gate]()
+        except PrerequisiteMissing as exc:
+            pending[gate] = str(exc)
+            results[gate] = "pending"
+            print(f"[PENDING] {gate} — {exc}")
+            continue
+        except Failed:
+            results[gate] = "failed"
+            raise
+        results[gate] = "passed"
+    receipt = {"revision": revision, "digests": digests, "gates": results,
+               "pending": pending}
     out = pathlib.Path(os.environ.get("SR_APPLIANCE_RECEIPT", "")) if \
         os.environ.get("SR_APPLIANCE_RECEIPT") else None
     if out:
         out.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
-    ok("appliance software matrix", f"{len(results)} gates passed at "
-                                   f"{revision[:12]}"
-                                   + (f", base {digests['appliance-base'][:12]}"
-                                      if digests else ""))
+    ok("appliance software matrix",
+       f"{len([g for g in results.values() if g == 'passed'])} gates passed at "
+       f"{revision[:12]}"
+       + (f", base {digests['appliance-base'][:12]}" if digests else "")
+       + (f"; {len(pending)} operator gate(s) pending: "
+          + ", ".join(sorted(pending)) if pending else ""))
 
 
 CHECKS = {

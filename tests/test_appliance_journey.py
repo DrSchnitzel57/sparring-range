@@ -16,8 +16,13 @@ pytestmark = pytest.mark.journey
 
 
 def test_installed_appliance_full_practice_journey(tmp_path):
+    # The member SSH rehearsal, the browser journey and the incident
+    # workflow are part of the acceptance: a journey that could pass
+    # without them was not the acceptance the release promised.
     required = ("SR_JOURNEY_BASE_URL", "SR_JOURNEY_OPERATOR_TOKEN",
-                "SR_JOURNEY_MEMBER_TOKEN")
+                "SR_JOURNEY_MEMBER_TOKEN", "SR_JOURNEY_SSH_KEY",
+                "SR_JOURNEY_BASTION_KNOWN_HOSTS", "SR_JOURNEY_BROWSER_URL",
+                "SR_JOURNEY_BROWSER_USER", "SR_JOURNEY_BROWSER_PASSWORD")
     missing = [k for k in required if not os.environ.get(k)]
     if missing:
         message = ("installed-appliance journey inputs missing: "
@@ -39,6 +44,9 @@ def test_installed_appliance_full_practice_journey(tmp_path):
         ssh_key=os.environ.get("SR_JOURNEY_SSH_KEY") or None,
         bastion_known_hosts=os.environ.get(
             "SR_JOURNEY_BASTION_KNOWN_HOSTS") or None,
+        browser_url=os.environ.get("SR_JOURNEY_BROWSER_URL", ""),
+        browser_user=os.environ.get("SR_JOURNEY_BROWSER_USER", ""),
+        browser_password=os.environ.get("SR_JOURNEY_BROWSER_PASSWORD", ""),
         reuse=os.environ.get("SR_JOURNEY_REUSE", "1") != "0")
     evidence = tmp_path / "journey-evidence.json"
     evidence.write_text(json.dumps(out, indent=2, sort_keys=True) + "\n")
@@ -49,6 +57,19 @@ def test_installed_appliance_full_practice_journey(tmp_path):
         assert session["launch_state"] == "succeeded"
         assert session["end_status"] in ("complete", "torn_down")
         assert session["score_status"] in ("scored", "partial", "unscored")
-    if os.environ.get("SR_JOURNEY_SSH_KEY"):
-        assert any((s.get("ssh") or {}).get("output") for s in out["sessions"])
-        assert any(s.get("casts", 0) >= 1 for s in out["sessions"])
+    assert any((s.get("ssh") or {}).get("output") for s in out["sessions"])
+    assert any(s.get("casts", 0) >= 1 for s in out["sessions"])
+    # the incident (break) -> submission -> decision workflow
+    incidents = [s.get("incident") for s in out["sessions"] if s.get("incident")]
+    assert incidents, "no session exercised the incident workflow"
+    assert incidents[0]["submission_status"], incidents[0]
+    assert "duplicate" in str(incidents[0].get("duplicate_note") or ""), \
+        incidents[0]
+    # the failure workflows: the API refused what it could not do
+    for session in out["sessions"]:
+        refusals = session.get("refusals") or {}
+        assert refusals.get("unknown_session") == 404, refusals
+        assert refusals.get("unknown_release") == 404, refusals
+        assert refusals.get("operator_only_view") == 403, refusals
+    # the browser journey
+    assert (out.get("browser") or {}).get("logged_in") is True, out.get("browser")

@@ -68,7 +68,9 @@ def test_journey_creates_a_session_for_every_option(monkeypatch):
             if url.endswith("/score"):
                 return _Resp({"status": "unscored"})
             if url.endswith("/replay"):
-                return _Resp({"casts": [], "timeline": []})
+                # the member's SSH transcript exists after the rehearsal
+                return _Resp({"casts": [{"frames": [{"t": 0, "text": "hello"}]}],
+                              "timeline": []})
             return _Resp({"session_id": "sid-1", "status": "complete",
                            "deployment_status": "ready",
                            "match": {"state": "ready", "snapshot_version": 7,
@@ -78,8 +80,24 @@ def test_journey_creates_a_session_for_every_option(monkeypatch):
             pass
 
     monkeypatch.setattr(journey, "_client", lambda *a, **k: _Client())
+    # The live steps (SSH, the browser, the incident workflow) are proven by
+    # the journey gate against the INSTALLED appliance; here they are
+    # stubbed so this test can check the option matrix in isolation.
+    async def _fake_ssh(*a, **k):
+        return {"output": "ok"}
+
+    monkeypatch.setattr(journey, "_ssh_check", _fake_ssh)
+    monkeypatch.setattr(journey, "_browser_check",
+                        lambda *a, **k: {"logged_in": True, "library": True})
+    monkeypatch.setattr(journey, "_inject_workflow",
+                        lambda *a, **k: {"submission_status": "incorrect"})
+    monkeypatch.setattr(journey, "_refusal_paths", lambda *a, **k: {})
     journey.run_journey(base_url="https://appliance.invalid",
-                        operator_token="op", member_token="member")
+                        operator_token="op", member_token="member",
+                        ssh_key="/tmp/member.key",
+                        bastion_known_hosts="/tmp/known_hosts",
+                        browser_url="https://appliance.invalid",
+                        browser_user="member", browser_password="secret")
     bodies = [e["body"] for e in seen if e["url"] == "/sessions"]
     # both presets, the whole option matrix, and the reuse session
     assert len(bodies) == (len(journey.PRESETS) + len(journey.SESSION_OPTIONS)
@@ -139,7 +157,9 @@ def test_journey_refuses_a_session_that_ignored_its_options(monkeypatch):
             if url.endswith("/score"):
                 return _Resp({"status": "unscored"})
             if url.endswith("/replay"):
-                return _Resp({"casts": [], "timeline": []})
+                # the member's SSH transcript exists after the rehearsal
+                return _Resp({"casts": [{"frames": [{"t": 0, "text": "hello"}]}],
+                              "timeline": []})
             return _Resp({"session_id": "sid-1", "status": "ready",
                            "deployment_status": "ready",
                            "match": {"state": "ready", "snapshot_version": 7,
@@ -149,6 +169,19 @@ def test_journey_refuses_a_session_that_ignored_its_options(monkeypatch):
             pass
 
     monkeypatch.setattr(journey, "_client", lambda *a, **k: _Client())
+    async def _fake_ssh(*a, **k):
+        return {"output": "ok"}
+
+    monkeypatch.setattr(journey, "_ssh_check", _fake_ssh)
+    monkeypatch.setattr(journey, "_browser_check",
+                        lambda *a, **k: {"logged_in": True, "library": True})
+    monkeypatch.setattr(journey, "_inject_workflow",
+                        lambda *a, **k: {"submission_status": "incorrect"})
+    monkeypatch.setattr(journey, "_refusal_paths", lambda *a, **k: {})
     with pytest.raises(journey.JourneyError):
         journey.run_journey(base_url="https://appliance.invalid",
-                            operator_token="op", member_token="member")
+                            operator_token="op", member_token="member",
+                            ssh_key="/tmp/member.key",
+                            bastion_known_hosts="/tmp/known_hosts",
+                            browser_url="https://appliance.invalid",
+                            browser_user="member", browser_password="secret")

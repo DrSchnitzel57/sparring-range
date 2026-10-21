@@ -30,10 +30,14 @@ import json
 import os
 import pathlib
 import shlex
+import subprocess
 import sys
 import time
+import uuid
 
 import httpx
+
+REPO = pathlib.Path(__file__).resolve().parents[2]
 
 PRESETS = ("mojang-web-01", "mojang-web-db-01")
 
@@ -127,9 +131,157 @@ async def _ssh_check(conn: dict, key: str, known_hosts: str) -> dict:
         return {"host": host, "port": port, "output": (result.stdout or "").strip()}
 
 
+def _playwright_cli() -> str | None:
+    """The PINNED local Playwright CLI (the web devDependency)."""
+    local = REPO / "web" / "node_modules" / ".bin" / "playwright-cli"
+    if local.exists():
+        return str(local)
+    import shutil
+
+    return shutil.which("playwright-cli")
+
+
+def _browser_check(base_url: str, username: str, password: str, *,
+                   cli: str | None = None, timeout: int = 180) -> dict:
+    """Drive a REAL browser against the installed appliance.
+
+    The member's browser journey (login -> library) is part of the product:
+    an API-only journey would not notice a frontend that cannot log in, and
+    the review of the release must not accept one.
+    """
+    cli = cli or _playwright_cli()
+    if not cli:
+        raise JourneyError("the browser step needs the pinned playwright CLI "
+                           "(run `npm ci` in web/ first)")
+    session = f"sr-journey-{uuid.uuid4().hex[:8]}"
+
+    def pw(*args, check=True, timeout=timeout):
+        r = subprocess.run([cli, f"-s={session}", *args], capture_output=True,
+                           text=True, timeout=timeout, cwd=str(REPO))
+        if check and r.returncode != 0:
+            raise JourneyError(f"playwright-cli {' '.join(args)} -> "
+                               f"{r.returncode}: {(r.stdout or r.stderr)[-400:]}")
+        return r
+
+    out: dict = {"base_url": base_url}
+    try:
+        pw("open", base_url, "--browser=chromium")
+        pw("fill", 'input[placeholder="username"]', username)
+        pw("fill", 'input[placeholder="password"]', password)
+        pw("click", 'button[type="submit"]')
+        deadline = time.time() + 60
+        body = ""
+        while time.time() < deadline:
+            body = pw("--raw", "eval", "document.body.innerText",
+                      check=False).stdout
+            if "scenario library" in body or "sparring-range" in body:
+                break
+            if "expired" in body.lower() or "invalid" in body.lower():
+                raise JourneyError(f"the browser login was refused: {body[:300]}")
+            time.sleep(1)
+        if "scenario library" not in body:
+            raise JourneyError("the browser never reached the scenario library "
+                               f"after the login: {body[:300]}")
+        out["logged_in"] = True
+        out["library"] = True
+    finally:
+        pw("close", check=False)
+    return out
+
+
+def _inject_workflow(c: httpx.Client, sid: str, *, wait_s: float) -> dict:
+    """The incident (break) -> submission -> decision workflow.
+
+    The release inbox is the product's incident plan: each entry breaks
+    something in the practice environment and the verifier decides whether
+    it was repaired.  This step proves the whole path:
+
+    * a submission BEFORE the release opens is REFUSED (never queued);
+    * an open release accepts a submission and the verifier decides it;
+    * the first answer decides: a second submission never re-decides.
+    """
+    out: dict = {}
+    inbox = _json(c.get(f"/sessions/{sid}/injects"), "inject inbox")
+    releases = inbox.get("releases") or []
+    out["releases"] = len(releases)
+    if not releases:
+        raise JourneyError("the session has no incident releases — the break/"
+                           "repair workflow cannot be exercised")
+    # 1. the refusal path
+    early = [r for r in releases if r.get("status") == "pending"]
+    if early:
+        refused = c.post(f"/sessions/{sid}/injects/{early[0]['release_id']}",
+                         json={"content": "answer before the incident opened"})
+        out["early_submission"] = refused.status_code
+        if refused.status_code != 409:
+            raise JourneyError(
+                f"a submission before the release opened was not refused: "
+                f"HTTP {refused.status_code} {refused.text[:200]}")
+    # 2. wait for the incident to open, then answer it
+    opened = None
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        inbox = _json(c.get(f"/sessions/{sid}/injects"), "inject inbox")
+        for r in inbox.get("releases") or []:
+            if r.get("status") == "pending":
+                opened = r
+                break
+        if opened is not None:
+            break
+        time.sleep(5)
+    if opened is None:
+        raise JourneyError(f"no incident release opened within {wait_s:.0f}s — "
+                           "the break/repair workflow was not exercised")
+    first = c.post(f"/sessions/{sid}/injects/{opened['release_id']}",
+                   json={"content": "the answer that decides the incident"})
+    if first.status_code != 200:
+        raise JourneyError(f"the submission to an open incident was refused: "
+                           f"HTTP {first.status_code} {first.text[:300]}")
+    out["submission_status"] = (first.json() or {}).get("status")
+    out["inject_id"] = opened.get("inject_id")
+    # 3. the first answer decides
+    second = c.post(f"/sessions/{sid}/injects/{opened['release_id']}",
+                    json={"content": "a second answer"})
+    if second.status_code != 200:
+        raise JourneyError(f"the duplicate submission was refused: "
+                           f"HTTP {second.status_code}")
+    payload = second.json() or {}
+    out["duplicate_note"] = payload.get("note")
+    if "duplicate" not in str(payload.get("note") or ""):
+        raise JourneyError(f"the second submission re-decided the incident: "
+                           f"{payload}")
+    out["duplicate_status"] = payload.get("status")
+    return out
+
+
+def _refusal_paths(c: httpx.Client, sid: str) -> dict:
+    """The failure workflows: the API must REFUSE, not fake a success."""
+    out: dict = {}
+    unknown = c.get("/sessions/00000000-0000-0000-0000-000000000000")
+    out["unknown_session"] = unknown.status_code
+    if unknown.status_code != 404:
+        raise JourneyError(f"an unknown session was not refused: "
+                           f"HTTP {unknown.status_code}")
+    unknown_release = c.post(
+        f"/sessions/{sid}/injects/00000000-0000-0000-0000-000000000000",
+        json={"content": "x"})
+    out["unknown_release"] = unknown_release.status_code
+    if unknown_release.status_code != 404:
+        raise JourneyError(f"an unknown incident release was not refused: "
+                           f"HTTP {unknown_release.status_code}")
+    # an operator-only view must stay closed to a member
+    member_only = c.get("/safety/status")
+    out["operator_only_view"] = member_only.status_code
+    if member_only.status_code != 403:
+        raise JourneyError(f"a member reached an operator-only view: "
+                           f"HTTP {member_only.status_code}")
+    return out
+
+
 def _run_preset(c: httpx.Client, preset: str, *, duration: int, pace: int,
                 ssh_key: str | None, known_hosts: str | None,
-                label: str, options: dict | None = None) -> dict:
+                label: str, options: dict | None = None,
+                incident: bool = False, inject_wait_s: float = 420.0) -> dict:
     opts = dict(options or SESSION_OPTIONS[0])
     created = _json(c.post("/sessions", json={
         "scenario_id": preset, "duration_minutes": opts["duration_minutes"],
@@ -167,14 +319,17 @@ def _run_preset(c: httpx.Client, preset: str, *, duration: int, pace: int,
                 f"{preset}: the session did not record {key}={value!r} "
                 f"(snapshot: {snapshot.get(key)!r})")
 
+    # The member SSH rehearsal is part of the journey: a journey that skipped
+    # it would pass without ever proving that the member can reach the
+    # practice environment.
+    if not ssh_key or not known_hosts:
+        raise JourneyError(
+            "the member SSH rehearsal is part of the journey: "
+            "SR_JOURNEY_SSH_KEY and SR_JOURNEY_BASTION_KNOWN_HOSTS are "
+            "required (the bastion's pinned host key and the member's key)")
     conn = _ssh_connection(c, sid)
     out["ssh_instruction"] = conn.get("ssh")
-    out["ssh"] = None
-    if ssh_key and known_hosts:
-        out["ssh"] = asyncio.run(_ssh_check(conn, ssh_key, known_hosts))
-    elif ssh_key or known_hosts:
-        raise JourneyError("SR_JOURNEY_SSH_KEY and "
-                           "SR_JOURNEY_BASTION_KNOWN_HOSTS must be set together")
+    out["ssh"] = asyncio.run(_ssh_check(conn, ssh_key, known_hosts))
 
     started = _json(c.post(f"/sessions/{sid}/begin"), "begin")
     if started.get("status") != "running":
@@ -201,6 +356,15 @@ def _run_preset(c: httpx.Client, preset: str, *, duration: int, pace: int,
         if out["casts"] < 1 or out["cast_frames"] < 1:
             raise JourneyError(f"{preset}: no replay cast frames after member SSH")
 
+    # The failure workflows: the API refuses what it cannot do.
+    out["refusals"] = _refusal_paths(c, sid)
+
+    # The incident (break) -> submission -> decision workflow, on the primary
+    # session: the release schedule opens minutes into the match, so it is
+    # exercised once rather than in every option-matrix session.
+    if incident:
+        out["incident"] = _inject_workflow(c, sid, wait_s=inject_wait_s)
+
     score = c.post(f"/sessions/{sid}/score")
     if score.status_code != 200:
         raise JourneyError(f"score {preset}: HTTP {score.status_code} "
@@ -225,20 +389,39 @@ def run_journey(*, base_url: str, operator_token: str, member_token: str,
                 ca_file: str | None = None, presets: tuple[str, ...] = PRESETS,
                 duration: int = 30, pace: int = 30, ssh_key: str | None = None,
                 bastion_known_hosts: str | None = None,
-                reuse: bool = True) -> dict:
+                reuse: bool = True,
+                browser_url: str = "", browser_user: str = "",
+                browser_password: str = "", browser_cli: str | None = None,
+                require_browser: bool = True,
+                inject_wait_s: float | None = None) -> dict:
     operator = _client(base_url, operator_token, ca_file)
     member = _client(base_url, member_token, ca_file)
+    if inject_wait_s is None:
+        # the first incident opens at 20% of the match duration
+        inject_wait_s = max(120.0, duration * 60 * 0.25 + 60)
     results = []
     try:
+        # The browser journey: the product is used through the browser, so the
+        # release may not be accepted on the API's word alone.
+        browser: dict = {"skipped": True}
+        if browser_url and browser_user and browser_password:
+            browser = _browser_check(browser_url, browser_user, browser_password,
+                                     cli=browser_cli)
+        elif require_browser:
+            raise JourneyError(
+                "the browser journey is part of the acceptance: provide the "
+                "appliance's browser URL and the member's login "
+                "(SR_JOURNEY_BROWSER_URL / _USER / _PASSWORD)")
         # Operator visibility is checked independently of the member's own view.
         visible = _json(operator.get("/sessions?mine=false"), "operator sessions")
         if not isinstance(visible, list):
             raise JourneyError("operator session listing is not a list")
-        for preset in presets:
+        for index, preset in enumerate(presets):
             results.append(_run_preset(
                 member, preset, duration=duration, pace=pace,
                 ssh_key=ssh_key, known_hosts=bastion_known_hosts,
-                label="primary"))
+                label="primary", incident=(index == 0),
+                inject_wait_s=inject_wait_s))
         # the option matrix: every documented match option is exercised
         for index, options in enumerate(SESSION_OPTIONS):
             results.append(_run_preset(
@@ -253,7 +436,8 @@ def run_journey(*, base_url: str, operator_token: str, member_token: str,
                 ssh_key=ssh_key, known_hosts=bastion_known_hosts,
                 label="reuse"))
         return {"ok": True, "base_url": base_url, "presets": list(presets),
-                "sessions": results, "operator_sessions_visible": len(visible)}
+                "sessions": results, "operator_sessions_visible": len(visible),
+                "browser": browser}
     finally:
         operator.close()
         member.close()
@@ -278,6 +462,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pace", type=int,
                     default=int(os.environ.get("SR_JOURNEY_PACE_SECONDS", "30")))
     ap.add_argument("--no-reuse", action="store_true")
+    ap.add_argument("--browser-url",
+                    default=os.environ.get("SR_JOURNEY_BROWSER_URL", ""))
+    ap.add_argument("--browser-user",
+                    default=os.environ.get("SR_JOURNEY_BROWSER_USER", ""))
+    ap.add_argument("--browser-password",
+                    default=os.environ.get("SR_JOURNEY_BROWSER_PASSWORD", ""))
     ap.add_argument("--evidence-out")
     args = ap.parse_args(argv)
     missing = [name for name, value in (
@@ -293,7 +483,9 @@ def main(argv: list[str] | None = None) -> int:
         presets=tuple(x.strip() for x in args.preset.split(",") if x.strip()),
         duration=args.duration, pace=args.pace, ssh_key=args.ssh_key,
         bastion_known_hosts=args.bastion_known_hosts,
-        reuse=not args.no_reuse)
+        reuse=not args.no_reuse,
+        browser_url=args.browser_url, browser_user=args.browser_user,
+        browser_password=args.browser_password)
     text = json.dumps(out, indent=2, sort_keys=True)
     if args.evidence_out:
         pathlib.Path(args.evidence_out).write_text(text + "\n")

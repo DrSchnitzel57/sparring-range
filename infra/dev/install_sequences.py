@@ -181,6 +181,18 @@ def run_sequences(root: pathlib.Path, manifest: pathlib.Path) -> dict:
     if any("token" in str(k) and "sha256" not in str(k) for k in receipt):
         raise InstallSequenceError("receipt contains something that is not a digest")
 
+    # --- the managed-service contract ---------------------------------------
+    # The files are rendered; this checks that the SERVICES could run with
+    # them: identities, environments, credential readability, the front
+    # door's routing and the TLS artifacts the bootstrap really creates.
+    from infra.dev.service_contract import contract_problems
+    problems = contract_problems(manifest)
+    if problems:
+        raise InstallSequenceError(
+            "the managed-service installation contract is violated:\n  - "
+            + "\n  - ".join(problems))
+    evidence["service_contract"] = {"ok": True, "problems": 0}
+
     # --- rerun ---------------------------------------------------------------
     second = _apply(root, manifest)
     if second["changed"]:

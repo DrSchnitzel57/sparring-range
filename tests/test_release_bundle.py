@@ -19,13 +19,20 @@ def _fake_image(path: pathlib.Path, size: int = 4096) -> pathlib.Path:
     return path
 
 
-def _build(tmp_path: pathlib.Path) -> pathlib.Path:
+def _build(tmp_path: pathlib.Path, *, roles: bool = True) -> pathlib.Path:
+    """Build a bundle.
+
+    A RELEASE bundle carries the ROLE artifacts: the base image is a bare
+    Ubuntu and the practice product is baked into the role images.
+    """
     base = _fake_image(tmp_path / "appliance-base.qcow2")
-    web = _fake_image(tmp_path / "web-local.qcow2", 2048)
+    role_images = {}
+    if roles:
+        for role in ("attacker", "mojang-web-local", "mojang-web-db"):
+            role_images[role] = _fake_image(tmp_path / f"{role}.qcow2", 2048)
     out = tmp_path / "bundle"
-    bundle_mod.build(out, base_image=base,
-                    role_images={"mojang-web-local": web},
-                    app_dir=REPO)
+    bundle_mod.build(out, base_image=base, role_images=role_images,
+                     app_dir=REPO)
     return out
 
 
@@ -93,6 +100,20 @@ def _operator_keys(tmp_path: pathlib.Path) -> dict[str, str]:
     return keys
 
 
+def test_a_bundle_without_the_role_artifacts_cannot_render_a_manifest(tmp_path):
+    """A bundle that carries only the base image would ship bare guests."""
+    out = _build(tmp_path, roles=False)
+    with pytest.raises(bundle_mod.BundleError) as bad:
+        bundle_mod.render_manifest(
+            out, tmp_path / "manifest.json",
+            installation_id="4f0e7a1c-8a59-4a4e-9b5d-74f0e7a1c999",
+            lan_address="10.10.10.50", range_cidr="10.66.0.0/24",
+            public_url="https://sr.example.edu",
+            internal_url="http://127.0.0.1:8000",
+            ingest_url="https://10.66.0.1:8443")
+    assert "role image" in str(bad.value)
+
+
 def test_bundle_renders_a_valid_operator_manifest(tmp_path):
     out = _build(tmp_path)
     out_manifest = tmp_path / "manifest.json"
@@ -117,6 +138,14 @@ def test_bundle_renders_a_valid_operator_manifest(tmp_path):
     assert parsed.installation_id == raw["installation_id"]
     assert sorted(parsed.images) == ["attacker", "mojang-web-db",
                                      "mojang-web-local"]
+    # every role points at ITS OWN artifact, and the paths are absolute
+    for role, image in parsed.images.items():
+        assert pathlib.Path(image.path).is_absolute(), (role, image.path)
+        assert image.path.endswith(f"{role}.qcow2"), (role, image.path)
+    # the role images carry the canonical template ids and budgets
+    assert parsed.images["attacker"].template_id == 9005
+    assert parsed.images["mojang-web-local"].template_id == 9011
+    assert parsed.images["mojang-web-db"].template_id == 9012
 
 
 def test_bundle_cli_verify_and_manifest(tmp_path):
