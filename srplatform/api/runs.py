@@ -738,12 +738,19 @@ def stop_run(db: Session, run_id, runner=None,
                 # signal the child. Ask it and wait for its report.
                 return _await_supervisor_stop(db, run_id,
                                               timeout_s=supervisor_wait_s)
-            # NOTHING was ever started for this run (no spawner, no
-            # supervisor): there is no process to stop, so the run resolves
-            # now. Leaving it in 'stopping' would strand it forever — the
-            # supervisor only claims 'queued' rows, so it would never be
-            # claimed and never finish.
-            return _cancel_unstarted(db, run)
+            # NOTHING was ever started for this run: no inline spawner
+            # (it would have left its credential on the row) and no
+            # supervisor claim. There is no process to stop and nothing will
+            # ever claim the row, so the run resolves now. Leaving it in
+            # 'stopping' would strand it forever.
+            if not run.worker_token and not run.worker_claim_token:
+                return _cancel_unstarted(db, run)
+            # A spawner or a supervisor owns this row: the termination
+            # obligation stays with it until it reports the outcome.
+            return {"ok": False, "status": run.status,
+                    "detail": "the worker is still being registered; the "
+                              "spawner or supervisor retains the termination "
+                              "obligation — NOT confirmed"}
 
     if run.worker_claim_token and not was_queued:
         # The worker belongs to a DIFFERENT UID (the supervisor's child). The

@@ -11,8 +11,11 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
+import shutil
 import subprocess
 import sys
+
+import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
@@ -152,3 +155,48 @@ def test_the_shared_secret_group_holds_only_the_entitled_readers():
     members = {user for user, (_g, extras) in installer.USERS.items()
                if "sr-secrets" in extras}
     assert members == {"srrange", "srworker"}
+
+
+def _keypair(tmp_path: pathlib.Path, name: str) -> tuple[pathlib.Path,
+                                                        pathlib.Path]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    priv = tmp_path / name
+    if not priv.with_suffix(".pub").exists():
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "",
+                        "-C", f"sr-keys-{name}", "-f", str(priv)],
+                       check=True, capture_output=True)
+    return priv, priv.with_suffix(".pub")
+
+
+def test_the_operator_key_pair_is_installed_where_its_service_reads_it(tmp_path):
+    """The shipped images have the operator's PUBLIC halves baked in.
+
+    The private half that belongs to them is the one the service must use,
+    so the installer installs that pair instead of inventing a new one.
+    """
+    from deploy import appliance_services as svc
+
+    priv, pub = _keypair(tmp_path, "runner")
+    etc = tmp_path / "etc"
+    out = svc.ensure_service_keys(lambda *a, **k: None, etc=etc,
+                                   sandboxed=True,
+                                   access_keys={"runner": str(pub)})
+    installed = pathlib.Path(out["runner"]["path"])
+    assert installed.is_file()
+    assert out["runner"]["installed_from"] == str(priv)
+    assert out["runner"]["template_key_must_be_rebuilt"] is False
+
+
+def test_a_key_pair_that_does_not_match_the_templates_is_refused(tmp_path):
+    from deploy import appliance_services as svc
+
+    priv, pub = _keypair(tmp_path, "runner")
+    other, _other_pub = _keypair(tmp_path / "other", "runner")
+    # the file next to the public key is NOT that public key's private half
+    shutil.copyfile(other, priv)
+    etc = tmp_path / "etc"
+    with pytest.raises(RuntimeError) as bad:
+        svc.ensure_service_keys(lambda *a, **k: None, etc=etc,
+                                sandboxed=True,
+                                access_keys={"runner": str(pub)})
+    assert "would refuse it" in str(bad.value)

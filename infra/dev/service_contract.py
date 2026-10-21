@@ -137,8 +137,8 @@ def contract_problems(manifest: pathlib.Path) -> list[str]:
             if not path:
                 problems.append(f"the derived environment names no {key}")
                 continue
-            expected = [rel for _name, rel, own, _g, _c in SERVICE_KEYS
-                        if own == owner]
+            expected = [rel for _name, rel, own, _g, _c, _principal in
+                        SERVICE_KEYS if own == owner]
             if not any(path.endswith(rel) for rel in expected):
                 problems.append(f"{key} names {path}, which no service "
                                 f"provisions for {owner}")

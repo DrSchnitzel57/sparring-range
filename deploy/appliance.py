@@ -821,7 +821,9 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
         services["onboarding"] = svc.onboard_operator(
             run, etc=lay.etc, authorized_keys=member_keys)
         services["service_keys"] = svc.ensure_service_keys(
-            run, etc=lay.etc, sandboxed=lay.sandboxed)
+            run, etc=lay.etc, sandboxed=lay.sandboxed,
+            access_keys={role: m.access_keys[role].path
+                         for role in m.access_keys})
         services["web"] = svc.ensure_web_build(run, source=source,
                                                public_url=m.public_url)
         # the public front door: enable the rendered site and reload nginx

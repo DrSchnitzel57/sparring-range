@@ -1631,13 +1631,52 @@ def check_journey() -> None:
 # bundle (16): the release bundle's digests, completeness and secret-freedom  #
 # -------------------------------------------------------------------------- #
 
+def _role_images(tmp: pathlib.Path) -> tuple[dict, dict]:
+    """The ROLE artifacts a release bundle must carry.
+
+    The real ones are used when the images gate has built them (the release
+    flow); otherwise a placeholder is used and the gate says so — the gate
+    then proves the bundle's mechanics, not the image content, and the
+    `images` gate is what proves the content.
+    """
+    roles = ("attacker", "mojang-web-local", "mojang-web-db")
+    out: dict = {}
+    real: dict = {}
+    dirs = []
+    env_dir = os.environ.get("SR_APPLIANCE_ROLE_IMAGE_DIR", "").strip()
+    if env_dir:
+        dirs.append(pathlib.Path(env_dir))
+    dirs += [REPO / ".cache/images", REPO / ".cache/appliance",
+             pathlib.Path("/tmp/sr-guest-cache")]
+    for role in roles:
+        found = None
+        for d in dirs:
+            if not d.is_dir():
+                continue
+            for p in sorted(d.rglob("*.qcow2")):
+                if role in p.name:
+                    found = p
+                    break
+            if found is not None:
+                break
+        if found is None:
+            placeholder = tmp / f"{role}.qcow2"
+            placeholder.write_bytes(b"synthetic-role-image" * 64)
+            found = placeholder
+            real[role] = False
+        else:
+            real[role] = True
+        out[role] = found
+    return out, real
+
+
 def check_bundle() -> None:
     """The release bundle is what the operator carries into their own VM.
 
-    The gate builds the REAL bundle from the flattened guest base, verifies
-    every digest, renders the operator's manifest from it, and then proves
-    that a tampered bundle is refused.  A bundle that cannot be verified is
-    never installed.
+    The gate builds the REAL bundle from the flattened guest base AND the
+    role artifacts, verifies every digest, renders the operator's manifest
+    from it, and then proves that a tampered bundle is refused.  A bundle
+    that cannot be verified is never installed.
     """
     import subprocess
     import tempfile
@@ -1651,9 +1690,12 @@ def check_bundle() -> None:
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="sr-bundle-gate-"))
     try:
         bundle = tmp / "bundle"
-        r = subprocess.run(
-            [sys.executable, str(REPO / "deploy/bundle.py"), "build",
-             "--output", str(bundle), "--base-image", base],
+        role_images, real_roles = _role_images(tmp)
+        cmd = [sys.executable, str(REPO / "deploy/bundle.py"), "build",
+               "--output", str(bundle), "--base-image", base]
+        for role, path in sorted(role_images.items()):
+            cmd += ["--role-image", f"{role}={path}"]
+        r = subprocess.run(cmd,
             capture_output=True, text=True, cwd=REPO, timeout=3600)
         if r.returncode != 0:
             fail("release bundle build",
@@ -1666,9 +1708,14 @@ def check_bundle() -> None:
             fail("release bundle verify",
                  f"exit {v.returncode}:\n{(v.stdout + v.stderr)[-1500:]}")
         report = json.loads(v.stdout)
+        synthetic = [role for role, real in sorted(real_roles.items()) if not real]
         ok("release bundle verifies", f"{report['files']} files, "
                                      f"{report['images']} image(s), "
-                                     f"revision {report['revision'][:12]}")
+                                     f"revision {report['revision'][:12]}"
+                                     + (f"; PLACEHOLDER role image(s): "
+                                        f"{synthetic} (the images gate proves "
+                                        "the real artifacts)" if synthetic
+                                        else "; real role artifacts"))
 
         # the operator's manifest is RENDERED from the bundle, never hand
         # written: it must satisfy the strict appliance schema.

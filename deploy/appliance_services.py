@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import pathlib
 import shlex
+import subprocess
 
 # Pinned by the release.  The appliance needs no Proxmox client, no outer
 # token and no hypervisor tooling beyond these.
@@ -255,45 +256,101 @@ def onboard_operator(run, *, etc: pathlib.Path,
 
 
 # The appliance's own MACHINE credentials: the key pairs the services
-# present on the isolated range.  The operator's keys are a different thing
-# (their public halves are baked into the templates; the private halves stay
-# with their owner) and are never written here.
+# present on the isolated range.  They are the PRIVATE halves of the
+# operator's three key pairs (runner, bastion, mgmt) whose PUBLIC halves are
+# baked into the guest templates — a key the guests do not accept is not a
+# working key, so the private half that goes with the shipped images is the
+# one that belongs here.
 SERVICE_KEYS = (
-    # (name, relative path, owning user, owning group, comment)
+    # (name, relative path, owning user, owning group, comment,
+    #  the operator key whose private half belongs here)
     ("runner", "secrets/worker_runner_key", "srworker", "srworker",
-     "sparring-range-runner"),
+     "sparring-range-runner", "runner"),
     ("verifier", "secrets/verifier_key", "srrange", "srrange",
-     "sparring-range-verifier"),
+     "sparring-range-verifier", "mgmt"),
     ("bastion-client", "ssh/bastion_client_ed25519", "srbastion", "srbastion",
-     "sparring-range-bastion-client"),
+     "sparring-range-bastion-client", "bastion"),
 )
 
 
+def _public_line(path) -> str:
+    """The public half of a key file, without the comment."""
+    try:
+        text = pathlib.Path(path).read_text().strip()
+    except OSError:
+        return ""
+    return text.split()[1] if len(text.split()) > 1 else ""
+
+
+def _public_half(private_path) -> str:
+    """The public half that belongs to a private key file."""
+    pub = pathlib.Path(str(private_path) + ".pub")
+    if pub.is_file():
+        return _public_line(pub)
+    out = subprocess.run(["ssh-keygen", "-y", "-f", str(private_path)],
+                         capture_output=True, text=True, timeout=30)
+    if out.returncode != 0:
+        return ""
+    return out.stdout.strip().split()[1] if out.stdout.strip() else ""
+
+
 def ensure_service_keys(run, *, etc: pathlib.Path,
-                        sandboxed: bool = False) -> dict:
+                        sandboxed: bool = False,
+                        access_keys: dict | None = None) -> dict:
     """Provision the machine key pairs the services use on the range.
 
     Each key belongs to the identity that USES it: the runner key is read by
     the worker (srworker), the verifier key by the API (srrange), the bastion
     dial key by the bastion (srbastion).  The files stay 0600 and the PUBLIC
     halves are reported, because the guest templates must be built with those
-    public halves — a key the guests do not accept is not a working key.
+    public halves.
+
+    When the operator's private half is next to the public key in the
+    manifest (the normal case: ``<key>.pub`` and ``<key>``), THAT key is
+    installed — it is the one the shipped images accept.  Only when it is
+    missing is a fresh pair generated, and then the public half is reported
+    so the operator can rebuild the templates with it.
 
     An existing key is never replaced: the installer preserves it (and its
     ownership) so a rerun cannot break a live installation.
     """
     import grp as _grp
     import pwd as _pwd
+    import shutil
 
     out: dict = {}
-    for name, rel, owner, group, comment in SERVICE_KEYS:
+    for name, rel, owner, group, comment, principal in SERVICE_KEYS:
         path = etc / rel
         created = False
+        source = ""
         if not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", comment,
-                "-f", str(path))
-            created = True
+            public = (access_keys or {}).get(principal)
+            private = None
+            if public:
+                stem = str(public)[:-4] if str(public).endswith(".pub") \
+                    else str(public)
+                candidate = pathlib.Path(stem)
+                if candidate.is_file():
+                    private = candidate
+            if private is not None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(private, path)
+                os.chmod(path, 0o600)
+                source = str(private)
+                # The private half must belong to the public half the
+                # templates have baked in: a mismatched pair would be
+                # refused by every guest.
+                installed = _public_half(path)
+                expected = _public_line(public)
+                if installed and expected and installed != expected:
+                    raise RuntimeError(
+                        f"{private} is not the private half of {public}: the "
+                        "guest templates would refuse it")
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C",
+                    comment, "-f", str(path))
+                created = True
         try:
             uid = _pwd.getpwnam(owner).pw_uid
             gid = _grp.getgrnam(group).gr_gid
@@ -308,7 +365,11 @@ def ensure_service_keys(run, *, etc: pathlib.Path,
             public = pub_path.read_text().strip()
             run("chmod", "0644", str(pub_path), check=False)
         out[name] = {"path": str(path), "owner": owner, "group": group,
-                     "created": created, "public": public}
+                     "created": created, "public": public,
+                     "installed_from": source,
+                     # a generated key does not match the shipped templates:
+                     # the operator must rebuild them with this public half
+                     "template_key_must_be_rebuilt": created}
     return out
 
 

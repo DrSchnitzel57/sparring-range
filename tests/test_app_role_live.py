@@ -68,7 +68,7 @@ def test_app_role_live_boundaries(migrated_db, test_db_url_app):
             # migration metadata: read yes, write no
             assert c.execute(
                 sa.text("SELECT version_num FROM alembic_version")
-            ).scalar() == "0018"
+            ).scalar() == "0019"
             with _savepoint(c):
                 c.execute(sa.text("UPDATE alembic_version "
                                   "SET version_num='0000'"))
