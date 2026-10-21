@@ -1746,7 +1746,9 @@ def check_appliance() -> None:
     if out:
         out.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
     ok("appliance software matrix", f"{len(results)} gates passed at "
-                                   f"{revision[:12]}")
+                                   f"{revision[:12]}"
+                                   + (f", base {digests['appliance-base'][:12]}"
+                                      if digests else ""))
 
 
 CHECKS = {
