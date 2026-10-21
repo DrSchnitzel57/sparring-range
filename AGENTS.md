@@ -179,6 +179,46 @@ fresh uv `.venv`, Python 3.13.5):
 These are the plan-13 starting failures to repair; the fast default remains
 green and infrastructure-free.
 
+### Milestone 15 implementation baseline (2026-10-21, branch `15`)
+
+Reproduced on the branch, in a Debian 13 container with **no `/dev/kvm`**, no
+root and no installed appliance. Guest boots are software emulation and are
+labelled as such; they are **not** nested-KVM acceptance.
+
+- `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 \
+  .venv/bin/python -m pytest -q -ra -p no:cacheprovider` — exit 0:
+  **395 passed, 0 failed, 0 skipped**, 254 deselected, 4 warnings, ~59s.
+- `.venv/bin/python infra/dev/acceptance.py selection` — **PASS**
+  (all tests classified; fast default clean).
+- `… python` — **PASS**; `… db` — **PASS** (171 tests, disposable
+  PostgreSQL 16); `… authority` — **PASS** (25); `… containment` — **PASS** (21).
+- `… install` — **PASS**: the REAL install sequences (clean, rerun, reboot,
+  populated upgrade, drift + repair) in a sandbox root. The old
+  `SR_INSTALL_VM_EVIDENCE=1` environment attestation is **removed**; the
+  managed-service half in a real VM stays the operator's.
+- `… hypervisor` — **PASS**: real libvirt clone/start/QGA readiness/host key/
+  ownership/stop/destroy (accelerator: explicit TCG).
+- `… access` — **PASS**: a real Ubuntu guest; guest-agent readiness marker and
+  fixed host key, real SSH, the real recording bastion, `.cast` bytes, `sudo`
+  for the management identity, an interactive PTY with a recorded resize, a
+  reconnect, and the refusal of an unauthorized key.
+- `… bundle` — **PASS**: the release bundle verifies, the operator manifest
+  renders from it and validates, and a tampered bundle is refused.
+- `… frontend` — **PASS** (zero high/critical audit findings); `… browser` —
+  **PASS**; `… compose` — **PASS**.
+- `… images` — **FAILED**: the role-image builds miss the 1500 s serial-marker
+  timeout under software emulation (the serial logs show `apt` still fetching).
+  This is an emulation-speed limit, not an image defect; it needs a KVM runner.
+  `… capture` depends on those builds.
+- `… packet` — **FAILED (environment)**: it needs root and `nft`; it fails
+  closed with the exact missing prerequisite and was not simulated.
+- `… journey` — **FAILED (prerequisite)**: it needs the INSTALLED appliance and
+  operator/member bearer tokens; it fails closed by design.
+
+Plan 13's recorded authority failures (the pre-policy `web01-deadbeef` fixture
+names) and the `SR_MATCH_*` settings probe are **repaired**: the authority
+gate passes and the settings names resolve.
+
 ## Validation commands and safety
 
 - Fast baseline: the pytest command above (infrastructure-free since `ac5a61b`:
