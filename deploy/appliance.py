@@ -893,11 +893,13 @@ def firstboot_report(m: ApplianceManifest, layout: Layout) -> dict:
         except OSError:
             return False
 
+    ingest = m.network.ingest_address
     add("ingest listener",
-        tcp(m.network.ingest_address, int(m.network.ingest_port)),
-        f"{m.network.ingest_address}:{m.network.ingest_port}")
-    add("bastion listener", tcp(m.network.bastion_address, 2222),
-        f"{m.network.bastion_address}:2222")
+        bool(ingest) and tcp(str(ingest), int(m.network.ingest_port)),
+        f"{ingest}:{m.network.ingest_port}" if ingest else "not configured")
+    bastion = m.network.bastion_address
+    add("bastion listener", bool(bastion) and tcp(str(bastion), 2222),
+        f"{bastion}:2222" if bastion else "not configured")
     for unit in UNITS:
         state = _unit_state(unit)
         add(f"unit {unit}", state == "active", state)
