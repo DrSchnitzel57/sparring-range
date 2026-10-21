@@ -141,7 +141,10 @@ until the `apply` step, and `apply` is the only step that changes the VM.
 .venv/bin/python infra/images/appliance_base.py --cache-dir .cache/appliance
 .venv/bin/python deploy/bundle.py build \
     --output .cache/bundle/sparring-range-appliance \
-    --base-image .cache/appliance/appliance-base.qcow2
+    --base-image .cache/appliance/appliance-base.qcow2 \
+    --role-image attacker=$HOME/.cache/sr-guest-cache/attacker.qcow2 \
+    --role-image mojang-web-local=$HOME/.cache/sr-guest-cache/mojang-web-local.qcow2 \
+    --role-image mojang-web-db=$HOME/.cache/sr-guest-cache/mojang-web-db.qcow2
 .venv/bin/python deploy/bundle.py verify .cache/bundle/sparring-range-appliance
 ```
 
@@ -149,7 +152,29 @@ until the `apply` step, and `apply` is the only step that changes the VM.
 unlisted file, or credential material. A bundle that does not verify is
 never installed.
 
+**The ROLE images are not optional.** The base image is a bare Ubuntu; the
+practice product (the web/DB services, the shipped payload, the baked role
+keys) lives in the role images. `deploy/bundle.py manifest` therefore
+**refuses** to render an operator manifest from a bundle that lacks a role
+artifact — a bundle that silently assigned the base image to every role
+would ship guests that cannot run the scenario. The build prints
+`roles_missing` when a role is absent.
+
 ### 2. On the appliance VM: verify, then render the manifest
+
+The one-command path does all of this (and stops at the first failure):
+
+```bash
+sudo ./deploy/hand_off.sh \
+    --bundle /opt/sparring-range \
+    --installation-id "$(uuidgen)" \
+    --lan-address 10.10.10.50 --range-cidr 10.66.0.0/24 \
+    --public-url https://sr.example.edu \
+    --bridge srlab0 \
+    --model-base-url http://127.0.0.1:8001/v1 --model-alias my-model
+```
+
+The steps it performs, if you prefer to run them by hand:
 
 ```bash
 cd /opt/sparring-range            # the unpacked bundle
@@ -166,6 +191,7 @@ python3 deploy/bundle.py manifest . --out /etc/sparring-range/appliance-manifest
     --public-url https://sr.example.edu \
     --internal-url http://127.0.0.1:8000 \
     --ingest-url https://10.66.0.1:8443 \
+    --bridge srlab0 \
     --access-key runner=/etc/sparring-range/keys/runner.pub \
     --access-key bastion=/etc/sparring-range/keys/bastion.pub \
     --access-key mgmt=/etc/sparring-range/keys/mgmt.pub \
@@ -174,6 +200,31 @@ python3 deploy/bundle.py manifest . --out /etc/sparring-range/appliance-manifest
 
 The manifest is **rendered**, never hand-written: it satisfies the strict
 appliance schema (image digests, budgets, subnets) or the command fails.
+
+#### The two database credentials are separate files
+
+The **schema owner** credential is used ONLY to run the forward migrations.
+It lives in its own root-only file and is never written into an environment
+that a service loads:
+
+```bash
+# /etc/sparring-range/secrets/db-owner.env   (0600, root only)
+SR_POSTGRES_URL_OWNER=postgresql+psycopg2://sr_owner:<pw>@127.0.0.1:5432/sparring_range
+```
+
+The **runtime** credential (the app role) goes into the environment the API,
+the ingest listener and the bastion load:
+
+```bash
+# /etc/sparring-range/control-plane.env      (0640, root:srrange)
+SR_POSTGRES_URL=postgresql+psycopg2://sr_app:<pw>@127.0.0.1:5432/sparring_range
+```
+
+`apply` creates both roles, runs `alembic upgrade head` with
+`POSTGRES_URL_OWNER` **in the environment** (never on a command line, never
+in a log) and refuses to continue if the owner URL is missing. `hand_off.sh`
+writes both files for you. If the owner URL ever appears in
+`control-plane.env`, every service holds the schema owner — move it back.
 
 ### 3. Plan, then apply
 
@@ -185,9 +236,27 @@ python3 deploy/appliance.py apply --manifest /etc/sparring-range/appliance-manif
 
 `apply` installs the pinned native packages, builds the locked venv, creates
 the database roles and runs the forward migrations **as the owner role**,
-provisions the TLS material, onboards the member's public keys, renders the
-fixed systemd units and the network artifacts, and enables the services. It
-never regenerates an existing key or capability, so a rerun is safe.
+provisions the TLS material (including the guest-facing ingest certificate
+with its SANs), onboards the member's public keys in the bastion's
+`<username> <public-key>` format, provisions the appliance's own machine keys
+(runner/verifier/bastion-client, each owned by the identity that uses it),
+builds the frontend with the public API URL baked in, renders the fixed
+systemd units and the network artifacts, and enables the services. It never
+regenerates an existing key or capability, so a rerun is safe.
+
+**Routing:** the API's routes are unprefixed (`/auth/login`, `/sessions`).
+The clients use the `/api` prefix, and nginx **strips** it. The frontend is
+built with `NEXT_PUBLIC_API_URL=<public url>/api`, so the browser reaches
+the API through the same origin. Do not "fix" a routing problem by changing
+the prefix in one place only.
+
+**The worker-supervisor capability** is a secret, and the production
+settings refuse a group-readable token file, so it exists as TWO 0600
+copies of the same value: the API's (`worker-supervisor.token`, owned by
+`srrange`) and the supervisor's (`worker-supervisor.token.srworker`, owned
+by `srworker`). The secrets directory is `0750 root:sr-secrets`; the
+`sr-secrets` group holds exactly `srrange` and `srworker` — the ingest
+listener, the bastion and the frontend must never read it.
 
 ### 4. Apply the isolated range's network, then start the services
 
@@ -232,6 +301,22 @@ fails. It is read-only and prints no secret.
   replay → cleanup → second fresh launch) is the **manual** check of
   milestone 14/17: record the exact commands and outcomes. It cannot be
   automated away, and a green script is not a substitute for it.
+* `python3 infra/dev/acceptance.py journey` — the automated member journey
+  against the installed appliance. It now requires **all** of:
+
+  | Variable | What it is |
+  |---|---|
+  | `SR_JOURNEY_BASE_URL` | the installed API (https) |
+  | `SR_JOURNEY_OPERATOR_TOKEN`, `SR_JOURNEY_MEMBER_TOKEN` | the two bearer tokens |
+  | `SR_JOURNEY_SSH_KEY`, `SR_JOURNEY_BASTION_KNOWN_HOSTS` | the member's key and the pinned bastion host key — the SSH rehearsal is **not** optional |
+  | `SR_JOURNEY_BROWSER_URL`, `SR_JOURNEY_BROWSER_USER`, `SR_JOURNEY_BROWSER_PASSWORD` | the browser journey (a real Chromium login into the appliance) |
+  | `SR_JOURNEY_CA_FILE` | the appliance's CA, when the URL is private-CA https |
+
+  The journey also walks the **incident workflow**: a submission before the
+  release opens is refused (409), an open incident accepts an answer and the
+  verifier decides it, and the second answer never re-decides. The failure
+  paths (unknown session → 404, unknown incident → 404, an operator-only
+  view as a member → 403) are checked in every session.
 
 ## Historical direct-PVE runbook
 

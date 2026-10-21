@@ -1,5 +1,57 @@
 # Current findings and validation evidence
 
+## Review round — 2026-10-21, branch `15` (after the independent review)
+
+An independent reviewer read milestone 15 and returned **VERDICT: FIX** with
+17 findings (six security/lifecycle, nine installation/integration, two
+acceptance). Every finding that reproduced was fixed on this branch; the
+fixes are listed in `docs/HANDOFF-15.md` ("The independent review round").
+
+**Environment (unchanged from the milestone run):** Debian 13 container, no
+`/dev/kvm`, no root, no installed appliance, unprivileged libvirt from
+extracted Debian packages. Every guest boot is **TCG software emulation**.
+The two operator gates (`packet`, `journey`) are reported **pending with
+their exact prerequisite** by the aggregate — they are attempted, not
+omitted.
+
+| Command (from the repository root) | Result |
+|---|---|
+| `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD .venv/bin/python -m pytest -q -ra -p no:cacheprovider` | **413 passed, 0 failed, 0 skipped**, 261 deselected, 4 warnings (65.5 s) |
+| `… acceptance.py selection` | **PASS** — every test classified; the fast default selects 413 tests with 0 skips |
+| `… acceptance.py python` | **PASS** — fresh locked install, dependency check, 4 entrypoint imports (including `telemetry.shipper`) |
+| `… acceptance.py db` | **PASS** (467 s) — 177 db tests against a disposable PostgreSQL 16 container, 0 skipped. The new regressions: the fenced supervisor callbacks, the guarded terminal transition, the unstarted queued run, the cross-UID stop that keeps the obligation until the supervisor reports |
+| `… acceptance.py authority` | **PASS** — 25 broker boundary/durability/cessation tests |
+| `… acceptance.py containment` | **PASS** — 21 tests, no leaked cgroups |
+| `… acceptance.py install` | **PASS** — the real install sequences in a sandbox root **plus the new managed-service contract check** (`infra/dev/service_contract.py`): the identities, the environments each unit loads, the readability of every credential, the front door's routing and the TLS artifacts the bootstrap creates |
+| `… acceptance.py hypervisor` | **PASS** (254 s, 2 tests) — real libvirt lifecycle/QGA/ownership/destroy and the live broker authority path over the real Unix socket. The gate needs the unprivileged session daemon: `sh .cache/libvirt-debs/start-session.sh` first, then `sh -c '. .cache/libvirt-debs/env.sh && .venv/bin/python infra/dev/acceptance.py hypervisor'` |
+| `… acceptance.py access` | **PASS** (155 s) — the real guest: readiness marker, pinned host key, real SSH, the recording bastion's `.cast`, `sudo`, an interactive PTY with a recorded resize, a reconnect and the refusal of an unauthorized key |
+| `… acceptance.py images` | **PASS** (1871 s, 18 passed / 1 skipped) — the role images build, boot, serve, seed, expose the documented flaws and take the fixes. The skipped test is a DB test that needs an explicit PostgreSQL admin. The **role artifacts are now carried by the release bundle** |
+| `… acceptance.py bundle` | **PASS** (23 s) — the REAL bundle with the **role artifacts** (306 files, 4 images: the appliance base + attacker + mojang-web-local + mojang-web-db), every digest verifies, the operator's manifest renders from it with **absolute** image paths and the canonical template ids, and a tampered bundle is refused |
+| `… acceptance.py frontend` | **PASS** (7 s) — lockfile-faithful `npm ci`, the production build, `npm audit --omit=dev` with zero high/critical findings |
+| `… acceptance.py browser` | **PASS** (46 s) — the isolated real-browser workflow and its replay |
+| `… acceptance.py compose` | see the aggregate below |
+| `… acceptance.py packet` | **PENDING (environment)** — needs root and `nft`. The aggregate now attempts it and reports the exact missing prerequisite instead of omitting it |
+| `… acceptance.py journey` | **PENDING (environment)** — needs the installed appliance, the member's SSH key, the pinned bastion host key and the browser login. The journey now requires all of them, drives a real browser and walks the incident (break → submission → decision) and refusal paths |
+
+**What the review found and what changed** (the full table is in
+`docs/HANDOFF-15.md`): the supervisor's callbacks were unfenced; the API
+signalled a worker it does not own; the controller kept acting after its
+lock's session died; the Unix-socket deployment never armed the control
+lease; the match scheduler was disabled in production; the schema-owner
+credential travelled in an environment every service loads; the database
+bootstrap split the URL on `/` and never created the owner role; the ingest
+certificate was skipped (`INGEST_SANS` missing) and the telemetry trust
+anchor named a file the bootstrap never creates; the member's keys were
+written in a format the bastion cannot read; the capability and the machine
+keys were unreachable by the identities that use them; the frontend build
+passed an argument the runner rejects, baked no API URL and nginx kept a
+prefix the API does not serve; the guest NIC carried a VLAN tag the broker
+policy refuses; the bundle lacked `verifiers/` and `telemetry/` and gave
+every role the bare base image; the hand-off passed a flag the CLI does not
+have and `apply` demanded the venv it creates; and the aggregate omitted
+the operator gates while `install` and `journey` checked less than they
+promised.
+
 ## Milestone 15 implementation evidence — 2026-10-20/21, branch `15`
 
 > Reviewer handoff (read this first): [docs/HANDOFF-15.md](HANDOFF-15.md) —

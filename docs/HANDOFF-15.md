@@ -36,6 +36,7 @@ Read in this order:
 | `aa50a52` | One controller per database (PostgreSQL advisory lock) and visible startup failures |
 | `7600722` | The live broker-authority gate: the real broker over the real Unix socket against real libvirt |
 | `24c56ad` | The journey's match-option matrix |
+| `review round` (this branch, after `e587a07`) | The independent review's findings: fenced supervisor callbacks (migration `0019`), cross-UID cancellation through the supervisor, controller-lock loss detection, the Unix-socket control heartbeat, the separate schema-owner credential, the TLS SANs, the credential accessibility contract, the frontend build/routing, the manifest's role images, the journey's SSH/browser/incident workflows and the managed-service installation contract |
 
 ## Verify it yourself
 
@@ -98,6 +99,34 @@ and `bundle` gates, plus the `appliance` aggregate (14 gates, one run,
   operator's manual gates. Nothing in this branch claims them.
 - Every guest boot here was **TCG**, never KVM.
 
+## The independent review round (after `e587a07`)
+
+A reviewer read the milestone and returned **VERDICT: FIX** with 17 findings.
+Every finding that reproduced was fixed; the fixes are in the commits after
+`e587a07` on this branch. What changed, and where:
+
+| Area | What was wrong | The fix |
+|---|---|---|
+| Supervisor callbacks | The claim credential was not compared: an obsolete claimant could assign, heartbeat and overwrite a terminal state | A second credential (`runs.worker_claim_token`, migration `0019`) fences every callback; `worker_failed` only transitions a run that is still `running`/`stopping` |
+| Cross-UID cancellation | The API signalled worker groups it does not own; a stopped run stayed `stopping` forever | The API never signals a foreign-UID child: it marks the run, the supervisor learns it on the heartbeat, terminates the child and reports the cessation; a run that never started resolves immediately |
+| Controller lock | Ownership survived the death of the lock's session | `ControllerLock.held` is a live fact, a monitor drops the ownership, the readiness report shows it and the control heartbeat stops renewing |
+| Control heartbeat | A Unix-socket deployment never armed the broker lease | The heartbeat starts for `broker_socket` **or** `broker_url` |
+| Match scheduler | The generated environment left it disabled | `SR_MATCH_SCHEDULER_ENABLED=1` in the derived environment |
+| Owner credential | `ensure_database` recommended putting the schema owner in the environment every service loads | The owner URL lives in its own root-only file and reaches Alembic through the environment only |
+| Database bootstrap | The URL was split on `/`, the owner role was never created, `SR_POSTGRES_URL_OWNER` was passed to Alembic (which reads `POSTGRES_URL_OWNER`) | A proper URL parse, both roles created, `POSTGRES_URL_OWNER` in the environment, the DSN never on a command line |
+| TLS artifacts | `INGEST_SANS` was missing (no ingest certificate) and the telemetry trust anchor named a file the bootstrap never creates | The SANs are derived from the manifest; the anchor is the API CA |
+| Member onboarding | Bare public keys were written; the bastion read the username as `ssh-ed25519` | `<username> <public-key>` lines |
+| Credential accessibility | The capability sat under a `0700` directory; the API and the supervisor could not read it, and the runner/verifier/bastion keys were never provisioned | A `sr-secrets` group (`srrange`, `srworker` only), one 0600 copy per service, and the machine keys provisioned with the ownership of their reader |
+| Frontend | The build passed `cwd` to a `Runner` that rejects it, baked no API URL, and nginx kept a prefix the API does not serve | `cwd` support, `NEXT_PUBLIC_API_URL=<public>/api`, nginx strips `/api` |
+| Guest NIC | The controller asked for `virtio,bridge=srlab0,tag=66`; the policy accepts only the untagged form | The tag is omitted when the range has no VLAN; the derived environment says so |
+| Bundle | `verifiers/` and `telemetry/` were missing; every role got the bare base image; the manifest's image paths could be relative | The allowlist carries the missing packages (with a hermetic import test), a manifest without the role artifacts is refused, the paths are absolute |
+| Hand-off | `--range-bridge` did not exist, and `apply` demanded the venv it creates | `--bridge`, and the venv check removed from the path that creates it |
+| Acceptance | The aggregate omitted `packet`/`journey`; `install` checked files, not the services; the journey could pass without SSH, browser, submissions or failures | The aggregate attempts the operator gates and reports them pending with the exact prerequisite; the install gate checks the managed-service contract; the journey requires SSH, drives a real browser and walks the incident and refusal paths |
+
+The contract checks that would have caught several of these at install time
+are now a gate of their own: `infra/dev/service_contract.py` (checked by the
+`install` gate and by `tests/test_appliance_service_contract.py`).
+
 ## Where I would look hardest
 
 1. `srplatform/bastion/proxy.py` — the interactive path changed three times
@@ -130,3 +159,12 @@ and `bundle` gates, plus the `appliance` aggregate (14 gates, one run,
    under test?
 8. `docs/FINDINGS_CHECKLIST.md` — the counts and results are per revision
    and per environment; please re-run rather than trust them.
+9. The cross-UID stop path (`srplatform/api/runs.py` +
+   `srplatform/worker_supervisor.py`) — the API now waits for the
+   supervisor's report instead of killing a process group it does not own.
+   Ask whether a supervisor that dies mid-run still leaves the obligation
+   visible and recoverable, and whether the 45 s wait is the right shape.
+10. The capability's two copies — the API and the supervisor hold the same
+    value in two 0600 files. Ask what happens on a partial restore (one
+    copy present, one missing): the installer refuses, which is the safe
+    direction, but the operator has to know that is what happened.
