@@ -1601,6 +1601,92 @@ def check_journey() -> None:
        f"{counts.get('passed', 0)} passed, {counts.get('skipped', 0)} skipped")
 
 
+# -------------------------------------------------------------------------- #
+# bundle (16): the release bundle's digests, completeness and secret-freedom  #
+# -------------------------------------------------------------------------- #
+
+def check_bundle() -> None:
+    """The release bundle is what the operator carries into their own VM.
+
+    The gate builds the REAL bundle from the flattened guest base, verifies
+    every digest, renders the operator's manifest from it, and then proves
+    that a tampered bundle is refused.  A bundle that cannot be verified is
+    never installed.
+    """
+    import subprocess
+    import tempfile
+    import shutil as _sh
+
+    base = os.environ.get("SR_APPLIANCE_BASE_IMAGE", "").strip()
+    if not base or not pathlib.Path(base).is_file():
+        fail("release bundle (digests, completeness, secret-freedom)",
+             f"requires SR_APPLIANCE_BASE_IMAGE (the flattened guest base) - "
+             f"not found: {base or '(unset)'}")
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="sr-bundle-gate-"))
+    try:
+        bundle = tmp / "bundle"
+        r = subprocess.run(
+            [sys.executable, str(REPO / "deploy/bundle.py"), "build",
+             "--output", str(bundle), "--base-image", base],
+            capture_output=True, text=True, cwd=REPO, timeout=3600)
+        if r.returncode != 0:
+            fail("release bundle build",
+                 f"exit {r.returncode}:\n{(r.stdout + r.stderr)[-1500:]}")
+        v = subprocess.run(
+            [sys.executable, str(REPO / "deploy/bundle.py"), "verify",
+             str(bundle)], capture_output=True, text=True, cwd=REPO,
+            timeout=1800)
+        if v.returncode != 0:
+            fail("release bundle verify",
+                 f"exit {v.returncode}:\n{(v.stdout + v.stderr)[-1500:]}")
+        report = json.loads(v.stdout)
+        ok("release bundle verifies", f"{report['files']} files, "
+                                     f"{report['images']} image(s), "
+                                     f"revision {report['revision'][:12]}")
+
+        # the operator's manifest is RENDERED from the bundle, never hand
+        # written: it must satisfy the strict appliance schema.
+        keys = tmp / "keys"
+        keys.mkdir()
+        for role in ("runner", "bastion", "mgmt"):
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "",
+                            "-f", str(keys / role)], check=True,
+                           capture_output=True)
+        model = tmp / "model.key"
+        model.write_text("gate-model-key\n")
+        m = subprocess.run(
+            [sys.executable, str(REPO / "deploy/bundle.py"), "manifest",
+             str(bundle), "--out", str(tmp / "manifest.json"),
+             "--installation-id", "4f0e7a1c-8a59-4a4e-9b5d-74f0e7a1c444",
+             "--lan-address", "10.10.10.50", "--range-cidr", "10.66.0.0/24",
+             "--public-url", "https://sr.example.edu",
+             "--internal-url", "http://127.0.0.1:8000",
+             "--ingest-url", "https://10.66.0.1:8443",
+             "--model-api-key-file", str(model),
+             "--access-key", f"runner={keys/'runner.pub'}",
+             "--access-key", f"bastion={keys/'bastion.pub'}",
+             "--access-key", f"mgmt={keys/'mgmt.pub'}"],
+            capture_output=True, text=True, cwd=REPO, timeout=1800)
+        if m.returncode != 0:
+            fail("operator manifest rendered from the bundle",
+                 f"exit {m.returncode}:\n{(m.stdout + m.stderr)[-1500:]}")
+        ok("operator manifest renders from the bundle and validates")
+
+        # a tampered bundle is refused
+        (bundle / "requirements.lock").write_text("tampered\n")
+        t = subprocess.run(
+            [sys.executable, str(REPO / "deploy/bundle.py"), "verify",
+             str(bundle)], capture_output=True, text=True, cwd=REPO,
+            timeout=1800)
+        if t.returncode == 0:
+            fail("a tampered bundle is refused",
+                 "verify accepted a bundle whose file no longer matches its "
+                 "digest")
+        ok("a tampered bundle is refused")
+    finally:
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
 CHECKS = {
     "selection": check_selection,
     "python": check_python,
@@ -1618,6 +1704,7 @@ CHECKS = {
     "access": check_access,
     "journey": check_journey,
     "install": check_install,
+    "bundle": check_bundle,
     "release": check_release,
 }
 
