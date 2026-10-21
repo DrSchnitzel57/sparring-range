@@ -29,6 +29,8 @@ import time
 
 import pytest
 
+import asyncssh
+
 from infra.appliance.manifest import ApplianceManifest
 from infra.appliance.seed import (SeedInputs, marker_path, render_network_config,
                                  render_user_data)
@@ -71,15 +73,17 @@ def _guest_seed(tmp_path: pathlib.Path, base: pathlib.Path):
     with base.open("rb") as fh:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             h.update(chunk)
-    raw["images"]["attacker"] = {
-        "template_id": 9005, "path": str(base), "sha256": h.hexdigest(),
+    raw["images"]["mojang-web-local"] = {
+        "template_id": 9011, "path": str(base), "sha256": h.hexdigest(),
         "size_bytes": base.stat().st_size, "disk_gb": 8,
         "memory_mb": 1536, "vcpus": 2,
     }
     raw["budgets"].update({"max_memory_mb": 8192, "max_vcpus": 6,
                            "max_disk_gb": 44})
     m = ApplianceManifest.from_dict(raw, verify_images=True)
-    image = m.image_for_role("attacker")
+    # The DEFENDER guest: the member's bastion path and the sudo proof both
+    # belong to the defended guest, not to the attack identity.
+    image = m.image_for_role("mojang-web-local")
     inp = SeedInputs(
         manifest=m, image=image, vmid=230, session_id="access-gate",
         hostname="sr-access", address="10.0.2.15", prefix=24,
@@ -89,9 +93,13 @@ def _guest_seed(tmp_path: pathlib.Path, base: pathlib.Path):
                    meta_data(f"iid-access-{os.getpid()}", "sr-access"),
                    network_config=render_network_config(inp))
     member_key = tmp_path / "member"
-    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "",
-                    "-f", str(member_key)], check=True, capture_output=True)
-    return m, seed_path, member_key
+    stranger_key = tmp_path / "stranger"
+    for key in (member_key, stranger_key):
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "",
+                        "-f", str(key)], check=True, capture_output=True)
+    # The manifest's bastion key role is the guest's defender identity; it
+    # carries the management sudo rule.
+    return m, seed_path, member_key, tmp_path / "bastion", stranger_key
 
 
 def _wait_ready(qga_sock: pathlib.Path, proc: subprocess.Popen,
@@ -127,25 +135,38 @@ def _wait_ready(qga_sock: pathlib.Path, proc: subprocess.Popen,
     raise AssertionError(f"guest never reported readiness: {last}")
 
 
+class _Collector(asyncssh.SSHClientSession):
+    """Collects an interactive session's output."""
+
+    def __init__(self):
+        self.output = ""
+        self.status = None
+
+    def data_received(self, data):
+        self.output += data
+
+    def exit_status_received(self, status):
+        self.status = status
+
+
 async def _ssh_and_record(m: ApplianceManifest, port: int, runner_key: pathlib.Path,
                           member_key: pathlib.Path, recordings: pathlib.Path,
-                          known_hosts: pathlib.Path):
-    import asyncssh
-
+                          known_hosts: pathlib.Path, defender_key: pathlib.Path,
+                          stranger_key: pathlib.Path):
     deadline = time.monotonic() + 600
     last = None
     known_key = None
     while time.monotonic() < deadline:
         try:
             async with asyncssh.connect(
-                    "127.0.0.1", port, username="attacker",
+                    "127.0.0.1", port, username="defender",
                     client_keys=[str(runner_key)], known_hosts=None,
                     connect_timeout=5, login_timeout=10) as conn:
                 known_key = conn.get_server_host_key()
                 result = await conn.run("cat /etc/sparring-range/role; id -u",
                                         check=False)
                 assert result.exit_status == 0, result.stderr
-                assert "attacker" in (result.stdout or ""), result.stdout
+                assert "mojang-web-local" in (result.stdout or ""), result.stdout
                 break
         except Exception as exc:  # noqa: BLE001 — boot retry
             last = exc
@@ -162,7 +183,7 @@ async def _ssh_and_record(m: ApplianceManifest, port: int, runner_key: pathlib.P
     from srplatform.settings import get_settings
     os.environ.update({
         "SR_ENV": "dev",
-        "SR_BASTION_TARGET_USER": "attacker",
+        "SR_BASTION_TARGET_USER": "defender",
         "SR_BASTION_CLIENT_KEY_PATH": str(runner_key),
         "SR_BASTION_TARGETS_KNOWN_HOSTS": str(known_hosts),
         "SR_RECORDINGS_DIR": str(recordings),
@@ -190,6 +211,7 @@ async def _ssh_and_record(m: ApplianceManifest, port: int, runner_key: pathlib.P
     await proxy.start("127.0.0.1", 0)
     bastion_port = proxy._server.sockets[0].getsockname()[1]  # noqa: SLF001
     try:
+        # 1. exec through the bastion: the command and its output are recorded.
         async with asyncssh.connect(
                 "127.0.0.1", bastion_port, username="tok-access",
                 client_keys=[str(member_key)], known_hosts=None,
@@ -197,24 +219,82 @@ async def _ssh_and_record(m: ApplianceManifest, port: int, runner_key: pathlib.P
             result = await conn.run("cat /etc/sparring-range/role; id -u",
                                     check=False)
             assert result.exit_status == 0, result.stderr
-            assert "attacker" in (result.stdout or ""), result.stdout
+            assert "mojang-web-local" in (result.stdout or ""), result.stdout
+
+        # 2. an interactive PTY, a terminal resize and a reconnect.
+        async with asyncssh.connect(
+                "127.0.0.1", bastion_port, username="tok-access",
+                client_keys=[str(member_key)], known_hosts=None,
+                connect_timeout=10, login_timeout=15) as conn:
+            collector = _Collector()
+            channel, _session = await conn.create_session(
+                lambda: collector, term_type="xterm-256color",
+                term_size=(80, 24))
+            # A real terminal types into a shell that may still be starting:
+            # input sent before the shell exists is swallowed by the login
+            # process, and a PTY holds a partial line.  The proof therefore
+            # keeps the command going until the shell answers it.
+            marker = "SR-INTERACTIVE-OK"
+            deadline = time.monotonic() + 180
+            resized = False
+            while time.monotonic() < deadline and marker not in collector.output:
+                channel.write(f"echo {marker}\n")
+                await asyncio.sleep(3)
+                if not resized:
+                    # A real terminal resize must reach the recording as a
+                    # resize frame.
+                    channel.change_terminal_size(120, 40)
+                    resized = True
+            channel.close()
+            await asyncio.sleep(1)
+        assert marker in collector.output, (
+            f"the interactive session never answered: {collector.output[:200]!r}")
+
+        # 3. reconnect: the same guest serves a second recorded session.
+        async with asyncssh.connect(
+                "127.0.0.1", bastion_port, username="tok-access",
+                client_keys=[str(member_key)], known_hosts=None,
+                connect_timeout=10, login_timeout=15) as conn:
+            result = await conn.run("cat /etc/sparring-range/role", check=False)
+            assert result.exit_status == 0, result.stderr
+            assert "mojang-web-local" in (result.stdout or "")
+
+        # 4. denial: an unauthorised key is refused.
+        refused = False
+        try:
+            async with asyncssh.connect(
+                    "127.0.0.1", bastion_port, username="tok-access",
+                    client_keys=[str(stranger_key)], known_hosts=None,
+                    connect_timeout=10, login_timeout=15) as conn:
+                result = await conn.run("id", check=False)
+                refused = (result.exit_status != 0
+                           or not (result.stdout or "").strip())
+        except Exception:  # noqa: BLE001 — a refused login is the expected result
+            refused = True
+        assert refused, "the bastion accepted a key it does not authorize"
     finally:
         await proxy.stop()
         get_settings.cache_clear()
 
-    casts = list(recordings.glob("*.cast"))
-    assert len(casts) == 1, casts
-    lines = casts[0].read_text().splitlines()
-    header = json.loads(lines[0])
-    assert header["version"] == 2
-    assert header["session_id"] == "access-session"
-    output = "".join(json.loads(line)[2] for line in lines[1:]
-                     if json.loads(line)[1] == "o")
-    assert "attacker" in output, output
+    casts = sorted(recordings.glob("*.cast"))
+    assert len(casts) >= 3, casts
+    frames = []
+    for cast in casts:
+        lines = cast.read_text().splitlines()
+        header = json.loads(lines[0])
+        assert header["version"] == 2
+        assert header["session_id"] == "access-session"
+        for line in lines[1:]:
+            frames.append(json.loads(line))
+    assert any(f[1] == "r" for f in frames), "no terminal resize was recorded"
+    output = "".join(f[2] for f in frames if f[1] == "o")
+    assert "mojang-web-local" in output, output
     assert any(e["action_type"] == "bastion_session_start" for e in events)
     assert any(e["action_type"] == "command" for e in events)
     assert any(e["action_type"] == "bastion_session_end" for e in events)
-    return {"cast": str(casts[0]), "events": len(events), "target_key": pub}
+    return {"cast": str(casts[0]), "events": len(events), "target_key": pub,
+            "casts": len(casts), "resize_recorded": True,
+            "denied_stranger": True, "reconnected": True}
 
 
 def test_real_guest_ssh_and_bastion_cast_replay(tmp_path):
@@ -222,7 +302,7 @@ def test_real_guest_ssh_and_bastion_cast_replay(tmp_path):
     _require(qemu is not None, "QEMU (qemu-system-x86_64) is required for access")
     _require(shutil.which("ssh-keygen") is not None, "ssh-keygen is required")
     base = _base_image()
-    m, seed, member_key = _guest_seed(tmp_path, base)
+    m, seed, member_key, defender_key, stranger_key = _guest_seed(tmp_path, base)
     run_dir = qemu_guest.make_run_dir()
     serial = run_dir / "access.serial.log"
     port = _free_port()
@@ -254,8 +334,22 @@ def test_real_guest_ssh_and_bastion_cast_replay(tmp_path):
         recordings = tmp_path / "recordings"
         recordings.mkdir()
         known = tmp_path / "known_hosts"
-        out = asyncio.run(_ssh_and_record(m, port, tmp_path / "runner",
-                                          member_key, recordings, known))
+        # sudo: the management identity administers the guest, and the attack
+        # identity does not get a blanket rule.
+        async def _sudo():
+            async with asyncssh.connect(
+                    "127.0.0.1", port, username="defender",
+                    client_keys=[str(defender_key)], known_hosts=None,
+                    connect_timeout=10, login_timeout=20) as conn:
+                ok = await conn.run("sudo -n id -u", check=False)
+                no = await conn.run("id -u", check=False)
+                return ok.stdout.strip(), no.stdout.strip()
+        sudo_root, sudo_plain = asyncio.run(_sudo())
+        assert sudo_root == "0", f"sudo did not work: {sudo_root!r}"
+        assert sudo_plain != "0", "the defender must not BE root without sudo"
+        out = asyncio.run(_ssh_and_record(m, port, defender_key,
+                                          member_key, recordings, known,
+                                          defender_key, stranger_key))
         assert "ssh-" in out["target_key"]
         print("access accelerator:", "kvm" if use_kvm else "tcg",
               "marker:", ready["marker"], "cast:", out["cast"],

@@ -25,7 +25,12 @@ _MARKER_PATH = "/var/lib/sparring-range/first-boot-complete"
 
 
 def _role_access(role: str) -> dict[str, tuple[str, ...]]:
-    """Which manifest key role lands on which Unix account for a guest role."""
+    """Which manifest key role lands on which Unix account for a guest role.
+
+    Only the keys the role needs are injected: the attack identity gets the
+    runner key, a defended guest gets the bastion and management keys.
+    A guest never carries a key that is not meant for it.
+    """
     if role == "attacker":
         return {"attacker": ("runner",)}
     return {"defender": ("bastion",), "root": ("mgmt",)}
@@ -144,6 +149,13 @@ def render_user_data(inp: SeedInputs) -> str:
                         "[Service]\nType=oneshot\n"
                         "ExecStart=/usr/local/sbin/sr-first-boot-complete\n"
                         "[Install]\nWantedBy=multi-user.target\n"},
+            # The bastion and the management identities administer the guest;
+            # the attack identity does NOT get a blanket sudo rule, so the
+            # exercise keeps its own privilege boundaries.
+            {"path": "/etc/sudoers.d/sr-management",
+             "permissions": "0440",
+             "content": "defender ALL=(ALL) NOPASSWD:ALL\n"
+                        "root ALL=(ALL) NOPASSWD:ALL\n"},
         ],
         # qemu-guest-agent is installed in the golden image but was not
         # running when the image was built (no virtio channel existed then).

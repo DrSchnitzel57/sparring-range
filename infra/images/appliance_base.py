@@ -112,6 +112,12 @@ def _user_data() -> str:
             # addressing (and the build's own DHCP file cannot leak into a
             # production guest).
             "rm -f /etc/netplan/*.yaml",
+            # The cloud image prints a MOTD on every interactive login, and
+            # one of those scripts (landscape-sysinfo) collects system
+            # information over the network: an interactive member shell then
+            # takes minutes to appear, which looks exactly like a broken
+            # bastion.  A practice guest prints no MOTD.
+            "chmod -x /etc/update-motd.d/* 2>/dev/null || true",
             # The published image keeps a 32-zero-byte /etc/machine-id — the
             # Ubuntu cloud-image convention.  A MISSING machine-id is not the
             # same thing: systemd-networkd reads it while configuring a link

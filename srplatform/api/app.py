@@ -152,7 +152,17 @@ def readyz():
     try:
         with db() as s:
             v = s.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).scalar()
-        cfg = Config("alembic.ini")
+        # An installed appliance has no checkout: the migrations ship with
+        # the package, so the script location follows the INSTALLED package
+        # and only falls back to the checkout layout.
+        import pathlib
+
+        import srplatform
+
+        migrations = (pathlib.Path(srplatform.__file__).resolve().parent
+                      / "db" / "migrations")
+        cfg = Config()
+        cfg.set_main_option("script_location", str(migrations))
         head = ScriptDirectory.from_config(cfg).get_current_head()
         if v and head and v != head:
             issues.append(f"schema {v} behind head {head}")
