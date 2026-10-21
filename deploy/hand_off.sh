@@ -9,7 +9,8 @@
 #   ./deploy/hand_off.sh --bundle /opt/sparring-range \
 #        --installation-id "$(uuidgen)" \
 #        --lan-address 10.10.10.50 --range-cidr 10.66.0.0/24 \
-#        --public-url https://sr.example.edu
+#        --public-url https://sr.example.edu \
+    --model-base-url http://127.0.0.1:8001/v1 --model-alias my-model
 #
 # The internal and ingest URLs default to the loopback API and the
 # controller's range address; override them with --internal-url/--ingest-url
@@ -24,6 +25,8 @@ PUBLIC_URL=""
 INTERNAL_URL=""
 INGEST_URL=""
 RANGE_BRIDGE="srlab0"
+MODEL_BASE_URL="http://127.0.0.1:8001/v1"
+MODEL_ALIAS="sr-model"
 HOSTNAME="sr-appliance"
 KEYS_DIR="/etc/sparring-range/keys"
 SECRETS_DIR="/etc/sparring-range/secrets"
@@ -46,6 +49,8 @@ while [ $# -gt 0 ]; do
     --ingest-url) INGEST_URL="$2"; shift 2;;
     --range-bridge) RANGE_BRIDGE="$2"; shift 2;;
     --hostname) HOSTNAME="$2"; shift 2;;
+    --model-base-url) MODEL_BASE_URL="$2"; shift 2;;
+    --model-alias) MODEL_ALIAS="$2"; shift 2;;
     --keys-dir) KEYS_DIR="$2"; shift 2;;
     --secrets-dir) SECRETS_DIR="$2"; shift 2;;
     --manifest) MANIFEST="$2"; shift 2;;
@@ -93,7 +98,8 @@ fi
   --access-key "runner=$KEYS_DIR/runner.pub" \
   --access-key "bastion=$KEYS_DIR/bastion.pub" \
   --access-key "mgmt=$KEYS_DIR/mgmt.pub" \
-  --model-api-key-file "$SECRETS_DIR/model.key"
+  --model-api-key-file "$SECRETS_DIR/model.key" \
+  --model-base-url "$MODEL_BASE_URL" --model-alias "$MODEL_ALIAS"
 
 say "4/6 plan the installation"
 "$PYTHON" deploy/appliance.py plan --manifest "$MANIFEST"
