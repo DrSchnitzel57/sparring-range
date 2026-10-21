@@ -119,6 +119,97 @@ The journey launches both Mojang presets, begins a match, reads the live view,
 replays the recorded session, scores, ends, and launches a second session to
 prove the range is reusable. It mutates only the sessions it creates.
 
+## Installing the appliance in your own virtual machine (bundle hand-off)
+
+This is the operator-facing path for milestone 16/17: one bundle, one
+manifest, one installer, one health check. Everything below is read-only
+until the `apply` step, and `apply` is the only step that changes the VM.
+
+### 0. What the appliance needs from the VM
+
+* Ubuntu 24.04 LTS, x86-64, a fixed LAN address, and **nested virtualization**
+  actually exposed (an inner guest must boot with KVM — TCG is not accepted
+  for a real match).
+* The bundle's base image must be copied to the appliance's image directory
+  and its digest must match the bundle's `MANIFEST.json`.
+* Your own public keys: one for the attack identity, one for the bastion
+  (member) identity, one for management. The bundle never carries them.
+
+### 1. Build the bundle (on a machine with the repository)
+
+```bash
+.venv/bin/python infra/images/appliance_base.py --cache-dir .cache/appliance
+.venv/bin/python deploy/bundle.py build \
+    --output .cache/bundle/sparring-range-appliance \
+    --base-image .cache/appliance/appliance-base.qcow2
+.venv/bin/python deploy/bundle.py verify .cache/bundle/sparring-range-appliance
+```
+
+`verify` re-computes every digest in `MANIFEST.json` and refuses drift, an
+unlisted file, or credential material. A bundle that does not verify is
+never installed.
+
+### 2. On the appliance VM: verify, then render the manifest
+
+```bash
+cd /opt/sparring-range            # the unpacked bundle
+python3 deploy/bundle.py verify .            # the bundle root
+mkdir -p /etc/sparring-range/keys
+ssh-keygen -t ed25519 -N '' -f /etc/sparring-range/keys/runner
+ssh-keygen -t ed25519 -N '' -f /etc/sparring-range/keys/bastion
+ssh-keygen -t ed25519 -N '' -f /etc/sparring-range/keys/mgmt
+install -m 0600 /dev/null /etc/sparring-range/secrets/model.key   # then put the model key in it
+
+python3 deploy/bundle.py manifest . --out /etc/sparring-range/appliance-manifest.json \
+    --installation-id "$(uuidgen)" \
+    --lan-address 10.10.10.50 --range-cidr 10.66.0.0/24 \
+    --public-url https://sr.example.edu \
+    --internal-url http://127.0.0.1:8000 \
+    --ingest-url https://10.66.0.1:8443 \
+    --access-key runner=/etc/sparring-range/keys/runner.pub \
+    --access-key bastion=/etc/sparring-range/keys/bastion.pub \
+    --access-key mgmt=/etc/sparring-range/keys/mgmt.pub \
+    --model-api-key-file /etc/sparring-range/secrets/model.key
+```
+
+The manifest is **rendered**, never hand-written: it satisfies the strict
+appliance schema (image digests, budgets, subnets) or the command fails.
+
+### 3. Plan, then apply
+
+```bash
+python3 deploy/appliance.py plan  --manifest /etc/sparring-range/appliance-manifest.json
+python3 deploy/appliance.py apply --manifest /etc/sparring-range/appliance-manifest.json --dry-run
+python3 deploy/appliance.py apply --manifest /etc/sparring-range/appliance-manifest.json
+```
+
+`apply` installs the pinned native packages, builds the locked venv, creates
+the database roles and runs the forward migrations **as the owner role**,
+provisions the TLS material, onboards the member's public keys, renders the
+fixed systemd units and the network artifacts, and enables the services. It
+never regenerates an existing key or capability, so a rerun is safe.
+
+### 4. Check the appliance came up
+
+```bash
+python3 deploy/appliance.py firstboot --manifest /etc/sparring-range/appliance-manifest.json
+```
+
+Every check is named and reported; the command exits non-zero if any of them
+fails. It is read-only and prints no secret.
+
+### 5. Prove it, and keep the evidence
+
+* `python3 deploy/appliance.py status` — units, the broker's inventory.
+* `python3 deploy/appliance.py doctor` — prerequisites and the KVM state.
+* `python3 deploy/appliance.py recovery status` — the broker's obligations;
+  an unresolved obligation keeps the range reserved and is released only
+  with fresh evidence (`recovery resolve --obligation N --evidence FILE`).
+* The rehearsal itself (fresh launch → member SSH → sudo → reconnect →
+  replay → cleanup → second fresh launch) is the **manual** check of
+  milestone 14/17: record the exact commands and outcomes. It cannot be
+  automated away, and a green script is not a substitute for it.
+
 ## Historical direct-PVE runbook
 
 Status: **planning runbook, not an accepted production installation guide**.

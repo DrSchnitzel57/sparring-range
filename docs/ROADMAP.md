@@ -35,11 +35,14 @@ Tests were deferred by the user; this planning pass supplies no new acceptance.
   sustained AI behavior under a distinct worker identity, browser/CLI authorization,
   reports and history. Reuse
   existing functionality; repair missing end-to-end behavior rather than rebuild.
-  *Status 2026-10-20 (branch `15`):* separate-UID worker dispatch, the appliance
-  installer, the controller MySQL client and the `hypervisor`/`access`/`journey`
-  layers are implemented. The `journey` layer requires the INSTALLED appliance, so
-  it cannot be closed in a developer environment; the real-model and human gates
-  stay open.
+  *Status 2026-10-20/21 (branch `15`):* separate-UID worker dispatch, the
+  appliance installer, the controller MySQL client, the release bundle and the
+  `hypervisor`/`access`/`journey`/`bundle` layers are implemented, and
+  `selection`/`python`/`db`/`authority`/`install`/`hypervisor`/`access`/`bundle`
+  pass here. The `journey` layer requires the INSTALLED appliance, so it cannot
+  be closed in a developer environment; the real-model and human gates stay open,
+  and `images`/`capture` need a KVM runner (their image builds exceed the
+  serial-marker timeout under software emulation).
 - [ ] **16 — Installable appliance and qualified release.**
   [Plan](../.openchamber/plans/16-appliance-release.md).
   Finish the checksummed release bundle, upgrade/history-import/recovery tooling
@@ -52,8 +55,10 @@ Tests were deferred by the user; this planning pass supplies no new acceptance.
   operator can install and test in their own virtual machine. This is also
   where milestone 14's promotion gate closes for real — nested KVM, isolation,
   emergency stop and member SSH rehearsed on hardware instead of asserted.
-  It consumes 15 and 16; it does not replace them. **Deferred at the user's
-  instruction: 14, 15 and 16 are executed first, and 17 has not been started.**
+  It consumes 15 and 16; it does not replace them. The hand-off path is
+  implemented (the release bundle, the rendered operator manifest, the
+  installer and the `firstboot` health check); the rehearsal itself is the
+  operator's, in their own VM.
 
 Three milestones are the minimum useful split: an accessible/recoverable platform,
 a complete practice product, then a qualified release. Each has internal coding

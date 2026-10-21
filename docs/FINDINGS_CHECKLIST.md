@@ -20,6 +20,7 @@ open for the operator.
 | `… acceptance.py install` | **PASS** — the **real** appliance install sequences in a sandbox root: clean install, rerun (0 files changed, capability preserved byte for byte), reboot (runtime restored, data and keys preserved), populated upgrade, drift detected and repaired, foreign file untouched. The previous `SR_INSTALL_VM_EVIDENCE=1` environment attestation is **removed** |
 | `… acceptance.py hypervisor` | **PASS** (122 s) — real libvirt: clone → start → guest-agent readiness marker → host-key read → ownership identity (a foreign installation is refused) → stop → destroy, and a repeated destroy of an absent guest is idempotent. Accelerator: explicit TCG |
 | `… acceptance.py access` | **PASS** (≈130 s) — a real Ubuntu guest: guest-agent readiness marker and fixed host-key path read through the agent, real SSH with the role key, the **real recording bastion** writing `.cast` bytes, `sudo` for the management identity (and not for the attack identity), an interactive PTY **with a recorded terminal resize**, a reconnect to the same guest, and the refusal of an unauthorized key |
+| `… acceptance.py bundle` | **PASS** (54 s) — the REAL bundle is built from the flattened base image (263 files), every digest verifies, the operator's manifest is rendered from it and satisfies the strict appliance schema, and a tampered bundle is refused |
 | `… acceptance.py images` | **FAIL** — the role-image **builds** miss the 1500 s serial-marker timeout under software emulation (the preserved serial logs show `apt` still fetching packages). This is an emulation-speed limit, not an image defect; it needs a KVM runner |
 | `… acceptance.py capture` | not run — it depends on the image builds above |
 | `… acceptance.py containment` / `packet` | not runnable here: they need cgroup delegation, root and `nft` |
@@ -54,6 +55,24 @@ found by inspecting a running guest rather than by reading code):
    The appliance guest prints no MOTD.
 9. The installed-migration lookup assumed a source checkout next to the
    working directory; it now follows the installed package.
+10. asyncssh's `create_process()` sends **EOF on the remote stdin by
+    default**, so the guest's login shell exited immediately and every
+    interactive member session died before a command could be typed. The
+    remote session is now created with `send_eof=False`, and the member's
+    keystrokes are held until the guest's shell has produced output.
+11. A terminal resize arrives as a `TerminalSizeChanged` **exception** from
+    the reader; it was unhandled, so the session died on the first resize.
+    The resize is now recorded in the cast and forwarded to the guest.
+
+**Release bundle:** `deploy/bundle.py build|verify|manifest` produces the
+artifact an operator carries into their own VM (the application, the locked
+dependencies, the flattened guest base image, the installer and its fixed
+artifacts, and a `MANIFEST.json` addressing every file by SHA-256). The
+bundle is appliance-generic — the operator's addresses, ranges and
+installation id are rendered from it — and it can never carry operator
+material: secrets, keys, known_hosts, casts and the ledger are excluded and
+configuration files are scanned for credential material. The built bundle
+verifies against revision `5f018ad`.
 
 **Still open and not claimed by this milestone:** nested-KVM promotion, the
 isolation/emergency-stop rehearsal, the real-model and human gates, the

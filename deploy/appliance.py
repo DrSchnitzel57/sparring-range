@@ -849,6 +849,78 @@ def doctor(m: ApplianceManifest, *, as_json: bool = False) -> dict:
 # operator recovery (local, evidence-bound)                                   #
 # --------------------------------------------------------------------------- #
 
+def firstboot_report(m: ApplianceManifest, layout: Layout) -> dict:
+    """A read-only health report for a freshly installed appliance.
+
+    The operator runs this in THEIR virtual machine: it answers "is the
+    appliance actually up?" without guessing, and without printing anything
+    secret.  Every check names what it looked at and what it saw.
+    """
+    import socket as _socket
+    import urllib.error
+    import urllib.request
+
+    checks: list[dict] = []
+
+    def add(name: str, ok: bool, detail: str = "") -> None:
+        checks.append({"check": name, "ok": bool(ok), "detail": detail[:200]})
+
+    add("manifest", True, m.installation_id)
+    add("broker socket", pathlib.Path(m.broker_socket).exists(), m.broker_socket)
+    broker = _broker_status(m)
+    add("broker answers", broker.get("ok", False),
+        "inventory" if broker.get("ok") else str(broker.get("error", ""))[:120])
+
+    def http(url: str) -> tuple[bool, str]:
+        try:
+            with urllib.request.urlopen(url, timeout=8) as r:
+                body = r.read(400).decode("utf-8", "replace")
+                return 200 <= r.status < 300, body
+        except urllib.error.HTTPError as exc:
+            return False, f"HTTP {exc.code}"
+        except Exception as exc:  # noqa: BLE001
+            return False, f"{type(exc).__name__}"
+
+    ok_health, body = http(m.internal_url.rstrip("/") + "/healthz")
+    add("api /healthz", ok_health, body)
+    ok_ready, body = http(m.internal_url.rstrip("/") + "/readyz")
+    add("api /readyz", ok_ready, body)
+
+    def tcp(host: str, port: int) -> bool:
+        try:
+            with _socket.create_connection((host, port), timeout=5):
+                return True
+        except OSError:
+            return False
+
+    add("ingest listener",
+        tcp(m.network.ingest_address, int(m.network.ingest_port)),
+        f"{m.network.ingest_address}:{m.network.ingest_port}")
+    add("bastion listener", tcp(m.network.bastion_address, 2222),
+        f"{m.network.bastion_address}:2222")
+    for unit in UNITS:
+        state = _unit_state(unit)
+        add(f"unit {unit}", state == "active", state)
+    add("isolated bridge", pathlib.Path("/sys/class/net/"
+                                         f"{m.network.range_bridge}").exists(),
+        m.network.range_bridge)
+    add("nftables rules", shutil.which("nft") is not None,
+        "nft is required for the range isolation rules")
+    for role, image in sorted(m.images.items()):
+        path = pathlib.Path(image.path)
+        add(f"image {role}", path.is_file(),
+            f"{path} ({path.stat().st_size if path.is_file() else 0} bytes)")
+    add("TLS material", (layout.etc / "tls").is_dir(),
+        str(layout.etc / "tls"))
+    add("bastion keys", (layout.etc / "ssh" / "authorized_keys").is_file(),
+        str(layout.etc / "ssh" / "authorized_keys"))
+    add("worker capability",
+        (layout.etc / "secrets" / "worker-supervisor.token").is_file(),
+        str(layout.etc / "secrets" / "worker-supervisor.token"))
+    return {"ok": all(c["ok"] for c in checks), "checks": checks,
+            "installation_id": m.installation_id}
+
+
 def _ledger(m: ApplianceManifest):
     from infra.broker.ledger import Ledger
     return Ledger(m.broker_ledger)
@@ -1081,6 +1153,10 @@ def main(argv: list[str] | None = None) -> int:
     common(pvf)
     pvf.add_argument("--json", action="store_true")
 
+    pf = sub.add_parser("firstboot")
+    common(pf)
+    pf.add_argument("--json", action="store_true")
+
     ps = sub.add_parser("status")
     common(ps)
     ps.add_argument("--json", action="store_true")
@@ -1151,6 +1227,17 @@ def main(argv: list[str] | None = None) -> int:
                     check=False)
             out["upgrade"] = "config/units re-rendered; data and keys preserved"
             print(json.dumps(out, indent=2, sort_keys=True))
+        elif args.cmd == "firstboot":
+            lay = _layout(args)
+            report = firstboot_report(sandbox_manifest(m, lay.root), lay)
+            if args.json:
+                print(json.dumps(report, indent=2, sort_keys=True))
+            else:
+                for c in report["checks"]:
+                    print(("  [ok]  " if c["ok"] else "  [FAIL] ")
+                          + c["check"] + (f" - {c['detail']}" if c["detail"] else ""))
+            if not report["ok"]:
+                return 1
         elif args.cmd == "verify":
             lay = _layout(args)
             out = verify_install(sandbox_manifest(m, lay.root), lay)
