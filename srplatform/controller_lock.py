@@ -21,6 +21,7 @@ in its readiness report instead of pretending to be healthy.
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -51,6 +52,9 @@ class ControllerLock:
         except ImportError:  # pragma: no cover - psycopg2 is a dependency
             self.detail = "psycopg2 is not installed"
             return False
+        # The settings carry a SQLAlchemy URL ("postgresql+psycopg2://...");
+        # the driver speaks the plain form.
+        dsn = re.sub(r"^postgresql\+\w+://", "postgresql://", dsn)
         deadline = time.monotonic() + max(0.0, timeout_s)
         conn = None
         last = ""

@@ -105,7 +105,21 @@ if [ "$(id -u)" != "0" ]; then
 fi
 "$PYTHON" deploy/appliance.py apply --manifest "$MANIFEST"
 
-say "6/6 check that the appliance came up"
+say "6/7 apply the range network and start the services"
+cat <<'NOTE'
+The inner bridge and the fixed nftables rules are RENDERED but not applied:
+they change the host's networking, so the operator reviews and applies them
+in a maintenance window.
+
+  less /etc/nftables.d/sr-appliance.nft
+  less /etc/systemd/network/10-srlab.netdev /etc/systemd/network/20-srlab.network
+  networkctl reload
+  nft -f /etc/nftables.d/sr-appliance.nft
+  systemctl enable --now sr-appliance-broker sr-api sr-appliance-ingest \
+    sr-worker-supervisor sr-bastion sr-web
+NOTE
+
+say "7/7 check that the appliance came up"
 "$PYTHON" deploy/appliance.py firstboot --manifest "$MANIFEST"
 
 printf '\nhand-off complete: the manual rehearsal (fresh launch, member SSH,\n'

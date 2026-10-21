@@ -189,7 +189,30 @@ provisions the TLS material, onboards the member's public keys, renders the
 fixed systemd units and the network artifacts, and enables the services. It
 never regenerates an existing key or capability, so a rerun is safe.
 
-### 4. Check the appliance came up
+### 4. Apply the isolated range's network, then start the services
+
+`apply` renders the inner bridge and the fixed nftables rules but does NOT
+change the host's live networking: those artifacts are a one-time, reviewable
+change to the machine, and the operator applies them in a maintenance window.
+
+```bash
+# REVIEW the rules first. They drop management/WAN/IPv6/model/NAS traffic
+# from the range and keep the authorized flows.
+less /etc/nftables.d/sr-appliance.nft
+less /etc/systemd/network/10-srlab.netdev /etc/systemd/network/20-srlab.network
+
+# apply them
+networkctl reload
+nft -f /etc/nftables.d/sr-appliance.nft
+systemctl enable --now sr-appliance-broker sr-api sr-appliance-ingest \
+  sr-worker-supervisor sr-bastion sr-web
+```
+
+If the rules do not fit your host, change them in the manifest and re-render
+(`appliance.py plan` shows the exact artifacts) - never hand-edit the rendered
+files, and never widen them to make a test pass.
+
+### 5. Check the appliance came up
 
 ```bash
 python3 deploy/appliance.py firstboot --manifest /etc/sparring-range/appliance-manifest.json
@@ -198,7 +221,7 @@ python3 deploy/appliance.py firstboot --manifest /etc/sparring-range/appliance-m
 Every check is named and reported; the command exits non-zero if any of them
 fails. It is read-only and prints no secret.
 
-### 5. Prove it, and keep the evidence
+### 6. Prove it, and keep the evidence
 
 * `python3 deploy/appliance.py status` — units, the broker's inventory.
 * `python3 deploy/appliance.py doctor` — prerequisites and the KVM state.

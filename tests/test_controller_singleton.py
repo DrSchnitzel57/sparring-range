@@ -56,17 +56,34 @@ def test_readiness_reports_a_healthy_controller():
 
 @pytest.mark.db
 def test_only_one_process_can_be_the_controller(client):
-    """Two locks against the same database: the second one is refused."""
+    """Two locks against the same database: the second one is refused.
+
+    The test uses its own key so it measures the MECHANISM; the API's own
+    controller lock is held by the fixture's application, which is exactly
+    the production situation a second API process would meet.
+    """
     from srplatform.settings import get_settings
 
-    first = ControllerLock()
+    key = CONTROLLER_LOCK_KEY + 1
+    first = ControllerLock(key=key)
     assert first.acquire(get_settings().postgres_url, timeout_s=5.0) is True
     try:
-        second = ControllerLock()
+        second = ControllerLock(key=key)
         assert second.acquire(get_settings().postgres_url, timeout_s=1.0) is False
         assert "another controller" in second.detail
     finally:
         first.release()
-    third = ControllerLock()
+    third = ControllerLock(key=key)
     assert third.acquire(get_settings().postgres_url, timeout_s=5.0) is True
     third.release()
+
+
+@pytest.mark.db
+def test_the_running_api_holds_the_controller_lock(client):
+    """The application that serves requests IS the controller."""
+    from srplatform.api import app as app_mod
+    from srplatform.settings import get_settings
+
+    lock = ControllerLock()
+    assert lock.acquire(get_settings().postgres_url, timeout_s=2.0) is False, (
+        "the API process should already hold the controller lock")
