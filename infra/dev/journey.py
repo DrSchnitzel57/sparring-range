@@ -37,6 +37,25 @@ import httpx
 
 PRESETS = ("mojang-web-01", "mojang-web-db-01")
 
+# The match options the product must cover (plan 15): both presets, the three
+# durations, the two modes, both start conditions and the inject toggle.  The
+# journey walks this matrix so a missing option is a failed journey, not a
+# silently untested one.
+SESSION_OPTIONS = (
+    {"duration_minutes": 30, "mode": "practice",
+     "start_condition": "network-entry", "injects_enabled": True},
+    {"duration_minutes": 60, "mode": "practice",
+     "start_condition": "network-entry", "injects_enabled": True},
+    {"duration_minutes": 120, "mode": "practice",
+     "start_condition": "network-entry", "injects_enabled": True},
+    {"duration_minutes": 30, "mode": "practice",
+     "start_condition": "assumed-breach", "injects_enabled": True},
+    {"duration_minutes": 30, "mode": "practice",
+     "start_condition": "network-entry", "injects_enabled": False},
+    {"duration_minutes": 30, "mode": "evaluation",
+     "start_condition": "network-entry", "injects_enabled": True},
+)
+
 
 class JourneyError(RuntimeError):
     pass
@@ -110,11 +129,13 @@ async def _ssh_check(conn: dict, key: str, known_hosts: str) -> dict:
 
 def _run_preset(c: httpx.Client, preset: str, *, duration: int, pace: int,
                 ssh_key: str | None, known_hosts: str | None,
-                label: str) -> dict:
+                label: str, options: dict | None = None) -> dict:
+    opts = dict(options or SESSION_OPTIONS[0])
     created = _json(c.post("/sessions", json={
-        "scenario_id": preset, "duration_minutes": duration,
-        "pace_seconds": pace, "mode": "practice",
-        "start_condition": "network-entry", "injects_enabled": True}),
+        "scenario_id": preset, "duration_minutes": opts["duration_minutes"],
+        "pace_seconds": pace, "mode": opts["mode"],
+        "start_condition": opts["start_condition"],
+        "injects_enabled": opts["injects_enabled"]}),
         f"create {preset}")
     sid = created["session_id"]
     out: dict = {"preset": preset, "session_id": sid, "label": label}
@@ -132,7 +153,19 @@ def _run_preset(c: httpx.Client, preset: str, *, duration: int, pace: int,
     if (sess.get("match") or {}).get("state") != "ready":
         raise JourneyError(f"{preset} match not ready: {sess.get('match')}")
     out["ready"] = True
+    out["options"] = opts
     out["match_snapshot"] = (sess.get("match") or {}).get("snapshot_version")
+    snapshot = (sess.get("match") or {}).get("snapshot") or {}
+    # the session must record the options it was created with: a journey
+    # that silently ignored an option is not a journey.
+    for key, value in (("duration_minutes", opts["duration_minutes"]),
+                       ("mode", opts["mode"]),
+                       ("start_condition", opts["start_condition"]),
+                       ("injects_enabled", opts["injects_enabled"])):
+        if snapshot and snapshot.get(key) not in (None, value):
+            raise JourneyError(
+                f"{preset}: the session did not record {key}={value!r} "
+                f"(snapshot: {snapshot.get(key)!r})")
 
     conn = _ssh_connection(c, sid)
     out["ssh_instruction"] = conn.get("ssh")
@@ -206,6 +239,12 @@ def run_journey(*, base_url: str, operator_token: str, member_token: str,
                 member, preset, duration=duration, pace=pace,
                 ssh_key=ssh_key, known_hosts=bastion_known_hosts,
                 label="primary"))
+        # the option matrix: every documented match option is exercised
+        for index, options in enumerate(SESSION_OPTIONS):
+            results.append(_run_preset(
+                member, presets[0], duration=duration, pace=pace,
+                ssh_key=ssh_key, known_hosts=bastion_known_hosts,
+                label=f"options-{index}", options=options))
         if reuse:
             # The second launch proves release/destroy/reuse with the SAME
             # member after a completed primary journey.
