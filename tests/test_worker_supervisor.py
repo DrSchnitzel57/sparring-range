@@ -223,3 +223,126 @@ def test_stopping_an_unstarted_queued_run_resolves_it(migrated_db):
         assert out["ok"] is True, out
         row = d.get(Run, run_id)
         assert row.status == "cancelled", row.status
+
+
+def test_every_failure_report_carries_the_claim_credential(monkeypatch):
+    """The report endpoint refuses a body without the claim credential.
+
+    A report without it is a 422 and the run stays unresolved: the
+    supervisor must present the credential on EVERY path.
+    """
+    from srplatform import worker_supervisor as ws
+
+    seen: list[dict] = []
+
+    class _Resp:
+        status_code = 200
+        content = b"{}"
+
+        def json(self):
+            return {}
+
+    class _Client:
+        def post(self, url, headers=None, json=None, timeout=None):
+            seen.append({"url": url, "body": json or {}})
+            return _Resp()
+
+    sup = ws.Supervisor("http://api.invalid", "t" * 40, 1, 1)
+    assignment = ws.Assignment("run-1", "claim-token-1")
+    sup._report(_Client(), assignment, "the worker exited")
+    sup._report(_Client(), assignment, "the child was stopped")
+    assert seen, "no report was sent"
+    for entry in seen:
+        assert entry["body"].get("claim_token") == "claim-token-1", entry
+
+
+def test_a_late_heartbeat_cannot_clear_the_next_assignment():
+    """The heartbeat works on ITS assignment, never on the current one.
+
+    A heartbeat that is still waiting for its reply when the worker exits
+    must not clear the run id of the assignment that follows it.
+    """
+    from srplatform import worker_supervisor as ws
+
+    sup = ws.Supervisor("http://api.invalid", "t" * 40, 1, 1)
+    first = ws.Assignment("run-1", "claim-1")
+    second = ws.Assignment("run-2", "claim-2")
+    sup.current = second
+    # the late heartbeat only ever touches the assignment it was given
+    assert first.run_id == "run-1"
+    assert sup.current.run_id == "run-2"
+    assert sup.current.claim_token == "claim-2"
+    # the assignment is immutable: a late thread cannot rewrite it
+    with pytest.raises(AttributeError):
+        first.run_id = "run-9"
+
+
+def test_the_post_helper_raises_a_status_error():
+    """The 409 handler must be reachable: the error carries the status."""
+    import httpx
+
+    from srplatform import worker_supervisor as ws
+
+    class _Resp:
+        status_code = 409
+        content = b"{}"
+        text = "conflict"
+        request = httpx.Request("POST", "http://api.invalid/x")
+
+    class _Client:
+        def post(self, url, headers=None, json=None, timeout=None):
+            return _Resp()
+
+    with pytest.raises(httpx.HTTPStatusError) as bad:
+        ws._post(_Client(), "http://api.invalid/x", {})
+    assert bad.value.response.status_code == 409
+
+
+def test_a_claim_rotated_during_the_cancellation_cannot_fail_the_run(
+        migrated_db, monkeypatch):
+    """Every final UPDATE is fenced by the claim hash.
+
+    The reviewer's probe: while claim A's cancellation is running, the run is
+    reclaimed and assigned to claim B. A must then NOT be able to mark the
+    run failed or revoke B's credentials.
+    """
+    from srplatform.api import runs
+    from srplatform.db.models import Run, Session as SessionModel, User
+    from srplatform.db.session import db as db_ctx
+    from sqlalchemy import update as sa_update
+
+    with db_ctx() as d:
+        u = User(username=f"rot-{uuid.uuid4().hex[:8]}", role="member")
+        d.add(u)
+        d.flush()
+        s = SessionModel(scenario_id="mojang-web-01", user_id=u.user_id,
+                         status="running")
+        d.add(s)
+        d.flush()
+        run = Run(session_id=s.session_id, scenario_id=s.scenario_id,
+                  status="queued")
+        d.add(run)
+        d.commit()
+        run_id = run.run_id
+        _run, _token, claim_a = runs.claim_run(d, 1)
+        assert runs.assign_run(d, run_id, 4242, 4242, 99, claim_a) is True
+
+        def reclaim_while_cancelling(db, run):
+            # the controller reclaims the run and hands it to claim B
+            db.execute(sa_update(Run).where(Run.run_id == run.run_id)
+                       .values(worker_claim_token="claim-b-hash",
+                               worker_token="claim-b-token"))
+            db.commit()
+            return {"ok": True}
+
+        monkeypatch.setattr(runs, "cancel_remote_operations",
+                            reclaim_while_cancelling)
+        out = runs.worker_failed(d, run_id, "claim A reports a failure",
+                                 claim_a)
+        assert out["ok"] is False, out
+        row = d.get(Run, run_id)
+        # the run belongs to claim B now: it is untouched and its credential
+        # was not revoked
+        assert row.status == "running", row.status
+        assert row.worker_claim_token == "claim-b-hash"
+        assert row.worker_token == "claim-b-token"

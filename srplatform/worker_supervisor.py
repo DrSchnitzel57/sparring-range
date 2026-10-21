@@ -9,6 +9,14 @@ The supervisor holds no database, broker, libvirt, model or controller secret.
 The assignment response contains only the worker's serialized environment:
 API base URL, one-shot run capability, runner channel, pace/deadline. The API
 cannot spawn or signal this UID; this process owns its child group.
+
+Every callback carries the CLAIM credential the controller handed out with the
+assignment. It fences the callback: once the controller has reclaimed the run
+the credential is rotated and this supervisor's authority is gone.
+
+The state of ONE assignment is immutable and is never shared with the next
+one: a heartbeat that is still waiting for its reply when the worker exits
+must not clear the run id of the assignment that follows it.
 """
 from __future__ import annotations
 
@@ -45,10 +53,47 @@ def _token_file() -> str:
 
 def _post(client: httpx.Client, url: str, headers: dict,
           body: dict | None = None):
+    """POST and raise on an error status.
+
+    The error is an ``httpx.HTTPStatusError`` so the callers can look at the
+    status code (a 409 means "the controller no longer recognises this
+    claim"), not a bare RuntimeError.
+    """
     r = client.post(url, headers=headers, json=body or {}, timeout=30)
     if r.status_code >= 400:
-        raise RuntimeError(f"{url} -> {r.status_code}: {r.text[:300]}")
+        raise httpx.HTTPStatusError(
+            f"{url} -> {r.status_code}: {r.text[:300]}",
+            request=r.request, response=r)
     return r.json() if r.content else {}
+
+
+class Assignment:
+    """The immutable state of ONE claimed run.
+
+    The heartbeat thread works on its own assignment: it must never touch the
+    supervisor's current assignment, because a late heartbeat (the join
+    timed out) would otherwise clear the run id and the claim credential of
+    the NEXT assignment.
+    """
+
+    __slots__ = ("run_id", "claim_token", "_child")
+
+    def __init__(self, run_id: str, claim_token: str | None,
+                 child: subprocess.Popen | None = None):
+        object.__setattr__(self, "run_id", run_id)
+        object.__setattr__(self, "claim_token", claim_token)
+        object.__setattr__(self, "_child", child)
+
+    @property
+    def child(self) -> subprocess.Popen | None:
+        return self._child
+
+    def attach_child(self, child: subprocess.Popen) -> None:
+        """The spawned child belongs to THIS assignment and to no other."""
+        object.__setattr__(self, "_child", child)
+
+    def __setattr__(self, name, value):
+        raise AttributeError("an assignment is immutable once it is claimed")
 
 
 class Supervisor:
@@ -59,66 +104,67 @@ class Supervisor:
         self.poll_s = max(0.25, float(poll_s))
         self.heartbeat_s = max(1.0, float(heartbeat_s))
         self.stop = threading.Event()
-        self.child: subprocess.Popen | None = None
-        self.run_id: str | None = None
-        # The claim credential for the run this supervisor currently owns.
-        # It fences every callback: if the controller reclaimed the run, the
-        # credential is rotated and this supervisor's authority is gone.
-        self.claim_token: str | None = None
+        # The assignment this supervisor currently owns (never mutated in
+        # place: a new assignment replaces it).
+        self.current: Assignment | None = None
 
-    def _terminate_child(self, grace_s: float = 8.0) -> str:
-        proc = self.child
-        if proc is None:
+    # ---------------------------------------------------------------- child --
+    def _terminate_child(self, child: subprocess.Popen | None,
+                         grace_s: float = 8.0) -> str:
+        if child is None:
             return "no child"
-        if proc.poll() is not None:
-            return f"child already exited {proc.returncode}"
+        if child.poll() is not None:
+            return f"child already exited {child.returncode}"
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            os.killpg(os.getpgid(child.pid), signal.SIGTERM)
         except OSError as exc:
             return f"killpg failed: {exc}"
         try:
-            proc.wait(timeout=grace_s)
+            child.wait(timeout=grace_s)
             return "child group terminated"
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                os.killpg(os.getpgid(child.pid), signal.SIGKILL)
             except OSError:
                 pass
             try:
-                proc.wait(timeout=5)
+                child.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 return "child group termination UNCONFIRMED"
             return "child group killed"
 
-    def _report(self, client, reason: str) -> None:
+    # --------------------------------------------------------------- report --
+    def _report(self, client, assignment: Assignment | None,
+                reason: str) -> None:
         """Tell the controller that the child is gone.
 
         The report is best effort: a stale credential is refused (the
         controller has moved on) and that refusal is the correct outcome.
+        The CLAIM credential is always presented — the endpoint refuses a
+        report without it.
         """
-        if not self.run_id:
+        if assignment is None:
             return
         try:
             _post(client,
-                  f"{self.api}/internal/worker/{self.run_id}/failed",
+                  f"{self.api}/internal/worker/{assignment.run_id}/failed",
                   self.headers,
                   {"reason": reason,
-                   "claim_token": self.claim_token or ""})
+                   "claim_token": assignment.claim_token or ""})
         except Exception as exc:  # noqa: BLE001 — the report is best effort
             print(f"[supervisor] failure report refused: {exc}",
                   file=sys.stderr, flush=True)
 
-    def _beat(self, done: threading.Event) -> None:
+    # ------------------------------------------------------------ heartbeat --
+    def _beat(self, done: threading.Event, assignment: Assignment) -> None:
         with httpx.Client() as client:
             while not done.wait(self.heartbeat_s):
-                if not self.run_id:
-                    continue
                 try:
                     reply = _post(client,
                                   f"{self.api}/internal/worker/"
-                                  f"{self.run_id}/heartbeat",
+                                  f"{assignment.run_id}/heartbeat",
                                   self.headers,
-                                  {"claim_token": self.claim_token or ""})
+                                  {"claim_token": assignment.claim_token or ""})
                 except httpx.HTTPStatusError as exc:
                     if exc.response.status_code == 409:
                         # The controller no longer recognises this claim: the
@@ -128,11 +174,10 @@ class Supervisor:
                         print("[supervisor] claim refused — terminating the "
                               "child (the authority is gone)",
                               file=sys.stderr, flush=True)
-                        self._terminate_child()
-                        self._report(client, "the controller no longer "
-                                           "recognises this claim")
-                        self.run_id = None
-                        self.claim_token = None
+                        self._terminate_child(assignment.child)
+                        self._report(client, assignment,
+                                     "the controller no longer recognises "
+                                     "this claim")
                         return
                     print(f"[supervisor] heartbeat failed: {exc}",
                           file=sys.stderr, flush=True)
@@ -153,12 +198,12 @@ class Supervisor:
                     # foreign-UID child, so the request comes back here.
                     print("[supervisor] stop requested by the controller",
                           file=sys.stderr, flush=True)
-                    self._terminate_child()
-                    self._report(client, "stopped at the controller's request")
-                    self.run_id = None
-                    self.claim_token = None
+                    self._terminate_child(assignment.child)
+                    self._report(client, assignment,
+                                 "stopped at the controller's request")
                     return
 
+    # ------------------------------------------------------------------ run --
     def run(self) -> int:
         with httpx.Client() as client:
             while not self.stop.is_set():
@@ -170,90 +215,84 @@ class Supervisor:
                           file=sys.stderr, flush=True)
                     self.stop.wait(self.poll_s)
                     continue
-                assignment = body.get("assignment") if body else None
-                if not assignment:
+                payload = body.get("assignment") if body else None
+                if not payload:
                     self.stop.wait(self.poll_s)
                     continue
-                self.run_id = assignment["run_id"]
-                self.claim_token = assignment.get("claim_token")
-                env = dict(assignment.get("env") or {})
+                assignment = Assignment(payload["run_id"],
+                                        payload.get("claim_token"))
+                self.current = assignment
+                env = dict(payload.get("env") or {})
                 # The child gets ONLY this serialized environment. Never
                 # inherit the supervisor's own token or controller secrets.
                 for key in ("PATH", "HOME", "LANG", "LC_ALL", "TZ"):
                     if key not in env and os.environ.get(key):
-                        env[key] = os.environ[key]
+                        env[key] = os.environ.get(key)
                 env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
                 try:
-                    self.child = subprocess.Popen(
+                    assignment.attach_child(subprocess.Popen(
                         [sys.executable, "-m", "srplatform.red_agent.worker"],
-                        env=env, start_new_session=True)
+                        env=env, start_new_session=True))
                 except OSError as exc:
-                    _post(client,
-                          f"{self.api}/internal/worker/{self.run_id}/failed",
-                          self.headers,
-                          {"reason": f"worker spawn failed: {exc}",
-                           "claim_token": self.claim_token or ""})
-                    self.run_id = None
-                    self.claim_token = None
+                    self._report(client, assignment,
+                                 f"worker spawn failed: {exc}")
+                    self.current = None
                     continue
-                pgid = os.getpgid(self.child.pid)
+                pgid = os.getpgid(assignment.child.pid)
                 try:
                     _post(client,
-                          f"{self.api}/internal/worker/{self.run_id}/assign",
+                          f"{self.api}/internal/worker/{assignment.run_id}/assign",
                           self.headers,
-                          {"pid": self.child.pid, "pgid": pgid,
-                           "pgid_pstart": _pstart(self.child.pid),
-                           "claim_token": self.claim_token or ""})
+                          {"pid": assignment.child.pid, "pgid": pgid,
+                           "pgid_pstart": _pstart(assignment.child.pid),
+                           "claim_token": assignment.claim_token or ""})
                 except Exception as exc:  # noqa: BLE001
                     print(f"[supervisor] assign refused: {exc}",
                           file=sys.stderr, flush=True)
-                    self._terminate_child()
-                    try:
-                        _post(client,
-                              f"{self.api}/internal/worker/{self.run_id}/failed",
-                              self.headers,
-                              {"reason": f"assign refused: {exc}"})
-                    except Exception:  # noqa: BLE001
-                        pass
-                    self.run_id = None
-                    self.claim_token = None
-                    self.child = None
+                    self._terminate_child(assignment.child)
+                    # The assignment may already have been stopped while it
+                    # was being registered: the report resolves it.
+                    self._report(client, assignment, f"assign refused: {exc}")
+                    self.current = None
                     continue
                 done = threading.Event()
-                beat = threading.Thread(target=self._beat, args=(done,),
-                                        daemon=True)
+                beat = threading.Thread(target=self._beat,
+                                        args=(done, assignment), daemon=True)
                 beat.start()
-                rc = self.child.wait()
+                rc = assignment.child.wait()
                 done.set()
                 beat.join(timeout=5)
                 # The worker normally posts /internal/runs/{id}/complete before
                 # exit. This report is a no-op if that already made the run
-                # terminal; otherwise it records a truthful failure.
+                # terminal; otherwise it records a truthful failure. It names
+                # THIS assignment, never the next one.
                 try:
                     _post(client,
-                          f"{self.api}/internal/worker/{self.run_id}/failed",
+                          f"{self.api}/internal/worker/{assignment.run_id}/failed",
                           self.headers,
                           {"reason": f"worker process exited with status {rc} "
-                                     "without a confirmed completion"})
+                                     "without a confirmed completion",
+                           "claim_token": assignment.claim_token or ""})
                 except Exception as exc:  # noqa: BLE001
                     print(f"[supervisor] failure report failed: {exc}",
                           file=sys.stderr, flush=True)
-                self.child = None
-                self.run_id = None
+                self.current = None
                 if self.stop.is_set():
                     break
         return 0
 
     def terminate(self) -> None:
         self.stop.set()
-        if self.run_id and self.child is not None:
-            detail = self._terminate_child()
+        assignment = self.current
+        if assignment is not None and assignment.child is not None:
+            detail = self._terminate_child(assignment.child)
             try:
                 with httpx.Client() as client:
                     _post(client,
-                          f"{self.api}/internal/worker/{self.run_id}/failed",
+                          f"{self.api}/internal/worker/{assignment.run_id}/failed",
                           self.headers,
-                          {"reason": f"supervisor stopping: {detail}"})
+                          {"reason": f"supervisor stopping: {detail}",
+                           "claim_token": assignment.claim_token or ""})
             except Exception:  # noqa: BLE001
                 pass
 

@@ -87,3 +87,24 @@ def test_the_running_api_holds_the_controller_lock(client):
     lock = ControllerLock()
     assert lock.acquire(get_settings().postgres_url, timeout_s=2.0) is False, (
         "the API process should already hold the controller lock")
+
+
+def test_the_scheduler_stops_when_the_control_ownership_is_lost():
+    """A process that lost the controller lock must stop dispatching duties.
+
+    The scheduler releases matches and expires sessions: after another
+    controller took the lock over, the old one must not keep doing that
+    behind the new controller's back.
+    """
+    from srplatform import lifecycle
+
+    lifecycle._thread = None
+    owned = {"value": False}
+    thread = lifecycle.start_scheduler(interval_s=1,
+                                       guard=lambda: owned["value"])
+    assert thread is not None
+    # the guard is false: the scheduler must give up
+    thread.join(timeout=15)
+    assert not thread.is_alive(), (
+        "the scheduler kept dispatching after the control ownership was lost")
+    lifecycle._thread = None

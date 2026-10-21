@@ -509,15 +509,26 @@ def worker_failed(db: Session, run_id, reason: str,
     Remote operations that cannot be confirmed remain 'cancel-unknown' and
     keep the reservation.
     """
-    run = db.get(Run, run_id)
+    # The row is read under a lock so the claim check and the terminal
+    # update are serialized against a reclamation (which rotates the
+    # credential under the same lock).
+    run = db.execute(select(Run).where(Run.run_id == run_id)
+                     .with_for_update()).scalars().first()
     if run is None:
+        db.rollback()
         return {"ok": False, "detail": "unknown run"}
     if not _claim_matches(run.worker_claim_token, claim_token):
         db.rollback()
         return {"ok": False, "detail": "claim credential does not match — "
                                         "refused (obsolete claimant)"}
     if run.status in TERMINAL:
+        db.commit()
         return {"ok": True, "detail": f"run already {run.status}"}
+    # The credential the run carries NOW is the one every final update is
+    # fenced by: if the run was reclaimed while the remote operations were
+    # being cancelled, the updates below match nothing and the new claim's
+    # run is left alone.
+    expected_claim = run.worker_claim_token
     cancel = cancel_remote_operations(db, run)
     ok = bool(cancel.get("ok"))
     reason = (reason or "worker exited")[:1000]
@@ -531,12 +542,14 @@ def worker_failed(db: Session, run_id, reason: str,
              "ended_at": _now(), "worker_token": None,
              "worker_claim_token": None,
              "worker_heartbeat_at": _now()},
-            extra_where=(Run.status.in_(("running", "stopping")),))
+            extra_where=(Run.status.in_(("running", "stopping")),
+                         Run.worker_claim_token == expected_claim))
         if wrote == 0:
             ok = False
     if not ok:
         db.execute(update(Run).where(Run.run_id == run.run_id,
-                                     Run.status.not_in(TERMINAL))
+                                     Run.status.not_in(TERMINAL),
+                                     Run.worker_claim_token == expected_claim)
                    .values(status="cancel-unknown", outcome="worker_failure",
                            error=(reason + " — cessation UNCONFIRMED")[:1000],
                            worker_token=None, worker_claim_token=None,

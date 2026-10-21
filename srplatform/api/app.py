@@ -2195,6 +2195,12 @@ def _startup():
             broker4 = _deps4.get_broker()
             with _db4() as s:
                 lifecycle.reconcile_on_startup(s, broker=broker4)
-            lifecycle.start_scheduler(interval_s=s4.match_scheduler_interval_s)
+            # Only the process that HOLDS the controller lock dispatches the
+            # scheduler's duties: when the lock is lost (another controller
+            # took over) the scheduler stops instead of expiring sessions and
+            # releasing matches behind the new controller's back.
+            lifecycle.start_scheduler(
+                interval_s=s4.match_scheduler_interval_s,
+                guard=lambda: bool(lock.held) if lock is not None else True)
     except Exception:
         pass  # the scheduler retries every tick; startup must not crash

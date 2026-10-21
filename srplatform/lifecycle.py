@@ -530,10 +530,18 @@ def reconcile_on_startup(db, *, broker) -> list[dict]:
 _thread: threading.Thread | None = None
 
 
-def start_scheduler(interval_s: int = 15) -> threading.Thread | None:
+def start_scheduler(interval_s: int = 15,
+                    guard=None) -> threading.Thread | None:
     """Background scheduler for the control plane (opt-in:
     SR_MATCH_SCHEDULER_ENABLED=1). Ticks `tick()` every interval; all errors
-    are contained — the API keeps serving even if the DB hiccups."""
+    are contained — the API keeps serving even if the DB hiccups.
+
+    `guard` is the OWNERSHIP check.  A process that has lost the controller
+    lock (another controller took it over) must stop dispatching duties: the
+    scheduler would otherwise keep releasing matches and expiring sessions
+    while it is no longer the control plane.  When the guard turns false the
+    scheduler stops and says so.
+    """
     global _thread
     if _thread is not None and _thread.is_alive():
         return _thread
@@ -542,6 +550,17 @@ def start_scheduler(interval_s: int = 15) -> threading.Thread | None:
         from srplatform.db.session import db as db_ctx
         while True:
             time.sleep(interval_s)
+            if guard is not None:
+                try:
+                    owned = bool(guard())
+                except Exception as exc:  # noqa: BLE001 — an exploding guard
+                    print(f"[scheduler] ownership check raised: {exc}",
+                          flush=True)
+                    return
+                if not owned:
+                    print("[scheduler] control ownership lost — the scheduler "
+                          "stops dispatching duties", flush=True)
+                    return
             try:
                 from srplatform.api.deps import get_broker
                 broker = get_broker()
