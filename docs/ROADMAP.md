@@ -39,7 +39,8 @@ Tests were deferred by the user; this planning pass supplies no new acceptance.
   appliance installer, the controller MySQL client, the release bundle and the
   `hypervisor`/`access`/`journey`/`bundle` layers are implemented, and
   `selection`/`python`/`db`/`authority`/`install`/`hypervisor`/`access`/`bundle`
-  pass here. The `journey` layer requires the INSTALLED appliance, so it cannot
+  pass here, and the aggregate `appliance` gate runs the whole software matrix
+  in one pass. The `journey` layer requires the INSTALLED appliance, so it cannot
   be closed in a developer environment; the real-model and human gates stay open,
   and `images`/`capture` need a KVM runner (their image builds exceed the
   serial-marker timeout under software emulation).

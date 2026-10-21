@@ -18,7 +18,7 @@ open for the operator.
 | `… acceptance.py db` | **PASS** — 172 db tests against a disposable PostgreSQL 16 container. Two failures were found and fixed: a spawn-race regression introduced in this milestone (the queued-run credential held a row lock across the spawn window, turning an unconfirmed queued stop into a confirmed kill) and a stale migration-head assertion |
 | `… acceptance.py authority` | **PASS** — 25 broker boundary/durability/cessation tests |
 | `… acceptance.py install` | **PASS** — the **real** appliance install sequences in a sandbox root: clean install, rerun (0 files changed, capability preserved byte for byte), reboot (runtime restored, data and keys preserved), populated upgrade, drift detected and repaired, foreign file untouched. The previous `SR_INSTALL_VM_EVIDENCE=1` environment attestation is **removed** |
-| `… acceptance.py hypervisor` | **PASS** (122 s) — real libvirt: clone → start → guest-agent readiness marker → host-key read → ownership identity (a foreign installation is refused) → stop → destroy, and a repeated destroy of an absent guest is idempotent. Accelerator: explicit TCG |
+| `… acceptance.py hypervisor` | **PASS** (250 s, 2 tests) — real libvirt: clone → start → guest-agent readiness marker → host-key read → ownership identity (a foreign installation is refused) → stop → destroy, and a repeated destroy of an absent guest is idempotent. The second test drives the **broker's own authority path**: the real `BrokerService` behind the real Unix peer-UID socket with the real libvirt backend, reserving a VMID, cloning, configuring, starting, pinning the host key through the agent, refusing a second session's claim on the same VMID, destroying and reading back that the domain and the guest's files are gone, and ending with no open obligation. Accelerator: explicit TCG |
 | `… acceptance.py access` | **PASS** (≈130 s) — a real Ubuntu guest: guest-agent readiness marker and fixed host-key path read through the agent, real SSH with the role key, the **real recording bastion** writing `.cast` bytes, `sudo` for the management identity (and not for the attack identity), an interactive PTY **with a recorded terminal resize**, a reconnect to the same guest, and the refusal of an unauthorized key |
 | `… acceptance.py bundle` | **PASS** (54 s) — the REAL bundle is built from the flattened base image (263 files), every digest verifies, the operator's manifest is rendered from it and satisfies the strict appliance schema, and a tampered bundle is refused |
 | `… acceptance.py images` | **PASS** (1793 s, 19 tests) — the role images build, boot, serve, seed, expose the documented flaws, take the fixes and report readiness. On a COLD cache the build alone exceeds the 1500 s serial-marker timeout under software emulation (the preserved logs show `apt` still fetching); the gate then passes with the cache warm. A KVM runner removes the distinction |
@@ -68,6 +68,15 @@ found by inspecting a running guest rather than by reading code):
 11. A terminal resize arrives as a `TerminalSizeChanged` **exception** from
     the reader; it was unhandled, so the session died on the first resize.
     The resize is now recorded in the cast and forwarded to the guest.
+
+**Controller singleton:** the API process that serves requests also runs the
+controller duties (reconciling interrupted runs, clearing dead operation
+claims, heartbeating the control lease). It now takes a PostgreSQL advisory
+lock — a lock the *database* holds, so it cannot leak and is released when a
+crashed process's session dies. A process that does not hold it does not run
+the duties and says so. The startup no longer swallows failures: every
+startup problem is recorded and appears in the readiness report, so a
+half-initialised controller is visible instead of looking healthy.
 
 **Release bundle:** `deploy/bundle.py build|verify|manifest` produces the
 artifact an operator carries into their own VM (the application, the locked
