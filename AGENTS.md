@@ -206,10 +206,11 @@ labelled as such; they are **not** nested-KVM acceptance.
   renders from it and validates, and a tampered bundle is refused.
 - `… frontend` — **PASS** (zero high/critical audit findings); `… browser` —
   **PASS**; `… compose` — **PASS**.
-- `… images` — **FAILED**: the role-image builds miss the 1500 s serial-marker
-  timeout under software emulation (the serial logs show `apt` still fetching).
-  This is an emulation-speed limit, not an image defect; it needs a KVM runner.
-  `… capture` depends on those builds.
+- `… images` — **PASS** (1793 s, 19 tests) and `… capture` — **PASS** (751 s, 11
+  tests). On a COLD build cache the role-image build alone exceeds the 1500 s
+  serial-marker timeout under software emulation (the serial logs show `apt`
+  still fetching); the gate passes with the cache warm, and a KVM runner
+  removes the distinction.
 - `… packet` — **FAILED (environment)**: it needs root and `nft`; it fails
   closed with the exact missing prerequisite and was not simulated.
 - `… journey` — **FAILED (prerequisite)**: it needs the INSTALLED appliance and
