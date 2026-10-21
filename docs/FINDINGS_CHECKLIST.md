@@ -25,7 +25,11 @@ open for the operator.
 | `… acceptance.py capture` | not run — it depends on the image builds above |
 | `… acceptance.py containment` / `packet` | not runnable here: they need cgroup delegation, root and `nft` |
 | `… acceptance.py journey` | requires the **installed** appliance with operator/member tokens; it fails closed here by design |
-| `… acceptance.py frontend` / `browser` / `compose` | not re-run in this pass |
+| `… acceptance.py frontend` | **PASS** (9.5 s) — lockfile-faithful `npm ci`, the production Next build, and `npm audit --omit=dev` with **zero high/critical** findings |
+| `… acceptance.py browser` | **PASS** (44.8 s) — the isolated real-browser workflow and its replay, against a disposable PostgreSQL 16 container |
+| `… acceptance.py compose` | **PASS** (360.9 s) — the run-owned stack builds, the bastion capability is issued and scoped, the services come up, and every run-owned resource is removed |
+| `… acceptance.py containment` | **PASS** (10.1 s) — namespace, recursive-membership and cancellation regressions, required mode, no leaked cgroups |
+| `… acceptance.py packet` | **FAIL (environment)** — the gate needs root and `nft`, which this container does not have. It fails closed with the exact missing prerequisite and was not simulated |
 
 **Defects this milestone found and fixed** (each with a regression test, each
 found by inspecting a running guest rather than by reading code):
