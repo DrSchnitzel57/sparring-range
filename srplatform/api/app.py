@@ -41,6 +41,7 @@ from srplatform.safety import get_supervisor
 app = FastAPI(title="sparring-range API", version="0.2.0")
 
 # LAN origins are EXPLICIT (F23) — never wildcard, never silently localhost.
+from srplatform.controller_lock import ControllerLock
 from srplatform.settings import get_settings  # noqa: E402
 
 
@@ -172,8 +173,18 @@ def readyz():
     runner_ok, runner_why = get_supervisor().runner_available()
     rec_dir = s.recordings_dir
     rec_ok = os.access(rec_dir, os.W_OK) if os.path.isdir(rec_dir) else False
+    # Startup failures and the controller singleton are VISIBLE: a process
+    # that could not take the controller lock, or whose startup duties
+    # failed, must not look healthy.
+    startup_issues = list(getattr(app.state, "startup_issues", []) or [])
+    controller = bool(getattr(app.state, "controller", False))
+    controller_detail = getattr(app.state, "controller_detail", "")
+    issues.extend(startup_issues)
+    if not controller and controller_detail:
+        issues.append(f"controller: {controller_detail}")
     return {"ready": v is not None and not issues,
             "migration_version": v, "issues": issues,
+            "controller": {"ok": controller, "detail": controller_detail},
             "runner": {"ok": runner_ok, "detail": runner_why},
             "recordings_writable": rec_ok,
             "safety": get_supervisor().verify()}
@@ -2055,22 +2066,52 @@ def _log_event(db: Session, session_id, actor, host, action_type, payload, phase
 # remove their serialization. The listener serves ingest routes only.
 @app.on_event("startup")
 def _startup():
+    """Start the controller duties - ONCE, and visibly.
+
+    The controller duties (reconciling interrupted runs, clearing dead
+    operation claims, heartbeating the control lease) belong to exactly ONE
+    process per database: two controllers race over the same durable state.
+    The process therefore takes the controller advisory lock, and a process
+    that does not hold it does not run them.
+
+    Failures are RECORDED, not swallowed: they appear in the readiness
+    report, so a half-initialised controller is visible instead of looking
+    healthy.
+    """
     from srplatform.settings import get_settings as _gs0
     ingest_only = _gs0().api_ingest_only
     if ingest_only:
         return
+    issues: list[str] = []
+    app.state.startup_issues = issues
+    app.state.controller = False
+    lock = ControllerLock()
+    app.state.controller_lock = lock
+    try:
+        got = lock.acquire(_gs0().postgres_url, timeout_s=5.0)
+    except Exception as exc:  # noqa: BLE001 - reported, never hidden
+        got = False
+        issues.append(f"controller lock: {type(exc).__name__}: {exc}")
+    if not got:
+        # Not an error by itself: a second process is simply not the
+        # controller.  The reason is still reported.
+        app.state.controller = False
+        app.state.controller_detail = lock.detail or "not the controller"
+        return
+    app.state.controller = True
+    app.state.controller_detail = lock.detail
     try:
         runs_svc.reconcile_on_startup()
-    except Exception:
-        pass  # readiness endpoint reports DB problems; startup must not crash
+    except Exception as exc:  # noqa: BLE001 - reported, never hidden
+        issues.append(f"reconcile on startup: {type(exc).__name__}: {exc}")
     try:
         # durable operation claims only have meaning while THIS process serves;
         # anything left over belongs to a dead request (crash recovery).
         from srplatform.scenario_engine import orchestrator
         with db() as s:
             orchestrator.clear_operation_claims(s)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - reported, never hidden
+        issues.append(f"clear operation claims: {type(exc).__name__}: {exc}")
     # milestone 02: wire the independent broker cessation layer into the
     # supervisor, and run the control-lease heartbeat when a real broker is
     # configured (the broker's own watchdog stops the range if we die).
