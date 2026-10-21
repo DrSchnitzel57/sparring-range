@@ -1634,10 +1634,10 @@ def check_journey() -> None:
 def _role_images(tmp: pathlib.Path) -> tuple[dict, dict]:
     """The ROLE artifacts a release bundle must carry.
 
-    The real ones are used when the images gate has built them (the release
-    flow); otherwise a placeholder is used and the gate says so — the gate
-    then proves the bundle's mechanics, not the image content, and the
-    `images` gate is what proves the content.
+    They must be the REAL artifacts: a bundle that ships placeholder bytes
+    proves nothing about the guests it would install.  When they are
+    missing the gate fails with the exact prerequisite — the `images` gate
+    builds them.
     """
     roles = ("attacker", "mojang-web-local", "mojang-web-db")
     out: dict = {}
@@ -1660,12 +1660,12 @@ def _role_images(tmp: pathlib.Path) -> tuple[dict, dict]:
             if found is not None:
                 break
         if found is None:
-            placeholder = tmp / f"{role}.qcow2"
-            placeholder.write_bytes(b"synthetic-role-image" * 64)
-            found = placeholder
-            real[role] = False
-        else:
-            real[role] = True
+            fail("release bundle role artifacts",
+                 f"no {role} image found in {dirs} — build the role images "
+                 "first (the images gate) or point SR_APPLIANCE_ROLE_IMAGE_DIR "
+                 "at them. A bundle with placeholder image bytes would prove "
+                 "nothing about the guests it installs.")
+        real[role] = True
         out[role] = found
     return out, real
 
@@ -1834,12 +1834,19 @@ def check_appliance() -> None:
         os.environ.get("SR_APPLIANCE_RECEIPT") else None
     if out:
         out.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
-    ok("appliance software matrix",
+    if pending:
+        # A pending MANDATORY gate is not a pass: the release matrix is
+        # incomplete, and the receipt says exactly what is missing.
+        fail("appliance release matrix",
+             f"the software matrix passed "
+             f"({len([g for g in results.values() if g == 'passed'])} gates at "
+             f"{revision[:12]}) but {len(pending)} mandatory gate(s) are still "
+             "pending: " + "; ".join(f"{gate}: {reason}"
+                                     for gate, reason in sorted(pending.items())))
+    ok("appliance release matrix",
        f"{len([g for g in results.values() if g == 'passed'])} gates passed at "
        f"{revision[:12]}"
-       + (f", base {digests['appliance-base'][:12]}" if digests else "")
-       + (f"; {len(pending)} operator gate(s) pending: "
-          + ", ".join(sorted(pending)) if pending else ""))
+       + (f", base {digests['appliance-base'][:12]}" if digests else ""))
 
 
 CHECKS = {

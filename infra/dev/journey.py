@@ -34,6 +34,7 @@ import subprocess
 import sys
 import time
 import uuid
+from datetime import datetime, timezone
 
 import httpx
 
@@ -159,9 +160,38 @@ def _browser_check(base_url: str, username: str, password: str, *,
         r = subprocess.run([cli, f"-s={session}", *args], capture_output=True,
                            text=True, timeout=timeout, cwd=str(REPO))
         if check and r.returncode != 0:
-            raise JourneyError(f"playwright-cli {' '.join(args)} -> "
-                               f"{r.returncode}: {(r.stdout or r.stderr)[-400:]}")
+            # The command line may carry the member's PASSWORD (the fill
+            # command): the diagnostics must never echo it.
+            shown = []
+            hide_next = False
+            for arg in args:
+                if hide_next:
+                    shown.append("***")
+                    hide_next = False
+                    continue
+                if arg == "fill":
+                    hide_next = True
+                shown.append(arg)
+            detail = (r.stdout or r.stderr)[-400:]
+            if password:
+                detail = detail.replace(password, "***")
+            raise JourneyError(f"playwright-cli {' '.join(shown)} -> "
+                               f"{r.returncode}: {detail}")
         return r
+
+    def redact(args: tuple) -> str:
+        """Never echo a secret: the password is a FILL argument."""
+        shown = []
+        hide_next = False
+        for arg in args:
+            if hide_next:
+                shown.append("***")
+                hide_next = False
+                continue
+            if arg == "fill":
+                hide_next = True
+            shown.append(arg)
+        return " ".join(shown)
 
     out: dict = {"base_url": base_url}
     try:
@@ -169,14 +199,17 @@ def _browser_check(base_url: str, username: str, password: str, *,
         pw("fill", 'input[placeholder="username"]', username)
         pw("fill", 'input[placeholder="password"]', password)
         pw("click", 'button[type="submit"]')
-        deadline = time.time() + 60
+        deadline = time.time() + 90
         body = ""
+        # The login page carries the product's own heading ("sparring-range —
+        # login"), so only the LIBRARY proves that the login worked.
         while time.time() < deadline:
             body = pw("--raw", "eval", "document.body.innerText",
                       check=False).stdout
-            if "scenario library" in body or "sparring-range" in body:
+            if "scenario library" in body:
                 break
-            if "expired" in body.lower() or "invalid" in body.lower():
+            low = body.lower()
+            if "expired" in low or "invalid" in low or "bad" in low:
                 raise JourneyError(f"the browser login was refused: {body[:300]}")
             time.sleep(1)
         if "scenario library" not in body:
@@ -187,6 +220,19 @@ def _browser_check(base_url: str, username: str, password: str, *,
     finally:
         pw("close", check=False)
     return out
+
+
+def _parse_iso(text) -> datetime | None:
+    """Parse the API's ISO timestamps (they may carry an offset)."""
+    if not text:
+        return None
+    try:
+        value = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value
 
 
 def _inject_workflow(c: httpx.Client, sid: str, *, wait_s: float) -> dict:
@@ -207,7 +253,9 @@ def _inject_workflow(c: httpx.Client, sid: str, *, wait_s: float) -> dict:
     if not releases:
         raise JourneyError("the session has no incident releases — the break/"
                            "repair workflow cannot be exercised")
-    # 1. the refusal path
+    before = dict(inbox.get("score") or {})
+    # 1. the refusal path: a release that has not opened yet refuses the
+    #    answer instead of queueing it.
     early = [r for r in releases if r.get("status") == "pending"]
     if early:
         refused = c.post(f"/sessions/{sid}/injects/{early[0]['release_id']}",
@@ -217,13 +265,19 @@ def _inject_workflow(c: httpx.Client, sid: str, *, wait_s: float) -> dict:
             raise JourneyError(
                 f"a submission before the release opened was not refused: "
                 f"HTTP {refused.status_code} {refused.text[:200]}")
-    # 2. wait for the incident to open, then answer it
+    # 2. wait for the incident to OPEN. A release is open when its window
+    #    has started (scheduled_at) and it is still pending: answering a
+    #    release that has not opened is refused, not accepted.
     opened = None
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
         inbox = _json(c.get(f"/sessions/{sid}/injects"), "inject inbox")
+        now = datetime.now(timezone.utc)
         for r in inbox.get("releases") or []:
-            if r.get("status") == "pending":
+            if r.get("status") != "pending":
+                continue
+            scheduled = _parse_iso(r.get("scheduled_at"))
+            if scheduled is None or scheduled <= now:
                 opened = r
                 break
         if opened is not None:
@@ -232,14 +286,31 @@ def _inject_workflow(c: httpx.Client, sid: str, *, wait_s: float) -> dict:
     if opened is None:
         raise JourneyError(f"no incident release opened within {wait_s:.0f}s — "
                            "the break/repair workflow was not exercised")
+    out["opened_at"] = opened.get("scheduled_at")
     first = c.post(f"/sessions/{sid}/injects/{opened['release_id']}",
                    json={"content": "the answer that decides the incident"})
     if first.status_code != 200:
         raise JourneyError(f"the submission to an open incident was refused: "
                            f"HTTP {first.status_code} {first.text[:300]}")
-    out["submission_status"] = (first.json() or {}).get("status")
+    decision = (first.json() or {}).get("status")
+    out["submission_status"] = decision
     out["inject_id"] = opened.get("inject_id")
-    # 3. the first answer decides
+    # 3. the DECISION: the verifier ran against the broken service and said
+    #    whether it was repaired ("correct") or still broken ("incorrect").
+    if decision not in ("correct", "incorrect", "late"):
+        raise JourneyError(f"the incident was not decided: {decision!r}")
+    out["decided"] = True
+    # 4. the SCORE changed: the closed incident enters the inject score.
+    after = _json(c.get(f"/sessions/{sid}/injects"), "inject inbox")
+    score = after.get("score") or {}
+    out["score_before"] = before
+    out["score_after"] = score
+    if int(score.get("technical_closed") or 0) <= \
+            int(before.get("technical_closed") or 0):
+        raise JourneyError(
+            "the decided incident did not change the inject score: "
+            f"before {before}, after {score}")
+    # 5. the first answer decides
     second = c.post(f"/sessions/{sid}/injects/{opened['release_id']}",
                     json={"content": "a second answer"})
     if second.status_code != 200:
