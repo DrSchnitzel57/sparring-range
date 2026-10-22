@@ -127,6 +127,23 @@ The contract checks that would have caught several of these at install time
 are now a gate of their own: `infra/dev/service_contract.py` (checked by the
 `install` gate and by `tests/test_appliance_service_contract.py`).
 
+### The second review round
+
+A second review of the first round's fixes returned **VERDICT: FIX** with 13
+findings; all of them are fixed (`dd88707`, `d36264a`, `45064d0` and the
+bundle/image commits). The evidence and the exact commands are in
+`docs/FINDINGS_CHECKLIST.md` ("Second review round"). Two things a reviewer
+should look at hardest in that round:
+
+* the cross-UID stop path (`srplatform/api/runs.py` +
+  `srplatform/worker_supervisor.py`): every callback carries the claim
+  credential, every final UPDATE is fenced by the claim hash, and the state
+  of one assignment is immutable — a late heartbeat cannot touch the next
+  one;
+* the shipped images (`deploy/bundle.py`): the bundle flattens an image that
+  depends on a backing file, verifies that what it ships stands alone, and
+  the bundle gate boots a shipped image from the bundle.
+
 ## Where I would look hardest
 
 1. `srplatform/bastion/proxy.py` — the interactive path changed three times

@@ -52,6 +52,54 @@ have and `apply` demanded the venv it creates; and the aggregate omitted
 the operator gates while `install` and `journey` checked less than they
 promised.
 
+## Second review round — 2026-10-22, branch `15`
+
+A second reviewer read the first round's fixes and returned **VERDICT: FIX**
+again, with 13 findings. Every reproduced one is fixed (commits `dd88707`,
+`d36264a`, `45064d0` and the bundle/image commits below). What changed:
+
+* **The supervisor's callbacks the first round missed.** Three failure-report
+  paths did not present the claim credential (the endpoint refused them with
+  422, so a run stopped between the claim and the assignment stayed
+  unresolved); the HTTP helper raised a bare `RuntimeError`, so the 409
+  handler was unreachable; a late heartbeat could clear the *next*
+  assignment's run id; and the final UPDATEs were not fenced by the claim
+  hash, so a claimant whose run was reclaimed could mark the new claim's run
+  failed and revoke its credentials. The assignment's state is now immutable
+  and belongs to that assignment; every report carries the credential; every
+  final UPDATE is fenced by the claim hash.
+* **The controller lock.** The scheduler kept dispatching duties after the
+  lock was lost: it is now fenced by the same ownership check and stops.
+* **The installation.** The hand-off still passed `--range-bridge` (the CLI
+  takes `--bridge`) and exited 2; the database bootstrap wrote its SQL to a
+  root-owned 0600 file the postgres user could not read and terminated
+  `\gexec` with a semicolon; the bastion and the ingest listener validated
+  the API's supervisor capability and the API validated the bastion's dial
+  key; the members were onboarded under the machine role names, so no person
+  could authenticate; the key pair was validated *after* the copy, so a
+  mismatched half was installed and a rerun accepted it; a dry run changed
+  the capability's permissions.
+* **The shipped artifacts.** The three role images referenced the build
+  machine's deleted backing files. They are now flattened and self-contained,
+  the bundle verifies that what it ships stands alone, and the bundle gate
+  **boots a shipped image from the bundle** (through a throwaway overlay, so
+  the released artifact is not modified) and proves it becomes ready.
+* **The acceptance.** The aggregate exited 0 while mandatory gates were
+  pending; the bundle gate accepted placeholder image bytes; the journey
+  answered an incident before its window opened and mistook the login page's
+  own heading for a successful login, and it echoed the member's password
+  in its diagnostics.
+
+| Command | Result |
+|---|---|
+| `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD .venv/bin/python -m pytest -q -ra -p no:cacheprovider` | **424 passed, 0 failed, 0 skipped**, 262 deselected, 4 warnings (66 s) |
+| `… acceptance.py install` | **PASS** (7 s) — the real install sequences in a sandbox root + the managed-service contract check |
+| `… acceptance.py bundle` | **PASS** (232 s) — the release bundle (306 files, 4 images) verifies in place, the operator manifest renders from it, **the shipped `mojang-web-local` image boots from the bundle and becomes ready** (TCG), and a tampered bundle is refused |
+| `… acceptance.py db` | **PASS** (467 s) — 177 db tests, 0 skipped (the fenced callbacks, the guarded terminal transition, the cross-UID stop and the rotation-during-cancellation regression) |
+| `… acceptance.py hypervisor` / `access` / `authority` / `containment` / `frontend` / `browser` | **PASS** — unchanged by this round (the hypervisor gate needs `sh .cache/libvirt-debs/start-session.sh` first) |
+| `… acceptance.py images` | **PASS** (1871 s, 18 passed / 1 skipped) — the role images build and boot |
+| `… acceptance.py packet` / `journey` | **PENDING (environment)** — root + `nft`; the installed appliance with the member's SSH key, the pinned bastion host key and the browser login. The aggregate now FAILS while a mandatory gate is pending |
+
 ## Milestone 15 implementation evidence — 2026-10-20/21, branch `15`
 
 > Reviewer handoff (read this first): [docs/HANDOFF-15.md](HANDOFF-15.md) —
