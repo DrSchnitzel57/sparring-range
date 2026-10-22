@@ -24,9 +24,12 @@ def test_the_browser_diagnostics_never_echo_the_password(tmp_path):
     fake = tmp_path / "fake-playwright"
     # the browser opens, then the FILL fails and echoes every argument it
     # was given (including the password).
+    # the USERNAME fill succeeds; the PASSWORD fill fails and echoes every
+    # argument it was given (including the password).
+    # $1=-s=<session> $2=fill $3=<selector> $4=<value>
     fake.write_text("#!/bin/sh\n"
-                    "case \"$2\" in\n"
-                    "  fill) echo \"fill failed with: $*\"; exit 3;;\n"
+                    "case \"$3\" in\n"
+                    "  *password*) echo \"fill failed with: $*\"; exit 3;;\n"
                     "  *) exit 0;;\n"
                     "esac\n")
     fake.chmod(0o755)
@@ -36,6 +39,29 @@ def test_the_browser_diagnostics_never_echo_the_password(tmp_path):
     text = str(bad.value)
     assert secret not in text, text
     assert "***" in text, text
+
+
+def test_a_password_fill_timeout_does_not_disclose_the_password(tmp_path):
+    """A TIMEOUT escapes before the exit-status redaction.
+
+    The original exception carries the whole command line — with the
+    password in it — so it is caught and replaced by a sanitized message.
+    """
+    secret = "SYNTHETIC-PASSWORD-DO-NOT-LOG"
+    fake = tmp_path / "stalling-playwright"
+    fake.write_text("#!/bin/sh\n"
+                    "case \"$3\" in\n"
+                    "  *password*) sleep 30;;\n"
+                    "  *) exit 0;;\n"
+                    "esac\n")
+    fake.chmod(0o755)
+    with pytest.raises(journey.JourneyError) as bad:
+        journey._browser_check("https://appliance.invalid", "alice", secret,
+                               cli=str(fake), timeout=2)
+    text = str(bad.value)
+    assert secret not in text, text
+    assert "***" in text, text
+    assert "timed out" in text, text
 
 
 def test_the_redactor_hides_the_value_not_the_selector():
@@ -93,6 +119,24 @@ def test_the_break_repair_transition_is_observed(monkeypatch):
     assert any("systemctl start" in c for c in commands)
     # the score was taken twice: once broken, once repaired
     assert operator.calls >= 2
+
+
+def test_a_stopped_service_is_observed_by_the_liveness_check(monkeypatch):
+    """`service_present` asks whether the unit EXISTS.
+
+    A stopped unit still exists, so the break must be observed by the
+    LIVENESS check (http_content): with the service present but not
+    serving, the break is real and the journey must accept it.
+    """
+
+    async def _fake_exec(conn, key, known_hosts, command):
+        return {"exit_status": 0, "stdout": "ok", "stderr": ""}
+
+    monkeypatch.setattr(journey, "_ssh_exec", _fake_exec)
+    operator = _ScoreClient(["fail", "pass"])
+    out = journey._break_repair(None, operator, "sid-1", conn={}, ssh_key="k",
+                                known_hosts="h")
+    assert out["verified"] is True
 
 
 def test_a_break_that_is_not_observed_fails_the_journey(monkeypatch):

@@ -1670,21 +1670,38 @@ def _role_images(tmp: pathlib.Path) -> tuple[dict, dict]:
     return out, real
 
 
-def _copy_bundle(bundle: pathlib.Path, target: pathlib.Path) -> None:
-    """Copy a bundle for a destructive test (without the gigabyte images)."""
-    import shutil as _sh
+def _build_disposable_bundle(tmp: pathlib.Path, target: pathlib.Path) -> None:
+    """Build a small, SELF-CONTAINED bundle for the destructive test.
 
-    target.mkdir(parents=True, exist_ok=True)
-    for path in sorted(bundle.rglob("*")):
-        rel = path.relative_to(bundle)
-        if rel.parts and rel.parts[0] == "images":
-            continue          # the images are verified in place, not copied
-        dst = target / rel
-        if path.is_dir():
-            dst.mkdir(parents=True, exist_ok=True)
+    It carries real (tiny) qcow2 images, so it verifies exactly like the
+    release bundle: the negative test then fails for the tampering and not
+    for a missing file.
+    """
+    import shutil as _sh
+    import subprocess as _sp
+
+    images = tmp / "tiny-images"
+    images.mkdir(parents=True, exist_ok=True)
+    roles = ("attacker", "mojang-web-local", "mojang-web-db")
+    args: list[str] = []
+    for role in ("appliance-base",) + roles:
+        path = images / f"{role}.qcow2"
+        r = _sp.run(["qemu-img", "create", "-f", "qcow2", str(path), "8M"],
+                    capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            fail("the disposable bundle is valid",
+                 f"cannot create the tiny image {path}: {r.stderr[-200:]}")
+        if role == "appliance-base":
+            args += ["--base-image", str(path)]
         else:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            _sh.copyfile(path, dst)
+            args += ["--role-image", f"{role}={path}"]
+    r = _sp.run([sys.executable, str(REPO / "deploy/bundle.py"), "build",
+                 "--output", str(target), *args],
+                capture_output=True, text=True, cwd=REPO, timeout=3600)
+    if r.returncode != 0:
+        fail("the disposable bundle is valid",
+             f"the fixture could not be built: {(r.stdout + r.stderr)[-600:]}")
+    _sh.rmtree(images, ignore_errors=True)
 
 
 def _bind_bundle_to_candidate(bundle: pathlib.Path) -> None:
@@ -1692,39 +1709,52 @@ def _bind_bundle_to_candidate(bundle: pathlib.Path) -> None:
 
     A bundle verifies against itself: a bundle built from an older revision
     would pass every internal check while shipping yesterday's code.  The
-    packaged runtime, the configuration and the lock file are therefore
-    compared with the checkout, digest by digest.
+    comparison is therefore COMPLETE and BIDIRECTIONAL:
+
+    * every runtime file the checkout has must be IN the bundle with the
+      same digest (a bundle that omits ``srplatform/settings.py`` is not
+      the checkout), and
+    * every runtime file the bundle has must be IN the checkout (a stale
+      login page or an old module is not the checkout either).
+
+    The frontend's source and configuration are part of the runtime: the
+    browser loads the bundle's web files, so they are compared like the
+    rest.
     """
     import hashlib
 
+    from deploy.bundle import app_file_relpaths, is_runtime
+
     manifest_path = bundle / "MANIFEST.json"
     if not manifest_path.is_file():
-        fail("release bundle binding",
-             f"{bundle} has no MANIFEST.json")
+        fail("release bundle binding", f"{bundle} has no MANIFEST.json")
     files = json.loads(manifest_path.read_text()).get("files") or {}
-    roots = ("srplatform/", "deploy/", "infra/", "verifiers/", "telemetry/",
-             "audit/", "rangectl/", "scenarios/", "web/package-lock.json",
-             "requirements.lock", "pyproject.toml", "alembic.ini")
-    stale: list[str] = []
-    for rel, meta in sorted(files.items()):
-        if not any(rel == root or rel.startswith(root) for root in roots):
-            continue
+    packaged = {rel for rel in files if is_runtime(rel)}
+    expected = {rel for rel in app_file_relpaths(REPO) if is_runtime(rel)}
+    missing = sorted(expected - packaged)
+    extra = sorted(packaged - expected)
+    changed: list[str] = []
+    for rel in sorted(expected & packaged):
         source = REPO / rel
         if not source.is_file():
-            stale.append(f"{rel} is not in the checkout")
+            extra.append(rel)
             continue
         h = hashlib.sha256()
         with source.open("rb") as fh:
             for block in iter(lambda: fh.read(1 << 20), b""):
                 h.update(block)
-        if h.hexdigest() != meta.get("sha256"):
-            stale.append(rel)
-    if stale:
+        if h.hexdigest() != files[rel].get("sha256"):
+            changed.append(rel)
+    if missing or extra or changed:
         fail("release bundle binding",
-             f"{len(stale)} packaged file(s) are not the checkout under test "
-             f"(first: {stale[:5]}) — rebuild the bundle before accepting it")
+             f"the release bundle is not the checkout under test: "
+             f"{len(missing)} missing (first: {missing[:3]}), "
+             f"{len(extra)} not in the checkout (first: {extra[:3]}), "
+             f"{len(changed)} changed (first: {changed[:3]}) — rebuild the "
+             "bundle before accepting it")
     ok("the release bundle is bound to the checkout under test",
-       f"{len(files)} packaged files compared")
+       f"{len(packaged)} runtime files compared (missing, stale and changed "
+       "all checked)")
 
 
 def _wait_guest_ready(qga_sock: pathlib.Path, proc: subprocess.Popen,
@@ -1938,11 +1968,22 @@ def check_bundle() -> None:
         # accepted, and it is never skipped into a pass.
         _shipped_image_boots(tmp, bundle)
 
-        # a tampered bundle is refused — on a DISPOSABLE copy of the
-        # release, never on the release itself: a cancelled gate must not
-        # leave a damaged artifact behind.
-        disposable = tmp / "tamper-copy"
-        _copy_bundle(bundle, disposable)
+        # a tampered bundle is refused — on a DISPOSABLE bundle of its own
+        # (never on the release: a cancelled gate must not leave a damaged
+        # artifact behind).  The fixture is verified FIRST: it must be
+        # internally valid, so the refusal below is caused by the tampering
+        # and not by a missing file.
+        disposable = tmp / "tamper-bundle"
+        _build_disposable_bundle(tmp, disposable)
+        positive = subprocess.run(
+            [sys.executable, str(REPO / "deploy/bundle.py"), "verify",
+             str(disposable)], capture_output=True, text=True, cwd=REPO,
+            timeout=1800)
+        if positive.returncode != 0:
+            fail("the disposable bundle is valid",
+                 f"the fixture the negative test uses does not verify: "
+                 f"{positive.stdout[-600:]}")
+        ok("the disposable bundle is valid before it is tampered with")
         victim = disposable / "requirements.lock"
         victim.write_bytes(b"tampered\n")
         t = subprocess.run(
@@ -1953,7 +1994,12 @@ def check_bundle() -> None:
             fail("a tampered bundle is refused",
                  "verify accepted a bundle whose file no longer matches "
                  "its digest")
-        ok("a tampered bundle is refused")
+        problems = (json.loads(t.stdout or "{}").get("problems") or [])
+        if not any("drift" in p for p in problems):
+            fail("a tampered bundle is refused for the right reason",
+                 f"the refusal was not a digest mismatch: {problems[:5]}")
+        ok("a tampered bundle is refused",
+           f"digest drift detected: {problems[0][:80]}")
     finally:
         _sh.rmtree(tmp, ignore_errors=True)
 

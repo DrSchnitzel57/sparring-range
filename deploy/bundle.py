@@ -102,6 +102,32 @@ def _revision() -> str:
         return "unknown"
 
 
+# The directories and top-level files a release bundle carries.
+APP_DIRS = ("docs", "deploy", "scenarios", "srplatform", "rangectl", "infra",
+            "tests", "web", "audit", "verifiers", "telemetry")
+APP_FILES = ("pyproject.toml", "requirements.lock", "alembic.ini", "README.md",
+             "AGENTS.md")
+# The parts of the bundle that are RUNTIME: what the appliance executes.
+RUNTIME_DIRS = ("srplatform", "deploy", "infra", "verifiers", "telemetry",
+                "audit", "rangectl", "scenarios", "web")
+RUNTIME_FILES = ("pyproject.toml", "requirements.lock", "alembic.ini")
+
+
+def is_runtime(rel) -> bool:
+    """Is this packaged path part of the application's runtime?"""
+    rel = str(rel)
+    if rel in RUNTIME_FILES:
+        return True
+    head = rel.split("/", 1)[0]
+    return head in RUNTIME_DIRS
+
+
+def app_file_relpaths(root: pathlib.Path) -> set[str]:
+    """The relative paths a bundle built from ``root`` carries."""
+    return {str(rel) for rel, _path in _iter_app_files(root)
+            if rel.parts[0] in APP_DIRS or rel.parts[0] in APP_FILES}
+
+
 def _iter_app_files(root: pathlib.Path):
     for path in sorted(root.rglob("*")):
         if not path.is_file():
@@ -204,11 +230,7 @@ def build(output: pathlib.Path, *, base_image: pathlib.Path,
 
     # 1. the application (source + locked dependencies + tests)
     for rel, path in _iter_app_files(app_dir):
-        if rel.parts[0] in ("docs", "deploy", "scenarios", "srplatform",
-                            "rangectl", "infra", "tests", "web", "audit",
-                            "verifiers", "telemetry") or \
-                rel.parts[0] in ("pyproject.toml", "requirements.lock",
-                                 "alembic.ini", "README.md", "AGENTS.md"):
+        if rel.parts[0] in APP_DIRS or rel.parts[0] in APP_FILES:
             add(path, str(rel))
     # 2. the guest base images — self-contained, verified
     images = {}

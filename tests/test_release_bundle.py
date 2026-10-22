@@ -190,3 +190,41 @@ def test_a_bundle_that_is_not_the_checkout_is_refused(tmp_path, capfd):
         acc._bind_bundle_to_candidate(out)
     assert "release bundle binding" in str(bad.value)
     assert "srplatform/settings.py" in capfd.readouterr().out
+
+
+def test_a_bundle_that_omits_a_runtime_file_is_refused(tmp_path, capfd):
+    """A bundle that leaves a runtime file out is not the checkout."""
+    import infra.dev.acceptance as acc
+
+    out = _build(tmp_path)
+    victim = out / "srplatform" / "settings.py"
+    victim.unlink()
+    manifest = json.loads((out / bundle_mod.MANIFEST_NAME).read_text())
+    manifest["files"].pop("srplatform/settings.py")
+    (out / bundle_mod.MANIFEST_NAME).write_text(
+        json.dumps(manifest, indent=2, sort_keys=True))
+    with pytest.raises(acc.Failed):
+        acc._bind_bundle_to_candidate(out)
+    detail = capfd.readouterr().out
+    assert "missing" in detail, detail
+    assert "srplatform/settings.py" in detail, detail
+
+
+def test_a_bundle_with_a_stale_frontend_file_is_refused(tmp_path, capfd):
+    """The frontend's files are runtime: a stale login page is not the
+    checkout either."""
+    import infra.dev.acceptance as acc
+
+    out = _build(tmp_path)
+    stale = out / "web" / "stale-page.js"
+    stale.write_text("// yesterday's login page\n")
+    manifest = json.loads((out / bundle_mod.MANIFEST_NAME).read_text())
+    manifest["files"]["web/stale-page.js"] = {
+        "sha256": bundle_mod._sha256(stale), "bytes": stale.stat().st_size}
+    (out / bundle_mod.MANIFEST_NAME).write_text(
+        json.dumps(manifest, indent=2, sort_keys=True))
+    with pytest.raises(acc.Failed):
+        acc._bind_bundle_to_candidate(out)
+    detail = capfd.readouterr().out
+    assert "not in the checkout" in detail, detail
+    assert "web/stale-page.js" in detail, detail

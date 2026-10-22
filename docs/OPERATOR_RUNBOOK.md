@@ -295,10 +295,14 @@ curl -sS -X POST https://sr.example.edu/api/admin/service_tokens \
      -d '{"scope": "bastion"}'
 # -> {"token": "svc-bastion-...", ...}
 
-# 2. it goes into the bastion's own file
-install -m 0600 -o root -g srbastion /dev/null \
-     /etc/sparring-range/secrets/bastion.token
-printf '%s' 'svc-bastion-...' > /etc/sparring-range/secrets/bastion.token
+# 2. it goes into the bastion's own file (the bastion's directory is
+#    0750 root:srbastion; the file is 0640 root:srbastion, so the service
+#    can read it and nobody else can)
+install -m 0640 -o root -g srbastion /dev/null \
+     /etc/sparring-range/ssh/bastion.token
+printf '%s' 'svc-bastion-...' > /etc/sparring-range/ssh/bastion.token
+chown root:srbastion /etc/sparring-range/ssh/bastion.token
+chmod 0640 /etc/sparring-range/ssh/bastion.token
 systemctl restart sr-bastion
 ```
 

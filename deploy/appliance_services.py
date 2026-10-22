@@ -342,21 +342,26 @@ def ensure_bastion_token_file(run, *, etc: pathlib.Path,
     import grp as _grp
     import pwd as _pwd
 
-    path = etc / "secrets" / "bastion.token"
+    # The file lives in the BASTION'S OWN directory (0750 root:srbastion):
+    # a secret under the shared secrets directory is unreachable for an
+    # identity that is not in sr-secrets, and a 0600 root-owned file is
+    # unreadable by the service as well.
+    path = etc / "ssh" / "bastion.token"
     path.parent.mkdir(parents=True, exist_ok=True)
     created = False
     if not path.exists():
         path.write_text("")
         created = True
-    run("chmod", "0600", str(path), check=False)
+    run("chmod", "0640", str(path), check=False)
     if not sandboxed:
         try:
-            uid = _pwd.getpwnam("srbastion").pw_uid
+            uid = _pwd.getpwnam("root").pw_uid
             gid = _grp.getgrnam("srbastion").gr_gid
             run("chown", f"{uid}:{gid}", str(path), check=False)
         except KeyError:
             pass
     return {"path": str(path), "created": created,
+            "mode": "0640", "owner": "root:srbastion",
             "note": "put the API's bastion service token in this file "
                     "(POST /admin/service_tokens with scope 'bastion')"}
 

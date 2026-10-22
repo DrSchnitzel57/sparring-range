@@ -383,3 +383,29 @@ def test_the_bastion_owns_its_service_token():
         if old is not None:
             _os.environ["SR_BASTION_TOKEN"] = old
     assert headers.get("Authorization") == "Bearer svc-bastion-abc123"
+
+
+def test_the_bastion_token_file_is_reachable_by_the_bastion(tmp_path):
+    """Owning a file is not enough: the service must be able to TRAVERSE
+    its directory and READ the file."""
+    from deploy import appliance as installer
+    from deploy import appliance_services as svc
+
+    calls: list[tuple] = []
+
+    def run(*args, **kwargs):
+        calls.append(args)
+
+    etc = tmp_path / "etc"
+    out = svc.ensure_bastion_token_file(run, etc=etc, sandboxed=True)
+    # it lives in the bastion's OWN directory, not under the shared secrets
+    # directory (which srbastion may not traverse)
+    assert out["path"] == str(etc / "ssh" / "bastion.token"), out
+    assert installer.SSH_DIR_GROUP == "srbastion"
+    assert installer.SSH_DIR_MODE & 0o010, "the group cannot traverse it"
+    # 0640 root:srbastion: the service's group reads it
+    assert out["mode"] == "0640"
+    assert out["owner"] == "root:srbastion"
+    assert ("chmod", "0640", str(etc / "ssh" / "bastion.token")) in calls
+    # the shared secrets directory is NOT the bastion's
+    assert installer.SECRET_DIR_GROUP != "srbastion"

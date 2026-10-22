@@ -89,6 +89,11 @@ class InstallError(RuntimeError):
 SECRET_DIR_MODE = 0o750
 SECRET_DIR_GROUP = "sr-secrets"
 
+# The bastion's own directory: it holds the keys and the service token the
+# bastion reads, and it is traversable by the bastion's group.
+SSH_DIR_MODE = 0o750
+SSH_DIR_GROUP = "srbastion"
+
 
 # --------------------------------------------------------------------------- #
 # pure rendering                                                              #
@@ -333,7 +338,10 @@ def render_bastion_env(m: ApplianceManifest, *,
         # (0600, root:srbastion), never in a shared environment. The API
         # issues it (POST /admin/service_tokens, scope "bastion"); the
         # operator writes it here.
-        ("SR_BASTION_TOKEN_FILE", str(etc / "secrets/bastion.token")),
+        # The bastion's OWN directory (0750 root:srbastion): the token must
+        # be reachable by the identity that reads it.  The secrets
+        # directory is root:sr-secrets, which srbastion may not traverse.
+        ("SR_BASTION_TOKEN_FILE", str(etc / "ssh/bastion.token")),
     ])
 
 
@@ -719,7 +727,7 @@ def _ensure_dirs(m: ApplianceManifest, run: Runner, lay: Layout) -> None:
              "sr-broker-clients"),
             (lay.run, 0o750, "srbroker", "sr-broker-clients"),
             (lay.etc / "tls", 0o755, "root", "root"),
-            (lay.etc / "ssh", 0o750, "root", "srbastion")):
+            (lay.etc / "ssh", SSH_DIR_MODE, "root", SSH_DIR_GROUP)):
         if lay.sandboxed:
             # A sandbox install cannot create system identities; the mode is
             # still enforced so the receipt describes the intended layout.

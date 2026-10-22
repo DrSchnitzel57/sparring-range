@@ -198,8 +198,17 @@ def _browser_check(base_url: str, username: str, password: str, *,
     session = f"sr-journey-{uuid.uuid4().hex[:8]}"
 
     def pw(*args, check=True, timeout=timeout):
-        r = subprocess.run([cli, f"-s={session}", *args], capture_output=True,
-                           text=True, timeout=timeout, cwd=str(REPO))
+        try:
+            r = subprocess.run([cli, f"-s={session}", *args],
+                               capture_output=True, text=True, timeout=timeout,
+                               cwd=str(REPO))
+        except subprocess.TimeoutExpired as exc:
+            # The original exception carries the FULL command line — with
+            # the member's password in it.  It is never re-raised: the
+            # diagnostics name the redacted command only.
+            raise JourneyError(
+                f"playwright-cli {' '.join(_redact_args(args))} -> timed out "
+                f"after {timeout}s") from None
         if check and r.returncode != 0:
             # The command line may carry the member's PASSWORD (the fill
             # command's value): the diagnostics must never echo it.
@@ -254,10 +263,16 @@ def _parse_iso(text) -> datetime | None:
 
 
 def _availability_checks(card: dict) -> list[dict]:
-    """The scorecard's availability checks (the recover domain)."""
+    """The scorecard's LIVENESS checks.
+
+    Only the checks that observe whether the service actually SERVES can
+    see a service being stopped: ``service_present`` asks whether the unit
+    exists, and a stopped unit still exists — using it would make the
+    journey reject a genuine break.  ``http_content`` probes the service
+    over the management channel, so it fails when the service is stopped.
+    """
     items = card.get("items") or []
-    return [i for i in items
-            if i.get("verifier") in ("http_content", "service_present")]
+    return [i for i in items if i.get("verifier") == "http_content"]
 
 
 def _break_repair(member: httpx.Client, operator: httpx.Client, sid: str, *,
@@ -282,48 +297,65 @@ def _break_repair(member: httpx.Client, operator: httpx.Client, sid: str, *,
                                f"{r.text[:300]}")
         return r.json() or {}
 
-    # 1. the BREAK
-    stopped = asyncio.run(_ssh_exec(
-        conn, ssh_key, known_hosts, f"sudo -n systemctl stop {service}"))
-    out["break_command"] = stopped
-    if stopped.get("exit_status") != 0:
-        raise JourneyError(f"the journey could not stop {service}: {stopped}")
-    broken = score()
-    out["broken"] = broken
-    checks = _availability_checks(broken)
-    if not checks:
-        raise JourneyError("the scorecard has no availability check to "
-                           "observe the break with")
-    if any(c.get("status") == "passed" for c in checks):
-        raise JourneyError(
-            "the break was not observed: the availability checks still pass "
-            f"with {service} stopped: {[c.get('verifier') for c in checks]}")
+    stopped = False
+    try:
+        # 1. the BREAK
+        result = asyncio.run(_ssh_exec(
+            conn, ssh_key, known_hosts, f"sudo -n systemctl stop {service}"))
+        out["break_command"] = result
+        if result.get("exit_status") != 0:
+            raise JourneyError(f"the journey could not stop {service}: {result}")
+        stopped = True
+        broken = score()
+        out["broken"] = broken
+        checks = _availability_checks(broken)
+        if not checks:
+            raise JourneyError("the scorecard has no liveness check "
+                               "(http_content) to observe the break with")
+        if any(c.get("status") == "passed" for c in checks):
+            raise JourneyError(
+                "the break was not observed: the liveness check still passes "
+                f"with {service} stopped: "
+                f"{[(c.get('verifier'), c.get('status')) for c in checks]}")
 
-    # 2. the REPAIR
-    started = asyncio.run(_ssh_exec(
-        conn, ssh_key, known_hosts,
-        f"sudo -n systemctl start {service}; sleep 3; "
-        f"systemctl is-active {service}"))
-    out["repair_command"] = started
-    if started.get("exit_status") != 0:
-        raise JourneyError(f"the journey could not start {service}: {started}")
-    deadline = time.monotonic() + repair_timeout_s
-    repaired: dict = {}
-    while time.monotonic() < deadline:
-        repaired = score()
+        # 2. the REPAIR
+        started = asyncio.run(_ssh_exec(
+            conn, ssh_key, known_hosts,
+            f"sudo -n systemctl start {service}; sleep 3; "
+            f"systemctl is-active {service}"))
+        out["repair_command"] = started
+        if started.get("exit_status") != 0:
+            raise JourneyError(f"the journey could not start {service}: "
+                               f"{started}")
+        stopped = False
+        deadline = time.monotonic() + repair_timeout_s
+        repaired: dict = {}
+        while time.monotonic() < deadline:
+            repaired = score()
+            checks = _availability_checks(repaired)
+            if checks and all(c.get("status") == "passed" for c in checks):
+                break
+            time.sleep(5)
+        out["repaired"] = repaired
         checks = _availability_checks(repaired)
-        if checks and all(c.get("status") == "passed" for c in checks):
-            break
-        time.sleep(5)
-    out["repaired"] = repaired
-    checks = _availability_checks(repaired)
-    if not checks or not all(c.get("status") == "passed" for c in checks):
-        raise JourneyError(
-            "the repair was not verified: the availability checks did not "
-            f"pass after {service} was started: "
-            f"{[(c.get('verifier'), c.get('status')) for c in checks]}")
-    out["verified"] = True
-    return out
+        if not checks or not all(c.get("status") == "passed" for c in checks):
+            raise JourneyError(
+                "the repair was not verified: the liveness check did not "
+                f"pass after {service} was started: "
+                f"{[(c.get('verifier'), c.get('status')) for c in checks]}")
+        out["verified"] = True
+        return out
+    finally:
+        if stopped:
+            # The guest is left as the journey found it, even when the
+            # repair failed: a journey must not leave the practice
+            # environment broken.
+            try:
+                asyncio.run(_ssh_exec(
+                    conn, ssh_key, known_hosts,
+                    f"sudo -n systemctl start {service}"))
+            except Exception:  # noqa: BLE001 — the original error stands
+                pass
 
 
 def _inject_workflow(c: httpx.Client, sid: str, *, wait_s: float) -> dict:
