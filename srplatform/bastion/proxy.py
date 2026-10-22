@@ -352,7 +352,19 @@ class BastionProxy:
 
 # ---------------------------------------------------------------- production wiring
 def _svc_headers() -> dict:
-    tok = os.environ.get("SR_BASTION_TOKEN", "")
+    """The bastion's service credential.
+
+    It is a SECRET: it comes from the environment or from the bastion's own
+    0600 file, never from a shared environment every service loads.
+    """
+    tok = (os.environ.get("SR_BASTION_TOKEN") or "").strip()
+    if not tok:
+        path = os.environ.get("SR_BASTION_TOKEN_FILE", "").strip()
+        if path:
+            try:
+                tok = Path(path).read_text().strip()
+            except OSError:
+                tok = ""
     return {"Authorization": f"Bearer {tok}"} if tok else {}
 
 

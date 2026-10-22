@@ -329,6 +329,11 @@ def render_bastion_env(m: ApplianceManifest, *,
         ("SR_BASTION_CLIENT_KEY_PATH", str(etc / "ssh/bastion_client_ed25519")),
         ("SR_BASTION_TARGETS_KNOWN_HOSTS", str(etc / "known_hosts/range_hosts")),
         ("SR_RECORDINGS_DIR", m.recordings_dir),
+        # The bastion's SERVICE token: a secret in the bastion's OWN file
+        # (0600, root:srbastion), never in a shared environment. The API
+        # issues it (POST /admin/service_tokens, scope "bastion"); the
+        # operator writes it here.
+        ("SR_BASTION_TOKEN_FILE", str(etc / "secrets/bastion.token")),
     ])
 
 
@@ -890,6 +895,8 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
                        for username, key in m.member_public_keys().items()]
         services["onboarding"] = svc.onboard_operator(
             run, etc=lay.etc, authorized_keys=member_keys)
+        services["bastion_token"] = svc.ensure_bastion_token_file(
+            run, etc=lay.etc, sandboxed=lay.sandboxed)
         services["service_keys"] = svc.ensure_service_keys(
             run, etc=lay.etc, sandboxed=lay.sandboxed,
             access_keys={role: m.access_keys[role].path

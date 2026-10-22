@@ -329,3 +329,57 @@ def test_the_members_are_onboarded_under_their_own_usernames(tmp_path):
     with pytest.raises(RuntimeError):
         svc.onboard_operator(run, etc=etc,
                              authorized_keys=["ssh-ed25519 AAAA"])
+
+
+def test_a_corrupted_private_key_is_refused(tmp_path):
+    """A key that cannot produce its public half is an error, never a pass.
+
+    The adjacent .pub file is a hint, not a substitute: believing it would
+    install a broken pair and accept it again on the next run.
+    """
+    from deploy import appliance_services as svc
+
+    priv, pub = _keypair(tmp_path, "runner")
+    priv.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\ncorrupted\n")
+    etc = tmp_path / "etc"
+    with pytest.raises(RuntimeError) as bad:
+        svc.ensure_service_keys(lambda *a, **k: None, etc=etc,
+                                sandboxed=True,
+                                access_keys={"runner": str(pub)})
+    assert "cannot be read" in str(bad.value)
+    # nothing was installed
+    assert not (etc / "secrets" / "worker_runner_key").exists()
+
+
+def test_the_bastion_owns_its_service_token():
+    """The bastion's credential is a secret in the bastion's OWN file.
+
+    The unit no longer loads the controller's environment, so the token must
+    come from a source the bastion can read — otherwise every callback to
+    the API is refused and no member can authenticate.
+    """
+    from deploy import appliance as installer
+
+    m = _fake_manifest()
+    bastion = installer.render_bastion_env(m)
+    assert "SR_BASTION_TOKEN_FILE" in bastion
+    assert "SR_BASTION_TOKEN=" not in bastion
+    # the proxy reads the file when the environment has no token
+    from srplatform.bastion import proxy
+
+    import os as _os
+    import tempfile as _tempfile
+
+    tmp = pathlib.Path(_tempfile.mkdtemp(prefix="sr-bastion-token-"))
+    token_file = tmp / "bastion.token"
+    token_file.write_text("svc-bastion-abc123\n")
+    token_file.chmod(0o600)
+    old = _os.environ.pop("SR_BASTION_TOKEN", None)
+    _os.environ["SR_BASTION_TOKEN_FILE"] = str(token_file)
+    try:
+        headers = proxy._svc_headers()
+    finally:
+        _os.environ.pop("SR_BASTION_TOKEN_FILE", None)
+        if old is not None:
+            _os.environ["SR_BASTION_TOKEN"] = old
+    assert headers.get("Authorization") == "Bearer svc-bastion-abc123"

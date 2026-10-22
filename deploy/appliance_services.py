@@ -309,20 +309,56 @@ def _public_half(private_path) -> str:
     """The public half that belongs to a private key file.
 
     The private key is the authority: ``ssh-keygen -y`` derives the public
-    half from it.  A ``.pub`` file next to it is only a hint — it can
-    belong to a DIFFERENT key, and believing it would install a pair the
-    guests refuse.
+    half from it.  A ``.pub`` file next to it is only a hint and is NEVER
+    used as a substitute: a CORRUPTED private key would then "match" a
+    public half it cannot produce, and the broken pair would be installed
+    and accepted again on the next run.  A key that cannot be read is an
+    error, not a silent pass.
     """
     out = subprocess.run(["ssh-keygen", "-y", "-f", str(private_path)],
                          capture_output=True, text=True, timeout=30)
-    if out.returncode == 0 and out.stdout.strip():
-        parts = out.stdout.strip().split()
-        if len(parts) > 1:
-            return parts[1]
-    pub = pathlib.Path(str(private_path) + ".pub")
-    if pub.is_file():
-        return _public_line(pub)
-    return ""
+    detail = (out.stderr or out.stdout or "").strip()[:200]
+    if out.returncode != 0 or not out.stdout.strip():
+        raise RuntimeError(
+            f"the private key {private_path} cannot be read"
+            + (f": {detail}" if detail else ""))
+    parts = out.stdout.strip().split()
+    if len(parts) < 2:
+        raise RuntimeError(f"the private key {private_path} produced no "
+                           "public half")
+    return parts[1]
+
+
+def ensure_bastion_token_file(run, *, etc: pathlib.Path,
+                              sandboxed: bool = False) -> dict:
+    """Provision the file the bastion reads its service token from.
+
+    The token is issued by the API (POST /admin/service_tokens, scope
+    "bastion") and is shown once; the operator writes it here. The file is
+    created empty and 0600: the bastion refuses to start without a token
+    (its callbacks would be refused and no member could authenticate), so an
+    empty file fails loudly instead of silently.
+    """
+    import grp as _grp
+    import pwd as _pwd
+
+    path = etc / "secrets" / "bastion.token"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    created = False
+    if not path.exists():
+        path.write_text("")
+        created = True
+    run("chmod", "0600", str(path), check=False)
+    if not sandboxed:
+        try:
+            uid = _pwd.getpwnam("srbastion").pw_uid
+            gid = _grp.getgrnam("srbastion").gr_gid
+            run("chown", f"{uid}:{gid}", str(path), check=False)
+        except KeyError:
+            pass
+    return {"path": str(path), "created": created,
+            "note": "put the API's bastion service token in this file "
+                    "(POST /admin/service_tokens with scope 'bastion')"}
 
 
 def ensure_service_keys(run, *, etc: pathlib.Path,
@@ -361,7 +397,7 @@ def ensure_service_keys(run, *, etc: pathlib.Path,
             # was copied by an earlier, failed run must not be accepted
             # because the file exists.
             installed = _public_half(path)
-            if expected and installed and installed != expected:
+            if expected and installed != expected:
                 raise RuntimeError(
                     f"{path} is not the private half of {public}: the guest "
                     "templates would refuse it")
@@ -378,7 +414,7 @@ def ensure_service_keys(run, *, etc: pathlib.Path,
                 # templates have baked in — CHECKED BEFORE THE COPY, so a
                 # mismatched pair never reaches the appliance.
                 offered = _public_half(private)
-                if expected and offered and offered != expected:
+                if expected and offered != expected:
                     raise RuntimeError(
                         f"{private} is not the private half of {public}: the "
                         "guest templates would refuse it")

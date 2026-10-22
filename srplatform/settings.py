@@ -271,6 +271,10 @@ class Settings(BaseSettings):
     # generation (rebuild + reimport = new key).
     bastion_target_user: str = "defender"
     bastion_client_key_path: str = ""
+    # The bastion's SERVICE token: it authenticates the bastion's callbacks
+    # to the API.  It is a secret, so it lives in a file the bastion owns
+    # (0600), never in a shared environment.
+    bastion_token_file: str = ""
     recording_max_bytes: int = 32 * 1024 * 1024
 
     # --- Telemetry ingest (F09) ---
@@ -325,6 +329,21 @@ def process_role() -> str:
     ONLY role that may hold PVE credentials; it validates its own policy/TLS
     material instead of the controller's."""
     return os.environ.get("SR_PROCESS_ROLE", "controller")
+
+
+def _bastion_token(s: Settings) -> str:
+    """The bastion's service token, from the environment or its own file."""
+    import os as _os
+
+    token = (_os.environ.get("SR_BASTION_TOKEN") or "").strip()
+    if token:
+        return token
+    if s.bastion_token_file:
+        try:
+            return pathlib.Path(s.bastion_token_file).read_text().strip()
+        except OSError:
+            return ""
+    return ""
 
 
 def validate_production(s: Settings, role: str = "controller") -> None:
@@ -423,6 +442,12 @@ def validate_production(s: Settings, role: str = "controller") -> None:
         if not s.bastion_client_key_path:
             problems.append("bastion_client_key_path missing (the bastion "
                             "presents it when it dials the guests)")
+        # The bastion's service token: without it every callback to the API
+        # is refused and no member can authenticate.
+        if not _bastion_token(s):
+            problems.append("the bastion has no service token (SR_BASTION_TOKEN "
+                            "or bastion_token_file): its API callbacks would be "
+                            "refused and no member could authenticate")
         if s.bastion_client_key_path:
             try:
                 check_private_key(s.bastion_client_key_path,
