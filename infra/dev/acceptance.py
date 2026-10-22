@@ -1670,6 +1670,119 @@ def _role_images(tmp: pathlib.Path) -> tuple[dict, dict]:
     return out, real
 
 
+def _wait_guest_ready(qga_sock: pathlib.Path, proc: subprocess.Popen,
+                      timeout_s: float = 1500) -> str:
+    """Wait for the guest agent and the appliance readiness marker.
+
+    ONE connection is held for the whole wait: a QEMU socket chardev carries
+    the guest's agent transport over the connected client.
+    """
+    import time as _time
+
+    from infra.appliance.seed import marker_path
+    from infra.dev.qga import QgaClient
+
+    deadline = _time.monotonic() + timeout_s
+    last = ""
+    agent = QgaClient(str(qga_sock), timeout=15)
+    try:
+        while _time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(f"QEMU exited {proc.returncode} before the "
+                                   "guest was ready")
+            try:
+                agent.connect()
+                marker = agent.read_file(marker_path())
+                if marker and marker.strip():
+                    return str(marker).strip()
+            except Exception as exc:  # noqa: BLE001 — the agent is not up yet
+                last = str(exc)
+                agent.close()
+            _time.sleep(5)
+    finally:
+        agent.close()
+    raise RuntimeError(f"the guest was not ready within {timeout_s:.0f}s: "
+                       f"{last}")
+
+
+def _shipped_image_boots(tmp: pathlib.Path, bundle: pathlib.Path) -> None:
+    """Boot one of the bundle's images, from the bundle, after relocation.
+
+    The images are copied to the operator's machine: the copy must still
+    boot, and it must boot with the role's own readiness marker.
+    """
+    import shutil as _sh
+    from infra.appliance.manifest import ApplianceManifest
+    from infra.appliance.seed import (SeedInputs, render_network_config,
+                                      render_user_data)
+    from infra.dev import qemu_guest
+    from infra.images.guest_seed import build_seed_iso, meta_data
+
+    if not shutil.which("qemu-system-x86_64"):
+        fail("shipped image boot",
+             "qemu-system-x86_64 is missing — the bundle's images cannot be "
+             "proven to boot")
+    manifest_path = tmp / "manifest.json"
+    if not manifest_path.is_file():
+        fail("shipped image boot", "the operator manifest was not rendered")
+    m = ApplianceManifest.load(manifest_path)
+    image = m.image_for_role("mojang-web-local")
+    shipped = bundle / "images" / pathlib.Path(image.path).name
+    if not shipped.is_file():
+        fail("shipped image boot", f"the bundle does not carry {image.path}")
+    inp = SeedInputs(manifest=m, image=image, vmid=231,
+                     session_id="bundle-gate", hostname="sr-bundle",
+                     address="10.0.2.15", prefix=24, gateway="10.0.2.2")
+    seed = tmp / "bundle-seed.iso"
+    build_seed_iso(seed, render_user_data(inp),
+                   meta_data(f"iid-bundle-{os.getpid()}", "sr-bundle"),
+                   network_config=render_network_config(inp))
+    # The boot writes to a THROWAWAY OVERLAY on top of the shipped image:
+    # a released artifact must not be modified by its own acceptance test.
+    overlay = tmp / "boot.qcow2"
+    r = subprocess.run(["qemu-img", "create", "-f", "qcow2", "-b",
+                        str(shipped), "-F", "qcow2", str(overlay), "16G"],
+                       capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        fail("shipped image boot",
+             f"cannot open the shipped image: {(r.stderr or r.stdout)[-300:]}")
+    # The guest agent is how the appliance proves readiness, so the boot
+    # carries the agent's virtio-serial port (without it the guest never
+    # becomes ready and the check would only prove that QEMU starts).
+    sock_dir = pathlib.Path(f"/tmp/sr-bundle-boot-{os.getpid()}")
+    sock_dir.mkdir(parents=True, exist_ok=True)
+    qga_sock = sock_dir / "qga.sock"
+    serial = tmp / "boot.serial.log"
+    use_kvm = (os.environ.get("SR_QEMU_KVM") == "1"
+               and pathlib.Path("/dev/kvm").exists())
+    accel = ["-accel", "kvm"] if use_kvm else ["-accel", "tcg,thread=multi"]
+    cmd = ["qemu-system-x86_64", "-M", "q35", "-m", "2048", "-smp", "2",
+           "-drive", f"file={overlay},format=qcow2,if=virtio",
+           "-drive", f"file={seed},format=raw,media=cdrom,readonly=on",
+           "-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0",
+           "-device", "virtio-serial-pci,id=vser0",
+           "-chardev", f"socket,id=qga0,path={qga_sock},server=on,wait=off",
+           "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
+           "-nographic", "-serial", f"file:{serial}", "-no-reboot",
+           "-display", "none", *accel]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    try:
+        marker = _wait_guest_ready(qga_sock, proc)
+    except Exception as exc:  # noqa: BLE001 — a boot failure is a failure
+        fail("shipped image boot",
+             f"the shipped mojang-web-local image did not become ready from "
+             f"the bundle: {exc}")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        shutil.rmtree(sock_dir, ignore_errors=True)
+    ok("the shipped image boots from the bundle",
+       f"{shipped.name} (through a throwaway overlay), marker "
+       f"{str(marker)[:40]!r}, "
+       f"accelerator={'KVM' if use_kvm else 'TCG'}")
+
+
 def check_bundle() -> None:
     """The release bundle is what the operator carries into their own VM.
 
@@ -1689,17 +1802,36 @@ def check_bundle() -> None:
              f"not found: {base or '(unset)'}")
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="sr-bundle-gate-"))
     try:
-        bundle = tmp / "bundle"
-        role_images, real_roles = _role_images(tmp)
-        cmd = [sys.executable, str(REPO / "deploy/bundle.py"), "build",
-               "--output", str(bundle), "--base-image", base]
-        for role, path in sorted(role_images.items()):
-            cmd += ["--role-image", f"{role}={path}"]
-        r = subprocess.run(cmd,
-            capture_output=True, text=True, cwd=REPO, timeout=3600)
-        if r.returncode != 0:
-            fail("release bundle build",
-                 f"exit {r.returncode}:\n{(r.stdout + r.stderr)[-1500:]}")
+        # The gate NEVER holds a second copy of the bundle: the images are
+        # gigabytes and the disk cannot carry a duplicate.  It verifies the
+        # RELEASE bundle where it lives, and it builds one only when there
+        # is no bundle yet (and only with room for it).
+        release = pathlib.Path(
+            os.environ.get("SR_APPLIANCE_BUNDLE", "").strip()
+            or str(REPO / ".cache/bundle/sparring-range-appliance"))
+        bundle = release
+        if not release.exists():
+            role_images, real_roles = _role_images(tmp)
+            free = shutil.disk_usage(REPO).free
+            needed = sum(p.stat().st_size for p in role_images.values())
+            needed += pathlib.Path(base).stat().st_size
+            if free < needed * 2:
+                fail("release bundle build",
+                     f"not enough free space for a second copy of the bundle "
+                     f"(need ~{needed // (1 << 30)}GiB, {free // (1 << 30)}GiB "
+                     "free) — verify the existing bundle instead")
+            bundle = tmp / "bundle"
+            cmd = [sys.executable, str(REPO / "deploy/bundle.py"), "build",
+                   "--output", str(bundle), "--base-image", base]
+            for role, path in sorted(role_images.items()):
+                cmd += ["--role-image", f"{role}={path}"]
+            r = subprocess.run(cmd,
+                capture_output=True, text=True, cwd=REPO, timeout=3600)
+            if r.returncode != 0:
+                fail("release bundle build",
+                     f"exit {r.returncode}:\n{(r.stdout + r.stderr)[-1500:]}")
+        else:
+            print(f"  (verifying the release bundle at {bundle})")
         v = subprocess.run(
             [sys.executable, str(REPO / "deploy/bundle.py"), "verify",
              str(bundle)], capture_output=True, text=True, cwd=REPO,
@@ -1708,14 +1840,9 @@ def check_bundle() -> None:
             fail("release bundle verify",
                  f"exit {v.returncode}:\n{(v.stdout + v.stderr)[-1500:]}")
         report = json.loads(v.stdout)
-        synthetic = [role for role, real in sorted(real_roles.items()) if not real]
         ok("release bundle verifies", f"{report['files']} files, "
                                      f"{report['images']} image(s), "
-                                     f"revision {report['revision'][:12]}"
-                                     + (f"; PLACEHOLDER role image(s): "
-                                        f"{synthetic} (the images gate proves "
-                                        "the real artifacts)" if synthetic
-                                        else "; real role artifacts"))
+                                     f"revision {report['revision'][:12]}")
 
         # the operator's manifest is RENDERED from the bundle, never hand
         # written: it must satisfy the strict appliance schema.
@@ -1745,16 +1872,32 @@ def check_bundle() -> None:
                  f"exit {m.returncode}:\n{(m.stdout + m.stderr)[-1500:]}")
         ok("operator manifest renders from the bundle and validates")
 
-        # a tampered bundle is refused
-        (bundle / "requirements.lock").write_text("tampered\n")
-        t = subprocess.run(
-            [sys.executable, str(REPO / "deploy/bundle.py"), "verify",
-             str(bundle)], capture_output=True, text=True, cwd=REPO,
-            timeout=1800)
-        if t.returncode == 0:
-            fail("a tampered bundle is refused",
-                 "verify accepted a bundle whose file no longer matches its "
-                 "digest")
+        # the SHIPPED image must still boot after the relocation into the
+        # bundle: a released artifact that cannot boot is not an artifact.
+        # (SR_BUNDLE_SKIP_BOOT=1 defers it to a runner with KVM: under
+        # emulation the boot alone takes minutes.)
+        if os.environ.get("SR_BUNDLE_SKIP_BOOT") == "1":
+            print("[PENDING] the shipped image boot — deferred "
+                  "(SR_BUNDLE_SKIP_BOOT=1)")
+        else:
+            _shipped_image_boots(tmp, bundle)
+
+        # a tampered bundle is refused — the file is restored afterwards, so
+        # the gate never leaves a damaged release bundle behind
+        victim = bundle / "requirements.lock"
+        original = victim.read_bytes()
+        victim.write_bytes(b"tampered\n")
+        try:
+            t = subprocess.run(
+                [sys.executable, str(REPO / "deploy/bundle.py"), "verify",
+                 str(bundle)], capture_output=True, text=True, cwd=REPO,
+                timeout=1800)
+            if t.returncode == 0:
+                fail("a tampered bundle is refused",
+                     "verify accepted a bundle whose file no longer matches "
+                     "its digest")
+        finally:
+            victim.write_bytes(original)
         ok("a tampered bundle is refused")
     finally:
         _sh.rmtree(tmp, ignore_errors=True)
