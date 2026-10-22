@@ -100,6 +100,49 @@ again, with 13 findings. Every reproduced one is fixed (commits `dd88707`,
 | `… acceptance.py images` | **PASS** (1871 s, 18 passed / 1 skipped) — the role images build and boot |
 | `… acceptance.py packet` / `journey` | **PENDING (environment)** — root + `nft`; the installed appliance with the member's SSH key, the pinned bastion host key and the browser login. The aggregate now FAILS while a mandatory gate is pending |
 
+## Third review round — 2026-10-22, branch `15`
+
+A third review of the second round's fixes returned **VERDICT: FIX** with
+seven findings. All of them are fixed (`51f4166`, `fec3f53`, `0a6638e`,
+`818d99e`):
+
+* **The bastion had lost its API credential.** Splitting the services'
+  environments took the controller's environment — and the service token
+  the bastion's callbacks need — away from the bastion, so every callback
+  was unauthenticated and no member could authenticate. The bastion now
+  owns its credential: a 0600 file (`SR_BASTION_TOKEN_FILE`), provisioned
+  by the installer, named in the bastion's environment, and required by the
+  production validation (an empty file fails loudly).
+* **The password still leaked.** The redaction hid the *selector* of a
+  `fill` command and left the password in the exception. The value is the
+  secret; it is hidden now, in the command line and in the captured
+  output, with execution-level tests.
+* **The journey did not prove a break/repair.** It accepted a wrong
+  answer and checked that a counter went up. The journey now stops the
+  practice service on the defender guest, requires the API's trusted
+  checks to FAIL, repairs the service and requires them to PASS — an
+  observable failure → repair → verified success transition.
+* **A corrupted private key was accepted.** The public-half derivation
+  failed and the adjacent `.pub` file was used instead. A key that cannot
+  produce its public half is now an error.
+* **The gate could damage the release.** The tamper test overwrote the
+  release's `requirements.lock`, and the write preceded the restoring
+  `try`. The negative test now runs on a disposable copy.
+* **A reused bundle was not bound to the candidate.** A bundle built from
+  an older revision verifies against itself. The packaged runtime,
+  configuration and lock file are compared with the checkout under test,
+  digest by digest; a stale bundle is refused.
+* **The shipped-image boot was skippable into a pass.** It is mandatory
+  now: there is no skip, and the gate fails without the proof.
+
+| Command | Result |
+|---|---|
+| `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD .venv/bin/python -m pytest -q -ra -p no:cacheprovider` | **432 passed, 0 failed, 0 skipped**, 262 deselected, 4 warnings (73 s) |
+| `… acceptance.py install` | **PASS** (8 s) — the real install sequences + the managed-service contract check |
+| `… acceptance.py bundle` | **PASS** (207 s) — the release bundle (307 files, 4 images) verifies, **is bound to the checkout under test** (307 packaged files compared), the operator manifest renders, **the shipped `mojang-web-local` image boots from the bundle** (TCG) and reports its readiness marker, and a tampered bundle is refused (on a disposable copy) |
+| `… acceptance.py db` / `authority` / `containment` / `frontend` / `browser` / `hypervisor` / `access` / `images` | **PASS** — unchanged by this round |
+| `… acceptance.py packet` / `journey` | **PENDING (environment)** — root + `nft`; the installed appliance with the member's SSH key, the pinned bastion host key and the browser login |
+
 ## Milestone 15 implementation evidence — 2026-10-20/21, branch `15`
 
 > Reviewer handoff (read this first): [docs/HANDOFF-15.md](HANDOFF-15.md) —

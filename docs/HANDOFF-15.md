@@ -144,6 +144,16 @@ should look at hardest in that round:
   depends on a backing file, verifies that what it ships stands alone, and
   the bundle gate boots a shipped image from the bundle.
 
+### The third review round
+
+A third review (VERDICT: FIX, seven findings) is fixed in `51f4166`,
+`fec3f53`, `0a6638e` and `818d99e`: the bastion's service credential (a
+0600 file of its own), the password redaction, the journey's real
+break/repair proof, the fail-closed key derivation, the disposable tamper
+fixture, the bundle's binding to the candidate and the mandatory
+shipped-image boot. The evidence is in `docs/FINDINGS_CHECKLIST.md`
+("Third review round").
+
 ## Where I would look hardest
 
 1. `srplatform/bastion/proxy.py` — the interactive path changed three times

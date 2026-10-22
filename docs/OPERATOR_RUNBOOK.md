@@ -281,6 +281,30 @@ If the rules do not fit your host, change them in the manifest and re-render
 (`appliance.py plan` shows the exact artifacts) - never hand-edit the rendered
 files, and never widen them to make a test pass.
 
+### 4b. Give the recording bastion its service token
+
+The bastion authenticates its callbacks to the API with a **service
+token**; the API issues it and shows it once. It is a secret, so it lives
+in the bastion's own 0600 file — not in an environment the API also loads.
+
+```bash
+# 1. the API issues a bastion-scoped service token (operator only)
+curl -sS -X POST https://sr.example.edu/api/admin/service_tokens \
+     -H "Authorization: Bearer $OPERATOR_TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"scope": "bastion"}'
+# -> {"token": "svc-bastion-...", ...}
+
+# 2. it goes into the bastion's own file
+install -m 0600 -o root -g srbastion /dev/null \
+     /etc/sparring-range/secrets/bastion.token
+printf '%s' 'svc-bastion-...' > /etc/sparring-range/secrets/bastion.token
+systemctl restart sr-bastion
+```
+
+The bastion **refuses to start without a token** (its callbacks would be
+refused and no member could authenticate), so an empty file fails loudly.
+
 ### 5. Check the appliance came up
 
 ```bash
