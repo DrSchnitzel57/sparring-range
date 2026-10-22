@@ -143,6 +143,45 @@ seven findings. All of them are fixed (`51f4166`, `fec3f53`, `0a6638e`,
 | `… acceptance.py db` / `authority` / `containment` / `frontend` / `browser` / `hypervisor` / `access` / `images` | **PASS** — unchanged by this round |
 | `… acceptance.py packet` / `journey` | **PENDING (environment)** — root + `nft`; the installed appliance with the member's SSH key, the pinned bastion host key and the browser login |
 
+## Fourth review round — 2026-10-22, branch `15`
+
+A fourth review (VERDICT: FIX, four blockers and one non-blocker) is fixed
+in `5b37915`:
+
+* **The bastion could not read its own credential.** The token lived under
+  the shared secrets directory (`root:sr-secrets 0750`, which `srbastion`
+  may not traverse), and the runbook replaced it with a `0600 root`-owned
+  file the service could not read either. It now lives in the bastion's
+  own directory (`0750 root:srbastion`) as `0640 root:srbastion`; the
+  effective permissions are tested.
+* **A password-fill timeout disclosed the password.** The timeout escaped
+  before the exit-status redaction and printed the whole command line. It
+  is caught and replaced by a sanitized message, and the execution test
+  now reaches the secret-bearing call instead of failing on the username
+  fill.
+* **The break/repair proof used a check that cannot see a stop.**
+  `service_present` asks whether a unit *exists* — a stopped unit still
+  exists — so the helper rejected a genuine stop. The break is now observed
+  by the liveness check (`http_content`, which fails when the service is
+  stopped), and the service is restored in a `finally` block even when the
+  repair fails.
+* **The candidate binding was incomplete.** It compared only the files the
+  bundle declared and excluded the frontend's source, so a bundle with a
+  stale login page — or one missing `srplatform/settings.py` — passed. The
+  comparison is now complete and bidirectional over the runtime file set
+  (frontend included): missing, stale and changed all fail the gate.
+* **The tamper test passed for the wrong reason.** The disposable copy
+  omitted the images but kept their manifest entries, so it already failed
+  verification for missing images. The fixture is now a small, internally
+  valid bundle that is verified **first** (the positive control), and the
+  refusal must be a digest drift.
+
+| Command | Result |
+|---|---|
+| `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD .venv/bin/python -m pytest -q -ra -p no:cacheprovider` | **437 passed, 0 failed, 0 skipped**, 262 deselected, 4 warnings (87 s) |
+| `… acceptance.py install` | **PASS** (9 s) — the real install sequences + the managed-service contract check |
+| `… acceptance.py bundle` | **PASS** (276 s) — the release bundle (307 files, 4 images) verifies, **is bound to the checkout** (215 runtime files compared; missing, stale and changed all checked), the operator manifest renders, **the shipped `mojang-web-local` image boots from the bundle** (TCG), the disposable fixture verifies before it is tampered with, and the tampered bundle is refused for a digest drift |
+
 ## Milestone 15 implementation evidence — 2026-10-20/21, branch `15`
 
 > Reviewer handoff (read this first): [docs/HANDOFF-15.md](HANDOFF-15.md) —

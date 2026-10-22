@@ -1723,6 +1723,8 @@ def _bind_bundle_to_candidate(bundle: pathlib.Path) -> None:
     """
     import hashlib
 
+    if str(REPO) not in sys.path:
+        sys.path.insert(0, str(REPO))
     from deploy.bundle import app_file_relpaths, is_runtime
 
     manifest_path = bundle / "MANIFEST.json"

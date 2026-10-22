@@ -154,6 +154,16 @@ fixture, the bundle's binding to the candidate and the mandatory
 shipped-image boot. The evidence is in `docs/FINDINGS_CHECKLIST.md`
 ("Third review round").
 
+### The fourth review round
+
+A fourth review (VERDICT: FIX, four blockers and one non-blocker) is fixed
+in `5b37915`: the bastion's credential is reachable by the identity that
+reads it, a password-fill timeout no longer prints the command line, the
+break/repair proof observes a real stop through the liveness check, the
+candidate binding is complete and bidirectional (frontend included), and
+the tamper fixture is internally valid before it is tampered with. The
+evidence is in `docs/FINDINGS_CHECKLIST.md` ("Fourth review round").
+
 ## Where I would look hardest
 
 1. `srplatform/bastion/proxy.py` — the interactive path changed three times
