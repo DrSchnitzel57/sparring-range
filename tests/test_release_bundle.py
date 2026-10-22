@@ -165,3 +165,28 @@ def test_bundle_cli_verify_and_manifest(tmp_path):
                        cwd=REPO, env=env, timeout=300)
     assert r.returncode == 0, (r.stdout + r.stderr)[-800:]
     assert json.loads(r.stdout)["ok"] is True
+
+
+def test_a_bundle_that_is_not_the_checkout_is_refused(tmp_path, capfd):
+    """A bundle verifies against itself.
+
+    A bundle built from an older revision passes every internal check
+    while shipping yesterday's code, so the gate compares the packaged
+    runtime with the checkout under test.
+    """
+    import infra.dev.acceptance as acc
+
+    out = _build(tmp_path)
+    # the packaged runtime no longer matches the checkout
+    victim = out / "srplatform" / "settings.py"
+    victim.write_text(victim.read_text() + "\n# stale\n")
+    manifest = json.loads((out / bundle_mod.MANIFEST_NAME).read_text())
+    manifest["files"]["srplatform/settings.py"] = {
+        "sha256": bundle_mod._sha256(victim),
+        "bytes": victim.stat().st_size}
+    (out / bundle_mod.MANIFEST_NAME).write_text(
+        json.dumps(manifest, indent=2, sort_keys=True))
+    with pytest.raises(acc.Failed) as bad:
+        acc._bind_bundle_to_candidate(out)
+    assert "release bundle binding" in str(bad.value)
+    assert "srplatform/settings.py" in capfd.readouterr().out
