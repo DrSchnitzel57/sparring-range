@@ -103,8 +103,8 @@ def _ssh_connection(c: httpx.Client, sid: str) -> dict:
     return (preferred or conns)[0]
 
 
-async def _ssh_check(conn: dict, key: str, known_hosts: str) -> dict:
-    import asyncssh
+def _ssh_target(conn: dict) -> tuple[str, int, str]:
+    """(host, port, login) from the bastion's SSH instruction."""
     args = shlex.split(conn["ssh"])
     if not args or args[0] != "ssh":
         raise JourneyError(f"unexpected SSH instruction: {conn['ssh']}")
@@ -123,6 +123,27 @@ async def _ssh_check(conn: dict, key: str, known_hosts: str) -> dict:
             i += 1
     if not token:
         token = conn.get("login_token", "")
+    return host, port, token
+
+
+async def _ssh_exec(conn: dict, key: str, known_hosts: str,
+                    command: str) -> dict:
+    """Run ONE command on the member's channel (the recorded bastion path)."""
+    import asyncssh
+
+    host, port, token = _ssh_target(conn)
+    async with asyncssh.connect(
+            host, port, username=token, client_keys=[key],
+            known_hosts=known_hosts, connect_timeout=20) as c:
+        result = await c.run(command, check=False)
+        return {"exit_status": result.exit_status,
+                "stdout": (result.stdout or "").strip()[:500],
+                "stderr": (result.stderr or "").strip()[:500]}
+
+
+async def _ssh_check(conn: dict, key: str, known_hosts: str) -> dict:
+    import asyncssh
+    host, port, token = _ssh_target(conn)
     async with asyncssh.connect(
             host, port, username=token, client_keys=[key],
             known_hosts=known_hosts, connect_timeout=20) as c:
@@ -140,6 +161,26 @@ def _playwright_cli() -> str | None:
     import shutil
 
     return shutil.which("playwright-cli")
+
+
+def _redact_args(args: tuple) -> tuple:
+    """Hide the SECRET argument of a command.
+
+    ``playwright-cli fill <selector> <value>`` carries the member's
+    PASSWORD as the value: the selector is not secret, the value is.
+    """
+    out: list = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        out.append(arg)
+        if arg == "fill" and index + 2 < len(args):
+            out.append(args[index + 1])      # the selector: not secret
+            out.append("***")                # the value: the secret
+            index += 3
+            continue
+        index += 1
+    return tuple(out)
 
 
 def _browser_check(base_url: str, username: str, password: str, *,
@@ -161,37 +202,14 @@ def _browser_check(base_url: str, username: str, password: str, *,
                            text=True, timeout=timeout, cwd=str(REPO))
         if check and r.returncode != 0:
             # The command line may carry the member's PASSWORD (the fill
-            # command): the diagnostics must never echo it.
-            shown = []
-            hide_next = False
-            for arg in args:
-                if hide_next:
-                    shown.append("***")
-                    hide_next = False
-                    continue
-                if arg == "fill":
-                    hide_next = True
-                shown.append(arg)
+            # command's value): the diagnostics must never echo it.
+            shown = " ".join(_redact_args(args))
             detail = (r.stdout or r.stderr)[-400:]
             if password:
                 detail = detail.replace(password, "***")
-            raise JourneyError(f"playwright-cli {' '.join(shown)} -> "
+            raise JourneyError(f"playwright-cli {shown} -> "
                                f"{r.returncode}: {detail}")
         return r
-
-    def redact(args: tuple) -> str:
-        """Never echo a secret: the password is a FILL argument."""
-        shown = []
-        hide_next = False
-        for arg in args:
-            if hide_next:
-                shown.append("***")
-                hide_next = False
-                continue
-            if arg == "fill":
-                hide_next = True
-            shown.append(arg)
-        return " ".join(shown)
 
     out: dict = {"base_url": base_url}
     try:
@@ -233,6 +251,79 @@ def _parse_iso(text) -> datetime | None:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value
+
+
+def _availability_checks(card: dict) -> list[dict]:
+    """The scorecard's availability checks (the recover domain)."""
+    items = card.get("items") or []
+    return [i for i in items
+            if i.get("verifier") in ("http_content", "service_present")]
+
+
+def _break_repair(member: httpx.Client, operator: httpx.Client, sid: str, *,
+                  conn: dict, ssh_key: str, known_hosts: str,
+                  service: str = "mojang-web",
+                  repair_timeout_s: float = 120.0) -> dict:
+    """Prove a REAL break and a REAL repair, observed through the API.
+
+    The journey stops the practice service on the defender guest, asks the
+    API to score — the trusted channel runs the verifiers against the live
+    hosts — and requires the availability checks to FAIL.  It then starts
+    the service again and requires them to PASS.  A journey that cannot
+    observe that transition has not proven the break/repair workflow: a
+    submission that merely counts as "closed" proves nothing.
+    """
+    out: dict = {"service": service}
+
+    def score() -> dict:
+        r = operator.post(f"/sessions/{sid}/score")
+        if r.status_code != 200:
+            raise JourneyError(f"score {sid}: HTTP {r.status_code} "
+                               f"{r.text[:300]}")
+        return r.json() or {}
+
+    # 1. the BREAK
+    stopped = asyncio.run(_ssh_exec(
+        conn, ssh_key, known_hosts, f"sudo -n systemctl stop {service}"))
+    out["break_command"] = stopped
+    if stopped.get("exit_status") != 0:
+        raise JourneyError(f"the journey could not stop {service}: {stopped}")
+    broken = score()
+    out["broken"] = broken
+    checks = _availability_checks(broken)
+    if not checks:
+        raise JourneyError("the scorecard has no availability check to "
+                           "observe the break with")
+    if any(c.get("status") == "passed" for c in checks):
+        raise JourneyError(
+            "the break was not observed: the availability checks still pass "
+            f"with {service} stopped: {[c.get('verifier') for c in checks]}")
+
+    # 2. the REPAIR
+    started = asyncio.run(_ssh_exec(
+        conn, ssh_key, known_hosts,
+        f"sudo -n systemctl start {service}; sleep 3; "
+        f"systemctl is-active {service}"))
+    out["repair_command"] = started
+    if started.get("exit_status") != 0:
+        raise JourneyError(f"the journey could not start {service}: {started}")
+    deadline = time.monotonic() + repair_timeout_s
+    repaired: dict = {}
+    while time.monotonic() < deadline:
+        repaired = score()
+        checks = _availability_checks(repaired)
+        if checks and all(c.get("status") == "passed" for c in checks):
+            break
+        time.sleep(5)
+    out["repaired"] = repaired
+    checks = _availability_checks(repaired)
+    if not checks or not all(c.get("status") == "passed" for c in checks):
+        raise JourneyError(
+            "the repair was not verified: the availability checks did not "
+            f"pass after {service} was started: "
+            f"{[(c.get('verifier'), c.get('status')) for c in checks]}")
+    out["verified"] = True
+    return out
 
 
 def _inject_workflow(c: httpx.Client, sid: str, *, wait_s: float) -> dict:
@@ -352,7 +443,9 @@ def _refusal_paths(c: httpx.Client, sid: str) -> dict:
 def _run_preset(c: httpx.Client, preset: str, *, duration: int, pace: int,
                 ssh_key: str | None, known_hosts: str | None,
                 label: str, options: dict | None = None,
-                incident: bool = False, inject_wait_s: float = 420.0) -> dict:
+                incident: bool = False, inject_wait_s: float = 420.0,
+                operator: httpx.Client | None = None,
+                break_repair: bool = False) -> dict:
     opts = dict(options or SESSION_OPTIONS[0])
     created = _json(c.post("/sessions", json={
         "scenario_id": preset, "duration_minutes": opts["duration_minutes"],
@@ -401,6 +494,19 @@ def _run_preset(c: httpx.Client, preset: str, *, duration: int, pace: int,
     conn = _ssh_connection(c, sid)
     out["ssh_instruction"] = conn.get("ssh")
     out["ssh"] = asyncio.run(_ssh_check(conn, ssh_key, known_hosts))
+
+    # The break/repair proof: a REAL service break, observed through the
+    # API's trusted checks, and a REAL repair, observed the same way.  It
+    # runs on the primary session only (it stops the practice service in
+    # the session the journey owns).
+    if break_repair:
+        if operator is None:
+            raise JourneyError("the break/repair proof needs the operator's "
+                               "client: the per-check results are operator-"
+                               "visible")
+        out["break_repair"] = _break_repair(
+            c, operator, sid, conn=conn, ssh_key=ssh_key,
+            known_hosts=known_hosts)
 
     started = _json(c.post(f"/sessions/{sid}/begin"), "begin")
     if started.get("status") != "running":
@@ -492,7 +598,8 @@ def run_journey(*, base_url: str, operator_token: str, member_token: str,
                 member, preset, duration=duration, pace=pace,
                 ssh_key=ssh_key, known_hosts=bastion_known_hosts,
                 label="primary", incident=(index == 0),
-                inject_wait_s=inject_wait_s))
+                inject_wait_s=inject_wait_s, operator=operator,
+                break_repair=(index == 0)))
         # the option matrix: every documented match option is exercised
         for index, options in enumerate(SESSION_OPTIONS):
             results.append(_run_preset(

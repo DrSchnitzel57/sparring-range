@@ -92,6 +92,8 @@ def test_journey_creates_a_session_for_every_option(monkeypatch):
     monkeypatch.setattr(journey, "_inject_workflow",
                         lambda *a, **k: {"submission_status": "incorrect"})
     monkeypatch.setattr(journey, "_refusal_paths", lambda *a, **k: {})
+    monkeypatch.setattr(journey, "_break_repair",
+                        lambda *a, **k: {"verified": True})
     journey.run_journey(base_url="https://appliance.invalid",
                         operator_token="op", member_token="member",
                         ssh_key="/tmp/member.key",
@@ -178,6 +180,8 @@ def test_journey_refuses_a_session_that_ignored_its_options(monkeypatch):
     monkeypatch.setattr(journey, "_inject_workflow",
                         lambda *a, **k: {"submission_status": "incorrect"})
     monkeypatch.setattr(journey, "_refusal_paths", lambda *a, **k: {})
+    monkeypatch.setattr(journey, "_break_repair",
+                        lambda *a, **k: {"verified": True})
     with pytest.raises(journey.JourneyError):
         journey.run_journey(base_url="https://appliance.invalid",
                             operator_token="op", member_token="member",

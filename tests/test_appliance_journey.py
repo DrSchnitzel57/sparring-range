@@ -73,3 +73,9 @@ def test_installed_appliance_full_practice_journey(tmp_path):
         assert refusals.get("operator_only_view") == 403, refusals
     # the browser journey
     assert (out.get("browser") or {}).get("logged_in") is True, out.get("browser")
+    # the break/repair proof: a real break observed through the API's trusted
+    # checks and a real repair, verified the same way
+    repairs = [s.get("break_repair") for s in out["sessions"]
+               if s.get("break_repair")]
+    assert repairs, "no session exercised the break/repair proof"
+    assert repairs[0].get("verified") is True, repairs[0]
