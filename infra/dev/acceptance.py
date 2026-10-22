@@ -1670,6 +1670,63 @@ def _role_images(tmp: pathlib.Path) -> tuple[dict, dict]:
     return out, real
 
 
+def _copy_bundle(bundle: pathlib.Path, target: pathlib.Path) -> None:
+    """Copy a bundle for a destructive test (without the gigabyte images)."""
+    import shutil as _sh
+
+    target.mkdir(parents=True, exist_ok=True)
+    for path in sorted(bundle.rglob("*")):
+        rel = path.relative_to(bundle)
+        if rel.parts and rel.parts[0] == "images":
+            continue          # the images are verified in place, not copied
+        dst = target / rel
+        if path.is_dir():
+            dst.mkdir(parents=True, exist_ok=True)
+        else:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            _sh.copyfile(path, dst)
+
+
+def _bind_bundle_to_candidate(bundle: pathlib.Path) -> None:
+    """The packaged runtime must BE the checkout under test.
+
+    A bundle verifies against itself: a bundle built from an older revision
+    would pass every internal check while shipping yesterday's code.  The
+    packaged runtime, the configuration and the lock file are therefore
+    compared with the checkout, digest by digest.
+    """
+    import hashlib
+
+    manifest_path = bundle / "MANIFEST.json"
+    if not manifest_path.is_file():
+        fail("release bundle binding",
+             f"{bundle} has no MANIFEST.json")
+    files = json.loads(manifest_path.read_text()).get("files") or {}
+    roots = ("srplatform/", "deploy/", "infra/", "verifiers/", "telemetry/",
+             "audit/", "rangectl/", "scenarios/", "web/package-lock.json",
+             "requirements.lock", "pyproject.toml", "alembic.ini")
+    stale: list[str] = []
+    for rel, meta in sorted(files.items()):
+        if not any(rel == root or rel.startswith(root) for root in roots):
+            continue
+        source = REPO / rel
+        if not source.is_file():
+            stale.append(f"{rel} is not in the checkout")
+            continue
+        h = hashlib.sha256()
+        with source.open("rb") as fh:
+            for block in iter(lambda: fh.read(1 << 20), b""):
+                h.update(block)
+        if h.hexdigest() != meta.get("sha256"):
+            stale.append(rel)
+    if stale:
+        fail("release bundle binding",
+             f"{len(stale)} packaged file(s) are not the checkout under test "
+             f"(first: {stale[:5]}) — rebuild the bundle before accepting it")
+    ok("the release bundle is bound to the checkout under test",
+       f"{len(files)} packaged files compared")
+
+
 def _wait_guest_ready(qga_sock: pathlib.Path, proc: subprocess.Popen,
                       timeout_s: float = 1500) -> str:
     """Wait for the guest agent and the appliance readiness marker.
@@ -1843,6 +1900,9 @@ def check_bundle() -> None:
         ok("release bundle verifies", f"{report['files']} files, "
                                      f"{report['images']} image(s), "
                                      f"revision {report['revision'][:12]}")
+        # the release must BE the candidate under test: a bundle built from
+        # an older revision verifies against itself and would pass here.
+        _bind_bundle_to_candidate(bundle)
 
         # the operator's manifest is RENDERED from the bundle, never hand
         # written: it must satisfy the strict appliance schema.
@@ -1874,30 +1934,25 @@ def check_bundle() -> None:
 
         # the SHIPPED image must still boot after the relocation into the
         # bundle: a released artifact that cannot boot is not an artifact.
-        # (SR_BUNDLE_SKIP_BOOT=1 defers it to a runner with KVM: under
-        # emulation the boot alone takes minutes.)
-        if os.environ.get("SR_BUNDLE_SKIP_BOOT") == "1":
-            print("[PENDING] the shipped image boot — deferred "
-                  "(SR_BUNDLE_SKIP_BOOT=1)")
-        else:
-            _shipped_image_boots(tmp, bundle)
+        # This proof is MANDATORY — a bundle whose images cannot boot is not
+        # accepted, and it is never skipped into a pass.
+        _shipped_image_boots(tmp, bundle)
 
-        # a tampered bundle is refused — the file is restored afterwards, so
-        # the gate never leaves a damaged release bundle behind
-        victim = bundle / "requirements.lock"
-        original = victim.read_bytes()
+        # a tampered bundle is refused — on a DISPOSABLE copy of the
+        # release, never on the release itself: a cancelled gate must not
+        # leave a damaged artifact behind.
+        disposable = tmp / "tamper-copy"
+        _copy_bundle(bundle, disposable)
+        victim = disposable / "requirements.lock"
         victim.write_bytes(b"tampered\n")
-        try:
-            t = subprocess.run(
-                [sys.executable, str(REPO / "deploy/bundle.py"), "verify",
-                 str(bundle)], capture_output=True, text=True, cwd=REPO,
-                timeout=1800)
-            if t.returncode == 0:
-                fail("a tampered bundle is refused",
-                     "verify accepted a bundle whose file no longer matches "
-                     "its digest")
-        finally:
-            victim.write_bytes(original)
+        t = subprocess.run(
+            [sys.executable, str(REPO / "deploy/bundle.py"), "verify",
+             str(disposable)], capture_output=True, text=True, cwd=REPO,
+            timeout=1800)
+        if t.returncode == 0:
+            fail("a tampered bundle is refused",
+                 "verify accepted a bundle whose file no longer matches "
+                 "its digest")
         ok("a tampered bundle is refused")
     finally:
         _sh.rmtree(tmp, ignore_errors=True)
