@@ -182,6 +182,30 @@ in `5b37915`:
 | `… acceptance.py install` | **PASS** (9 s) — the real install sequences + the managed-service contract check |
 | `… acceptance.py bundle` | **PASS** (276 s) — the release bundle (307 files, 4 images) verifies, **is bound to the checkout** (215 runtime files compared; missing, stale and changed all checked), the operator manifest renders, **the shipped `mojang-web-local` image boots from the bundle** (TCG), the disposable fixture verifies before it is tampered with, and the tampered bundle is refused for a digest drift |
 
+## Fifth review round — 2026-10-22, branch `15`
+
+A fifth review (VERDICT: FIX, one blocker) is fixed:
+
+* **`unknown` was accepted as an observed failure.** The API's verifiers
+  are three-valued: a probe that cannot reach the service reports
+  `unknown` — a transport or authentication failure, not evidence that the
+  service is down. The break/repair proof rejected only `passed`, so an
+  `unknown` check (the management SSH failing with exit 255) counted as a
+  broken service, and a later probe recovering made the journey report
+  `verified: true` — probe recovery, not an observed outage. The
+  affirmative evidence that a service is stopped now comes from the
+  service itself (`systemctl is-active` on the member's channel: a down
+  state is required, and an unavailable observation fails the journey).
+  The API's check stays the corroboration for the repair, where `unknown`
+  means "not verified" and fails the journey. Two regressions are pinned:
+  an unavailable verification is not a broken service, and a probe recovery
+  without an observed outage fails.
+
+| Command | Result |
+|---|---|
+| `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD .venv/bin/python -m pytest -q -ra -p no:cacheprovider` | **439 passed, 0 failed, 0 skipped**, 262 deselected, 4 warnings (90 s) |
+| `… acceptance.py install` | **PASS** (10 s) — the real install sequences + the managed-service contract check |
+
 ## Milestone 15 implementation evidence — 2026-10-20/21, branch `15`
 
 > Reviewer handoff (read this first): [docs/HANDOFF-15.md](HANDOFF-15.md) —

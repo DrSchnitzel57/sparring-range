@@ -164,6 +164,14 @@ candidate binding is complete and bidirectional (frontend included), and
 the tamper fixture is internally valid before it is tampered with. The
 evidence is in `docs/FINDINGS_CHECKLIST.md` ("Fourth review round").
 
+### The fifth review round
+
+A fifth review (VERDICT: FIX, one blocker) is fixed: the break/repair
+proof required the SERVICE's own state as the affirmative evidence that it
+was stopped, because the API's verifiers are three-valued and an
+`unknown` check is a transport failure, not a downtime. The evidence is in
+`docs/FINDINGS_CHECKLIST.md` ("Fifth review round").
+
 ## Where I would look hardest
 
 1. `srplatform/bastion/proxy.py` — the interactive path changed three times

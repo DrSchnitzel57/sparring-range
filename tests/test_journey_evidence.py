@@ -101,20 +101,37 @@ class _ScoreClient:
         ]})
 
 
-def test_the_break_repair_transition_is_observed(monkeypatch):
-    """A real break must FAIL the availability checks and the real repair
-    must make them pass again."""
+def _exec_recorder(states: list[str], *, failing: bool = False):
+    """A fake exec: the state answers come from `states` (in order)."""
     commands: list[str] = []
+    remaining = list(states)
 
     async def _fake_exec(conn, key, known_hosts, command):
         commands.append(command)
+        if "is-active" in command:
+            if failing:
+                return {"exit_status": 255, "stdout": "", "stderr": "ssh: fail"}
+            state = remaining.pop(0) if remaining else remaining_last(states)
+            return {"exit_status": 0, "stdout": state, "stderr": ""}
         return {"exit_status": 0, "stdout": "ok", "stderr": ""}
 
-    monkeypatch.setattr(journey, "_ssh_exec", _fake_exec)
+    def remaining_last(seq):
+        return seq[-1] if seq else ""
+
+    return _fake_exec, commands
+
+
+def test_the_break_repair_transition_is_observed(monkeypatch):
+    """A real break must FAIL the liveness check and the real repair must
+    make it pass again — and the service's OWN state must confirm both."""
+    fake, commands = _exec_recorder(["inactive", "active"])
+    monkeypatch.setattr(journey, "_ssh_exec", fake)
     operator = _ScoreClient(["fail", "pass"])
     out = journey._break_repair(None, operator, "sid-1", conn={}, ssh_key="k",
                                 known_hosts="h")
     assert out["verified"] is True
+    assert out["broken_state"] == "inactive"
+    assert out["repaired_state"] == "active"
     assert any("systemctl stop" in c for c in commands)
     assert any("systemctl start" in c for c in commands)
     # the score was taken twice: once broken, once repaired
@@ -129,10 +146,8 @@ def test_a_stopped_service_is_observed_by_the_liveness_check(monkeypatch):
     serving, the break is real and the journey must accept it.
     """
 
-    async def _fake_exec(conn, key, known_hosts, command):
-        return {"exit_status": 0, "stdout": "ok", "stderr": ""}
-
-    monkeypatch.setattr(journey, "_ssh_exec", _fake_exec)
+    fake, _commands = _exec_recorder(["inactive", "active"])
+    monkeypatch.setattr(journey, "_ssh_exec", fake)
     operator = _ScoreClient(["fail", "pass"])
     out = journey._break_repair(None, operator, "sid-1", conn={}, ssh_key="k",
                                 known_hosts="h")
@@ -143,10 +158,9 @@ def test_a_break_that_is_not_observed_fails_the_journey(monkeypatch):
     """The service stayed available: the break was not real, so the journey
     must not claim it proved a break/repair."""
 
-    async def _fake_exec(conn, key, known_hosts, command):
-        return {"exit_status": 0, "stdout": "ok", "stderr": ""}
-
-    monkeypatch.setattr(journey, "_ssh_exec", _fake_exec)
+    # the service never stopped: the check passes and the service says so
+    fake, _commands = _exec_recorder(["active", "active"])
+    monkeypatch.setattr(journey, "_ssh_exec", fake)
     operator = _ScoreClient(["pass"])
     with pytest.raises(journey.JourneyError) as bad:
         journey._break_repair(None, operator, "sid-1", conn={}, ssh_key="k",
@@ -154,12 +168,37 @@ def test_a_break_that_is_not_observed_fails_the_journey(monkeypatch):
     assert "break was not observed" in str(bad.value)
 
 
-def test_a_repair_that_is_not_verified_fails_the_journey(monkeypatch):
-    async def _fake_exec(conn, key, known_hosts, command):
-        return {"exit_status": 0, "stdout": "ok", "stderr": ""}
+def test_an_unavailable_verification_is_not_a_broken_service(monkeypatch):
+    """`unknown` is not evidence of a stopped service.
 
-    monkeypatch.setattr(journey, "_ssh_exec", _fake_exec)
-    operator = _ScoreClient(["fail", "fail"])
+    The reviewer's probe: the management channel fails (exit 255), the
+    check reports `unknown`, a later probe succeeds — that is probe
+    recovery, not an observed outage.  The journey must not accept it.
+    """
+    fake, _commands = _exec_recorder([], failing=True)
+    monkeypatch.setattr(journey, "_ssh_exec", fake)
+    operator = _ScoreClient(["unknown", "pass"])
+    with pytest.raises(journey.JourneyError):
+        journey._break_repair(None, operator, "sid-1", conn={}, ssh_key="k",
+                              known_hosts="h")
+
+
+def test_a_probe_recovery_without_an_observed_outage_fails(monkeypatch):
+    """The checks went unknown -> passed, but the service never stopped."""
+    fake, _commands = _exec_recorder(["active", "active"])
+    monkeypatch.setattr(journey, "_ssh_exec", fake)
+    operator = _ScoreClient(["unknown", "pass"])
+    with pytest.raises(journey.JourneyError) as bad:
+        journey._break_repair(None, operator, "sid-1", conn={}, ssh_key="k",
+                              known_hosts="h")
+    assert "break was not observed" in str(bad.value)
+
+
+def test_a_repair_that_is_not_verified_fails_the_journey(monkeypatch):
+    # the service comes back, but the API's verification stays unavailable
+    fake, _commands = _exec_recorder(["inactive", "active"])
+    monkeypatch.setattr(journey, "_ssh_exec", fake)
+    operator = _ScoreClient(["fail", "unknown"])
     with pytest.raises(journey.JourneyError) as bad:
         journey._break_repair(None, operator, "sid-1", conn={}, ssh_key="k",
                               known_hosts="h", repair_timeout_s=2)

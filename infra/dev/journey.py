@@ -262,6 +262,29 @@ def _parse_iso(text) -> datetime | None:
     return value
 
 
+# The states that mean "the service is not running".
+DOWN_STATES = {"inactive", "failed", "deactivating", "activating"}
+
+
+async def _service_state(conn: dict, key: str, known_hosts: str,
+                         service: str) -> str:
+    """The service's own state, observed on the member's channel.
+
+    The API's verifiers are three-valued: a probe that cannot reach the
+    service reports ``unknown`` (a transport or authentication failure),
+    which is NOT evidence that the service is down.  The affirmative
+    evidence that a service is stopped comes from the service itself.
+    """
+    result = await _ssh_exec(conn, key, known_hosts,
+                              f"systemctl is-active {service} || true")
+    if result.get("exit_status") != 0:
+        raise JourneyError(f"the service state of {service} could not be "
+                           f"read: {result}")
+    lines = [ln.strip() for ln in str(result.get("stdout") or "").splitlines()
+             if ln.strip()]
+    return lines[-1] if lines else ""
+
+
 def _availability_checks(card: dict) -> list[dict]:
     """The scorecard's LIVENESS checks.
 
@@ -306,6 +329,17 @@ def _break_repair(member: httpx.Client, operator: httpx.Client, sid: str, *,
         if result.get("exit_status") != 0:
             raise JourneyError(f"the journey could not stop {service}: {result}")
         stopped = True
+        # The AFFIRMATIVE evidence that the service is down: the service's
+        # own state.  The API's check may report "unknown" here (its probe
+        # cannot reach a stopped service) — that is corroboration, never
+        # the proof.
+        state = asyncio.run(_service_state(conn, ssh_key, known_hosts,
+                                           service))
+        out["broken_state"] = state
+        if state not in DOWN_STATES:
+            raise JourneyError(
+                f"the break was not observed: {service} reports {state!r}, "
+                "not a stopped service")
         broken = score()
         out["broken"] = broken
         checks = _availability_checks(broken)
@@ -331,14 +365,21 @@ def _break_repair(member: httpx.Client, operator: httpx.Client, sid: str, *,
         deadline = time.monotonic() + repair_timeout_s
         repaired: dict = {}
         while time.monotonic() < deadline:
-            repaired = score()
-            checks = _availability_checks(repaired)
-            if checks and all(c.get("status") == "passed" for c in checks):
-                break
+            state = asyncio.run(_service_state(conn, ssh_key, known_hosts,
+                                               service))
+            out["repaired_state"] = state
+            if state == "active":
+                repaired = score()
+                checks = _availability_checks(repaired)
+                if checks and all(c.get("status") == "passed" for c in checks):
+                    break
             time.sleep(5)
         out["repaired"] = repaired
         checks = _availability_checks(repaired)
         if not checks or not all(c.get("status") == "passed" for c in checks):
+            # "unknown" here means the verification was UNAVAILABLE: the
+            # repair is not verified, and an unavailable check is never
+            # mistaken for a success.
             raise JourneyError(
                 "the repair was not verified: the liveness check did not "
                 f"pass after {service} was started: "
