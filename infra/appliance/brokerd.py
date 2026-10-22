@@ -23,7 +23,8 @@ from infra.broker.service import BrokerService
 
 def build(manifest_path: str, policy_path: str, *, uri: str,
           allow_tcg: bool, fixture: bool):
-    manifest = ApplianceManifest.load(manifest_path, verify_images=True)
+    manifest = ApplianceManifest.load(manifest_path, verify_images=True,
+                                      verify_model_key=False)
     policy = AppliancePolicy.load(policy_path)
     policy.validate_manifest(manifest)
     manifest.ensure_state_dirs()

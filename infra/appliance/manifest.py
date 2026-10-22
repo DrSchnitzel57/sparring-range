@@ -208,7 +208,8 @@ class ApplianceManifest:
 
     # ------------------------------------------------------------------ load ---
     @classmethod
-    def load(cls, path: str | pathlib.Path, *, verify_images: bool = False):
+    def load(cls, path: str | pathlib.Path, *, verify_images: bool = False,
+             verify_model_key: bool = True):
         p = pathlib.Path(path)
         try:
             raw = json.loads(p.read_text())
@@ -216,11 +217,12 @@ class ApplianceManifest:
             raise ManifestError(f"appliance manifest missing: {p}") from exc
         except (OSError, json.JSONDecodeError) as exc:
             raise ManifestError(f"appliance manifest unreadable ({p}): {exc}") from exc
-        return cls.from_dict(raw, source=str(p), verify_images=verify_images)
+        return cls.from_dict(raw, source=str(p), verify_images=verify_images,
+                             verify_model_key=verify_model_key)
 
     @classmethod
     def from_dict(cls, raw: dict, *, source: str = "<dict>",
-                  verify_images: bool = False):
+                  verify_images: bool = False, verify_model_key: bool = True):
         if not isinstance(raw, dict):
             raise _bad("top level must be an object")
         _closed(raw, _SCHEMA_KEYS, "manifest")
@@ -436,12 +438,17 @@ class ApplianceManifest:
             model_api_key_file=api_key_file, backup_enabled=enabled,
             backup_destination=dest, member_keys=member_keys,
             source=source, raw=raw)
-        manifest.check_key_material()
+        manifest.check_key_material(verify_model_key=verify_model_key)
         return manifest
 
     # ---------------------------------------------------------------- checks ---
-    def check_key_material(self) -> None:
-        """References must be public keys, readable, and never private keys."""
+    def check_key_material(self, *, verify_model_key: bool = True) -> None:
+        """Validate public keys; only credential-owning callers check model keys.
+
+        The broker still validates all public keys and image/manifest policy,
+        but must not stat or read the model credential owned by another role.
+        Operator installation retains credential validation by default.
+        """
         for role, key in self.access_keys.items():
             p = pathlib.Path(key.path)
             if not p.is_file():
@@ -469,11 +476,12 @@ class ApplianceManifest:
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
             if not lines or not lines[0].startswith(("ssh-", "ecdsa-", "sk-")):
                 raise _bad(f"member_keys.{username} is not an OpenSSH public key")
-        model_key = pathlib.Path(self.model_api_key_file)
-        if not model_key.is_file():
-            raise _bad(f"model.api_key_file is missing: {model_key}")
-        if not model_key.read_text().strip():
-            raise _bad("model.api_key_file is empty")
+        if verify_model_key:
+            model_key = pathlib.Path(self.model_api_key_file)
+            if not model_key.is_file():
+                raise _bad(f"model.api_key_file is missing: {model_key}")
+            if not model_key.read_text().strip():
+                raise _bad("model.api_key_file is empty")
 
     @property
     def roles(self) -> tuple[str, ...]:

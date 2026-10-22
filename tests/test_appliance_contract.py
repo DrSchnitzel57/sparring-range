@@ -87,6 +87,57 @@ def test_manifest_loads_and_redacts(tmp_path):
     assert view["images"]["attacker"]["sha256"]
 
 
+def test_broker_manifest_never_accesses_model_secret(tmp_path, monkeypatch):
+    raw = _manifest(tmp_path)
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(raw))
+    model_key = pathlib.Path(raw["model"]["api_key_file"])
+    original_stat = pathlib.Path.stat
+
+    def deny_secret_stat(self, *args, **kwargs):
+        if self == model_key:
+            raise PermissionError("model secret belongs to another service")
+        return original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "stat", deny_secret_stat)
+    with pytest.raises(PermissionError, match="another service"):
+        ApplianceManifest.load(path, verify_images=True)
+    m = ApplianceManifest.load(path, verify_images=True, verify_model_key=False)
+    assert m.model_api_key_file == str(model_key)
+
+    # The actual daemon must use this role-specific boundary too. Stop after
+    # manifest loading so this regression needs no libvirt or service secrets.
+    from infra.appliance import brokerd
+
+    def reached_policy(*args, **kwargs):
+        raise RuntimeError("reached policy validation")
+
+    monkeypatch.setattr(brokerd.AppliancePolicy, "load", reached_policy)
+    with pytest.raises(RuntimeError, match="reached policy validation"):
+        brokerd.build(str(path), "unused", uri="qemu:///system",
+                      allow_tcg=False, fixture=False)
+
+    raw["images"]["attacker"]["sha256"] = "0" * 64
+    path.write_text(json.dumps(raw))
+    with pytest.raises(Exception, match="sha256 mismatch"):
+        brokerd.build(str(path), "unused", uri="qemu:///system",
+                      allow_tcg=False, fixture=False)
+
+
+def test_broker_manifest_still_rejects_private_public_key(tmp_path):
+    raw = _manifest(tmp_path)
+    raw["access_keys"]["runner"] = str(tmp_path / "runner")
+    with pytest.raises(Exception, match="PUBLIC key"):
+        ApplianceManifest.from_dict(raw, verify_model_key=False)
+
+
+def test_operator_manifest_still_requires_model_credential(tmp_path):
+    raw = _manifest(tmp_path)
+    pathlib.Path(raw["model"]["api_key_file"]).write_text("")
+    with pytest.raises(Exception, match="model.api_key_file is empty"):
+        ApplianceManifest.from_dict(raw)
+
+
 def test_manifest_unknown_key_placeholder_and_inline_secret_refused(tmp_path):
     raw = _manifest(tmp_path)
     raw["surprise"] = True
