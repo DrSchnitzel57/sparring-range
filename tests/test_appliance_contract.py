@@ -333,6 +333,12 @@ def test_attacker_seed_separates_management_and_runner_public_keys(tmp_path):
     assert "PRIVATE KEY" not in rendered
     assert m.public_key_for("bastion") not in rendered
     assert "defender" not in users
+    files = {entry["path"]: entry["content"] for entry in doc["write_files"]}
+    profile = files["/etc/apparmor.d/usr.bin.unshare"]
+    assert "userns," in profile and "change_profile unshare," not in profile
+    assert doc["runcmd"].index("apparmor_parser -r /etc/apparmor.d/usr.bin.unshare") < \
+        doc["runcmd"].index("/usr/local/sbin/sr-first-boot-complete")
+    assert any("unshare --user --map-root-user" in cmd for cmd in doc["runcmd"])
     assert "SR_RUNNER_SSH_TARGET=attacker@10.66.0.9" in render_control_env(m)
 
     defended = yaml.safe_load(render_user_data(SeedInputs(
@@ -342,6 +348,8 @@ def test_attacker_seed_separates_management_and_runner_public_keys(tmp_path):
     assert users["root"]["ssh_authorized_keys"] == [m.public_key_for("mgmt")]
     assert users["defender"]["ssh_authorized_keys"] == [m.public_key_for("bastion")]
     assert "attacker" not in users
+    assert "/etc/apparmor.d/usr.bin.unshare" not in {
+        entry["path"] for entry in defended["write_files"]}
 
 
 def test_seed_addressing_is_static_in_every_mode(tmp_path):

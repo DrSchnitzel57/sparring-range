@@ -22,6 +22,8 @@ from .manifest import ApplianceManifest, ImageSpec
 from infra.images.guest_seed import build_seed_iso, meta_data
 
 _MARKER_PATH = "/var/lib/sparring-range/first-boot-complete"
+_UNSHARE_APPARMOR = (pathlib.Path(__file__).resolve().parents[1]
+                     / "runner/apparmor/usr.bin.unshare")
 
 
 def _role_access(role: str) -> dict[str, tuple[str, ...]]:
@@ -205,6 +207,23 @@ def render_user_data(inp: SeedInputs) -> str:
             "content": f"INGEST_URL={inp.api_ingest_url}\n"
                        f"HOST_TAG={inp.hostname}\n",
         })
+    if inp.image.role == "attacker":
+        # Seed the corrected scoped AppArmor profile and load it before the
+        # readiness marker. The guest keeps kernel unprivileged-userns
+        # restrictions enabled; a broken profile or namespace boundary withholds
+        # readiness instead of allowing uncontained commands.
+        doc["write_files"].append({
+            "path": "/etc/apparmor.d/usr.bin.unshare",
+            "permissions": "0644",
+            "content": _UNSHARE_APPARMOR.read_text(),
+        })
+        doc["runcmd"] = [
+            "apparmor_parser -r /etc/apparmor.d/usr.bin.unshare",
+            "systemctl start sr-runner-cgroup.service 2>/dev/null || true",
+            "su -s /bin/sh attacker -c 'unshare --user --map-root-user "
+            "--mount --cgroup --pid --fork --mount-proc /bin/true'",
+            *doc["runcmd"],
+        ]
     if inp.fixture_http_port:
         # Fixture-only: make nginx listen on the port QEMU forwards. The
         # production image listens on 80 on the isolated bridge.

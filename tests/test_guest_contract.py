@@ -104,6 +104,11 @@ def test_attacker_build_carries_capture_and_boundary():
     assert "apparmor.d/usr.bin.unshare" in ud
     assert "RUNNER_CGROUP_ROOT=/sys/fs/cgroup/sr-runner" in ud
     assert "apparmor_parser" in ud
+    assert "apparmor_parser -r /etc/apparmor.d/usr.bin.unshare' || true" not in ud
+    assert "APPARMOR-LOAD-FAIL" in ud
+    verify = guest_userdata.attacker_verify_user_data()
+    assert "apparmor_parser -r /etc/apparmor.d/usr.bin.unshare" in verify
+    assert "unshare --user --map-root-user" in verify
     # role keys via policy, never one key everywhere
     assert "sr-bake-keys.sh" in ud
     assert "Runner" in ud and "Bastion" not in ud

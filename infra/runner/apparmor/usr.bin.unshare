@@ -16,18 +16,20 @@ profile unshare /usr/bin/unshare flags=(attach_disconnected) {
   # the supervisor invokes unshare with --user --map-root-user --mount
   # --cgroup --pid --fork --mount-proc and then bind-mounts the operation's
   # own cgroup directory over /sys/fs/cgroup inside the mount namespace.
+  userns,
   capability sys_admin,
   capability setuid,
   capability setgid,
   capability sys_chroot,
 
+  @{PROC}/@{pid}/{uid_map,gid_map,setgroups} rw,
   mount options=(rw bind) /sys/fs/cgroup/** -> /sys/fs/cgroup/,
   mount options=(rw) fstype=tmpfs tmpfs -> /**,
+  mount fstype=proc proc -> /proc/,
   umount,
 
   # the operation command itself executes within the namespaces
   /** rix,
 
-  change_profile unshare,
   signal (receive) peer=unconfined,
 }
