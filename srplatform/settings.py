@@ -15,6 +15,7 @@ import os
 import pathlib
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -237,6 +238,10 @@ class Settings(BaseSettings):
     llm_model_red: str = "qwen2.5-14b-instruct"
     llm_model_coach: str = "qwen2.5-32b-instruct"
     llm_timeout_s: int = 60   # per-call timeout (gateway policy, pilot step 3)
+    # Output includes reasoning on compatible thinking-model servers. Keep
+    # role budgets explicit, bounded and configurable without changing secrets.
+    llm_max_tokens_red: int = Field(default=2048, ge=1, le=32768)
+    llm_max_tokens_coach: int = Field(default=3072, ge=1, le=32768)
     # bounded model gateway (F18)
     model_queue_max: int = 32
     model_hint_max_wait_s: int = 150     # declared bound for interactive hints

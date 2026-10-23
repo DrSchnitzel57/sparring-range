@@ -135,25 +135,55 @@ class Supervisor:
 
     # --------------------------------------------------------------- report --
     def _report(self, client, assignment: Assignment | None,
-                reason: str) -> None:
+                reason: str) -> bool:
         """Tell the controller that the child is gone.
 
-        The report is best effort: a stale credential is refused (the
-        controller has moved on) and that refusal is the correct outcome.
+        True means acknowledged or definitively fenced, NOT confirmed remote
+        cessation. The API retains any unresolved cancellation obligation.
         The CLAIM credential is always presented — the endpoint refuses a
         report without it.
         """
         if assignment is None:
-            return
+            return True
         try:
-            _post(client,
+            reply = _post(client,
                   f"{self.api}/internal/worker/{assignment.run_id}/failed",
                   self.headers,
-                  {"reason": reason,
+                  {"reason": reason[:1000],
                    "claim_token": assignment.claim_token or ""})
-        except Exception as exc:  # noqa: BLE001 — the report is best effort
+            # This endpoint uses 200 even for a fenced claim and for a
+            # recorded cancel-unknown. Do not mistake either for cessation.
+            return (isinstance(reply, dict) and
+                    (reply.get("ok") is True or reply.get("detail") in {
+                        "unknown run",
+                        "claim credential does not match — refused (obsolete claimant)",
+                        "worker exit recorded; remote cessation UNCONFIRMED",
+                    }))
+        except httpx.HTTPStatusError as exc:
+            # A generic conflict is not proof this claim was superseded. Only
+            # the endpoint's explicit, authenticated fenced reply above is.
             print(f"[supervisor] failure report refused: {exc}",
                   file=sys.stderr, flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[supervisor] failure report refused: {exc}",
+                  file=sys.stderr, flush=True)
+        return False
+
+    def _resolve_assignment(self, client, assignment: Assignment, reason: str) -> bool:
+        """Retry with bounded backoff, never claim/restart while unresolved.
+
+        Shutdown may interrupt retries, but keeps ``current`` intact; the API's
+        durable run/operation obligations remain outstanding for recovery.
+        """
+        delay = self.poll_s
+        while True:
+            if self._report(client, assignment, reason):
+                if self.current is assignment:
+                    self.current = None
+                return True
+            if self.stop.wait(min(delay, 30.0)):
+                return False
+            delay = min(delay * 2, 30.0)
 
     # ------------------------------------------------------------ heartbeat --
     def _beat(self, done: threading.Event, assignment: Assignment) -> None:
@@ -234,9 +264,9 @@ class Supervisor:
                         [sys.executable, "-m", "srplatform.red_agent.worker"],
                         env=env, start_new_session=True))
                 except OSError as exc:
-                    self._report(client, assignment,
-                                 f"worker spawn failed: {exc}")
-                    self.current = None
+                    if not self._resolve_assignment(client, assignment,
+                                                    f"worker spawn failed: {exc}"):
+                        return 1
                     continue
                 pgid = os.getpgid(assignment.child.pid)
                 try:
@@ -252,8 +282,8 @@ class Supervisor:
                     self._terminate_child(assignment.child)
                     # The assignment may already have been stopped while it
                     # was being registered: the report resolves it.
-                    self._report(client, assignment, f"assign refused: {exc}")
-                    self.current = None
+                    if not self._resolve_assignment(client, assignment, f"assign refused: {exc}"):
+                        return 1
                     continue
                 done = threading.Event()
                 beat = threading.Thread(target=self._beat,
@@ -266,17 +296,10 @@ class Supervisor:
                 # exit. This report is a no-op if that already made the run
                 # terminal; otherwise it records a truthful failure. It names
                 # THIS assignment, never the next one.
-                try:
-                    _post(client,
-                          f"{self.api}/internal/worker/{assignment.run_id}/failed",
-                          self.headers,
-                          {"reason": f"worker process exited with status {rc} "
-                                     "without a confirmed completion",
-                           "claim_token": assignment.claim_token or ""})
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[supervisor] failure report failed: {exc}",
-                          file=sys.stderr, flush=True)
-                self.current = None
+                if not self._resolve_assignment(
+                        client, assignment, f"worker process exited with status {rc} "
+                                            "without a confirmed completion"):
+                    return 1
                 if self.stop.is_set():
                     break
         return 0
@@ -288,11 +311,7 @@ class Supervisor:
             detail = self._terminate_child(assignment.child)
             try:
                 with httpx.Client() as client:
-                    _post(client,
-                          f"{self.api}/internal/worker/{assignment.run_id}/failed",
-                          self.headers,
-                          {"reason": f"supervisor stopping: {detail}",
-                           "claim_token": assignment.claim_token or ""})
+                    self._report(client, assignment, f"supervisor stopping: {detail}")
             except Exception:  # noqa: BLE001
                 pass
 

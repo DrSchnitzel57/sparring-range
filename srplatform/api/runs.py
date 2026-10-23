@@ -843,7 +843,7 @@ def complete_run(db: Session, run_id: str, worker_token: str, result: dict) -> R
         # re-acquiring the run-row lock can prove nothing registered in
         # between — the guarded UPDATE's own snapshot may predate a
         # registration commit under READ COMMITTED.
-        status = "failed" if outcome == "worker_failure" else "completed"
+        status = "failed" if outcome in ("worker_failure", "model_unavailable") else "completed"
         ended = _now()
         resolved = False
         remote = {"ok": True, "detail": "no unresolved operations"}
@@ -857,7 +857,11 @@ def complete_run(db: Session, run_id: str, worker_token: str, result: dict) -> R
             status, ended = "cancel-unknown", None
             result = {**result, "containment": remote}
     values = dict(status=status, outcome=outcome, result=result,
-                  ended_at=ended, worker_token=None)
+                   ended_at=ended, worker_token=None)
+    if status == "failed":
+        values["error"] = str(result.get("error") or (
+            "model unavailable — see AI notes for the rejected request"
+            if outcome == "model_unavailable" else "worker failure"))[:1000]
     stmt = (update(Run)
             .where(Run.run_id == run_id, Run.worker_token == token_hash,
                    Run.status.in_(("queued", "running"))))

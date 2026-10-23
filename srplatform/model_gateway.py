@@ -125,6 +125,8 @@ class ModelGateway:
                 return fn(*args, **kwargs)
             except BaseException as e:  # noqa: BLE001 — retried or re-raised
                 last = e
+                if getattr(e, "retryable", True) is False:
+                    raise
                 if attempt + 1 >= MODEL_ATTEMPTS:
                     break
                 delay = MODEL_RETRY_DELAYS_S[min(attempt, len(MODEL_RETRY_DELAYS_S) - 1)]

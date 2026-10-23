@@ -21,6 +21,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 
 from srplatform.coach.timeline import compress_timeline, format_citation
+from srplatform.red_agent.llm import CompletionRejected
 
 CSF_MAP = {
     "detection": "DE — Detect",
@@ -204,6 +205,21 @@ def build_hint(events: list[dict], question: str, llm) -> dict:
                   f"{n_gap} with telemetry gaps (visibility unknown).")
     user = (f"DEFENDER QUESTION: {question or '(none — tell me where to look next)'}\n\n"
             f"CONTEXT (live log):\n{timeline}\n\n{state_line}")
-    text = llm.complete(user=user, system=HINT_SYSTEM) if llm else \
-        f"No model available — start from unconfirmed detections: {state_line}"
+    fallback_reason = "No model available"
+    text = None
+    if llm:
+        try:
+            text = llm.complete(user=user, system=HINT_SYSTEM)
+        except CompletionRejected:
+            fallback_reason = "Model response was empty, incomplete, or rejected"
+        # Test doubles/alternative adapters may not enforce the shared client's
+        # contract; never persist an empty hint from those either.
+        if not isinstance(text, str) or not text.strip():
+            fallback_reason = "Model response was empty, incomplete, or rejected"
+            text = None
+    if text is None:
+        text = (f"{fallback_reason} — deterministic guidance (not an AI-generated hint). "
+                f"{state_line} Which recent event can you corroborate with a second "
+                "log source, and where is visibility still missing? "
+                "No diagnosis or successful remediation is inferred.")
     return {"hint": text, "context_events": [e["event_id"] for e in events[-5:]] if events else []}

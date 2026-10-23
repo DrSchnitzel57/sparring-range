@@ -53,7 +53,7 @@ def get_coach_llm():
             from srplatform.red_agent.llm import LLM
             from srplatform.settings import get_settings
 
-            llm = LLM(model=get_settings().llm_model_coach)
+            llm = LLM(model=get_settings().llm_model_coach, role="coach")
             # Endpoint liveness probe OUTSIDE the gateway (audit Stage 5):
             # probing THROUGH the scheduler would make the probe itself wait
             # behind queued red turns, inflating the interactive hint bound
@@ -175,10 +175,16 @@ def aar_post(session_id: uuid.UUID, body: AarIn, p: Principal = Depends(any_memb
         if llm and body.narrative:
             from srplatform.coach.timeline import compress_timeline
             timeline, _ = compress_timeline(events, max_lines=40)
-            narrative = llm.complete(
-                "You are a CCDC coach writing the narrative section of a graded AAR. "
-                "Cite only events you were given (as #<event_id>). Be blunt and specific.",
-                f"Timeline:\n{timeline}")
+            from srplatform.red_agent.llm import CompletionRejected
+            try:
+                narrative = llm.complete(
+                    "You are a CCDC coach writing the narrative section of a graded AAR. "
+                    "Cite only events you were given (as #<event_id>). Be blunt and specific.",
+                    f"Timeline:\n{timeline}")
+            except CompletionRejected:
+                # A missing/truncated optional narrative cannot erase the
+                # deterministic evidence-linked report or invent model advice.
+                narrative = None
         return build_aar(events, spec, scorecard, narrative=narrative)
 
     try:

@@ -1222,7 +1222,7 @@ def internal_model_complete(body: ModelCompleteIn, p: Principal = Depends(servic
     no direct model credential ever reaches the worker. A running request is
     never preempted (documented bound); queue overflow is a visible 503."""
     from srplatform.model_gateway import PRIORITY_RED, QueueFull, get_model_gateway
-    from srplatform.red_agent.llm import LLM
+    from srplatform.red_agent.llm import CompletionRejected, LLM
     if len(body.system) + len(body.user) > 200_000:
         raise HTTPException(413, "model request too large")
     s = get_settings()
@@ -1235,6 +1235,8 @@ def internal_model_complete(body: ModelCompleteIn, p: Principal = Depends(servic
         raise HTTPException(503, "model gateway saturated — retry the turn shortly")
     except TimeoutError:
         raise HTTPException(504, "model turn exceeded its bound")
+    except CompletionRejected as e:
+        raise HTTPException(502, str(e)) from e
     return {"text": text}
 
 

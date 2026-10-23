@@ -171,15 +171,31 @@ class RedAgentLoop:
         """Carry the PREVIOUS report forward into every compression (F14).
         Returns None on model failure so the checkpoint never advances
         over unfactored events."""
+        # Progress telemetry is not situation-report input: otherwise failed
+        # summaries recursively summarize their own diagnostics on every turn.
+        self._log("red", "agent_note", {"activity": "compression", "state": "started",
+                                        "upto_event_id": upto_event_id})
         blob = "\n".join(f"[{e['event_id']}] {e['actor']}/{e['action_type']} @{e.get('host')}: "
-                         f"{str(e['payload'])[:200]}" for e in events)
+                         f"{str(e['payload'])[:200]}" for e in events
+                         if not self._compression_note(e))
         try:
             summary = self.llm.complete(
                 SUMMARIZER_PROMPT.format(previous=previous or "(none yet)", events=blob),
                 "summarize")
-        except Exception:
+            if not isinstance(summary, str) or not summary.strip():
+                raise ValueError("model returned an empty or non-text summary")
+        except Exception as exc:
+            self._log("red", "agent_note", {"activity": "compression", "state": "failed",
+                                            "error": str(exc)[:300]})
             return None
-        return summary, upto_event_id
+        self._log("red", "agent_note", {"activity": "compression", "state": "completed",
+                                        "upto_event_id": upto_event_id})
+        return summary.strip(), upto_event_id
+
+    @staticmethod
+    def _compression_note(event: dict) -> bool:
+        return (event.get("action_type") == "agent_note"
+                and (event.get("payload") or {}).get("activity") == "compression")
 
     # --------------------------------------------------------------------- run
     def _deadline_passed(self) -> bool:
@@ -250,7 +266,7 @@ class RedAgentLoop:
                 break
 
             recent = self.transport.events_since(self.session_id, summary_upto)
-            recent_tail = recent[-self.keep_recent:]
+            recent_tail = [e for e in recent if not self._compression_note(e)][-self.keep_recent:]
             recent_txt = "\n".join(
                 f"[{e['event_id']}] {e['actor']}/{e['action_type']} {str(e['payload'])[:200]}"
                 for e in recent_tail) or "(none yet)"
@@ -283,10 +299,15 @@ class RedAgentLoop:
                 try:
                     raw = self.llm.complete(prompt + "\n\nREMINDER: JSON ONLY, exact schema.",
                                             "next action")
+                except Exception as e:
+                    self._log("red", "agent_note", {"model_error": str(e)[:300]}, phase=pm.phase)
+                    outcome = "model_unavailable"
+                    break
+                try:
                     tc = parse_tool_call(raw)
                 except ValueError as e:
-                    self._log("system", "tool_call", {"error": f"model output rejected twice: {e}",
-                                                      "raw": raw[:500]}, phase=pm.phase)
+                    self._log("red", "agent_note", {"error": f"model output rejected twice: {e}"[:300],
+                                                       "raw": raw[:500]}, phase=pm.phase)
                     steps_run += 1
                     continue
 
@@ -383,10 +404,13 @@ class RedAgentLoop:
             # carrying the previous summary forward; checkpoint only on success
             all_new = self.transport.events_since(self.session_id, summary_upto)
             if len(all_new) > self.compress_after:
-                window = all_new[: len(all_new) - self.keep_recent]
-                compressed = self.compress(summary, window[-1]["event_id"], window)
-                if compressed:
-                    summary, summary_upto = compressed
+                # Bound each request even after repeated failures; never advance
+                # over substantive events that were not supplied to the model.
+                window = all_new[: max(0, len(all_new) - self.keep_recent)][:64]
+                if window:
+                    compressed = self.compress(summary, window[-1]["event_id"], window)
+                    if compressed:
+                        summary, summary_upto = compressed
 
             self.transport.save_agent_state(self.session_id, summary, summary_upto, pm.phase)
             steps_run += 1

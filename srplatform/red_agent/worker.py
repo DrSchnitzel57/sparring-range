@@ -64,7 +64,10 @@ def main() -> int:
         _report(api, run_id, token, {"outcome": "worker_failure", "error": str(e)[:1000]})
         print(f"[worker] failed: {e}", file=sys.stderr)
         return 1
-    _report(api, run_id, token, result)
+    if not _report(api, run_id, token, result):
+        # The supervisor retains the assignment and reports this exit through
+        # its fenced callback. Never present an unacknowledged completion as 0.
+        return 1
     print(json.dumps({"run_id": run_id, **{k: result[k] for k in
                                            ("steps", "phase", "achieved", "complete", "outcome")
                                            if k in result}}))
@@ -100,12 +103,15 @@ def _match_deadline():
         return None
 
 
-def _report(api: str, run_id: str, token: str, result: dict) -> None:
+def _report(api: str, run_id: str, token: str, result: dict) -> bool:
     try:
-        httpx.post(f"{api}/internal/runs/{run_id}/complete", json=result,
-                   headers={"X-Worker-Token": token}, timeout=15)
+        response = httpx.post(f"{api}/internal/runs/{run_id}/complete", json=result,
+                              headers={"X-Worker-Token": token}, timeout=15)
+        response.raise_for_status()
+        return True
     except Exception as e:  # noqa: BLE001
         print(f"[worker] could not report completion: {e}", file=sys.stderr)
+        return False
 
 
 if __name__ == "__main__":
