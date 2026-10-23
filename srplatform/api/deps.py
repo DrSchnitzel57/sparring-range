@@ -42,6 +42,23 @@ DbSession = Annotated[Session, Depends(get_db, scope="function")]
 _broker = None
 
 
+class DeferredBroker:
+    """Resolve on each operation, not before the appliance socket is ready.
+
+    Resolution errors propagate to cessation/heartbeat reporting. A failed
+    startup lookup must not permanently remove either safety layer.
+    """
+
+    def __getattr__(self, name):
+        return getattr(get_broker(), name)
+
+
+def get_safety_broker(settings):
+    if settings.broker_socket or settings.broker_url:
+        return DeferredBroker()
+    return get_broker()  # injected/dev fixtures retain their explicit client
+
+
 def get_broker():
     global _broker
     if _broker is None:

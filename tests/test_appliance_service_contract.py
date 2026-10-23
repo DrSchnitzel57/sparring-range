@@ -24,6 +24,71 @@ if str(REPO) not in sys.path:
 from infra.dev.service_contract import contract_problems  # noqa: E402
 
 
+def test_safety_broker_recovers_when_socket_appears_after_api_start(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from srplatform.api import deps
+    from srplatform.safety import Supervisor
+    from srplatform.settings import Settings
+    from srplatform.safety.lease import ControlHeartbeat
+
+    available = False
+    calls = []
+
+    class Broker:
+        def hard_stop_all(self, reason):
+            calls.append(("stop", reason))
+            return {"stopped": [200, 201], "failed": []}
+
+        def renew_lease(self, holder):
+            calls.append(("renew", holder))
+
+    def resolve():
+        if not available:
+            raise RuntimeError("socket not ready")
+        return Broker()
+
+    monkeypatch.setattr(deps, "get_broker", resolve)
+    proxy = deps.get_safety_broker(SimpleNamespace(
+        broker_socket="late.sock", broker_url=""))
+    sup = Supervisor(settings=Settings(sr_env="dev"),
+                     state_file=str(tmp_path / "safety.json"), broker=proxy)
+    monkeypatch.setattr(sup, "_db_write_state", lambda state: None)
+    monkeypatch.setattr(sup, "record", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sup, "kill_workers", lambda *args, **kwargs:
+                        {"ok": True, "results": []})
+    hb = ControlHeartbeat(proxy, active_check=lambda: True)
+    assert hb.tick() is False
+    failed = sup.engage("early")
+    assert failed["killswitch"] == "engaged-partial"
+    assert failed["broker"]["configured"] is True
+    assert failed["broker"]["ok"] is False
+    assert "network IS severed" not in failed["warning"]
+    available = True
+    assert hb.tick() is True
+    result = sup.engage("recovered")
+    assert result["killswitch"] == "engaged"
+    assert result["broker"]["report"]["stopped"] == [200, 201]
+    assert json.loads((tmp_path / "safety.json").read_text())["latched"] is True
+    assert calls == [("renew", "api-control"), ("stop", "killswitch: recovered")]
+
+
+def test_production_killswitch_without_broker_is_not_success(tmp_path, monkeypatch):
+    from srplatform.safety import Supervisor
+    from srplatform.settings import Settings
+
+    settings = Settings(sr_env="dev")
+    settings.sr_env = "production"
+    sup = Supervisor(settings=settings, state_file=str(tmp_path / "safety.json"))
+    monkeypatch.setattr(sup, "_db_write_state", lambda state: None)
+    monkeypatch.setattr(sup, "record", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sup, "kill_workers", lambda *args, **kwargs:
+                        {"ok": True, "results": []})
+    result = sup.engage("unconfigured")
+    assert result["killswitch"] == "engaged-partial"
+    assert result["broker"]["configured"] is False
+    assert result["broker"]["ok"] is False
+
+
 def _key(tmp_path: pathlib.Path, name: str) -> pathlib.Path:
     path = tmp_path / f"{name}.pub"
     if not path.exists():

@@ -357,7 +357,7 @@ class Supervisor:
         # confirmed, obligations retained on failure). Attempted regardless
         # of how (a) and (b) went.
         if self.broker is None:
-            broker_stop = {"ok": True, "configured": False,
+            broker_stop = {"ok": self.settings.sr_env != "production", "configured": False,
                            "detail": "no broker configured (unit/dev scope)"}
         else:
             try:
@@ -398,9 +398,14 @@ class Supervisor:
                                  + (f"Broker cessation incomplete ({broker_stop['detail']}) — "
                                     "VMs may still be running; check brokerctl status. "
                                     if not broker_stop["ok"] else "")
-                                 + ("Worker termination failed; network IS severed." if datapath["ok"] else
-                                    "Datapath drop FAILED — range traffic may still flow; "
-                                    "run infra/firewall/killswitch.sh on the Proxmox host NOW."))
+                                 + ("Worker termination incomplete. " if not workers["ok"] else "")
+                                 + ("Static isolation is not a network-disconnect action; "
+                                    "verify broker VM cessation."
+                                    if datapath.get("mechanism") == "static" else
+                                    "Emergency datapath action confirmed."
+                                    if datapath["ok"] else
+                                    "Datapath action FAILED; use the operator's "
+                                    "independent appliance power-off procedure."))
         return result
 
     def release(self) -> dict:

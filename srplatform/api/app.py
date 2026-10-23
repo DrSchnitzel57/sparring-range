@@ -2163,7 +2163,7 @@ def _startup():
         sup = get_supervisor()
         if sup.broker is None:
             try:
-                sup.broker = deps.get_broker()
+                sup.broker = deps.get_safety_broker(get_settings())
             except Exception:
                 pass  # unconfigured broker: readiness reports it; killswitch
                 # still latches + reports the layer honestly
@@ -2178,8 +2178,8 @@ def _startup():
                                   guard=lambda: bool(lock.held) if lock else True)
             hb.start()
             app.state.control_heartbeat = hb
-    except Exception:
-        pass
+    except Exception as exc:
+        issues.append(f"broker safety wiring: {type(exc).__name__}: {exc}")
     # PILOT STEP 4: match lifecycle — an API restart INTERRUPTS running
     # matches (never resumes them) and retries interrupted cleanup; the
     # scheduler enforces idle expiry + deadlines. Opt-in
