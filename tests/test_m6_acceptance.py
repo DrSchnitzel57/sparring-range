@@ -124,8 +124,13 @@ def test_m6_full_practice_loop_over_cli_and_http(live_api, tmp_path, monkeypatch
     def host_exec(host, command):
         if command.startswith("cat "):
             return (0, state["flag"]) if state["flag"] else (1, "no such file")
-        if command.startswith("ls -1 /etc/cron.d/"):
-            return 0, "\n".join(state["cron"]) + "\n---\n"
+        if command.startswith("python3 -c ") and "crontab" in command:
+            import hashlib
+            import json
+            files = {name: {"uid": 0, "gid": 0, "mode": 0o644,
+                            "sha256": hashlib.sha256(name.encode()).hexdigest()}
+                     for name in state["cron"]}
+            return 0, json.dumps({"files": files, "crontab": ""})
         if "awk" in command:
             return 0, ""
         return 127, "no route"

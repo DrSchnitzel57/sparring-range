@@ -152,22 +152,33 @@ def test_begin_starts_prober_and_samples_are_identity_bound(client, users,
 
 @pytest.mark.db
 def test_uptime_samples_append_only_and_displayed(client, users, fake_pve,
-                                                  test_db_url_app):
+                                                   test_db_url_app):
+    from datetime import datetime, timedelta, timezone
     from sqlalchemy import create_engine, text
     from sqlalchemy.exc import ProgrammingError
     sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
                       headers=users["member"]).json()["session_id"]
     launch_and_wait(client, users["member"], sid)
+    start = datetime.now(timezone.utc) - timedelta(seconds=30)
     with _db() as s:  # the app role may INSERT (prober path) — proven here
-        for state in ("up", "up", "down", "unknown"):
+        deployment_id = s.execute(text(
+            "SELECT deployment_id FROM deployments WHERE session_id=:s "
+            "AND status='ready' ORDER BY created_at DESC LIMIT 1"), {"s": sid}).scalar_one()
+        s.execute(text("UPDATE sessions SET started_at=:t WHERE session_id=:s"),
+                  {"t": start, "s": sid})
+        for index, state in enumerate(("up", "up", "down", "unknown")):
             s.execute(text("INSERT INTO uptime_samples (session_id, "
-                           "deployment_id, host, state) VALUES (:s, 'dep-t', "
-                           "'web01', :st)"), {"s": str(sid), "st": state})
+                           "deployment_id, host, state, ts) VALUES (:s, :d, "
+                           "'web01', :st, :t)"),
+                      {"s": str(sid), "d": str(deployment_id), "st": state,
+                       "t": start + timedelta(seconds=index * 10)})
         s.commit()
     live = client.get(f"/sessions/{sid}/live", headers=users["member"]).json()
     u = live["uptime"]
     assert u["scored"] and u["pct_up"] == 66.7 and u["unknown"] == 1
-    assert u["down"] == 1 and u["coverage_pct"] == 75.0
+    assert u["down"] == 1 and u["coverage_pct"] == 100.0
+    assert u["expected_checks"] == 4 and u["received"] == 4
+    assert u["duplicate_samples"] == 0 and u["excluded_samples"] == 0
     # samples are HISTORY: the app role holds SELECT+INSERT only
     eng = create_engine(test_db_url_app)
     with pytest.raises(ProgrammingError):

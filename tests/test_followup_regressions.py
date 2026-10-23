@@ -202,8 +202,23 @@ pytestmark_db = pytest.mark.db
 
 @pytest.mark.db
 def test_r09_absent_polarity_flips_with_host_state(client, users, fake_pve,
-                                                   monkeypatch):
+                                                   monkeypatch, tmp_path):
+    import hashlib
+    import json
+    from pathlib import Path
+    import yaml
     from srplatform import verification_service
+    from srplatform.scenario_engine import loader
+
+    # Fixture-owned clean image pin, supplied BEFORE the immutable session
+    # snapshot. Never learn trusted content from the compromised observation.
+    digest = hashlib.sha256(b"clean fixture maintenance job").hexdigest()
+    spec = yaml.safe_load(Path("scenarios/web-foothold-01.yaml").read_text())
+    for check in spec["scoring"]["blue_checks"]:
+        if check["verifier"] == "cron_persistence_present":
+            check["baseline_file_sha256"] = {"e2scrub_all": digest}
+    (tmp_path / "web-foothold-01.yaml").write_text(yaml.safe_dump(spec))
+    monkeypatch.setattr(loader, "scenarios_dir", lambda: tmp_path)
 
     sid, out = None, None
     sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
@@ -211,8 +226,10 @@ def test_r09_absent_polarity_flips_with_host_state(client, users, fake_pve,
     ip = launch_and_wait(client, users["member"], sid)["result"]["connections"][0]["ip"]
 
     def cron_card(cron_d_lines):
+        inventory = {name: {"uid": 0, "gid": 0, "mode": 0o644, "sha256": digest}
+                     for name in cron_d_lines.splitlines()}
         execd = ScriptedHostExec({ip: [
-            ("ls -1 /etc/cron.d", (0, cron_d_lines + "\n---\n")),
+            ("python3 -c", (0, json.dumps({"files": inventory, "crontab": ""}))),
         ]})
         verification_service.set_verifier_exec(execd)
         try:

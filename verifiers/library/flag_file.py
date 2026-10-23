@@ -74,6 +74,11 @@ _CRON_PROBE = r'''
 import hashlib, json, os, stat, subprocess
 directory = "/etc/cron.d"
 files = {}
+def identity(info):
+    # Reading may legitimately update atime. Detect identity/content/permission
+    # races without treating that access-time change as compromised inventory.
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 for name in os.listdir(directory):
     path = os.path.join(directory, name)
     info = os.lstat(path)
@@ -83,10 +88,10 @@ for name in os.listdir(directory):
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as stream:
             before = os.fstat(stream.fileno())
-            if not stat.S_ISREG(before.st_mode) or before != info:
+            if not stat.S_ISREG(before.st_mode) or identity(before) != identity(info):
                 raise RuntimeError("cron file changed during inventory")
             content = stream.read(1024 * 1024 + 1)
-            if len(content) > 1024 * 1024 or os.fstat(stream.fileno()) != before:
+            if len(content) > 1024 * 1024 or identity(os.fstat(stream.fileno())) != identity(before):
                 raise RuntimeError("cron file unreadable or changed during inventory")
         record["sha256"] = hashlib.sha256(content).hexdigest()
     files[name] = record

@@ -270,6 +270,7 @@ export default function LiveSession() {
         <div className="panel">
           <h3>web uptime</h3>
           <p className="dim">Service availability only — this does not measure AI progress or security.</p>
+          {live?.uptime?.coverage_error && <p className="bad">{live.uptime.coverage_error}</p>}
           {live?.uptime?.scored ? (
             <>
               <p style={{ fontSize: 20 }}>

@@ -4,6 +4,24 @@ from types import SimpleNamespace
 
 import pytest
 
+
+def test_registry_failure_cannot_reuse_old_generation_availability(monkeypatch):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from srplatform import lifecycle, uptime
+    monkeypatch.setattr(uptime, "summarize_for_session", lambda *args: {
+        "scored": True, "pct_up": 100.0, "up": 65, "samples": 65})
+    monkeypatch.setattr(lifecycle, "get_match", lambda *args: SimpleNamespace(
+        started_at=datetime.now(timezone.utc), state="running"))
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("fixture registry failure")
+    monkeypatch.setattr(uptime, "coverage_for_session", unavailable)
+    monkeypatch.setattr(uptime, "mysql_integrity", lambda *args: None)
+    result = uptime.live_projection(object(), "fixture-session")
+    assert result["scored"] is False and result["pct_up"] is None
+    assert result["samples"] == 0 and result["up"] == 0
+    assert result["coverage_error"] == "service coverage registry unavailable"
+
 from srplatform import uptime
 
 

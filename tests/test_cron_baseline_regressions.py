@@ -7,6 +7,30 @@ import sys
 
 import pytest
 
+
+def test_real_inventory_read_tolerates_atime_change(tmp_path, monkeypatch, capsys):
+    import hashlib
+    import json
+    import os
+    import subprocess
+    from types import SimpleNamespace
+    from verifiers.library.flag_file import _CRON_PROBE
+
+    job = tmp_path / "maintenance"
+    content = b"# synthetic clean cron fixture\n"
+    job.write_bytes(content)
+    os.utime(job, ns=(0, job.stat().st_mtime_ns))
+    def no_crontab(args, **kwargs):
+        assert args == ["crontab", "-l"]
+        return SimpleNamespace(returncode=1, stdout="", stderr="no crontab for fixture\n")
+    monkeypatch.setattr(subprocess, "run", no_crontab)
+    # Exercise the actual bounded probe against only the disposable directory.
+    probe = _CRON_PROBE.replace('directory = "/etc/cron.d"', f"directory = {str(tmp_path)!r}")
+    exec(probe, {})
+    result = json.loads(capsys.readouterr().out)
+    assert result["files"]["maintenance"]["sha256"] == hashlib.sha256(content).hexdigest()
+    assert result["crontab"] == ""
+
 from verifiers.base import Context
 from verifiers.library.flag_file import CronPersistencePresent, _CRON_PROBE
 

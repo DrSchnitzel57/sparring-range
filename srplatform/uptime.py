@@ -358,7 +358,8 @@ def live_projection(db, session_id) -> dict:
         cov = coverage_for_session(db, session_id, started_at=started,
                                    ended_at=ended)
     except Exception:  # noqa: BLE001 — coverage never breaks the projection
-        cov = {"expected_checks": None, "missed": None, "coverage_pct": None}
+        cov = {**summarize([]), "expected_checks": None, "missed": None,
+               "coverage_pct": None, "coverage_error": "service coverage registry unavailable"}
     # Do not fall back to received-only coverage on a registry/query failure:
     # that would let missing targets or old generations look fully covered.
     base.update(cov)
