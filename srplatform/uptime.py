@@ -141,13 +141,107 @@ def coverage(states: list[str], *, started_at: datetime,
 
 
 def coverage_for_session(db, session_id, *, started_at, ended_at=None,
-                         interval_s: float = INTERVAL_S) -> dict:
+                          interval_s: float = INTERVAL_S) -> dict:
     from sqlalchemy import select
-    from srplatform.db.models import UptimeSample
-    rows = db.execute(select(UptimeSample.state).where(
-        UptimeSample.session_id == session_id)).scalars().all()
-    return coverage(list(rows), started_at=started_at, ended_at=ended_at,
-                    interval_s=interval_s)
+    from srplatform.db.models import Deployment, UptimeSample
+    from srplatform import verification_service
+    dep = db.execute(select(Deployment).where(
+        Deployment.session_id == session_id).order_by(
+            Deployment.created_at.desc(), Deployment.deployment_id.desc())
+    ).scalars().first()
+    spec = verification_service.scenario_spec(db, session_id) if dep else {}
+    targets = _coverage_targets(spec, dep.resources or []) if dep else []
+    rows = db.execute(select(UptimeSample).where(
+        UptimeSample.session_id == session_id)
+        .order_by(UptimeSample.ts, UptimeSample.id)).scalars().all()
+    return scheduled_coverage(
+        [dict(state=r.state, ts=r.ts, host=r.host,
+              deployment_id=r.deployment_id, latency_ms=r.latency_ms,
+              detail=r.detail) for r in rows],
+        targets=targets, deployment_id=str(dep.deployment_id) if dep else None,
+        started_at=started_at, ended_at=ended_at, interval_s=interval_s)
+
+
+def _coverage_targets(spec: dict, resources: list[dict]) -> list[str]:
+    """Expected services come from inventory, NEVER observed sample hosts.
+
+    Keep the existing probe labels, including distinct database observation
+    paths. A missing probe/channel must leave a gap, not shrink the registry.
+    """
+    hosts = (spec.get("topology") or {}).get("hosts", [])
+    http = {h.get("name") for h in hosts if "http" in (h.get("services") or [])}
+    inventory = {r.get("host"): r for r in resources}
+    targets = set()
+    for r in resources:
+        host = r.get("host")
+        if not host or not r.get("ip"):
+            continue
+        if host in http:
+            targets.add(host)
+        if r.get("mysql_probe"):
+            targets.add(host + ":mysql" if host in http else host)
+            targets.add(host + ":banner")
+            if r.get("db_reader_password"):
+                targets.add(host + ":direct")
+    for h in hosts:
+        r = inventory.get(h.get("name")) or {}
+        db = inventory.get(h.get("db_ref")) or {}
+        if (r.get("ip") and db.get("ip") and db.get("mysql_probe")
+                and db.get("db_reader_password")):
+            targets.add(h["name"] + ":db-path")
+    return sorted(targets)
+
+
+def scheduled_coverage(samples: list[dict], *, targets: list[str],
+                       deployment_id: str | None, started_at: datetime,
+                       ended_at: datetime | None = None,
+                       interval_s: float = INTERVAL_S) -> dict:
+    """Unique (generation, service target, slot) coverage, not sample volume.
+
+    The window is inclusive: the prober runs immediately at start, then at
+    start + n*interval. At an exact boundary that new slot is already due.
+    Samples are completion timestamps (the persisted schema has no scheduled
+    timestamp); assign each to its containing slot. Keep the first observation
+    per slot, ordered by timestamp then input order (DB callers order by ID).
+    Duplicate observations never boost coverage or overwrite earlier downtime.
+    """
+    import math
+    if not math.isfinite(interval_s) or interval_s <= 0:
+        raise ValueError("interval_s must be finite and positive")
+
+    def utc(ts):
+        if isinstance(ts, str):
+            ts = datetime.fromisoformat(ts)
+        return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+    start = utc(started_at)
+    end = utc(ended_at or datetime.now(timezone.utc))
+    slots = int((end - start).total_seconds() // interval_s) + 1 if end >= start else 0
+    target_set = set(targets)
+    expected = slots * len(target_set)
+    accepted = {}
+    duplicates = excluded = 0
+    for sample in sorted(samples, key=lambda s: utc(s["ts"])):
+        ts = utc(sample["ts"])
+        if (deployment_id is None or str(sample.get("deployment_id")) != deployment_id
+                or sample.get("host") not in target_set or not start <= ts <= end):
+            excluded += 1
+            continue
+        key = (deployment_id, sample["host"],
+               int((ts - start).total_seconds() // interval_s))
+        if key in accepted:
+            duplicates += 1
+        else:
+            accepted[key] = sample
+    selected = list(accepted.values())
+    result = summarize(selected, now=end)
+    result.update(expected_checks=expected, received=len(selected),
+                  missed=expected - len(selected),
+                  coverage_pct=round(100.0 * len(selected) / expected, 1)
+                  if expected else None,
+                  duplicate_samples=duplicates, excluded_samples=excluded,
+                  raw_samples=len(samples), target_count=len(target_set))
+    return result
 
 
 def _integrity_db_host(db, session_id, deployment_id=None) -> str | None:
@@ -265,10 +359,9 @@ def live_projection(db, session_id) -> dict:
                                    ended_at=ended)
     except Exception:  # noqa: BLE001 — coverage never breaks the projection
         cov = {"expected_checks": None, "missed": None, "coverage_pct": None}
-    base["expected_checks"] = cov.get("expected_checks")
-    base["missed"] = cov.get("missed")
-    if cov.get("coverage_pct") is not None:
-        base["coverage_pct"] = cov["coverage_pct"]
+    # Do not fall back to received-only coverage on a registry/query failure:
+    # that would let missing targets or old generations look fully covered.
+    base.update(cov)
     try:
         integ = mysql_integrity(db, session_id)
     except Exception:  # noqa: BLE001 — integrity never breaks projection
@@ -579,7 +672,8 @@ def start_for_session(db, sess, dep, *, get=None) -> bool:
         runner = management_runner()
         if runner is not None:
             for r in db_hosts:
-                targets.append((r.get("host", "db"), "mysql",
+                host = r.get("host", "db")
+                targets.append((host + ":mysql" if host in http_hosts else host, "mysql",
                                 functools.partial(probe_mysql, runner,
                                                   r["ip"])))
         # Controller-direct authenticated transactions: one per DB

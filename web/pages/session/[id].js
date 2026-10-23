@@ -10,6 +10,9 @@ export default function LiveSession() {
   const [live, setLive] = useState(null);
   const [conns, setConns] = useState(null);
   const [hint, setHint] = useState("");
+  const [logKind, setLogKind] = useState("");
+  const [logEvents, setLogEvents] = useState([]);
+  const [logError, setLogError] = useState(null);
   const [injects, setInjects] = useState(null);
   const [injectDraft, setInjectDraft] = useState({});
   const [busy, setBusy] = useState(false);
@@ -71,12 +74,9 @@ export default function LiveSession() {
         if (!startRef.current && d.started_at) startRef.current = new Date(d.started_at).getTime();
         if (startRef.current) setSeconds(Math.max(0, Math.floor((Date.now() - startRef.current) / 1000)));
         // 202 lifecycle: the executor promotes provisioning → ready in the
-        // background — refresh the session (match state/buttons) on every
-        // tick until the session is running or complete. Transient errors
-        // must not freeze stale controls.
-        if (d.status !== "running" && d.status !== "complete") {
-          api(`/sessions/${id}`).then(s => { if (!stop) setSess(s); }).catch(() => {});
-        }
+        // background. Keep polling even during a running match: the attacker
+        // can fail while service probes and the match clock keep running.
+        api(`/sessions/${id}`).then(s => { if (!stop) setSess(s); }).catch(() => {});
       } catch (e) { /* transient */ }
     };
     tick();
@@ -90,6 +90,38 @@ export default function LiveSession() {
     const ti = setInterval(tin, 5000);
     const tc = setInterval(() => { if (startRef.current) setSeconds(s => s + 1); }, 1000);
     return () => { stop = true; clearInterval(t); clearInterval(ti); clearInterval(tc); };
+  }, [id]);
+
+  useEffect(() => {
+    if (!id) return;
+    let stop = false;
+    setLogEvents([]);
+    const load = async () => {
+      try {
+        // Filter BEFORE the tail on the API: telemetry volume must not hide
+        // the last AI action. The API still enforces competition redaction.
+        const kind = logKind ? `&action_type=${encodeURIComponent(logKind)}` : "";
+        const events = await api(`/events?session_id=${id}&tail=20${kind}`);
+        if (!stop) { setLogEvents(events); setLogError(null); }
+      } catch (e) { if (!stop) setLogError(String(e.message || e)); }
+    };
+    load();
+    const timer = setInterval(load, 5000);
+    return () => { stop = true; clearInterval(timer); };
+  }, [id, logKind]);
+
+  useEffect(() => {
+    if (!id) return;
+    let stop = false;
+    setHint("");
+    api(`/events?session_id=${id}&action_type=hint&tail=1`).then(events => {
+      if (!stop && events.length) {
+        const payload = events[0].payload || {};
+        setHint(payload.redacted || (payload.hint || "").trim() ||
+          "The last model hint was empty. No usable hint was generated.");
+      }
+    }).catch(() => {});
+    return () => { stop = true; };
   }, [id]);
 
   async function act(fn, label) {
@@ -115,7 +147,9 @@ export default function LiveSession() {
     if (!confirm("End match? Stops red, takes a trusted final score, revokes tokens and destroys the owned lab.")) return;
     act(async () => {
       const r = await api(`/sessions/${id}/end`, { method: "POST" });
-      setSess({ ...sess, status: r.status, outcome: r.outcome });
+      setSess(await api(`/sessions/${id}`));
+      if (!r.ok || !r.lease_released)
+        throw new Error(r.note || "cleanup incomplete — range reservation retained");
     }, "end");
   };
   // 202 lifecycle: launch/reset are accepted immediately and completed by
@@ -146,7 +180,7 @@ export default function LiveSession() {
   }, "redeploy");
   const askHint = () => act(async () => {
     const r = await api(`/sessions/${id}/hint`, { method: "POST", body: { question: "" } });
-    setHint(r.hint);
+    setHint((r.hint || "").trim() || "The model returned an empty hint. No usable hint was generated.");
   }, "hint");
   const submitInject = (releaseId) => act(async () => {
     // identity-bound; the FIRST answer decides (duplicates never re-decide)
@@ -181,7 +215,17 @@ export default function LiveSession() {
           </div>
           <p className="dim">status: {sess.status} {sess.outcome && `(${sess.outcome})`}
             {sess.active_run && ` · red run ${sess.active_run.slice(0, 8)}`} ·
-            phases advance only when verifiers pass</p>
+             phases advance only when verifiers pass</p>
+          {live?.attacker && <div aria-label="Attacker status">
+            <p className={["failed", "cancel-unknown"].includes(live.attacker.status) ? "bad" : "dim"}>
+              AI worker: {live.attacker.status}
+              {live.attacker.outcome && ` · ${live.attacker.outcome}`}
+              {live.attacker.event_age_s != null && ` · last AI event ${live.attacker.event_age_s}s ago`}
+            </p>
+            {live.attacker.error && <p className="bad">{live.attacker.error}</p>}
+            {["queued", "running"].includes(live.attacker.status) && live.attacker.event_age_s >= 300 &&
+              <p className="bad">No AI event for at least 5 minutes. The match clock and web uptime do not prove attacker progress.</p>}
+          </div>}
           {match && match.state === "ready" && (
             <p className="dim">lab ready — <b>begins idle-expiry</b>
               {match.ready_expires_at && ` at ${new Date(match.ready_expires_at).toLocaleTimeString()}`}
@@ -197,6 +241,7 @@ export default function LiveSession() {
               <button onClick={beginMatch} disabled={busy}>▶ begin match ({match.duration_minutes} min)</button>}
             {(!match || match.state !== "ready") && !running &&
               sess.status !== "complete" && sess.status !== "failed" &&
+              (!match || !["finalizing", "interrupted"].includes(match.state)) &&
               <button onClick={startRed} disabled={busy}>▶ start red</button>}
             {sess.active_run && <button onClick={stopRed} disabled={busy}>■ stop red</button>}
             {sess.status !== "complete" && <button className="danger" onClick={endSession} disabled={busy}>end session</button>}
@@ -216,10 +261,15 @@ export default function LiveSession() {
             <p className="dim">loading…</p>
           )}
           <p className="dim">Defend: SSH through the bastion with the token login; every keystroke
-            is recorded and replayable.</p>
+             is recorded and replayable.</p>
+          <p className="dim">SSH also requires this device’s public key to be enrolled by the operator
+            for your application account. The token username alone is not sufficient.
+            If your key is not offered automatically, use <code>ssh -i path/to/your/private-key</code>
+            {" "}with the connection options above. Keep the private key on your device.</p>
         </div>
         <div className="panel">
           <h3>web uptime</h3>
+          <p className="dim">Service availability only — this does not measure AI progress or security.</p>
           {live?.uptime?.scored ? (
             <>
               <p style={{ fontSize: 20 }}>
@@ -296,11 +346,28 @@ export default function LiveSession() {
         </div>
         <div className="panel">
           <h3>recent log</h3>
+          <label>Show events{" "}
+            <select aria-label="Event filter" value={logKind} onChange={e => setLogKind(e.target.value)}>
+              <option value="">all recent</option>
+              <option value="action_intent">AI commands dispatched</option>
+              <option value="action_result">AI command results</option>
+              <option value="agent_note">AI notes and errors</option>
+              <option value="verifier">verifier results</option>
+              <option value="hint">coach hints</option>
+            </select>
+          </label>
+          {logError && <p className="bad">Log refresh failed: {logError}</p>}
+          {!logEvents.length && <p className="dim">No matching events yet.</p>}
           <table><tbody>
-            {live?.recent.map(e => (
+            {logEvents.map(e => (
               <tr key={e.event_id}>
                 <td className="dim">{new Date(e.ts).toLocaleTimeString()}</td>
                 <td>{e.actor}</td><td>{e.action_type}</td><td>{e.phase || ""}</td>
+                <td><details><summary>details #{e.event_id}</summary>
+                  <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+                    {JSON.stringify(e.payload, null, 2)}
+                  </pre>
+                </details></td>
               </tr>))}
           </tbody></table>
         </div>

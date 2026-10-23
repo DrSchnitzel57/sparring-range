@@ -130,6 +130,12 @@ def _body_has(pw, text: str, timeout=40) -> str:
     last = ""
     while time.time() < deadline:
         last = pw("--raw", "eval", "document.body.innerText").stdout
+        try:
+            decoded = json.loads(last)
+            if isinstance(decoded, str):
+                last = decoded
+        except json.JSONDecodeError:
+            pass
         if text in last:
             return last
         time.sleep(0.5)
@@ -325,6 +331,25 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
         # proved nothing and the immediate assert raced the first poll.
         _body_has(pw, "command", timeout=20)
 
+        # Regression fixture: old deployments persisted empty model hints.
+        # Reload must expose that failure, not silently render no coach text.
+        eng = create_engine(test_db_url_owner)
+        with eng.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO events (session_id, ts, actor, action_type, payload) "
+                "VALUES (:s, now(), 'system', 'hint', CAST(:p AS jsonb))"),
+                {"s": sid, "p": json.dumps({"hint": "", "question": ""})})
+        eng.dispose()
+        pw("reload")
+        _body_has(pw, "The last model hint was empty")
+        pw("select", 'select[aria-label="Event filter"]', "hint")
+        _body_has(pw, "details #")
+        pw("click", "details summary")
+        _body_has(pw, '\"hint\": \"\"')
+        pw("select", 'select[aria-label="Event filter"]', "action_result")
+        _body_has(pw, "No matching events yet")
+        pw("select", 'select[aria-label="Event filter"]', "")
+
         # ---- begin match: SERVER clock + REAL worker subprocess via the UI ----
         pw("click", 'button:has-text("begin match")')
         _body_has(pw, "red run")
@@ -342,6 +367,17 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
             time.sleep(1)
         else:
             pytest.fail("the red run never stopped through the shared model path")
+        # The UI must poll session/run state even while the match clock runs;
+        # a finished worker must not leave a stale stop button indefinitely.
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            visible = pw("--raw", "eval",
+                         "[...document.querySelectorAll('button')].some(b => b.textContent.includes('stop red'))").stdout.strip()
+            if visible == "false":
+                break
+            time.sleep(0.5)
+        else:
+            pytest.fail("stopped worker remained active in the session UI")
 
         # ---- end session (confirm dialog) -> trusted final score -------------
         pw("eval", "window.confirm = () => true")

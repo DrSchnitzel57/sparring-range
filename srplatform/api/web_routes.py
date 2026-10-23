@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 
 from srplatform.api.auth import Principal, make_auth_dependencies
 from srplatform.api.deps import DbSession  # the ONE function-scoped session
-from srplatform.db.models import Event, Recording, Session as SessionModel
+from srplatform.db.models import Event, Recording, Run, Session as SessionModel
 from srplatform.settings import get_settings
 
 router = APIRouter()
@@ -222,6 +222,30 @@ def progress(username: str, p: Principal = Depends(any_member), db: DbSession = 
 
 
 # --- live dashboard: current red phase + real detections with source times -------
+def _attacker_projection(run, event, *, sealed: bool, now: datetime) -> dict | None:
+    """Operational status is distinct from match state and service uptime.
+
+    A heartbeat is liveness evidence, NOT proof that commands are progressing.
+    Do not serialize credentials, PID identities, results, or sealed errors.
+    """
+    if run is None:
+        return None
+    def age(value):
+        return max(0, int((now - value).total_seconds())) if value else None
+    progress_at = event.ingested_at if event is not None else None
+    heartbeat = run.worker_heartbeat_at
+    return {
+        "run_id": str(run.run_id), "status": run.status,
+        "outcome": None if sealed else run.outcome,
+        "error": ("Attacker failed; operator diagnostics required" if sealed and run.error
+                  else run.error),
+        "heartbeat_age_s": age(heartbeat),
+        "last_event_at": progress_at.isoformat() if progress_at else None,
+        "last_event_kind": None if sealed or event is None else event.action_type,
+        "event_age_s": age(progress_at or run.started_at),
+    }
+
+
 @router.get("/sessions/{session_id}/live")
 def live(session_id: uuid.UUID, p: Principal = Depends(any_member),
          db: DbSession = None):
@@ -238,8 +262,23 @@ def live(session_id: uuid.UUID, p: Principal = Depends(any_member),
     from srplatform.api.visibility import (
         competition_sealed, filter_detection)
     sealed = competition_sealed(db, sess, p)
+    from sqlalchemy import func
+    from srplatform.api.runs import ACTIVE
+    latest_run = db.execute(select(Run).where(Run.session_id == session_id).order_by(
+        Run.status.in_(ACTIVE).desc(),
+        func.coalesce(Run.ended_at, Run.started_at).desc().nulls_last(),
+        Run.run_id.desc()).limit(1)).scalar_one_or_none()
+    last_agent_event = None
+    if latest_run is not None and latest_run.started_at is not None:
+        last_agent_event = db.execute(select(Event).where(
+            Event.session_id == session_id, Event.actor == "red",
+            Event.ingested_at >= latest_run.started_at,
+            Event.action_type.in_(("action_intent", "action_result", "agent_note")))
+            .order_by(Event.event_id.desc()).limit(1)).scalar_one_or_none()
     return {
         "session_id": str(session_id), "status": sess.status,
+        "attacker": _attacker_projection(latest_run, last_agent_event,
+                                         sealed=sealed, now=datetime.now(timezone.utc)),
         "uptime": _uptime.live_projection(db, session_id),
         "started_at": sess.started_at.isoformat() if sess.started_at else None,
         "red_phase": None if sealed else (state.current_phase if state else None),
