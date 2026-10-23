@@ -5,10 +5,12 @@
 The user selected one Ubuntu appliance VM with nested full practice VMs. Read
 [the appliance architecture](ARCHITECTURE.md#ubuntu-kvm-appliance--2026-10-20)
 and [plans 14–16](ROADMAP.md#current-completion-sequence--draft-2026-10-20).
-Those plans are drafts, not a shipped appliance installer. **The commands below
-are historical direct-PVE deployment instructions, not appliance installation.**
-Their safety/evidence principles remain; replaced PVE mechanisms are mapped in
-the roadmap. No new passing test or live result is claimed by this planning pass.
+This section began as planning guidance. The installer now exists and the
+operator completed commissioning for the supervised AI run on the patched
+appliance. See [current receipts and unresolved repairs](FINDINGS_CHECKLIST.md#consolidated-deployment-and-product-status--2026-10-23)
+and [the installed patch handoff](HANDOFF-LIVE-PRACTICE.md). The appliance
+instructions below are current; later **historical direct-PVE** instructions are
+not appliance installation. No new live action is requested by this doc update.
 
 Operator checkpoints for the new release:
 
@@ -23,7 +25,9 @@ Operator checkpoints for the new release:
 4. Fresh launch, actual member SSH, sudo, exec/interactive/resize/reconnect,
    synthetic recording replay, cleanup, second fresh launch. Record the exact
    revision/config/images and user-visible outcomes. A ready flag cannot pass it.
-   This gate blocks promotion to milestone 15; deployed SSH is currently unproven.
+   Actual deployed member SSH/sudo/replay subsequently passed (2026-10-23).
+   Retain scoped evidence; do not repeat completed commissioning merely to
+   compensate for stale documentation. Complete milestone acceptance is broader.
 5. After milestone 15, validate the real model and complete both presets/modes/
    start conditions with truthful service/inject changes. Milestone 16 requires
    an operator and another member to complete the workflow unaided and reuse it.
@@ -78,6 +82,21 @@ existing private key or capability: a rerun is idempotent, and a suspiciously
 short existing token is an error, not something to overwrite.
 
 ### Recovery is local, explicit and evidence-bound
+
+**2026-10-23 field limitation:** normal End after killswitch can retain the
+reservation because typed destroy is refused under the broker cessation latch
+(HTTP 423), even when guests are stopped. `status:complete` alone is not cleanup
+success. The successful scoped workaround kept the API safety latch, stopped
+broker to avoid concurrent ledger writers, verified exact session/claims and zero
+obligations/intents, used broker-service identity and libvirt/KVM groups for typed
+stop/readback, audited broker release, typed destroy/independent absence and lease
+disarm; then restarted broker and retried authenticated API End for that session.
+This is a receipt, not a generic executable recipe: obtain fresh inventory and
+approval, never reuse old session IDs or edit SQL/ledger files. Open obligations
+need supported resolution tooling, not this zero-obligation workaround. Permanent
+teardown/recovery UX remains open; do not broadly remove latch checks or Begin
+to extend idle expiry. Local SSH waiting after verified VM shutdown is not proof
+of surviving guest work. Retain independent appliance power-off fallback.
 
 ```bash
 .venv/bin/python deploy/appliance.py recovery status    --manifest M

@@ -263,8 +263,13 @@ gate now runs **567 fast tests, 0 failed, 0 skipped** (267 deselected). The
 disposable PostgreSQL gate passes **183 tests**, and browser/authority/containment/
 frontend gates pass separately. Exact attempts, counts and limitations are in
 `docs/FINDINGS_CHECKLIST.md`; deployment constraints and the small source patch
-are in `docs/HANDOFF-LIVE-PRACTICE.md`. These fixes have not been installed on the
-operator appliance and do not close real-model, cron-image-pin or security gates.
+are in `docs/HANDOFF-LIVE-PRACTICE.md`. Operator installation subsequently
+succeeded on 2026-10-23. Commissioning for supervised practice (SSH/replay,
+scoped isolation, boot, VM stop/watchdog and real runner cancellation) completed;
+do not reopen these from older pending notes. Sustained useful AI, trusted cron
+pins, permanent teardown and adversarial safety remain separate open work.
+Current receipts/backlog are consolidated at the top of
+`docs/FINDINGS_CHECKLIST.md`; use repository docs, not Project Knowledge journals.
 
 - Fast baseline: the pytest command above (infrastructure-free since `ac5a61b`:
   0 failed, 0 prerequisite skips); integration layers are db/containment/packet/

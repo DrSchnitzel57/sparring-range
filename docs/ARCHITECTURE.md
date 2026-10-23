@@ -276,6 +276,10 @@ result. Reports/history survive guest cleanup.
 
 ## AI attack behavior and coaching
 
+Current agreed redesign requirements and unselected framework research are in
+[the 2026-10-23 decisions](#j-local-conversation-engine-admin-settings-and-session-review-2026-10-23).
+They supersede interim small-output-budget assumptions, not safety authority.
+
 Network-entry starts without target credentials against deliberately seeded,
 documented lab vulnerabilities. Assumed-breach starts with an explicitly
 disclosed limited guest foothold. Never silently seed access when network-entry
@@ -910,9 +914,83 @@ and no host firewall/auditd/host-shell capability was added to the product.
   including the first immediate probe. Duplicate/excluded observations are
   reported separately; clamping an inflated sample count to 100% was rejected.
 
-These are source repairs, not renewed deployed/model/security acceptance. The
+These repairs were subsequently installed (see current findings), not full
+model/security acceptance. The
 operator's AppArmor containment qualification, full useful model run, image
 baseline consolidation, and permanent post-killswitch cleanup repair remain open.
+
+### J. Local conversation engine, admin settings and session review (2026-10-23)
+
+Agreed requirements for the next planning discussion, **not implementation
+approval or a new plan**. Commissioning checks for the supervised AI run were
+completed; later practice exposed product defects. Receipts: [findings](FINDINGS_CHECKLIST.md).
+
+| Chosen | Rejected | Why |
+|---|---|---|
+| Replace conversation engine; retain execution/control plane | General agent replacing broker, runner and scoring | Context loss is the defect, not a reason to discard working safety authority. |
+| Structured conversation/tool history and durable API checkpoints | Last few raw telemetry events as memory; provider caches as persistence | Preserve evidence-linked facts, attempts/results, failed hypotheses, plan and next experiment. |
+| Token-aware pressure and reasoning/answer headroom for ~262k local context | Compaction after a handful of events; tiny output caps as containment | Context and output limits differ. Coordinate model-aware resource limits and real deadlines. |
+| One main model through the shared slot | Mandatory auxiliary or unscheduled background calls | Optional small model only after measuring resource/latency benefit, never for authorization/scoring. |
+| Versioned repository docs | Project Knowledge debugging journal | Findings/decisions/backlog travel with code. Migrate/delete notes, retain existing todo/plans. |
+
+**Agent boundary:** retain separate worker UID, API-only model credential, fixed
+pinned attacker VM, durable operation UUID/intent before dispatch, sequential
+bounded commands/pacing/deadline, independent supervisor/broker stop, append-only
+evidence and deterministic verifiers. Unknown cessation retains obligations and
+blocks progression. Only expose the approved range tool: no local shell, arbitrary
+SSH/backend/destination, host files, installs, plugin discovery or infrastructure
+credentials. Tool filters are not an OS boundary. Every main/summary/coach/report/
+retry request uses gateway admission; disable duplicate SDK retries and external
+tracing. Coroutine cancellation does not prove remote cessation or GPU slot release.
+
+The worker's `{system,user}` endpoint is not general OpenAI chat: a framework
+needs a scoped structured adapter/protocol, typed tool calls and usage/finish
+metadata. Current text-only finish parsing rejects native tool-call completions.
+Persist versioned run/deployment-bound history via API/forward migrations, not
+shared worker-local memory. Checkpoints do not silently resume attacks on restart.
+Failed compaction retains history/cutoff and uses bounded backoff, not identical
+window retries every turn. Separate useful action progress from model activity.
+
+**Admin-only GUI:** endpoint, model (discovery when supported), masked/write-only
+API key, thinking **none / low / medium / high**, context size, generation/time
+limits and connection/model test. Validate actual server capabilities; report
+unsupported thinking settings, never silently ignore them. Protect keys API-side;
+never return saved secrets or include them in browser state, prompts, normal logs
+or worker environments. Snapshot settings for new runs; do not silently change
+an active match. Local OpenAI-compatible transport does not prove model competence.
+
+**Session UX:** authenticated home active/recent/history cards; Overview / Activity /
+Replay / Report navigation and back links; safely rendered Markdown, not `<pre>`.
+Filter/group lifecycle/member/security events by host/actor/type, collapse MOTD/
+provisioning/verifier noise, retain expandable raw audit. Synchronize defender
+recordings and attacker command/output tracks with evidence/operation IDs and
+timestamps; existing action records are not historical PTY casts. Future streaming
+must label origin. API-enforced competition visibility applies to history/replay.
+Ground narrative in authoritative provenance: verifier probes are not attacker
+behavior; AI cannot turn UNSCORED into fail or award points. AAR narrative is not
+agent-memory compaction.
+
+**Research only; no framework chosen/installed:**
+
+- [Pydantic AI history](https://ai.pydantic.dev/message-history/),
+  [deferred tools](https://ai.pydantic.dev/deferred-tools/),
+  [OpenAI models](https://ai.pydantic.dev/models/openai/): slim OpenAI extra 2.60.0,
+  MIT/Python >=3.11; recommended small embedded prototype, not selected. Structured
+  history/custom external tools fit; dependency compatibility requires testing
+  (research release needs OpenAI >=3.26 versus lockfile 3.24). Platform durable
+  checkpoints/cancellation remain integration work.
+- [OpenAI Agents SDK models](https://openai.github.io/openai-agents-python/models/):
+  0.24.0, MIT/Python >=3.10; viable custom Chat Completions/tools/sessions option.
+  Disable external tracing; do not assume hosted Responses compaction works locally.
+- [Hermes integration](https://hermes-agent.nousresearch.com/docs/developer-guide/programmatic-integration),
+  [snapshot dc579a5](https://github.com/NousResearch/hermes-agent/tree/dc579a5a0319861e0cde4a9606d4c8d0053ef523):
+  full headless loop/history/recall/custom tools/compression, but broader runtime,
+  plugin/background surface. Source says supported Python 3.14 despite permissive
+  older-version metadata. Stock SSH uses `accept-new`/file sync, not our pinned
+  per-operation containment. Candidate only as restricted separate runtime with
+  custom range adapter, never unrestricted appliance Hermes. Main-model compression
+  possible; auxiliary calls still need shared admission. Footprint and actual Qwen
+  tool/reasoning compatibility unmeasured.
 
 ## Risks and explicitly unverified inputs (historical baseline; see reevaluation above)
 

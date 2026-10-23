@@ -1,6 +1,7 @@
 # Live-practice repairs — 2026-10-23
 
-Branch `15`; source changes only, not deployed acceptance. The source baseline
+Branch `15`; source repair handoff, subsequently installed by the operator;
+not full release acceptance. The source baseline
 was `5930c9d`. The user approved one supervised run, not general production
 promotion. No model endpoint, appliance, live guest or outer host was contacted
 by the repair agents. No image rebuild or host-security relaxation was performed.
@@ -62,11 +63,11 @@ Open work must not be hidden by these repairs:
 - Exit 127 identifies a missing executable, not which package to install. The
   user redacted that executable; do not assume it was nmap or add an unrestricted
   package-install fallback.
-- The Windows SSH client reached the bastion but failed public-key
-  authentication. A token username is not a password. Enroll that device’s
-  public key for member `sr`; keep its private key on Windows. The operator key
-  file uses `username public-key` lines and is loaded on bastion startup. Preserve
-  existing member keys and recordings; do not blindly restart an active bastion.
+- Public-key enrollment subsequently succeeded for member `sr`, and the user
+  connected from Linux with the local private-key file. Earlier Windows failure
+  is historical, not a general SSH blocker; Windows-agent login remains
+  unverified. A token username is not a password. Keep client private keys on
+  their device; preserve existing member keys/recordings.
 
 ## Deployment boundary
 
@@ -80,6 +81,21 @@ Patch runtime revision: `52ae3551ca057d33673bb38a9bd52eb7c4ebedf7`;
 `5593d1f58dfb7061918ba1c7da41604b4cb75b120a917cc8d8222847aed19f80`.
 Archive membership and every embedded file hash were independently read back.
 
+**Installed 2026-10-23 at 16:05:** operator preflight verified quiet broker and
+no active work, backed up touched source to
+`/var/lib/sparring-range/patch-backups/before-practice-repair-20261023-160507.tar.gz`
+(0600), installed all 16 verified files, ran `npm ci`/Next 16.4.2 build (audit
+zero), and restarted API/supervisor/web active with health `ok:true`. No image,
+environment, firewall or migration changes; no broker/ingest/bastion restart by
+this patch. These are operator receipts, not actions performed by repair agents.
+Later run `76499df5` completed eight commands but repeated recon and failed
+compaction at checkpoint 23964 (502/2048-token exhaustion). See the current
+[consolidated findings](FINDINGS_CHECKLIST.md#consolidated-deployment-and-product-status--2026-10-23).
+The narrow uncommitted memory filter is not part of this installed patch.
+
+The following is the retained installation procedure, not an instruction to
+repeat the completed deployment:
+
 Before applying: confirm the red worker has stopped, retain evidence from the
 failed session, complete ordinary cleanup if possible, and verify there is no
 active assignment. Do not restart the API/supervisor over unknown remote work.
@@ -91,7 +107,9 @@ changed services only after quiescence, then use a fresh session rather than
 resuming the old false-positive phase. Collect real command/result progression,
 nonempty hints, actual worker stop and cleanup evidence before promotion.
 
-Changing token budgets requires no image rebuild. Defaults retain the existing
+Changing token budgets requires no image rebuild. These patch defaults are
+interim, not the model-aware redesign: the user's local model has ~262k context
+and thinking can exhaust 2048/3072 tokens before an answer. Defaults retain the existing
 60-second per-call deadline: at the observed ~65 tokens/s the output portions
 take ~32/~47 seconds, but model/prefill/queue latency is still a manual check.
 Larger budgets require explicit latency/deadline coordination, not unlimited

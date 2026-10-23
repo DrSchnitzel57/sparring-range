@@ -1,10 +1,205 @@
 # Current findings and validation evidence
 
+## Consolidated deployment and product status — 2026-10-23
+
+This section supersedes intermediate status in the **67 Project Knowledge notes**
+migrated on this date. Operator receipts are observed evidence, not a fresh rerun.
+No tests, live operations or image builds were run for this documentation cleanup.
+The build checkout is not the Ubuntu appliance. **Commissioning checks for the
+supervised AI run were completed; do not reopen them merely because broader
+release acceptance and defects discovered during practice remain outstanding.**
+
+### Completed commissioning and deployment receipts
+
+Ubuntu 24.04 appliance: `sr@10.10.10.105`, `/opt/sparring-range`. Original
+verified bundle `b1ea58bfe246e41bda920401d40ac24a851d2983` had 307 files/four
+images. The installed system is now patched, not byte-identical to that bundle.
+Inner 200/201 are disposable libvirt guests, not outer Proxmox VMs. Outer
+management is `192.168.86.83`; the operator has **no NAS**.
+
+- **Readiness/SSH/replay completed:** real attacker/web guests reached enforced
+  readiness. Member `sr` used pinned bastion SSH, reached `defender`, ran
+  `whoami`, `hostname`, `sudo -n true`, logged out and viewed the recording in the
+  browser. After enrolling a Bitwarden Ed25519 public key, Linux login with a
+  local private-key file also succeeded (session prefix `c83edd83`). Earlier
+  Windows public-key refusal is not a current general SSH blocker; the Windows
+  agent itself was not subsequently verified.
+- **Reboot completed:** custom firewall, broker, API, ingest, bastion, supervisor
+  and web were active after reboot; appliance nft rules and the durable API latch
+  persisted. Readiness showed schema 0019, controller held, no issues.
+- **Scoped isolation completed:** identified attacker reached ingest
+  `10.66.0.1:8443` and practice HTTP `10.66.0.10:80`. TCP to inner `.1:22/8000`,
+  appliance `.105:22/443`, model `.197:8096`, outer Proxmox
+  `192.168.86.83:22/8006` and WAN `1.1.1.1:443` timed out (2 s). Temporary
+  guest default route was removed. WAN ping: 2 sent/0 received; DNS lookup: no
+  addresses; explicit UDP DNS query: timeout. One synthetic spoofed IPv4 UDP
+  frame incremented input DROP to 1 packet/28 bytes; one IPv6 UDP frame to
+  1 packet/48 bytes. These are the tested cases, not an all-protocol claim.
+- **API/broker VM stop completed:** running guests in session `1a125149`
+  stopped via authenticated killswitch, independently reconciled stopped with no
+  obligations/intents. Later session `5b75c2cb` had active harmless operation
+  `1f0cc8002f03415ba0850fa36ea46734`; killswitch stopped both guests and independent
+  system-libvirt readback showed both shut off. This proves command cessation
+  through VM shutdown, not full AI-worker cancellation (worker/operation action
+  lists were empty). Local SSH waiting after guest shutdown did not refute it.
+- **Independent control-loss watchdog completed:** with actual API lease
+  armed/fresh (4.2 s) and both guests running, stopping only API left broker alive;
+  at `control-lease-expired (age 33s)` both guests stopped, no obligations/intents.
+  This was neither idle expiry nor an API-kill call.
+- **Real runner cancellation completed:** after `5930c9d`, pinned SSH as
+  `srworker` ran `sleep 120`, operation `cb8e7625b73c439c9fb9f1e17cc4f7c2`.
+  Containment was confirmed running before cancel; cessation confirmed, zero of
+  one unconfirmed, remote state gone and host thread exited. Earlier namespace
+  refusal/not-found attempts were not passes. Full AI-worker/inference-request
+  cancellation is a distinct broader gate, not a reason to repeat this check.
+- **Model/first-run dispatch observed:** direct authenticated benign request to
+  `http://10.10.10.197:8096/v1`, alias `qwen-3.8-flash-next`, returned `OK` in
+  about 1 s. Subsequent supervised runs established actual API/worker/SSH dispatch.
+  Large cached 140k+ requests on this shared model server belonged to a different
+  coding project; do not attribute its whole dashboard to this range.
+- **Scoped recovery completed:** exact owned guests were hard-stopped/destroyed,
+  absence independently confirmed, leases disarmed, then authenticated API End
+  released app reservations (including session `2afbc6a0`). No direct SQL used.
+  Successful zero-obligation recovery does not repair normal teardown semantics.
+
+### Patch installed and latest practice findings
+
+Operator installed the 16-file patch, runtime
+`52ae3551ca057d33673bb38a9bd52eb7c4ebedf7`, at 16:05 on 2026-10-23. Hash/size
+are in [the handoff](HANDOFF-LIVE-PRACTICE.md#deployment-boundary). Preflight
+verified archive paths/hashes/content/Python compilation, quiet broker and no
+active runs/executors or running/finalizing/interrupted matches. Backup (0600):
+`/var/lib/sparring-range/patch-backups/before-practice-repair-20261023-160507.tar.gz`.
+`npm ci` and Next 16.4.2 build passed, audit zero; API/supervisor/web restarted
+active, health `ok:true`. No images, credentials, firewall or migrations changed;
+broker/ingest/bastion were not restarted by the patch.
+
+First supervised session `91553aeb-b0d9-4a3c-86fe-32efff9b9519` (red prefix
+`47eb0520`): intent 23171/result 23173, operation
+`b5c3ea8cbd5545bba74771a44a23cb10`, exit 127/missing executable. User redacted
+its name; do not infer nmap or install tools automatically. Saved hints 23496/23497
+were empty. Cron verifier 23231 mistook maintenance `e2scrub_all`/`sysstat` for
+persistence (zero points), and coverage displayed 104.5%. Source repairs and their
+separate passing gates are below; exact original worker-stall exception unknown.
+
+Patched run prefix `76499df5` executed **eight real commands, exit 0**, but repeated
+tool discovery, the HTTP page and ports 22/80. Compression repeatedly failed at
+checkpoint 23964 with HTTP 502 and 2048-token limit hits. Raw telemetry displaced
+useful agent context; failed compression refreshed activity without useful
+progress. A later summary succeeded, but thinking used 2000+ tokens and barely
+left answer room. `ping` EPERM is restricted-runner capability, not broken HTTP;
+do not grant root/capabilities to fix it. The local model has approximately 262k
+context; small output budgets are resource controls, **not containment**.
+
+Uncommitted/undeployed narrow memory filtering remains in
+`srplatform/red_agent/loop.py` and `tests/test_agent_memory_selection.py` (previous
+focused result: 66 passed/24 deselected; not rerun here). Preserve it separately
+from documentation. It is not the agreed full conversational-engine replacement.
+
+### Permanent release repairs still required
+
+Operator workarounds are not durable source/release fixes. Preserve real service
+identities, unrelated applications/history and disk space; no repeated full
+rehearsals or large image rebuilds without a specific need/approval.
+
+- **Installer:** TLS receives `IPv4Address` in subprocess env (operator bypass
+  converted to string); bare `systemd-sysctl` lookup fails (manual service/unit/
+  nginx completion succeeded); `deploy/hand_off.sh` executes an uncommented usage
+  line before `set -e` (bash syntax check misses it); empty model key is validated
+  before credential provisioning; firstboot runs before advertised manual steps.
+  Native provisioning lacks supported Node (Ubuntu supplied 18.19.1; operator
+  installed 22; Next requires >=20.9) and compatible distro libvirt bindings in
+  the isolated venv. Use narrow same-ABI binding exposure, not broad system site
+  packages. Verify import/listener/application readiness, not Type=exec uptime.
+- **Runtime/storage:** `.venv` root-only 0750 traversal caused 203/EXEC, likely
+  hand-off umask 027. Explicit dependency runtime modes and per-UID execution
+  checks needed. Root disk was 61G/47G free before transfer; images ~10G logical
+  versus ~4.5G source allocation: preflight headroom, avoid redundant copies.
+- **Permissions/trust:** both control-plane env files stay `root:srrange 0640`,
+  never public. Ingest TLS pair `root:sringest 0640`; bastion credential
+  `root:srbastion 0640`; public CA/HTTPS certs readable, private keys unchanged.
+  Bastion public nginx trust differs from internal API CA. Give narrow parent
+  traversal, dedicated worker dir and recordings access (including API), not
+  broker-group membership. Public runtime host pins must be writable under state,
+  not read-only `/etc`, consistently across readers. Never fake pins/bypass SSH
+  verification. Inaccessible home cwd can cause settings PermissionError without
+  a missing install. Never print env or deployment resources containing secrets.
+- **Configuration:** permanently render reachable LAN bastion `.105:2222`, not
+  unassigned range `.2`; wire the model key to API only. Installed API overrides
+  work but do not fix generator provisioning.
+- **Firewall:** `21ad727` fixed set references/first-run own-table handling,
+  spoof/IPv6 checks before conntrack and range exclusion from management allows.
+  Live parser/apply/new SSH and reboot passed; ship the operator-created dedicated
+  own-table loader plus broker dependency. Do not enable distro flush-ruleset
+  defaults, modify outer-PVE rules or overwrite unrelated tables.
+- **Focused source fixes retained:** `f1eafab` broker-safe model-secret validation
+  (13 focused passed); `9b1744d` narrow numeric QEMU storage ACLs (35);
+  `712f69f` attacker management-public-key/account correction (36); `cff590f`
+  deferred broker/heartbeat wiring and API-owned durable safety directory
+  (43 passed/2 deselected/2 warnings). Source tests alone were not installed gates.
+- **Namespace/cgroup:** `f321b39` repaired invalid/missing AppArmor load and
+  fail-closed attacker-UID checks (34 focused passed); `5930c9d` moved delegation
+  to attacker user slice/linger, never global cgroup-root writes (57). Function
+  subsequently passed live. Broader profile `9e03696` still needs independent
+  adversarial security acceptance; do not disable AppArmor/userns or use root.
+- **Recovery:** End for `5b75c2cb` returned `ok:false`, `status:complete`,
+  `lease_released:false`; destroys HTTP 423 while cessation latched. Need safe
+  teardown/recovery under latch, exact ownership/absence checks and truthful UI
+  cleanup state, not blanket latch bypass. Offline workaround required broker
+  identity/supplementary libvirt/KVM groups; plain `sudo -u` was insufficient.
+  Diagnostic SSH needs stdin DEVNULL/bounded keepalives; host transport liveness
+  is not guest cessation. Outer-appliance power-off remains the operator fallback;
+  these receipts do not establish an observed power-off rehearsal.
+- **Scoring/practice:** trusted clean image-bound cron hashes still absent;
+  UNKNOWN is correct, never learn pins from compromised guests or trust filenames.
+  Sustained useful AI, useful hints, both full presets, AI-worker stop and
+  server-side inference-slot cancellation need acceptance; uptime is not progress.
+
+### Coaching, navigation and replay
+
+AAR narrative mistook verifier/management hex-Python and `crontab -l` for
+suspicious activity and recommended failure despite deterministic UNSCORED.
+Require authoritative actor/tool provenance and semantic grounding, not merely
+existing citation IDs. Most report structure is deterministic; optional narrative
+is AI-produced. AAR generation is not agent-memory compression. UNSCORED may mean
+no scorecard before finalization, not automatically broken telemetry.
+
+Homepage is login-only; active/recent session cards/history are missing. Reports
+and replay lack useful return navigation, Markdown is literal `<pre>`, and replay
+floods pre-recording MOTD/provisioning events. Defender bastion casts exist; API
+explicitly has no AI-worker cast. Existing action intent/result evidence supports
+attacker command/output step-through, not invented historical PTY recordings.
+Preserve raw audit and enforce competition visibility in APIs, not only UI.
+Agreed future model/admin/session UX requirements are in the architecture.
+
+### Legacy reconciliation and note coverage
+
+The 2026-10-16 direct-PVE fix list is historical, not appliance instructions.
+Non-editable `rangectl db migrate/status` root/config lookup still needs installed
+acceptance (`_alembic_root` now exists; not rerun here). Runbook conflict markers
+are absent on inspection. Separate-ingest-unit wording still needs reconciliation
+for the applicable legacy deployment. Ref-only recovery is obsolete: 9100/9101
+destroyed, lease disarmed; do not resume them. `Ledger.resolve_obligation` still
+has no caller found under `infra`: audited resolution for destroy-confirmed/absent
+claims with open obligations remains a tooling gap; zero-obligation recovery
+passes do not close it. Deferred local pin fallback, source-text test replacement,
+install-layout policy and PVE ACL cron suggestions are not approved new appliance
+scope; never silently weaken pinning. Existing historical plan checkboxes are not
+advanced by this cleanup.
+
+Migration coverage: AI/framework/UI requirements → architecture and this section;
+source-repair/installation/first-run notes → patch receipts and handoff;
+runner/recovery/isolation/watchdog notes → scoped completed checks and repairs;
+earlier bootstrap/commissioning notes → identity, trust, native/runtime, firewall
+and configuration backlog; original two fix lists → installer/legacy reconciliation.
+Repeated intermediate pending states are superseded by later scoped outcomes.
+All 67 notes are covered; the backlog todo and ten existing plans are retained.
+
 ## Supervised live-practice repair — 2026-10-23, branch `15`
 
 Runtime source revision: `52ae355` (after `5930c9d`); handoff:
-[`HANDOFF-LIVE-PRACTICE.md`](HANDOFF-LIVE-PRACTICE.md). **Not deployed and not
-full release acceptance.** Agents worked on the build checkout, not the Ubuntu
+[`HANDOFF-LIVE-PRACTICE.md`](HANDOFF-LIVE-PRACTICE.md). **Subsequently installed
+by the operator (receipt above); not full release acceptance.** Agents worked on the build checkout, not the Ubuntu
 appliance. The observed first run dispatched one missing-executable command;
 blank saved hints and a cron maintenance false positive were genuine defects.
 The exact installed worker-stall exception was not obtained.
@@ -35,7 +230,8 @@ uptime). Neither selection contacts the deployed appliance/model.
 Independent read-only review of `5930c9d..52ae355`: **VERDICT: SHIP** for this
 diff only, with no concrete actionable regressions found. Narrow regression run:
 **118 passed / 5 deselected**, 2 warnings. This is not deployed/root-cause or
-release acceptance. The final source is committed; no push or live installation.
+release acceptance. The source was committed without a push; the later operator
+installation is recorded above.
 
 Diagnostic attempts are not hidden: the first full DB run was **179 passed /
 3 failed / 646 deselected**, 467.88 s. Two doubles recognized obsolete `ls` cron
@@ -57,8 +253,9 @@ available same-major **16.4.2** patch, not a blind major audit fix; audit is zer
 
 **Still open:** trusted image-bound cron pins (missing pins yield UNKNOWN),
 permanent post-killswitch teardown/latch recovery, adversarial installed AppArmor
-acceptance, useful sustained real-model behavior, and Windows laptop public-key
-enrollment. Service-up samples are not AI effectiveness. The small source patch
+acceptance and useful sustained real-model behavior. Public-key enrollment and
+Linux SSH subsequently succeeded; Windows-specific authentication is unverified.
+Service-up samples are not AI effectiveness. The small source patch
 is hash-verified, not a rebuilt/qualified sealed bundle. No roadmap promotion.
 
 ## Review round — 2026-10-21, branch `15` (after the independent review)

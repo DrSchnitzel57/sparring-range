@@ -1,6 +1,12 @@
 # Reviewer handoff — milestone 15 (appliance software)
 
-Branch `15`. The milestone's first commit is `96082f9`; **HEAD is `e587a07`**
+Historical software-review handoff. For subsequent operator commissioning,
+installed repairs and unresolved practice defects, use
+[current findings](FINDINGS_CHECKLIST.md#consolidated-deployment-and-product-status--2026-10-23)
+and [live-practice handoff](HANDOFF-LIVE-PRACTICE.md). Completed commissioning
+checks are not reopened by the older pending statements below.
+
+Branch `15`. The milestone's first commit is `96082f9`; **handoff revision was `e587a07`**
 (34 commits, nothing pushed). The objective was
 `.openchamber/plans/15-complete-practice-product.md`; plans **14** (nested
 appliance foundation), **16** (installable release) and **17** (hand-off) were

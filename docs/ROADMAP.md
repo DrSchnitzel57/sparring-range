@@ -10,9 +10,11 @@ User-approved direction: a complete individual-practice product in **one Ubuntu
 appliance using KVM/libvirt for nested full lab VMs**, with a separate local broker
 service and no outer-Proxmox credentials. No deadline-driven scope reductions.
 The user authorized planning the full sequence together;
-the three plans below await approval before implementation. Their numbers follow
+the three plans below were drafts; subsequent branch implementation and operator
+commissioning are recorded here, not proof of full milestone acceptance. Their
+numbers follow
 plan 13 and are completion milestones, not a renumbering of historical 01–12.
-Tests were deferred by the user; this planning pass supplies no new acceptance.
+Tests were deferred for that original planning pass; later evidence is dated below.
 
 - [ ] **14 — Nested appliance foundation and working SSH.**
   [Plan](../.openchamber/plans/14-nested-appliance-foundation.md).
@@ -20,15 +22,17 @@ Tests were deferred by the user; this planning pass supplies no new acceptance.
   clean guest images, actual member SSH/replay and recoverable resource lifecycle.
   **Promotion gate:** independent automated hypervisor/access/install proofs AND an operator
   fresh-launch → member SSH/sudo/reconnect/replay → cleanup → second-fresh-launch
-  rehearsal with real nested KVM/isolation/stop. The user's deployed SSH has not
-  worked; a ready flag cannot close it. No attacks are needed for this milestone.
+  rehearsal with real nested KVM/isolation/stop. **Update 2026-10-23:** actual
+  deployed SSH/sudo/replay and scoped isolation/stop commissioning succeeded;
+  a ready flag alone was not the evidence. See current findings. No attacks are
+  needed for this milestone.
   *Status 2026-10-20 (branch `15`):* the software half exists — typed libvirt
   broker behind a peer-UID Unix socket, manifest-derived policy, the operator
   installer with evidence-bound recovery, a golden-image builder and the
-  `hypervisor`/`access` layers. The **promotion gate is still open**: nested KVM
-  is unavailable in this environment, so the operator's fresh-launch → member
+  `hypervisor`/`access` layers. At that historical checkpoint the gate was open:
+  nested KVM was unavailable in this environment, so the operator's fresh-launch → member
   SSH → replay → cleanup → second-launch rehearsal with real isolation and stop
-  evidence has not been produced.
+  evidence had not yet been produced.
 - [ ] **15 — Complete integrated individual practice.**
   [Plan](../.openchamber/plans/15-complete-practice-product.md).
   Complete both presets, durable lifecycle, honest service/inject/security results,
@@ -76,6 +80,35 @@ a complete practice product, then a qualified release. Each has internal coding
 checkpoints and its own tests. Implement one at a time on a user-selected
 non-default branch; commit coherent changes, never push. Reviewers run the relevant
 gates independently. Any requirement not met stays open, regardless of plan ticks.
+
+### Post-commissioning backlog — 2026-10-23
+
+Commissioning for the supervised AI run is complete: readiness, SSH/sudo/replay,
+scoped network denial/spoof/IPv6 probes, boot persistence, API/broker VM stop,
+control-loss watchdog and real runner component cancellation. Do not repeat these
+as if no evidence exists. Full automated `packet`/`journey` command acceptance,
+adversarial qualification and whole-release acceptance are distinct claims.
+The source patch is installed; eight later commands establish dispatch but not
+useful sustained practice. Milestone checkboxes are not advanced by this cleanup.
+
+Retain this scope for the next fixes/improvements discussion, not a new plan:
+
+- Conversational history/checkpoints, token-aware ~262k local context and reasoning
+  headroom, bounded compaction recovery, real progress and cancellation. Framework
+  unselected; Pydantic AI slim prototype recommendation only.
+- Admin endpoint/model/write-only key/thinking none-low-medium-high GUI, capability
+  testing and run-snapshotted protected configuration.
+- Honest coach/AAR provenance/scoring, trusted image-bound cron hashes, useful
+  real-model behavior and complete preset acceptance.
+- Home active/history dashboard, session navigation, Markdown reports, filtered
+  timelines and separate honest attacker/defender replay tracks.
+- Permanent installer/native/UID/trust/firewall/config repairs replacing operator
+  workarounds; cessation-safe teardown/accurate cleanup UI and audited recovery,
+  including open obligations; independent adversarial AppArmor acceptance.
+
+Details: [findings](FINDINGS_CHECKLIST.md#consolidated-deployment-and-product-status--2026-10-23).
+Requirements: [architecture](ARCHITECTURE.md#j-local-conversation-engine-admin-settings-and-session-review-2026-10-23).
+No runtime replacement, new plan or live operation is authorized by this cleanup.
 
 ### Carry-forward map (no requirements silently dropped)
 
