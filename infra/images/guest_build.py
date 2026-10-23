@@ -196,6 +196,7 @@ def attacker_inputs_hash(repo_root: pathlib.Path,
             h.update(str(rel.relative_to(repo)).encode())
             h.update(rel.read_bytes())
     for mod in ("infra/runner/runner_supervise.sh",
+                "infra/runner/setup_cgroup.sh",
                 "infra/runner/sr-runner-cgroup.service",
                 "infra/runner/apparmor/usr.bin.unshare",
                 "infra/images/guest_userdata.py",

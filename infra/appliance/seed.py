@@ -108,8 +108,9 @@ def render_user_data(inp: SeedInputs) -> str:
     attacker_gate = ""
     if inp.image.role == "attacker":
         attacker_gate = (
+            "systemctl daemon-reload\n"
+            "systemctl restart sr-runner-cgroup.service\n"
             "apparmor_parser -r /etc/apparmor.d/usr.bin.unshare\n"
-            "systemctl start sr-runner-cgroup.service >/dev/null 2>&1 || true\n"
             "su -s /bin/sh attacker -c "
             "'unshare --user --map-root-user --mount --cgroup --pid --fork "
             "--mount-proc /bin/true'\n"
@@ -227,9 +228,16 @@ def render_user_data(inp: SeedInputs) -> str:
             "permissions": "0644",
             "content": _UNSHARE_APPARMOR.read_text(),
         })
+        runner_dir = _UNSHARE_APPARMOR.parent.parent
+        for source, target, mode in (
+                ("setup_cgroup.sh", "/usr/local/libexec/sr-runner-cgroup-setup", "0755"),
+                ("sr-runner-cgroup.service", "/etc/systemd/system/sr-runner-cgroup.service", "0644")):
+            doc["write_files"].append({"path": target, "permissions": mode,
+                                       "content": (runner_dir / source).read_text()})
         doc["runcmd"] = [
+            "systemctl daemon-reload",
+            "systemctl restart sr-runner-cgroup.service",
             "apparmor_parser -r /etc/apparmor.d/usr.bin.unshare",
-            "systemctl start sr-runner-cgroup.service 2>/dev/null || true",
             "su -s /bin/sh attacker -c 'unshare --user --map-root-user "
             "--mount --cgroup --pid --fork --mount-proc /bin/true'",
             *doc["runcmd"],

@@ -102,7 +102,8 @@ def test_attacker_build_carries_capture_and_boundary():
     # runner boundary: cgroup delegation + scoped AppArmor, reboot-persistent
     assert "sr-runner-cgroup.service" in ud
     assert "apparmor.d/usr.bin.unshare" in ud
-    assert "RUNNER_CGROUP_ROOT=/sys/fs/cgroup/sr-runner" in ud
+    assert "sr-runner-cgroup-setup" in ud
+    assert "CGROUP-DELEGATION-FAIL" in ud
     assert "apparmor_parser" in ud
     assert "apparmor_parser -r /etc/apparmor.d/usr.bin.unshare' || true" not in ud
     assert "APPARMOR-LOAD-FAIL" in ud
@@ -112,8 +113,22 @@ def test_attacker_build_carries_capture_and_boundary():
     # role keys via policy, never one key everywhere
     assert "sr-bake-keys.sh" in ud
     assert "Runner" in ud and "Bastion" not in ud
-    # pinned attacker packages include auditd
     assert "auditd" in guest_build.ATTACKER_PACKAGES
+
+
+def test_runner_delegation_is_inside_own_user_slice():
+    import subprocess
+
+    script = REPO / "infra/runner/setup_cgroup.sh"
+    subprocess.run(["bash", "-n", str(script)], check=True)
+    content = script.read_text()
+    assert '/user.slice/user-$uid.slice' in content
+    assert '"$parent/cgroup.procs"' in content
+    assert 'chown attacker:attacker /sys/fs/cgroup/cgroup.procs' not in content
+    assert "subtree_control\" 2>/dev/null || true" not in content
+    unit = (REPO / "infra/runner/sr-runner-cgroup.service").read_text()
+    assert "ExecStart=/usr/local/libexec/sr-runner-cgroup-setup" in unit
+    assert "Before=ssh.service" in unit
 
 
 def test_setup_script_separates_web_and_db_tiers():

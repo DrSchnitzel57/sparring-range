@@ -335,6 +335,11 @@ def test_attacker_seed_separates_management_and_runner_public_keys(tmp_path):
     assert "defender" not in users
     files = {entry["path"]: entry["content"] for entry in doc["write_files"]}
     profile = files["/etc/apparmor.d/usr.bin.unshare"]
+    assert "/usr/local/libexec/sr-runner-cgroup-setup" in files
+    assert "/etc/systemd/system/sr-runner-cgroup.service" in files
+    marker = files["/usr/local/sbin/sr-first-boot-complete"]
+    assert "systemctl restart sr-runner-cgroup.service\n" in marker
+    assert "sr-runner-cgroup.service >/dev/null 2>&1 || true" not in marker
     assert "flags=(attach_disconnected,mediate_deleted)" in profile
     assert "allow userns," in profile and "allow mount," in profile
     assert "allow capability," in profile and "/** rix," in profile

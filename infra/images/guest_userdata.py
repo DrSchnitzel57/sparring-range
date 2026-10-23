@@ -403,7 +403,7 @@ chk AUDITD-ACTIVE systemctl is-active --quiet auditd
 chk SHIPPER-UNIT bash -c 'systemctl is-active --quiet sparring-shipper && grep -q "^User=srshipper" /etc/systemd/system/sparring-shipper.service'
 chk SHIPPER-SPOOL bash -c 'test -d /var/lib/sparring-range/shipper && test -s /etc/sparring-range/shipper.env'
 chk AUDITD-RULES bash -c 'auditctl -l | grep -q sparring_cmd'
-chk CGROUP-DELEGATION bash -c 'systemctl is-enabled --quiet sr-runner-cgroup.service && test -d /sys/fs/cgroup/sr-runner && grep -q RUNNER_CGROUP_ROOT /etc/environment'
+chk CGROUP-DELEGATION bash -c 'systemctl is-enabled --quiet sr-runner-cgroup.service && systemctl is-active --quiet sr-runner-cgroup.service && test -d /sys/fs/cgroup/user.slice/user-$(id -u attacker).slice/sr-runner && grep -q RUNNER_CGROUP_ROOT /etc/environment'
 chk APPARMOR-PROFILE bash -c 'test -s /etc/apparmor.d/usr.bin.unshare && systemctl is-enabled --quiet apparmor && apparmor_parser -r /etc/apparmor.d/usr.bin.unshare'
 chk RUNNER-BOUNDARY bash -c 'test -x /usr/local/bin/runner-supervisor && su -s /bin/sh attacker -c "unshare --user --map-root-user --mount --cgroup --pid --fork --mount-proc /bin/true"'
 echo "SR-GUEST-DONE rc=$fails" > {SERIAL}; echo "SR-GUEST-DONE rc=$fails" > {SERIAL}
@@ -511,6 +511,9 @@ def attacker_build_user_data(payload: dict[str, str], packages: list[str],
         "/srv/sr-build-input/sr-runner-cgroup.service",
         (repo / "infra/runner/sr-runner-cgroup.service").read_text())
     files += _write_file_entry(
+        "/srv/sr-build-input/setup_cgroup.sh",
+        (repo / "infra/runner/setup_cgroup.sh").read_text())
+    files += _write_file_entry(
         "/srv/sr-build-input/usr.bin.unshare",
         (repo / "infra/runner/apparmor/usr.bin.unshare").read_text())
     tel = repo / "telemetry"
@@ -547,10 +550,13 @@ chown root:srshipper /etc/sparring-range/shipper.env
 chmod 0640 /etc/sparring-range/shipper.env
 # runner boundary: reboot-persistent cgroup delegation + scoped AppArmor
 install -m 0644 /srv/sr-build-input/sr-runner-cgroup.service /etc/systemd/system/sr-runner-cgroup.service
+install -d -m 0755 /usr/local/libexec
+install -m 0755 /srv/sr-build-input/setup_cgroup.sh /usr/local/libexec/sr-runner-cgroup-setup
 install -m 0644 /srv/sr-build-input/usr.bin.unshare /etc/apparmor.d/usr.bin.unshare
-echo 'RUNNER_CGROUP_ROOT=/sys/fs/cgroup/sr-runner' >> /etc/environment
 command -v apparmor_parser >/dev/null || {{ mark APPARMOR-MISSING; poweroff; }}
 systemctl enable sr-runner-cgroup.service apparmor || mark APPARMOR-EN-FAIL
+systemctl daemon-reload
+systemctl start sr-runner-cgroup.service || {{ mark CGROUP-DELEGATION-FAIL; poweroff; exit 1; }}
 apparmor_parser -r /etc/apparmor.d/usr.bin.unshare || {{ mark APPARMOR-LOAD-FAIL; poweroff; }}
 timeout 120 systemctl enable --now auditd sparring-shipper || {{ mark UNITS-FAIL; poweroff; }}
 timeout 60 systemctl restart auditd || true

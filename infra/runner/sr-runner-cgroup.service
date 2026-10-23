@@ -7,13 +7,14 @@
 [Unit]
 Description=sparring-range runner cgroup delegation
 Documentation=file:/usr/local/bin/runner-supervisor
-After=local-fs.target
-Before=sshd.service
+After=local-fs.target systemd-logind.service
+Requires=systemd-logind.service
+Before=ssh.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/bash -c 'set -e; d=/sys/fs/cgroup/sr-runner; mkdir -p "$d"; for c in cpu io memory; do [ -f /sys/fs/cgroup/cgroup.controllers ] && grep -qw $c /sys/fs/cgroup/cgroup.controllers && echo +$c > "$d/cgroup.subtree_control" 2>/dev/null || true; done; chown attacker:attacker "$d" "$d/cgroup.procs" "$d/cgroup.subtree_control" 2>/dev/null || true; chmod 0700 "$d"'
+ExecStart=/usr/local/libexec/sr-runner-cgroup-setup
 
 [Install]
 WantedBy=multi-user.target
