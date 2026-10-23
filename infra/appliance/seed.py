@@ -105,6 +105,15 @@ def render_user_data(inp: SeedInputs) -> str:
     # build-time key.  Listing users replaces the default set.
     users.append({"name": "srshipper", "system": True, "groups": ["adm"],
                   "shell": "/usr/sbin/nologin"})
+    attacker_gate = ""
+    if inp.image.role == "attacker":
+        attacker_gate = (
+            "apparmor_parser -r /etc/apparmor.d/usr.bin.unshare\n"
+            "systemctl start sr-runner-cgroup.service >/dev/null 2>&1 || true\n"
+            "su -s /bin/sh attacker -c "
+            "'unshare --user --map-root-user --mount --cgroup --pid --fork "
+            "--mount-proc /bin/true'\n"
+        )
     doc: dict = {
         "hostname": inp.hostname,
         "manage_etc_hosts": True,
@@ -130,6 +139,7 @@ def render_user_data(inp: SeedInputs) -> str:
              # to start without them.
              "content": "#!/bin/sh\nset -eu\n"
                         "install -d -m 0755 /var/lib/sparring-range\n"
+                        f"{attacker_gate}"
                         "systemctl start --no-block ssh.service "
                         ">/dev/null 2>&1 || true\n"
                         "i=0\n"

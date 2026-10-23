@@ -2,34 +2,34 @@
 # launcher (attacker guest). Ubuntu 24.04 restricts unprivileged user
 # namespaces to AppArmor-confined transitions; instead of relaxing that
 # globally (kernel.apparmor_restrict_unprivileged_userns=0), the runner's
-# boundary launcher /usr/bin/unshare is confined by this narrow profile,
-# which grants ONLY the namespace/mount permissions the supervisor's
-# documented boundary needs. Loaded at boot by apparmor.service from
-# /etc/apparmor.d — reboot-persistent. Nothing else changes.
+# boundary launcher /usr/bin/unshare is confined by this profile
+# (upstream apparmor bwrap-userns-restrict pattern). A real confined
+# profile keeps its permissions inside the namespace and exec'd children
+# (bash, mount, the operation command) inherit it via `/** rix,`.
+# Loaded at boot by apparmor.service from /etc/apparmor.d — reboot-persistent.
 
 abi <abi/4.0>,
 include <tunables/global>
 
-profile unshare /usr/bin/unshare flags=(attach_disconnected) {
+profile unshare /usr/bin/unshare flags=(attach_disconnected,mediate_deleted) {
   include <abstractions/base>
 
-  # the supervisor invokes unshare with --user --map-root-user --mount
-  # --cgroup --pid --fork --mount-proc and then bind-mounts the operation's
-  # own cgroup directory over /sys/fs/cgroup inside the mount namespace.
-  userns,
-  capability sys_admin,
-  capability setuid,
-  capability setgid,
-  capability sys_chroot,
+  allow capability,
+  allow file rwlkm /{**,},
+  allow network,
+  allow unix,
+  allow ptrace,
+  allow signal,
+  allow userns,
+  allow mount,
+  allow umount,
 
-  @{PROC}/@{pid}/{uid_map,gid_map,setgroups} rw,
-  mount options=(rw bind) /sys/fs/cgroup/** -> /sys/fs/cgroup/,
-  mount options=(rw) fstype=tmpfs tmpfs -> /**,
-  mount fstype=proc proc -> /proc/,
-  umount,
-
-  # the operation command itself executes within the namespaces
+  # EXEC grant with profile INHERITANCE: under abi/4.0 (policy v6) the
+  # file 'm' bit is mmap-exec, NOT execute — without an x rule the
+  # confined unshare cannot exec sh inside the boundary (EACCES). 'ix'
+  # keeps every exec'd child (bash, mount, the operation command) in this
+  # profile so capability/mount stay available inside the namespace.
   /** rix,
 
-  signal (receive) peer=unconfined,
+  include if exists <local/unshare>
 }

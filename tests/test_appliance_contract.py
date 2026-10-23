@@ -335,7 +335,15 @@ def test_attacker_seed_separates_management_and_runner_public_keys(tmp_path):
     assert "defender" not in users
     files = {entry["path"]: entry["content"] for entry in doc["write_files"]}
     profile = files["/etc/apparmor.d/usr.bin.unshare"]
-    assert "userns," in profile and "change_profile unshare," not in profile
+    assert "flags=(attach_disconnected,mediate_deleted)" in profile
+    assert "allow userns," in profile and "allow mount," in profile
+    assert "allow capability," in profile and "/** rix," in profile
+    assert "change_profile unshare," not in profile
+    first_boot = files["/usr/local/sbin/sr-first-boot-complete"]
+    assert "apparmor_parser -r /etc/apparmor.d/usr.bin.unshare" in first_boot
+    assert "unshare --user --map-root-user" in first_boot
+    assert first_boot.index("unshare --user --map-root-user") < \
+        first_boot.index("/var/lib/sparring-range/first-boot-complete")
     assert doc["runcmd"].index("apparmor_parser -r /etc/apparmor.d/usr.bin.unshare") < \
         doc["runcmd"].index("/usr/local/sbin/sr-first-boot-complete")
     assert any("unshare --user --map-root-user" in cmd for cmd in doc["runcmd"])
