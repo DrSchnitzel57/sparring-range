@@ -27,7 +27,7 @@ import subprocess
 NATIVE_PACKAGES = (
     "libvirt-daemon-system", "libvirt-daemon-driver-qemu", "libvirt-clients",
     "qemu-system-x86", "qemu-utils", "postgresql", "nginx", "nftables",
-    "git", "python3-venv", "python3-dev", "build-essential",
+    "git", "python3-venv", "python3-dev", "build-essential", "acl",
 )
 
 

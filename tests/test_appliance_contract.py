@@ -138,6 +138,75 @@ def test_operator_manifest_still_requires_model_credential(tmp_path):
         ApplianceManifest.from_dict(raw)
 
 
+def test_system_qemu_storage_acl_is_scoped_and_precedes_start(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from infra.appliance import backend as module
+
+    m = ApplianceManifest.from_dict(_manifest(tmp_path))
+    backend = module.LibvirtBackend(
+        m, AppliancePolicy.from_manifest(m), module.BackendConfig(uri="qemu:///system"))
+    guest = pathlib.Path(m.state_dir) / "guests" / "200"
+    guest.mkdir(parents=True, mode=0o700)
+    for name in ("disk.qcow2", "seed.iso"):
+        (guest / name).touch(mode=0o600)
+    calls = []
+    monkeypatch.setattr(module.pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=64055))
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+
+    class Domain:
+        active = False
+
+        def isActive(self):
+            return self.active
+
+        def create(self):
+            assert len(calls) == 3
+            self.active = True
+
+    dom = Domain()
+    monkeypatch.setattr(backend, "_find", lambda *args: (dom, {}))
+    backend.start_and_wait(m.installation_id, 200)
+    assert calls == [
+        ["setfacl", "-m", "u:64055:--x", m.state_dir,
+         str(guest.parent), str(guest)],
+        ["setfacl", "-m", "u:64055:rw-", str(guest / "disk.qcow2"),
+         str(guest / "serial.log")],
+        ["setfacl", "-m", "u:64055:r--", str(guest / "seed.iso")],
+    ]
+
+    # Fail closed rather than trying to start after ACL setup fails.
+    dom.active = False
+    monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs:
+                        subprocess.CompletedProcess(args[0], 1, "", "ACL denied"))
+    with pytest.raises(module.BackendUnavailable, match="ACL denied"):
+        backend.start_and_wait(m.installation_id, 200)
+    assert not dom.active
+
+    (guest / "seed.iso").unlink()
+    (guest / "seed.iso").symlink_to(tmp_path / "model.key")
+    with pytest.raises(module.BackendUnavailable, match="symlink refused"):
+        backend.start_and_wait(m.installation_id, 200)
+    assert not dom.active
+
+
+def test_session_qemu_does_not_change_storage_acl(tmp_path, monkeypatch):
+    from infra.appliance import backend as module
+
+    m = ApplianceManifest.from_dict(_manifest(tmp_path))
+    backend = module.LibvirtBackend(m, AppliancePolicy.from_manifest(m))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("session QEMU must not change cross-UID permissions")
+
+    monkeypatch.setattr(module.subprocess, "run", forbidden)
+    backend._prepare_qemu_storage(200)
+
+
 def test_manifest_unknown_key_placeholder_and_inline_secret_refused(tmp_path):
     raw = _manifest(tmp_path)
     raw["surprise"] = True

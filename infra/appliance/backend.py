@@ -24,6 +24,7 @@ import html
 import json
 import os
 import pathlib
+import pwd
 import re
 import shutil
 import subprocess
@@ -431,6 +432,7 @@ class LibvirtBackend:
         if dom is None:
             raise BackendUnavailable(f"VMID {vmid} has no appliance domain")
         if not dom.isActive():
+            self._prepare_qemu_storage(int(vmid))
             try:
                 dom.create()
             except Exception as exc:  # noqa: BLE001
@@ -444,6 +446,49 @@ class LibvirtBackend:
                 raise BackendUnavailable(f"start read-back failed: {exc}") from exc
             time.sleep(0.2)
         raise BackendReadBackFailed(f"VMID {vmid} did not reach running in {timeout}s")
+
+    def _prepare_qemu_storage(self, vmid: int) -> None:
+        """Grant the Ubuntu system QEMU identity only its fixed guest files.
+
+        The broker remains unprivileged and owns these paths. Its restrictive
+        umask must not prevent libvirt's separate QEMU UID from traversing the
+        storage parents. No controller directories are readable/listable, no
+        directory write access is granted, and the seed is read-only.
+        Session libvirt runs QEMU as the caller and needs no cross-UID ACL.
+        """
+        if self.cfg.uri != "qemu:///system":
+            return
+        state = pathlib.Path(self.manifest.state_dir)
+        guest = state / "guests" / str(int(vmid))
+        parents = (state, state / "guests", guest)
+        disk, seed, serial = (guest / name for name in
+                              ("disk.qcow2", "seed.iso", "serial.log"))
+        try:
+            uid = pwd.getpwnam("libvirt-qemu").pw_uid
+            for path in (*parents, disk, seed, serial):
+                if path.is_symlink():
+                    raise ValueError(f"symlink refused in QEMU storage: {path}")
+            if not all(path.is_dir() for path in parents):
+                raise ValueError("QEMU storage parent is not a directory")
+            if not disk.is_file() or not seed.is_file():
+                raise ValueError("QEMU disk or seed is missing or not a file")
+            if serial.exists() and not serial.is_file():
+                raise ValueError("QEMU serial log is not a file")
+            # QEMU can write the log but cannot create/replace directory entries.
+            serial.touch(mode=0o600, exist_ok=True)
+            grants = (("--x", parents), ("rw-", (disk, serial)),
+                      ("r--", (seed,)))
+            for permissions, paths in grants:
+                result = subprocess.run(
+                    ["setfacl", "-m", f"u:{uid}:{permissions}",
+                     *(str(path) for path in paths)],
+                    capture_output=True, text=True, timeout=10)
+                if result.returncode:
+                    raise RuntimeError(result.stderr.strip()[:400])
+        except (OSError, KeyError, ValueError, RuntimeError,
+                subprocess.TimeoutExpired) as exc:
+            raise BackendUnavailable(
+                f"cannot prepare QEMU storage for VMID {vmid}: {exc}") from exc
 
     def stop(self, node: str, vmid: int, force: bool = False) -> str:
         self._require_node(node)
