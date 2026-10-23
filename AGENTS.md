@@ -258,6 +258,14 @@ The repair investigation follows a real supervised run with empty model hints,
 false positive. Do not treat service uptime as AI progress or software fixtures
 as deployed acceptance.
 
+Source repairs through `52ae355` supersede that failing baseline: the selection
+gate now runs **567 fast tests, 0 failed, 0 skipped** (267 deselected). The
+disposable PostgreSQL gate passes **183 tests**, and browser/authority/containment/
+frontend gates pass separately. Exact attempts, counts and limitations are in
+`docs/FINDINGS_CHECKLIST.md`; deployment constraints and the small source patch
+are in `docs/HANDOFF-LIVE-PRACTICE.md`. These fixes have not been installed on the
+operator appliance and do not close real-model, cron-image-pin or security gates.
+
 - Fast baseline: the pytest command above (infrastructure-free since `ac5a61b`:
   0 failed, 0 prerequisite skips); integration layers are db/containment/packet/
   browser/live, and `python infra/dev/acceptance.py <check>` runs each real gate.

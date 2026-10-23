@@ -1,5 +1,66 @@
 # Current findings and validation evidence
 
+## Supervised live-practice repair — 2026-10-23, branch `15`
+
+Runtime source revision: `52ae355` (after `5930c9d`); handoff:
+[`HANDOFF-LIVE-PRACTICE.md`](HANDOFF-LIVE-PRACTICE.md). **Not deployed and not
+full release acceptance.** Agents worked on the build checkout, not the Ubuntu
+appliance. The observed first run dispatched one missing-executable command;
+blank saved hints and a cron maintenance false positive were genuine defects.
+The exact installed worker-stall exception was not obtained.
+
+Baseline: the documented no-admin fast command exited 1, **448 passed / 1 failed /
+262 deselected / 4 warnings**, 80.25 s. The warning-text regression was repaired
+without changing emergency safety behavior. Current source fixes include bounded
+role budgets, explicit completion rejection, retained worker failure reporting,
+truthful tool availability/progress/uptime, and content-aware cron verification.
+
+| Command from repository root | Observed result |
+|---|---|
+| `.venv/bin/python infra/dev/acceptance.py selection` | **PASS**, 127.7 s; all 834 tests classified; fast default **567 passed, 0 skipped, 267 deselected**. Its deliberately missing-containment, missing-DB and empty-selection probes fail as required. |
+| `.venv/bin/python infra/dev/acceptance.py db` | **PASS**, 183 passed / 649 deselected / 0 skipped, 471.8 s; disposable PostgreSQL 16. No run-owned test databases/roles remain; fixture container/volume removed. |
+| `.venv/bin/python infra/dev/acceptance.py authority` | **PASS**, 25 passed / 803 deselected, 24.4 s at the earlier repair working tree. No broker capability was widened. |
+| `.venv/bin/python infra/dev/acceptance.py containment` | **PASS**, 21 passed / 808 deselected, 9.9 s at the earlier repair working tree; real namespace/migration controls pass, no run-owned cgroups leaked. This does not certify the installed Ubuntu AppArmor profile. |
+| `.venv/bin/python infra/dev/acceptance.py frontend` | **PASS**, 10.0 s; lockfile-faithful install/build and production audit: 0 critical/high/moderate/low. Final browser rerun rebuilds the later UI text/error change. |
+| `.venv/bin/python infra/dev/acceptance.py browser` | **PASS**, 1 passed / 0 skipped, 52.9 s; real Next/browser/API/disposable PostgreSQL, with labeled model/runner doubles. Tests blank-hint reload, filtered event details, stopped-worker controls, ordinary cleanup and replay. |
+| `.venv/bin/python -m pytest -q -ra -p no:cacheprovider tests/test_cron_baseline_regressions.py tests/test_uptime_coverage_regressions.py` | **PASS**, 51 passed, 0.51 s; includes the actual bounded cron probe on disposable files and registry-failure fail-closed behavior. |
+
+Additional disposable-DB repair selection: **18 passed / 42 deselected**, 29.42 s
+(live attacker projection, rejected narrative, failed model completion, actual
+runner ingest, M3 and supervisor fencing); fixture cleanup `[]`. Three failing
+legacy fixtures were then corrected and independently rerun: **3 passed**,
+12.45 s, fixture cleanup `[]` (cron polarity, CLI/HTTP practice, generation/slot
+uptime). Neither selection contacts the deployed appliance/model.
+
+Independent read-only review of `5930c9d..52ae355`: **VERDICT: SHIP** for this
+diff only, with no concrete actionable regressions found. Narrow regression run:
+**118 passed / 5 deselected**, 2 warnings. This is not deployed/root-cause or
+release acceptance. The final source is committed; no push or live installation.
+
+Diagnostic attempts are not hidden: the first full DB run was **179 passed /
+3 failed / 646 deselected**, 467.88 s. Two doubles recognized obsolete `ls` cron
+output; one inserted a fake deployment ID and four same-slot samples. Updated
+fixtures retain clean/compromised polarity and append-only assertions, supplying
+trusted pins before the immutable snapshot and genuine generation/time slots.
+An earlier outer-tool 120 s timeout aborted a DB attempt; its exact run-owned
+container/volume were verified by label and removed. One browser attempt raced
+`npm ci` in another gate and failed its prerequisite; later runs are serialized
+against dependency installation and pass. An escaped-JSON browser assertion was
+also corrected to inspect decoded browser text.
+
+The original Next 16.4.0 build/audit newly reported three advisories: image
+optimization SVG RCE (`GHSA-2464-fhr4-w9xw`), App Router Server Actions DoS
+(`GHSA-p3m5-59mp-jv5r`) and cached typed-array RCE (`GHSA-673q-mjm6-r5xr`). This
+Pages Router app does not use App Router Server Actions or `use cache`; absence
+of those features is not proof the image endpoint is unreachable. Applied the
+available same-major **16.4.2** patch, not a blind major audit fix; audit is zero.
+
+**Still open:** trusted image-bound cron pins (missing pins yield UNKNOWN),
+permanent post-killswitch teardown/latch recovery, adversarial installed AppArmor
+acceptance, useful sustained real-model behavior, and Windows laptop public-key
+enrollment. Service-up samples are not AI effectiveness. The small source patch
+is hash-verified, not a rebuilt/qualified sealed bundle. No roadmap promotion.
+
 ## Review round — 2026-10-21, branch `15` (after the independent review)
 
 An independent reviewer read milestone 15 and returned **VERDICT: FIX** with
