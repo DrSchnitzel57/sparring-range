@@ -268,7 +268,7 @@ def render_control_env(m: ApplianceManifest, *, etc: pathlib.Path = DEFAULT_ETC,
         # Fixed attacker management address inside the isolated range. The
         # broker injects the runner public key; the private key remains a
         # srworker-readable file and never enters the API/model env.
-        ("SR_RUNNER_SSH_TARGET", f"runner@{m.network.range_cidr.network_address + 9}"),
+        ("SR_RUNNER_SSH_TARGET", f"attacker@{m.network.range_cidr.network_address + 9}"),
         ("SR_RUNNER_SSH_KEY_PATH", str(etc / "secrets/worker_runner_key")),
         ("SR_RUNNER_SSH_KNOWN_HOSTS", str(etc / "known_hosts/range_hosts")),
         ("SR_VERIFIER_SSH_KEY_PATH", str(etc / "secrets/verifier_key")),

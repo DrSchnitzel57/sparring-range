@@ -27,12 +27,13 @@ _MARKER_PATH = "/var/lib/sparring-range/first-boot-complete"
 def _role_access(role: str) -> dict[str, tuple[str, ...]]:
     """Which manifest key role lands on which Unix account for a guest role.
 
-    Only the keys the role needs are injected: the attack identity gets the
-    runner key, a defended guest gets the bastion and management keys.
-    A guest never carries a key that is not meant for it.
+    The attack identity gets only the runner public key. The separate guest
+    root identity gets the management public key for deterministic provisioning
+    and telemetry enrollment, on both attacker and defended guests. Neither
+    private key enters a guest; bastion access is limited to defended guests.
     """
     if role == "attacker":
-        return {"attacker": ("runner",)}
+        return {"attacker": ("runner",), "root": ("mgmt",)}
     return {"defender": ("bastion",), "root": ("mgmt",)}
 
 

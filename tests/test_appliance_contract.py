@@ -303,6 +303,33 @@ def test_seed_carries_only_role_keys_and_no_gateway_in_production(tmp_path):
     assert seed.is_file() and seed.stat().st_size > 0
 
 
+def test_attacker_seed_separates_management_and_runner_public_keys(tmp_path):
+    import yaml
+    from deploy.appliance import render_control_env
+
+    m = ApplianceManifest.from_dict(_manifest(tmp_path))
+    inp = SeedInputs(manifest=m, image=m.image_for_role("attacker"), vmid=210,
+                     session_id="a" * 32, hostname="attacker",
+                     address="10.66.0.9", prefix=24)
+    rendered = render_user_data(inp)
+    doc = yaml.safe_load(rendered)
+    users = {user["name"]: user for user in doc["users"]}
+    assert users["attacker"]["ssh_authorized_keys"] == [m.public_key_for("runner")]
+    assert users["root"]["ssh_authorized_keys"] == [m.public_key_for("mgmt")]
+    assert "PRIVATE KEY" not in rendered
+    assert m.public_key_for("bastion") not in rendered
+    assert "defender" not in users
+    assert "SR_RUNNER_SSH_TARGET=attacker@10.66.0.9" in render_control_env(m)
+
+    defended = yaml.safe_load(render_user_data(SeedInputs(
+        manifest=m, image=m.image_for_role("mojang-web-local"), vmid=211,
+        session_id="a" * 32, hostname="web01", address="10.66.0.10", prefix=24)))
+    users = {user["name"]: user for user in defended["users"]}
+    assert users["root"]["ssh_authorized_keys"] == [m.public_key_for("mgmt")]
+    assert users["defender"]["ssh_authorized_keys"] == [m.public_key_for("bastion")]
+    assert "attacker" not in users
+
+
 def test_seed_addressing_is_static_in_every_mode(tmp_path):
     """A golden image has no machine-id, so a DHCP client cannot even be
     configured (systemd-networkd: "Failed to configure DHCPv4 client").  The
