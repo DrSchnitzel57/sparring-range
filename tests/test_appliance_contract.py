@@ -284,6 +284,20 @@ def test_policy_is_typed_and_refuses_gateway_and_linked_clone():
         AppliancePolicy.from_dict(bad)
 
 
+def test_range_ingress_cannot_use_management_source_or_ipv6_rules(tmp_path):
+    rules = render_nftables(ApplianceManifest.from_dict(_manifest(tmp_path)))
+    assert "$management_v4" not in rules and "$range_v4" not in rules
+    assert rules.index("add table inet sr_appliance") < rules.index("delete table inet sr_appliance")
+    for name in ("input", "forward"):
+        chain = rules.split(f"chain {name} {{", 1)[1].split("\n    }", 1)[0]
+        state = chain.index("ct state established,related accept")
+        assert chain.index('iifname "srlab0" meta nfproto ipv6 counter drop') < state
+        assert chain.index('iifname "srlab0" ip saddr != @range_v4 counter drop') < state
+    for line in rules.splitlines():
+        if "@management_v4" in line and "accept" in line:
+            assert 'iifname != "srlab0"' in line
+
+
 def test_seed_carries_only_role_keys_and_no_gateway_in_production(tmp_path):
     m = ApplianceManifest.from_dict(_manifest(tmp_path), verify_images=True)
     image = m.image_for_role("mojang-web-local")
