@@ -8,8 +8,11 @@ flag checks accept an expected flag value for real provenance.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import shlex
+
+from pydantic import Field, field_validator
 
 from verifiers.base import Context, Verifier
 from verifiers.library.ccdc import CronArg, ExfilArg, _run
@@ -49,32 +52,118 @@ class FlagFilePresent(Verifier):
         }, None
 
 
+class ContentCronArg(CronArg):
+    # Trusted scenario/image-build data, NEVER values learned from the target's
+    # package database or a manifest stored on the compromised target.
+    baseline_file_sha256: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("baseline_file_sha256")
+    @classmethod
+    def _hashes(cls, values: dict[str, str]) -> dict[str, str]:
+        for name, digest in values.items():
+            if (not re.fullmatch(r"[A-Za-z0-9_.-]{1,255}", name)
+                    or name in {".", ".."}
+                    or not re.fullmatch(r"[0-9a-fA-F]{64}", digest)):
+                raise ValueError("cron baselines require bare filenames and SHA-256 hashes")
+        return {name: digest.lower() for name, digest in values.items()}
+
+
+# A single structured probe prevents `ls; ...; crontab` from masking a failed
+# inventory with the last command's status. Do not interpolate scenario data.
+_CRON_PROBE = r'''
+import hashlib, json, os, stat, subprocess
+directory = "/etc/cron.d"
+files = {}
+for name in os.listdir(directory):
+    path = os.path.join(directory, name)
+    info = os.lstat(path)
+    record = {"uid": info.st_uid, "gid": info.st_gid,
+              "mode": stat.S_IMODE(info.st_mode), "sha256": None}
+    if stat.S_ISREG(info.st_mode):
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode) or before != info:
+                raise RuntimeError("cron file changed during inventory")
+            content = stream.read(1024 * 1024 + 1)
+            if len(content) > 1024 * 1024 or os.fstat(stream.fileno()) != before:
+                raise RuntimeError("cron file unreadable or changed during inventory")
+        record["sha256"] = hashlib.sha256(content).hexdigest()
+    files[name] = record
+result = subprocess.run(["crontab", "-l"], capture_output=True, text=True,
+                        timeout=20, env={**os.environ, "LC_ALL": "C"})
+if result.returncode == 0:
+    crontab = result.stdout
+elif (result.returncode == 1 and not result.stdout
+      and result.stderr.strip().startswith("no crontab for ")
+      and len(result.stderr.strip().splitlines()) == 1):
+    crontab = ""
+else:
+    raise RuntimeError("crontab inventory unavailable")
+print(json.dumps({"files": files, "crontab": crontab}))
+'''
+
+
 class CronPersistencePresent(Verifier):
     id = "cron_persistence_present"
-    description = ("Cron entries EXCEPT the documented golden baseline exist (red persistence "
-                   "objective / blue detection). Baseline file names and crontab lines are "
-                   "declared in the scenario — normal OS cron no longer counts as 'unexpected'.")
+    description = ("Cron entries outside the trusted content-hashed baseline exist. "
+                   "Filename-only baselines cannot establish clean state.")
     observed_condition = "non-baseline cron entries exist"
     mitre = ["T1053.003"]
-    version = "2"
-    args_model = CronArg
+    version = "3"
+    args_model = ContentCronArg
 
-    # files shipped by typical base images even without an explicit baseline
     def observe(self, ctx: Context, host: str, baseline_files: list[str],
-                baseline_crontab: list[str]):
-        code, out = _run(ctx, host, "ls -1 /etc/cron.d/ 2>/dev/null; echo ---; crontab -l 2>/dev/null")
-        if code is None:
-            return None, {"host": host}, f"exec failed: {out[:120]}"
-        # exit code may be non-zero when there is no user crontab — probe is still valid
-        head, _, tail = out.partition("---")
-        files = {l.strip() for l in head.splitlines() if l.strip()}
-        user_lines = {re.sub(r"\s+", " ", l).strip() for l in tail.splitlines()
-                      if l.strip() and not l.strip().startswith("#")}
-        base_files = set(baseline_files)
-        base_lines = {re.sub(r"\s+", " ", l).strip() for l in baseline_crontab
-                      if l.strip() and not l.strip().startswith("#")}
-        unexpected_files = sorted(files - base_files)
+                baseline_crontab: list[str],
+                baseline_file_sha256: dict[str, str] | None = None):
+        code, out = _run(ctx, host, "python3 -c " + shlex.quote(_CRON_PROBE))
+        if code != 0:
+            return None, {"host": host, "exit_code": code}, "cron inventory unavailable"
+        try:
+            inventory = json.loads(out)
+            files, crontab = inventory["files"], inventory["crontab"]
+            if not isinstance(files, dict) or not isinstance(crontab, str):
+                raise ValueError("invalid inventory")
+            for name, record in files.items():
+                if (not isinstance(name, str) or not name or "/" in name
+                        or not isinstance(record, dict)
+                        or any(type(record[key]) is not int for key in ("uid", "gid", "mode"))
+                        or not 0 <= record["mode"] <= 0o7777
+                        or (record["sha256"] is not None and not re.fullmatch(
+                            r"[0-9a-f]{64}", record["sha256"]))):
+                    raise ValueError("invalid file metadata")
+        except (ValueError, KeyError, TypeError):
+            return None, {"host": host}, "malformed cron inventory"
+        # Preserve exact shell text: collapsing whitespace can hide a changed
+        # command inside quotes (e.g. printf 'a  b' versus printf 'a b').
+        user_lines = {line for line in crontab.splitlines()
+                      if line.strip() and not line.lstrip().startswith("#")}
+        base_lines = {line for line in baseline_crontab
+                      if line.strip() and not line.lstrip().startswith("#")}
+        hashes = baseline_file_sha256 or {}
+        ambiguous_names = set(baseline_files) | {"e2scrub_all", "sysstat", ".placeholder"}
+        unexpected_files, unverified_files = [], []
+        for name, record in files.items():
+            # Symlinks/nonregular files or writable/non-root metadata can never
+            # inherit a trusted baseline just by matching its bytes or name.
+            safe_metadata = (record["uid"] == record["gid"] == 0
+                             and not record["mode"] & 0o6022
+                             and record["sha256"] is not None)
+            if not safe_metadata:
+                unexpected_files.append(name)
+            elif name in hashes:
+                if record["sha256"] != hashes[name]:
+                    unexpected_files.append(name)
+            elif name in ambiguous_names:
+                unverified_files.append(name)
+            else:
+                unexpected_files.append(name)
+        unexpected_files.sort()
         unexpected_lines = sorted(user_lines - base_lines)
         found = bool(unexpected_files or unexpected_lines)
-        return found, {"host": host, "unexpected_files": unexpected_files[:10],
-                       "unexpected_crontab": unexpected_lines[:10]}, None
+        evidence = {"host": host, "unexpected_files": unexpected_files[:10],
+                    "unexpected_crontab": unexpected_lines[:10],
+                    "unverified_files": sorted(unverified_files)[:10]}
+        if unverified_files and not found:
+            return None, evidence, "trusted cron content baseline missing"
+        return found, evidence, None

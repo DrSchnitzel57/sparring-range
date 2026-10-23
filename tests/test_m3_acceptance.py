@@ -11,6 +11,9 @@ The loop is the real one over the real API (TestClient transport) and the real
 DB; the model is scripted, Kali is a scripted sandbox, and the target hosts
 are an exec-channel double wired into the trusted verification service.
 """
+import hashlib
+import json
+
 import pytest
 
 from srplatform import verification_service
@@ -38,9 +41,11 @@ def _setup(client, users):
             if state["flag"] is None:
                 return 1, "cat: No such file or directory"
             return 0, state["flag"]
-        if command.startswith("ls -1 /etc/cron.d/"):
-            files = "\n".join(state["cron_files"])
-            return 0, f"{files}\n---\n{state['crontab']}"
+        if command.startswith("python3 -c ") and "crontab" in command:
+            files = {name: {"uid": 0, "gid": 0, "mode": 0o644,
+                            "sha256": hashlib.sha256(name.encode()).hexdigest()}
+                     for name in state["cron_files"]}
+            return 0, json.dumps({"files": files, "crontab": state["crontab"]})
         return 127, "no route"
 
     verification_service.set_verifier_exec(host_exec)

@@ -114,19 +114,25 @@ def test_m4_library_metadata_for_launcher(client):
 
 # --- verifier library semantics (no DB): shared red/blue contract --------------
 def test_verifier_polarity_serves_red_and_blue():
+    import hashlib
+    import json
     from verifiers.library.flag_file import CronPersistencePresent
 
     cron = CronPersistencePresent()
-    ctx = Context(exec=lambda h, c: (0, "e2scrub_all\nbackdoor\n---\n"))
-    red = cron.evaluate(ctx, host="web01", baseline_files=["e2scrub_all"])
+    digest = hashlib.sha256(b"clean distro fixture").hexdigest()
+    baseline = {"uid": 0, "gid": 0, "mode": 0o644, "sha256": digest}
+    pins = {"baseline_file_sha256": {"e2scrub_all": digest}}
+    dirty = json.dumps({"files": {"e2scrub_all": baseline, "backdoor": baseline}, "crontab": ""})
+    ctx = Context(exec=lambda h, c: (0, dirty))
+    red = cron.evaluate(ctx, host="web01", **pins)
     assert red.status == "passed"                       # red: persistence exists
-    blue = cron.evaluate(ctx, host="web01", expect="absent", baseline_files=["e2scrub_all"])
+    blue = cron.evaluate(ctx, host="web01", expect="absent", **pins)
     assert blue.status == "failed"                      # blue: NOT allowed to award
-    clean = Context(exec=lambda h, c: (0, "e2scrub_all\n---\n"))
-    blue_clean = cron.evaluate(clean, host="web01", expect="absent", baseline_files=["e2scrub_all"])
+    clean = Context(exec=lambda h, c: (0, json.dumps({"files": {"e2scrub_all": baseline}, "crontab": ""})))
+    blue_clean = cron.evaluate(clean, host="web01", expect="absent", **pins)
     assert blue_clean.status == "passed"
     # baseline-only state must NOT count as red persistence (F10)
-    red_clean = cron.evaluate(clean, host="web01", baseline_files=["e2scrub_all"])
+    red_clean = cron.evaluate(clean, host="web01", **pins)
     assert red_clean.status == "failed"
 
 
