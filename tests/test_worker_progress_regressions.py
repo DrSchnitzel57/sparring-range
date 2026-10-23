@@ -55,6 +55,31 @@ def test_twice_malformed_output_uses_runner_permitted_note():
     assert "rejected twice" in transport.events[0]["payload"]["error"]
 
 
+def test_attacker_prompt_does_not_assume_kali_tools():
+    loop, _, model, _ = make_loop(['{"tool":"shell","args":{"command":"command -v curl"}}'])
+    loop.run()
+    prompt = model.complete.call_args.args[0]
+    assert "isolated Linux attacker VM" in prompt
+    assert "Do not assume Kali" in prompt
+    assert "command -v" in prompt
+    assert "There is no internet" in prompt
+
+
+def test_missing_tool_then_malformed_turn_does_not_kill_next_dispatch():
+    loop, transport, _, runner = make_loop([
+        '{"tool":"shell","args":{"command":"fixture-missing"}}',
+        "not JSON", "still not JSON",
+        '{"tool":"shell","args":{"command":"command -v curl"}}',
+    ])
+    loop.max_steps = 3
+    runner.run.side_effect = [(127, "fixture-missing: command not found"), (0, "/usr/bin/curl")]
+    result = loop.run()
+    assert result["steps"] == 3
+    assert runner.run.call_count == 2
+    assert sum(e["action_type"] == "action_result" for e in transport.events) == 2
+    assert any("rejected twice" in (e["payload"].get("error") or "") for e in transport.events)
+
+
 @pytest.mark.parametrize("replies", [
     [RuntimeError("model unavailable")],
     ["bad JSON", RuntimeError("empty/truncated response")],

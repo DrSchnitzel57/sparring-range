@@ -245,6 +245,19 @@ gate passes and the settings names resolve.
 
 ## Validation commands and safety
 
+### Live-practice repair baseline (2026-10-23, `5930c9d`)
+
+The infrastructure-free command below exited 1: **448 passed, 1 failed,
+262 deselected, 4 warnings**, 80.25 s. The sole failure is
+`test_m0_partial_engagement_is_reported_truthfully`: it expects the obsolete
+literal "Datapath drop FAILED" instead of the current static-isolation warning
+"Datapath action FAILED" and independent appliance power-off instruction.
+This is a prose assertion mismatch, not evidence the emergency mechanism passed.
+The repair investigation follows a real supervised run with empty model hints,
+600-token truncation, one failed dispatched command, and a suspected clean-cron
+false positive. Do not treat service uptime as AI progress or software fixtures
+as deployed acceptance.
+
 - Fast baseline: the pytest command above (infrastructure-free since `ac5a61b`:
   0 failed, 0 prerequisite skips); integration layers are db/containment/packet/
   browser/live, and `python infra/dev/acceptance.py <check>` runs each real gate.

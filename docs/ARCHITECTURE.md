@@ -886,6 +886,34 @@ Not changed by this milestone: the outer Proxmox remains operator-only, the
 appliance holds no outer credential, guests stay on the isolated inner bridge,
 and no host firewall/auditd/host-shell capability was added to the product.
 
+### Live-practice repair decisions (2026-10-23, branch `15`)
+
+- Completion budgets are role-specific configuration (red 2048, coach 3072 by
+  default), with the existing bounded call deadline retained. Rejected: a shared
+  hardcoded 600 tokens or unlimited output. Thinking can consume the same budget
+  as visible text; empty, truncated, and abnormal-stop completions are explicit
+  failures, not success. Identical rejected completions are not gateway-retried;
+  transient transport failures keep the bounded recovery policy. Optional coach
+  text falls back to labeled deterministic guidance/reporting, never fake advice.
+- Worker schema errors use the existing runner-owned `agent_note` capability.
+  Rejected: widening event producer permissions to let a worker forge system
+  events. A summary checkpoint advances only with usable text.
+- Match clock, attacker status/progress, and service availability are separate
+  projections. Rejected: interpreting a running match or healthy HTTP endpoint as
+  successful AI activity. The browser polls terminal transitions and fetches
+  filtered, API-authorized event details; competition redaction remains server-side.
+- Cron cleanliness requires trusted content pins and safe file metadata, not
+  familiar filenames. Missing trusted maintenance baselines remain UNKNOWN;
+  accepting package metadata from a compromised target as its own authority was
+  rejected. Existing image artifacts do not acquire trusted pins retroactively.
+- Availability coverage counts unique current-generation service/time slots,
+  including the first immediate probe. Duplicate/excluded observations are
+  reported separately; clamping an inflated sample count to 100% was rejected.
+
+These are source repairs, not renewed deployed/model/security acceptance. The
+operator's AppArmor containment qualification, full useful model run, image
+baseline consolidation, and permanent post-killswitch cleanup repair remain open.
+
 ## Risks and explicitly unverified inputs (historical baseline; see reevaluation above)
 
 - Same physical host retains hypervisor/resource-contention risk even with no

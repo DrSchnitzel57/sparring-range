@@ -95,7 +95,8 @@ def test_m0_partial_engagement_is_reported_truthfully(tmp_path):
     sup = Supervisor(datapath=BadDatapath(), state_file=str(tmp_path / "s.json"))
     result = sup.engage("test")
     assert result["killswitch"] == "engaged-partial"
-    assert "Datapath drop FAILED" in result["warning"]
+    assert "Datapath action FAILED" in result["warning"]
+    assert "independent appliance power-off" in result["warning"]
 
 
 def test_m0_release_requires_datapath_and_invalidates_evidence(tmp_path):
