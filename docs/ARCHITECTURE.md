@@ -992,6 +992,57 @@ agent-memory compaction.
   possible; auxiliary calls still need shared admission. Footprint and actual Qwen
   tool/reasoning compatibility unmeasured.
 
+### K. Agreed upgrade design — 2026-10-24
+
+Plans 18–21 approved by the user; implementation waits for their new worktree.
+The user authorized planning the entire sequence here on branch `15`,
+then validating/committing the existing memory fix separately, committing agreed
+docs and merging all branch work into `master` in the main checkout, never
+pushing. They will create the next implementation worktree. This is an exception
+to main-folder/one-milestone-at-a-time planning, not to safety/live-operation rules.
+
+| Chosen | Rejected | Why |
+|---|---|---|
+| Pydantic AI slim conversation engine behind the existing API | Further open-ended framework comparison; stock general-agent shell tools | Structured history/tools without replacing the working authority/containment plane. Require actual Strata compatibility before switching production. |
+| Shared named model profiles with attacker, coach/report and summarizer overrides | Only environment variables or a single inflexible model | Supports the local main model and optional auxiliary; all generations including probes/retries use one slot. |
+| Editable thinking-level mappings and allowed generation fields | Hardcoded universal low/medium/high semantics | Strata is the actual server; support its per-request fields and additional model-specific levels without allowing message/tool/auth/destination overrides. |
+| Pin configuration for the whole session | Coach/reports silently adopting newer models | Reproducible session behavior. Record profile revisions per generation/report. Secret replacement/revocation invalidates old keys immediately, including pinned sessions; do not silently substitute. |
+| Interrupt after bounded exhausted attacker retries | Quietly continuing a match without attacker pressure | Preserve truthful practice/competition outcomes. Remote cessation and server-request cancellation remain separate obligations. |
+| Conversational coach, guiding hints then explicit direct help | Permanently forbidding answer commands | Member can request explanations/examples in practice; coach remains advisory, never executes commands. Competition-safe evidence/policy remains enforced. |
+| Modern dark dashboard and synchronized timed replay | Cosmetic links only; command-result dump as full future replay | Readable proportional UI/report/chat text, monospace terminals, responsive session navigation; timed capture for new runs plus command navigation, honest old-run step-through. |
+| Supported in-place upgrade AND corrected fresh install | Throwaway reinstall or leaving installed workarounds undocumented | Preserve users, history, casts, pins/keys and unrelated apps; reuse unchanged valid images, rebuild only when changed evidence/artifacts require it. |
+
+**Initial editable defaults:** 262,144 context tokens; 32,768 maximum completion
+tokens including thinking; 900 s per-request ceiling, bounded by remaining match
+time. Compact near 80% context pressure with completion reserve accounted for;
+never equate event count/characters with exact token usage. Use server token counts
+where supported, conservative explicitly labeled estimates otherwise. Record actual
+usage/finish reason and truncation. Existing long synchronous HTTP waits need durable
+job/status/stream APIs for coach/report/admin probes, queue visibility and reload
+recovery. Do not promise immediate hints while a long generation occupies the slot;
+hint priority applies to queued work, not preemption. Close/cancel active requests
+and verify endpoint cessation where supported; unknown release must not be called
+confirmed or permit overlapping requests.
+
+**Strata research limitation:** upstream
+[`7ddc17a`](https://github.com/Niko1221/Strata/blob/7ddc17a38fe7f31637e895ecfba58c2cd43d65ec/serve/server.py)
+accepts per-request `reasoning_effort`/template kwargs and reasoning-budget fields,
+and watches disconnected clients. This is not proof of the installed version's
+behavior. Do not mutate shared Strata global settings, restart its service or run
+unrestricted tools. Discovery/test requests require explicit admin action, must
+use configured destinations/credentials and share gateway admission. Redirects
+must not carry secrets to another origin; saved configuration responses/logs must
+exclude keys. Treat server/model content as data, not instructions.
+
+Conversation/checkpoint storage and timed output are separate from raw event
+audit. Bound per-operation/session capture and storage; drain without unbounded
+memory, label truncation/gaps, retain final result/containment even if capture
+fails, and never infer success from playback. Forward-only schema additions and
+append-only artifact/checkpoint revisions preserve historical reports; legacy
+unknown attribution/timing stays unknown. New provenance is authenticated at the
+controller/operation boundary, not asserted by compromised guest audit alone.
+No model reasoning text is required to establish scores or trusted evidence.
+
 ## Risks and explicitly unverified inputs (historical baseline; see reevaluation above)
 
 - Same physical host retains hypervisor/resource-contention risk even with no

@@ -110,6 +110,37 @@ Details: [findings](FINDINGS_CHECKLIST.md#consolidated-deployment-and-product-st
 Requirements: [architecture](ARCHITECTURE.md#j-local-conversation-engine-admin-settings-and-session-review-2026-10-23).
 No runtime replacement, new plan or live operation is authorized by this cleanup.
 
+### Agreed upgrade sequence — planning 2026-10-24
+
+The user approved all four plans on 2026-10-24 after full-sequence planning here.
+The whole backlog remains in scope; these supplement, not falsely complete,
+historical 14–17. Implementation waits for the user's new worktree:
+
+- [ ] **18 — Permanent appliance and recovery repairs.**
+  [Plan](../.openchamber/plans/18-permanent-appliance-repairs.md). Installer/native/UID/
+  TLS/config/firewall reproducibility, packaged CLI migrations, cessation-safe
+  teardown/obligation tooling, trusted cron image pins and adversarial containment
+  regression fixtures. Preserve completed commissioning evidence.
+- [ ] **19 — Conversational agent and model administration.**
+  [Plan](../.openchamber/plans/19-conversation-and-model-admin.md). Pydantic AI slim,
+  protected versioned profiles/role overrides/thinking mappings, context-aware
+  history/checkpoints, one-slot async scheduling/cancellation and admin GUI.
+- [ ] **20 — Conversational coach and session review.**
+  [Plan](../.openchamber/plans/20-coach-dashboard-and-replay.md). Grounded coach/AAR,
+  modern home/history/session navigation, filtered audit and synchronized new-run
+  timed attacker/defender replay with honest historical fallback.
+- [ ] **21 — Upgrade and qualified integrated release.**
+  [Plan](../.openchamber/plans/21-upgrade-and-integrated-release.md). Supported preserving
+  in-place upgrade, corrected fresh-install bundle, changed-artifact rebuilds,
+  installed/aggregate proofs and explicit real-Strata/manual acceptance.
+
+Architecture section K records choices/defaults. Do not restart cancelled
+DB/selection runs as though they failed; future acceptance may run them when needed.
+The fast planning baseline is recorded in findings. No deployment or new feature
+implementation was performed during planning. After agreement, validate/commit
+the pre-existing memory fix separately, commit plans, merge `15` into `master`
+without pushing; user creates the new implementation worktree.
+
 ### Carry-forward map (no requirements silently dropped)
 
 | Existing contract | Completion owner |

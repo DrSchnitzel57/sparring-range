@@ -1,5 +1,27 @@
 # Current findings and validation evidence
 
+## Upgrade planning baseline — 2026-10-24, branch `15`
+
+The user approved plans 18–21. The existing memory repair was subsequently
+committed separately as `0fac623`; it is not deployed. No upgrade implementation
+or new live acceptance is claimed.
+
+At docs revision `a74363c` with the pre-existing uncommitted memory filter and
+`tests/test_agent_memory_selection.py`, user approved infrastructure-free checks:
+
+- `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -ra -p no:cacheprovider`
+  — exit 0, **571 passed / 267 deselected / 0 failed / 0 skipped / 4 warnings**,
+  80.66 s. Warnings: FastAPI startup hooks (2), transport class collection (1),
+  synchronous test asyncio mark (1).
+- Same environment prefix with `.venv/bin/python -m pytest tests/test_agent_memory_selection.py tests/test_worker_progress_regressions.py -q -ra -p no:cacheprovider`
+  — exit 0, **37 passed / 1 deselected**, 0.20 s.
+
+No DB, selection gate, model, appliance or guest operations. Earlier background
+DB/selection commands were **cancelled by the user**, not independent failures;
+they were not restarted for this baseline. These checks validate current source
+behavior, not future upgrades or installed Strata compatibility. Both cancelled
+gates may be run later when authorized acceptance needs them.
+
 ## Consolidated deployment and product status — 2026-10-23
 
 This section supersedes intermediate status in the **67 Project Knowledge notes**
@@ -91,10 +113,11 @@ left answer room. `ping` EPERM is restricted-runner capability, not broken HTTP;
 do not grant root/capabilities to fix it. The local model has approximately 262k
 context; small output budgets are resource controls, **not containment**.
 
-Uncommitted/undeployed narrow memory filtering remains in
+At this checkpoint uncommitted/undeployed narrow memory filtering was in
 `srplatform/red_agent/loop.py` and `tests/test_agent_memory_selection.py` (previous
 focused result: 66 passed/24 deselected; not rerun here). Preserve it separately
-from documentation. It is not the agreed full conversational-engine replacement.
+from documentation. It is not the full conversational-engine replacement.
+Subsequently committed as `0fac623` after the 2026-10-24 fast baseline; not deployed.
 
 ### Permanent release repairs still required
 

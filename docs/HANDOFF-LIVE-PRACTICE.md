@@ -91,7 +91,8 @@ this patch. These are operator receipts, not actions performed by repair agents.
 Later run `76499df5` completed eight commands but repeated recon and failed
 compaction at checkpoint 23964 (502/2048-token exhaustion). See the current
 [consolidated findings](FINDINGS_CHECKLIST.md#consolidated-deployment-and-product-status--2026-10-23).
-The narrow uncommitted memory filter is not part of this installed patch.
+The narrow memory filter (subsequently committed as `0fac623`) is not part of
+this installed patch.
 
 The following is the retained installation procedure, not an instruction to
 repeat the completed deployment:

@@ -47,6 +47,14 @@ to investigate, not current instructions or proof of acceptance.
   identity isolation, append-only evidence and fail-closed recovery. No outer
   Proxmox credential enters the appliance. Plans are drafts pending approval;
   architecture selection alone does not authorize implementation/live operations.
+- The user authorized a second full-sequence planning exception on 2026-10-24:
+  plan 18–21 together here on branch `15`, covering permanent repairs,
+  Pydantic AI/model administration, coaching/review UX and preserving upgrade.
+  After agreement, separately commit the validated pre-existing memory fix,
+  commit agreed docs/plans and merge the whole branch into `master` in the main
+  checkout, never push. The user will create the next implementation worktree.
+  The user approved all four plans; implementation waits for their new worktree.
+  This does not authorize live operations or new feature implementation here.
 - Implementation follows an agreed plan, with small commits, explicit decisions,
   and automated acceptance. Skip its manual checks; they belong to the operator.
   End the handoff with an acceptance-criterion PASS/FAIL table and nothing after.
