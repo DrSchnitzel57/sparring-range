@@ -2,9 +2,11 @@
 migrations run Alembic as the schema-OWNER role (the app role lacks DDL and its
 append-only revocations would fight the migrator).
 """
+import hashlib
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import typer
@@ -37,13 +39,102 @@ def _alembic_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+#: Minimal complete ini for the PURE installed case (no tree copy, no ini
+#: beside site-packages). Alembic resolves a relative script_location
+#: against the process CWD and `migrations/env.py` runs fileConfig(), so
+#: the fallback carries absolute paths AND the logging sections. The
+#: fast regression in tests/test_plan18_installed_cli.py proves this
+#: fallback migrates the same schema as the checked-in ini.
+_FALLBACK_INI = """[alembic]
+script_location = {root}
+prepend_module_path = {pkgroot}
+# URL is resolved from POSTGRES_URL_OWNER by env.py (schema owner only).
+sqlalchemy.url =
+
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARN
+handlers = console
+
+[logger_sqlalchemy]
+level = WARN
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+"""
+
+
+def _migrations_dir(root: Path) -> Path:
+    """Where the migration scripts actually live for this installation."""
+    candidate = root / "srplatform" / "db" / "migrations"
+    if candidate.is_dir():
+        return candidate
+    import srplatform  # the resolved root must contain the package anyway
+    installed = Path(srplatform.__file__).resolve().parent / "db" / "migrations"
+    if installed.is_dir():
+        return installed
+    return candidate
+
+
 def _alembic_config(root: Path) -> str:
-    """The alembic.ini to use, with script_location pointing at the
-    migrations that ship with the installed package."""
+    """An alembic config with ABSOLUTE paths for THIS installation.
+
+    The checked-in alembic.ini spells script_location relative to the
+    project root, which Alembic resolves against the process CWD: outside
+    the checkout (a non-editable install, or any other working directory
+    combined with an ``SR_ALEMBIC_ROOT`` override) the migrations were
+    silently invisible and `rangectl db migrate/status` failed with a
+    path error that looked like a broken installation.  This materialises
+    a deterministic config whose script_location and module path are the
+    real, absolute locations, so the CLI works from anywhere.
+    """
+    migrations = _migrations_dir(root)
     ini = root / "alembic.ini"
     if not ini.is_file():
         ini = Path(__file__).resolve().parents[2] / "alembic.ini"
-    return str(ini)
+    if ini.is_file():
+        lines = []
+        for line in ini.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith("script_location"):
+                lines.append(f"script_location = {migrations}")
+            elif stripped.startswith("prepend_module_path"):
+                lines.append(f"prepend_module_path = {root}")
+            else:
+                lines.append(line)
+        body = "\n".join(lines) + "\n"
+    else:
+        body = _FALLBACK_INI.format(root=migrations, pkgroot=root)
+    digest = hashlib.sha256(str(migrations).encode()).hexdigest()[:12]
+    path = Path(tempfile.gettempdir()) / f"sr-alembic-{digest}.ini"
+    if not path.is_file() or path.read_text() != body:
+        fd, tmp = tempfile.mkstemp(dir=tempfile.gettempdir(),
+                                   prefix=".sr-alembic-")
+        with os.fdopen(fd, "w") as fh:
+            fh.write(body)
+        os.replace(tmp, path)
+    return str(path)
 
 
 @app.command("migrate")
