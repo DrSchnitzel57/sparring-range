@@ -5,7 +5,7 @@
 - [x] Repair bootstrap, native/runtime provisioning, identities and trust.
 - [x] Implement safe latched teardown and audited obligation recovery.
 - [x] Bind clean cron evidence to images; qualify scoped containment.
-- [ ] Run acceptance; update findings, tick 18 on its gates and update architecture if changed.
+- [x] Run acceptance; update findings, tick 18 on its gates and update architecture if changed.
 
 ## Goal and context
 Replace operator workarounds with reproducible source fixes. Binding references:

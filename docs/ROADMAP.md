@@ -121,6 +121,19 @@ historical 14–17. Implementation waits for the user's new worktree:
   TLS/config/firewall reproducibility, packaged CLI migrations, cessation-safe
   teardown/obligation tooling, trusted cron image pins and adversarial containment
   regression fixtures. Preserve completed commissioning evidence.
+  *Status 2026-10-24 (branch `practice-upgrades-18-21`, implementation —
+  independent review pending):* all seven plan acceptance criteria were
+  reproduced or repaired with automated evidence: fast 604/0/0; `install`,
+  `authority` (32), `containment` (26, incl. five new inside-boundary
+  adversarial negatives), `db` (184, incl. installed-CLI migrate/status
+  reaching head outside the checkout) and `selection` PASS; `images` PASS
+  (19) with the artifact-bound cron-pin test under TCG (software emulation,
+  no `/dev/kvm`). Commits `2a162d9`…`9885f87`; decisions in the architecture
+  and exact attempts in the findings checklist. Pending operator gates stay
+  open and are NOT claimed here: `packet` (root+`nft`), `journey` (installed
+  appliance), the installed UID/TLS/boot/KVM rechecks affected by these
+  changes, and independent adversarial qualification of the broader
+  AppArmor profile `9e03696`.
 - [ ] **19 — Conversational agent and model administration.**
   [Plan](../.openchamber/plans/19-conversation-and-model-admin.md). Pydantic AI slim,
   protected versioned profiles/role overrides/thinking mappings, context-aware

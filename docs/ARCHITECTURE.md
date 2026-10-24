@@ -1043,6 +1043,21 @@ unknown attribution/timing stays unknown. New provenance is authenticated at the
 controller/operation boundary, not asserted by compromised guest audit alone.
 No model reasoning text is required to establish scores or trusted evidence.
 
+### Plan 18 implementation decisions (2026-10-24, branch `practice-upgrades-18-21`)
+
+| Chosen | Rejected | Why |
+|---|---|---|
+| Own-table nftables loader unit (`sr-appliance-netrules`, root oneshot, validate-then-load ONE rendered file, `Requires=` by the broker) plus a render-time own-table scope parser | Runtime firewall API; operator-applied rules only; `flush ruleset` convenience | Reboot used to silently lose range isolation (live find 2026-10-23). The loader can only load the installer's own render; the parser refuses flush-ruleset, foreign tables and includes at render time, and the broker cannot start before isolation. |
+| Latched destroy allowed ONLY with positive re-identification (ledger claim + session match + backend identity re-read; exact name match or confirmed absence), resolving only cessation-class obligations with audit; foreign identities retained as `vmid-recycled-no-destroy` | Blanket 423 refusal (stranded every latched teardown, `lease_released:false`); unconditional destroy | End could never complete under cessation, and the only exit was unaccepted manual hypervisor surgery. Starts/clones/lease renewal stay refused; a foreign machine is never destroyed on belief. |
+| Offline `brokerctl resolve --id` requires an independent backend read-back (absence, or a provably foreign name for recycled obligations) | Editing ledger rows; resolving on operator assertion | Resolving is evidence, not a belief; refusals stay open and audited. |
+| Trusted cron hashes captured from the CLEAN BUILT ARTIFACT (verify-boot serial marker / tree capture) and pinned to {digest, version, template_id}; injected only while the deployment's template matches | Filename-only trust; learning baselines from any running or compromised guest; scenario YAML carrying hashes | v3 correctly refused filename-only "clean". The artifact is the only honest source of clean; every mismatch degrades to UNKNOWN, never a pass. |
+| Model credential is an API-only file reference (`SR_LLM_API_KEY_FILE`, root:srrange 0640), unreadable/empty failing loudly naming the file | Literal env credential shared into worker environments | Workers call models through the API gateway and never hold the key. |
+| Runtime host pins live in the state tree (`/var/lib/sparring-range/known_hosts/range_hosts`) read by runner/verifier/bastion | Pins under /etc | `ProtectSystem=strict` makes /etc read-only for the API writer; one file, one authority. |
+| Pinned Node 22.23.4 (digest-checked) with explicit `auto\|require\|provision` mode, ABI-matched libvirt binding symlinks, and per-UID `runuser` execution verification in `apply` | `--system-site-packages` venv; trusting rendered units as proof | Ubuntu 24.04's Node 18 cannot build Next 16; the umask-027 venv passed every rendered check and still died 203/EXEC. Apply must prove the real identities execute what their units exec. |
+| Shared bounded SSH policy (`ServerAliveInterval=5`/`CountMax=3` + `stdin=DEVNULL`) on every platform diagnostic call | Outer timeout only | A wedged guest with an established TCP connection hangs ssh forever without keepalives; the timeout alone did not save the 2026-10-23 run. |
+| `rangectl db` materializes an ABSOLUTE-path alembic config (with a complete synthesised fallback) | Relative ini + CWD assumption | Outside a checkout Alembic resolved `script_location` against the process CWD; the installed CLI failed with a path error that looked like a broken install. |
+| Storage-headroom refusal BEFORE any apply effect (placed images + operator floor vs free) | Discovering ENOSPC mid-clone | A nearly-full appliance accepted the copy then failed later with generic I/O errors. |
+
 ## Risks and explicitly unverified inputs (historical baseline; see reevaluation above)
 
 - Same physical host retains hypervisor/resource-contention risk even with no

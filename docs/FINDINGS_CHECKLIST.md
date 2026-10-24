@@ -1,4 +1,79 @@
 # Current findings and validation evidence
+# Current findings and validation evidence
+
+## Plan-18 implementation evidence — 2026-10-24, branch `practice-upgrades-18-21`
+
+Source repairs for the retained live-practice defects (installer/bootstrap,
+latched teardown/recovery, bounded SSH, firewall persistence + headroom,
+trusted cron pins, installed `rangectl`). Commits `2a162d9` `923f4ff`
+`20d8d46` `d70762b` `d6723ee` `d7b8d5b` `9885f87` on top of the separately
+committed memory fix `0fac623`. No live appliance, model endpoint, outer
+Proxmox or global firewall/AppArmor change was touched; no commissioning
+receipt was rerun.
+
+Exact automated attempts in this container (Debian 13, **no `/dev/kvm`**,
+no root, docker available):
+
+- `.venv/bin/python -m pytest -q -ra -p no:cacheprovider` (no DB admin,
+  `SR_PG_ADMIN_*` unset) — exit 0: **604 passed / 280 deselected / 0 failed
+  / 0 skipped / 4 warnings**, 73.7 s (same four pre-existing warnings).
+- `infra/dev/acceptance.py install` — **PASS**: real sandbox sequences
+  (clean 18 files, rerun 0 changed, upgrade, drift+repair) plus identity
+  contracts including the new root netrules loader unit, and the install
+  gate's managed-service note stays the operator's.
+- `infra/dev/acceptance.py authority` — **PASS**: 32 passed / 0 skipped,
+  including the seven new cessation/resolve regressions (latched positive
+  identity destroy, foreign/unknown retention, audited
+  `brokerctl resolve` read-back refusals and proofs).
+- `infra/dev/acceptance.py containment` — **PASS**: 26 passed / 0 skipped,
+  no leaked run-owned cgroups; adds five adversarial negatives driven from
+  INSIDE the real boundary (cross-op discovery, cross-op signalling with
+  the known host PID, supervisor survival, state-mask and cgroup-reroot
+  visibility).
+- `infra/dev/acceptance.py db` — **PASS**: 184 passed / 0 skipped against
+  the run-owned disposable PostgreSQL 16, including the new installed-CLI
+  test (real `rangectl db migrate` then `status` reaching `(head)` from a
+  site-packages-style copy executed OUTSIDE the checkout, plus idempotent
+  rerun); owned DB resources and the fixture container verified removed.
+- `infra/dev/acceptance.py selection` — **PASS** (every test classified;
+  fast default infrastructure-free).
+- Installed-package criterion additionally shown by the fast
+  `tests/test_plan18_installed_cli.py` tree-copy/pure-installed layouts
+  running real `alembic history` from a foreign CWD (fails against the
+  pre-repair config with the historical path error).
+- Recovery read-back acceptance: `test_recovery_resolve_requires_rechecked_backend_absence`
+  (stale/mismatched evidence cannot release; backend re-read decides) plus
+  the new authority resolve regressions (presence, uncertainty and
+  non-foreign identity each REFUSE and stay open, audited). No SQL or
+  ledger editing path exists or was added.
+- `infra/dev/acceptance.py images` — **PASS** (2026-10-24): 19 passed /
+  0 skipped, 1729 s, run-owned disk-backed cache (base image downloaded in
+  that run; **no `/dev/kvm`** — all boots are software emulation and are
+  labelled as such, not nested-KVM acceptance). The extended web-local
+  verify test captured the cron pin from the clean verify boot's serial
+  marker and asserted digest + template binding (wrong template, wrong
+  role, rebuilt digest and tampered documents all yield NO trust) plus the
+  pin-document round-trip; absent/tampered-pins-never-pass is proven by
+  `tests/test_plan18_cron_pins.py` against the real verifier v3 (clean +
+  matching pin → passed; content-tampered file → failed deterministically;
+  no pin → UNKNOWN).
+- `infra/dev/acceptance.py packet` — **NOT RUN here (prerequisite)**: needs
+  root and `nft`; fails closed naming them. Operator gate, unchanged.
+- `infra/dev/acceptance.py journey` — **NOT RUN here (prerequisite)**:
+  needs the INSTALLED appliance with the member SSH key and browser login.
+  Operator gate, unchanged.
+- Installed adversarial AppArmor profile qualification for the broader
+  profile `9e03696`, the installed UID/TLS/boot/KVM rechecks affected by
+  these changes and any reboot rehearsal stay **Manual checks** (operator).
+  Software negatives above are NOT certification of that profile.
+
+Cron pins have no effect until the release build places
+`/var/lib/sparring-range/cron-baselines.json`
+(`python3 -m infra.images.cron_baseline capture --role ROLE --tree TREE
+--image IMAGE --template-id ID --out ...` per rebuilt role, or the
+verify-boot marker path); absent pins the cron check stays UNKNOWN, which
+the new fast tests prove is still never a pass.
+
 
 ## Upgrade planning baseline — 2026-10-24, branch `15`
 
@@ -198,14 +273,18 @@ Agreed future model/admin/session UX requirements are in the architecture.
 ### Legacy reconciliation and note coverage
 
 The 2026-10-16 direct-PVE fix list is historical, not appliance instructions.
-Non-editable `rangectl db migrate/status` root/config lookup still needs installed
-acceptance (`_alembic_root` now exists; not rerun here). Runbook conflict markers
-are absent on inspection. Separate-ingest-unit wording still needs reconciliation
-for the applicable legacy deployment. Ref-only recovery is obsolete: 9100/9101
-destroyed, lease disarmed; do not resume them. `Ledger.resolve_obligation` still
-has no caller found under `infra`: audited resolution for destroy-confirmed/absent
-claims with open obligations remains a tooling gap; zero-obligation recovery
-passes do not close it. Deferred local pin fallback, source-text test replacement,
+Non-editable `rangectl db migrate/status` root/config lookup: REPAIRED and
+installed-accepted 2026-10-24 (`_alembic_config` absolute-path materialization;
+fast + db-layer acceptance in `tests/test_plan18_installed_cli.py`). Runbook
+conflict markers are absent on inspection. Separate-ingest-unit wording:
+reconciled by inspection 2026-10-24 — the appliance has always rendered its own
+`sr-appliance-ingest.service` (installer UNITS + runbook §install); the legacy
+wording belongs to the superseded 2026-10-16 direct-PVE notes only. Ref-only
+recovery is obsolete: 9100/9101 destroyed, lease disarmed; do not resume them.
+`Ledger.resolve_obligation` tooling gap: CLOSED 2026-10-24 — confirmed latched
+destroy resolves cessation-class obligations in `infra/broker/service.py`, and
+`brokerctl resolve` (`infra/broker/tools.py`) resolves foreign/recycled
+obligations only on independent backend read-back, audited either way. Deferred local pin fallback, source-text test replacement,
 install-layout policy and PVE ACL cron suggestions are not approved new appliance
 scope; never silently weaken pinning. Existing historical plan checkboxes are not
 advanced by this cleanup.
