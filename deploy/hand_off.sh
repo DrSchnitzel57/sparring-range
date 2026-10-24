@@ -174,8 +174,8 @@ in a maintenance window.
   less /etc/systemd/network/10-srlab.netdev /etc/systemd/network/20-srlab.network
   networkctl reload
   nft -f /etc/nftables.d/sr-appliance.nft
-  systemctl enable --now sr-appliance-broker sr-api sr-appliance-ingest \
-    sr-worker-supervisor sr-bastion sr-web
+  systemctl enable --now sr-appliance-netrules sr-appliance-broker sr-api \
+    sr-appliance-ingest sr-worker-supervisor sr-bastion sr-web
 NOTE
 
 say "7/7 check that the appliance came up"

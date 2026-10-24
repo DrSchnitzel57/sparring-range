@@ -53,7 +53,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from infra.appliance.manifest import ApplianceManifest  # noqa: E402
-from infra.appliance.netrules import render_networkd, render_nftables  # noqa: E402
+from infra.appliance.netrules import (nft_scope_problems, render_networkd,
+                                      render_nftables)  # noqa: E402
 from infra.appliance.policy import AppliancePolicy  # noqa: E402
 
 DEFAULT_PREFIX = pathlib.Path("/opt/sparring-range")
@@ -64,6 +65,11 @@ DEFAULT_RUN = pathlib.Path("/run/sparring-range")
 UNITS = ("sr-appliance-broker.service", "sr-api.service",
          "sr-appliance-ingest.service", "sr-worker-supervisor.service",
          "sr-bastion.service", "sr-web.service")
+# The range firewall loader runs nft for exactly one file-scoped table.  It
+# is NOT one of the business services (it is root by necessity — nft needs
+# CAP_NET_ADMIN), so it stays outside UNITS, which the identity contract
+# audits, but it is installed, enabled and reported alongside them.
+NETRULES_UNIT = "sr-appliance-netrules.service"
 GROUPS = ("srrange", "srbastion", "sr-broker-clients", "sringest", "srworker",
           "srweb", "sr-secrets")
 USERS = {
@@ -452,10 +458,13 @@ def render_broker_unit(m: ApplianceManifest, *,
                        prefix: pathlib.Path = DEFAULT_PREFIX) -> str:
     return f"""[Unit]
 Description=sparring-range appliance broker (local libvirt, typed ops)
-After=network-online.target libvirtd.service
+After=network-online.target libvirtd.service {NETRULES_UNIT}
 Wants=network-online.target libvirtd.service
 # The broker is the ONLY process with a libvirt socket and /dev/kvm access.
-Requires=libvirtd.service
+# Fail-closed ordering (plan 18): no guest may exist before the range's
+# own isolation table is loaded; if the loader fails, the broker does not
+# start and the range stays closed.
+Requires=libvirtd.service {NETRULES_UNIT}
 
 [Service]
 Type=exec
@@ -603,6 +612,49 @@ server {{
 """
 
 
+def render_netrules_unit(lay: Layout) -> str:
+    """The boot loader for the appliance's OWN firewall table (plan 18).
+
+    Live find: the operator applied the rules once in the maintenance
+    window and a reboot silently lost them — the range came up unisolated.
+    This unit reloads exactly the one rendered file at boot: it runs
+    `nft -c` (parse/validate) first, then `nft -f` of that single file.  It
+    NEVER runs `flush ruleset`, never touches another table or chain, and
+    never executes operator-authored text at runtime — the file is the
+    installer's own render, validated at render time (see
+    netrules.nft_scope_problems).
+
+    It is deliberately root: nft needs CAP_NET_ADMIN; no service identity
+    of the range may hold it."""
+    nft = lay.nftables_dir / "sr-appliance.nft"
+    return f"""[Unit]
+Description=sparring-range range firewall (loads ONLY its own inet table)
+Documentation=file://{nft}
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Validate before loading: a corrupt render must fail this unit (and with
+# it the broker, which Requires it), never boot into a half-loaded range.
+ExecStartPre=/usr/sbin/nft -c -f {nft}
+# Table-scoped by construction: the file adds/deletes ONLY inet
+# sr_appliance. There is no flush-ruleset path in this installation.
+ExecStart=/usr/sbin/nft -f {nft}
+ExecStop=/usr/sbin/nft delete table inet sr_appliance
+TimeoutStartSec=30
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
 def render_files(m: ApplianceManifest, *,
                  prefix: pathlib.Path = DEFAULT_PREFIX,
                  etc: pathlib.Path = DEFAULT_ETC,
@@ -633,6 +685,8 @@ def render_files(m: ApplianceManifest, *,
                      render_networkd(m).split("\n\n", 1)[1], 0o644),
         RenderedFile(lay.nftables_dir / "sr-appliance.nft",
                      render_nftables(m), 0o644),
+        RenderedFile(lay.units_dir / NETRULES_UNIT,
+                     render_netrules_unit(lay), 0o644),
         RenderedFile(lay.units_dir / "sr-appliance-broker.service",
                      render_broker_unit(m, etc=lay.etc, prefix=lay.prefix), 0o644),
         RenderedFile(lay.units_dir / "sr-appliance-ingest.service",
@@ -667,9 +721,16 @@ def render_files(m: ApplianceManifest, *,
         "— real appliances only",
         "provision the TLS material and onboard the member keys — real "
         "appliances only",
-        "daemon-reload; enable --now " + " ".join(UNITS),
-        "apply fixed networkd bridge and nftables rules once; never at runtime",
+        "daemon-reload; enable --now " + " ".join([*UNITS, NETRULES_UNIT]),
+        "apply fixed networkd bridge and nftables rules once; the rules are "
+        "reloaded at every boot by " + NETRULES_UNIT + " (own table only)",
     ]
+    # Fail closed at RENDER time: a ruleset that could touch anything but
+    # its own table must never reach disk, let alone the loader service.
+    scope_problems = nft_scope_problems(render_nftables(m))
+    if scope_problems:
+        raise InstallError("rendered firewall violates its own-table scope: "
+                           + "; ".join(scope_problems))
     return Plan(files=files, actions=actions, units=list(UNITS))
 
 
@@ -891,6 +952,26 @@ def _receipt(m: ApplianceManifest, plan: Plan, lay: Layout) -> dict:
     return receipt
 
 
+def storage_headroom_problem(free_bytes: int, image_bytes: int,
+                             min_free_gb: int) -> str | None:
+    """Pure pre-flight: does the images filesystem still have room?
+
+    Live practice 2026-10-23: a nearly-full appliance accepted the image
+    copy and only failed later, mid-clone, with generic I/O errors.  The
+    rule stated HERE (and checked before apply's effects) is: the space
+    already occupied by the release images PLUS the operator's configured
+    free-space floor must fit in the current free space.  Returns None
+    when fine, otherwise an actionable one-liner naming the numbers."""
+    need = int(min_free_gb) * 1024**3 + int(image_bytes)
+    if int(free_bytes) >= need:
+        return None
+    return (f"images filesystem has {int(free_bytes) / 1024**3:.1f} GiB free "
+            f"but needs {need / 1024**3:.1f} GiB "
+            f"({int(image_bytes) / 1024**3:.1f} GiB of images already placed "
+            f"plus a {min_free_gb} GiB floor for guest clones) - free space "
+            "or point images at a larger filesystem before installing")
+
+
 def apply_plan(m: ApplianceManifest, plan: Plan, *,
                prefix: pathlib.Path = DEFAULT_PREFIX,
                etc: pathlib.Path = DEFAULT_ETC,
@@ -929,6 +1010,20 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
             run("chmod", "0640", str(model_key), check=False)
     services: dict = {}
     if not lay.sandboxed and not dry_run:
+        # Storage headroom BEFORE any effect (plan 18): a nearly-full
+        # images filesystem must refuse the installation here, naming the
+        # numbers, not fail later mid-clone with generic I/O errors.
+        probe = pathlib.Path(m.images_dir)
+        while not probe.is_dir() and probe != probe.parent:
+            probe = probe.parent
+        image_bytes = sum(
+            int(img.size_bytes) for img in m.images.values()
+            if pathlib.Path(img.path).is_file())
+        problem = storage_headroom_problem(
+            shutil.disk_usage(str(probe)).free, image_bytes,
+            m.budgets.min_free_gb)
+        if problem:
+            raise InstallError(problem)
         # The REAL service steps.  A sandbox install renders the same files
         # and proves the sequences, but it never pretends the services ran.
         from deploy import appliance_services as svc
@@ -986,8 +1081,10 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
         _apply_sysctls(run)
         # Network artifacts are installed but not applied to the host by this
         # command: the operator applies them during the approved maintenance
-        # window after reviewing the generated rules.
-        for unit in plan.units:
+        # window after reviewing the generated rules.  The netrules LOADER is
+        # enabled too — once the operator starts it (or reboots), the range
+        # isolation survives restarts instead of silently vanishing.
+        for unit in [*plan.units, NETRULES_UNIT]:
             run("systemctl", "enable", unit, check=False)
     return {"changed": changed, "supervisor_token": token_action,
             "services": services, "dry_run": dry_run}
@@ -1055,7 +1152,7 @@ def _broker_status(m: ApplianceManifest) -> dict:
 def status(m: ApplianceManifest, *, as_json: bool = False) -> dict:
     data = {
         "installation_id": m.installation_id,
-        "units": {u: _unit_state(u) for u in UNITS},
+        "units": {u: _unit_state(u) for u in (*UNITS, NETRULES_UNIT)},
         "broker": _broker_status(m),
         "paths": {
             "broker_socket": m.broker_socket,
@@ -1197,7 +1294,7 @@ def firstboot_report(m: ApplianceManifest, layout: Layout) -> dict:
         f"(range-side {m.network.bastion_address}; members connect via the "
         "LAN address)",
         pending_if_manual=True)
-    for unit in UNITS:
+    for unit in (*UNITS, NETRULES_UNIT):
         state = _unit_state(unit)
         add(f"unit {unit}", state == "active", state, pending_if_manual=True)
     add("isolated bridge", bridge_ready,

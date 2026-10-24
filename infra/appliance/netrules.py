@@ -14,7 +14,53 @@ runtime firewall API and no host shell endpoint.
 
 from __future__ import annotations
 
+import re
+
 from .manifest import ApplianceManifest
+
+TABLE = "inet sr_appliance"
+_TABLE_LINE = re.compile(
+    r"^\s*(add table|delete table|table|flush|include)\s*(\S*)\s*(\S*)\s*")
+
+
+def nft_scope_problems(text: str) -> list[str]:
+    """Verify the rendered ruleset touches ONLY its own table (plan 18).
+
+    The loader service feeds this file to `nft -f`; the file must therefore
+    never contain `flush ruleset`, never name a foreign table, and never
+    `include` other files (an include could smuggle in arbitrary host
+    rules).  Only three table-bearing forms are legal, all scoped to
+    ``inet sr_appliance``."""
+    problems: list[str] = []
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.split("#", 1)[0].strip()
+        if not stripped:
+            continue
+        if re.search(r"\bflush\s+ruleset\b", stripped, re.I):
+            problems.append(f"line {number}: flush ruleset is forbidden")
+        m = _TABLE_LINE.match(stripped)
+        if not m:
+            continue
+        verb, family, name = m.group(1), m.group(2), m.group(3)
+        if verb == "flush":
+            problems.append(f"line {number}: bare flush is forbidden "
+                            "(rules must be replaced atomically by table)")
+        elif verb == "include":
+            problems.append(f"line {number}: includes are forbidden "
+                            "(the loader may load exactly this file)")
+        elif f"{family} {name}".strip() not in (TABLE, "sr_appliance", ""):
+            problems.append(f"line {number}: touches foreign table "
+                            f"{family!r} {name!r}")
+    if "add table inet sr_appliance" not in text:
+        problems.append("ruleset does not declare its own table")
+    # First-run idempotence: `delete table` of a missing table fails, so
+    # the delete must follow the idempotent `add table`.
+    add, delete = text.find("add table inet sr_appliance"), \
+        text.find("delete table inet sr_appliance")
+    if delete >= 0 and not 0 <= add < delete:
+        problems.append("delete table must follow add table "
+                        "(first-run idempotence)")
+    return problems
 
 
 def _set(name: str, values: list[str]) -> list[str]:
