@@ -42,7 +42,7 @@ app = FastAPI(title="sparring-range API", version="0.2.0")
 
 # LAN origins are EXPLICIT (F23) — never wildcard, never silently localhost.
 from srplatform.controller_lock import ControllerLock
-from srplatform.settings import get_settings  # noqa: E402
+from srplatform.settings import bastion_login_target, get_settings  # noqa: E402
 
 
 class _StartupCORSMiddleware(CORSMiddleware):
@@ -493,7 +493,8 @@ def get_connections(session_id: uuid.UUID, p: Principal = Depends(any_member),
             LoginToken.expires_at > _now())).scalars():
         out.append({"host": name_by_ip.get(lt.target_host, lt.target_host),
                     "ip": lt.target_host, "login_token": lt.token,
-                    "ssh": f"ssh {s.bastion_address} -p {s.bastion_listen_port} -l {lt.token}",
+                    "ssh": f"ssh {bastion_login_target(s)} "
+                           f"-p {s.bastion_listen_port} -l {lt.token}",
                     "expires_at": lt.expires_at.isoformat() if lt.expires_at else None})
     return {"session_id": str(session_id), "connections": out}
 

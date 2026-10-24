@@ -238,7 +238,14 @@ def render_control_env(m: ApplianceManifest, *, etc: pathlib.Path = DEFAULT_ETC,
         ("SR_SAFETY_STATE_FILE", str(pathlib.Path(m.state_dir) / "controller" / "safety_state.json")),
         ("SR_BASTION_HOST_KEY_PATH", str(etc / "ssh/bastion_ed25519")),
         ("SR_BASTION_AUTHORIZED_KEYS_FILE", str(etc / "ssh/authorized_keys")),
-        ("SR_BASTION_TARGETS_KNOWN_HOSTS", str(etc / "known_hosts/range_hosts")),
+        # RUNTIME host pins live under the STATE directory, never under
+        # /etc (plan 18): every appliance unit runs with ProtectSystem=strict
+        # — /etc is read-only for the services that must WRITE fresh
+        # generation pins — and the API publishes them while the file
+        # owner's umask can differ from the installer's. The API is the only
+        # writer; the runner/verifier/bastion clients read the same files.
+        ("SR_BASTION_TARGETS_KNOWN_HOSTS",
+         str(pathlib.Path(m.state_dir) / "known_hosts/range_hosts")),
         ("SR_RANGE_BRIDGE", m.network.range_bridge),
         # The appliance's inner range is a plain isolated bridge: no VLAN tag
         # (the broker policy accepts exactly one NIC specification).
@@ -270,9 +277,21 @@ def render_control_env(m: ApplianceManifest, *, etc: pathlib.Path = DEFAULT_ETC,
         # srworker-readable file and never enters the API/model env.
         ("SR_RUNNER_SSH_TARGET", f"attacker@{m.network.range_cidr.network_address + 9}"),
         ("SR_RUNNER_SSH_KEY_PATH", str(etc / "secrets/worker_runner_key")),
-        ("SR_RUNNER_SSH_KNOWN_HOSTS", str(etc / "known_hosts/range_hosts")),
+        ("SR_RUNNER_SSH_KNOWN_HOSTS",
+         str(pathlib.Path(m.state_dir) / "known_hosts/range_hosts")),
         ("SR_VERIFIER_SSH_KEY_PATH", str(etc / "secrets/verifier_key")),
-        ("SR_VERIFIER_SSH_KNOWN_HOSTS", str(etc / "known_hosts/range_hosts")),
+        ("SR_VERIFIER_SSH_KNOWN_HOSTS",
+         str(pathlib.Path(m.state_dir) / "known_hosts/range_hosts")),
+        # The model credential is the API's alone (plan 18): a file
+        # reference, never the value, and never in a shared environment.
+        # The renderer only names the path the operator provisioned; the
+        # installer keeps it root:srrange 0640.
+        ("SR_LLM_API_KEY_FILE", m.model_api_key_file),
+        # Members connect to the bastion over the REACHABLE LAN address
+        # (plan 18): the range-side bastion_address is a planning address
+        # that may name no interface at all. Rendered hints use this.
+        ("SR_BASTION_PUBLIC_ADDRESS",
+         str(m.network.lan_address) if m.network.lan_address else ""),
         # The match scheduler (ready expiry, deadline cleanup, startup
         # reconciliation) is part of a working appliance, not an option.
         ("SR_MATCH_SCHEDULER_ENABLED", "1"),
@@ -332,7 +351,11 @@ def render_bastion_env(m: ApplianceManifest, *,
         ("SR_BASTION_AUTHORIZED_KEYS_FILE", str(etc / "ssh/authorized_keys")),
         ("SR_BASTION_HOST_KEY_PATH", str(etc / "ssh/bastion_ed25519")),
         ("SR_BASTION_CLIENT_KEY_PATH", str(etc / "ssh/bastion_client_ed25519")),
-        ("SR_BASTION_TARGETS_KNOWN_HOSTS", str(etc / "known_hosts/range_hosts")),
+        # The bastion READS the runtime pins the API publishes; they live
+        # under the state tree (plan 18) because ProtectSystem=strict makes
+        # /etc read-only for the writer.  Same file, one authority.
+        ("SR_BASTION_TARGETS_KNOWN_HOSTS",
+         str(pathlib.Path(m.state_dir) / "known_hosts/range_hosts")),
         ("SR_RECORDINGS_DIR", m.recordings_dir),
         # The bastion's SERVICE token: a secret in the bastion's OWN file
         # (0600, root:srbastion), never in a shared environment. The API
@@ -681,6 +704,17 @@ class Runner:
         if self.dry_run:
             return subprocess.CompletedProcess(list(cmd), 0, "", "")
         environ = {**os.environ, **(env or {})}
+        # subprocess requires every environment value to be a str; an
+        # IPv4Address (live find 2026-10-23: HTTPS_IP reached the TLS
+        # bootstrap as a real IPv4Address and died inside subprocess with a
+        # message naming nothing) must fail HERE, naming the key, and never
+        # mid-script.
+        for key, value in environ.items():
+            if not isinstance(value, str):
+                raise InstallError(
+                    f"environment value for {key!r} is {type(value).__name__}, "
+                    f"not str: convert explicitly at the call site "
+                    f"(str({key})) rather than at the process boundary")
         r = subprocess.run([str(c) for c in cmd], capture_output=True,
                            text=True, env=environ, cwd=cwd)
         if check and r.returncode != 0:
@@ -726,6 +760,12 @@ def _ensure_dirs(m: ApplianceManifest, run: Runner, lay: Layout) -> None:
             (pathlib.Path(m.broker_ledger).parent, 0o750, "srbroker",
               "sr-broker-clients"),
             (pathlib.Path(m.state_dir) / "controller", 0o700, "srrange", "srrange"),
+            # Runtime host pins live under state (plan 18): the API is the
+            # only writer (ProtectSystem=strict makes /etc read-only for it),
+            # the runner/verifier/bastion clients only need read access, and
+            # public host keys carry no secret.
+            (pathlib.Path(m.state_dir) / "known_hosts", 0o755, "srrange",
+             "srrange"),
             (lay.run, 0o750, "srbroker", "sr-broker-clients"),
             (lay.etc / "tls", 0o755, "root", "root"),
             (lay.etc / "ssh", SSH_DIR_MODE, "root", SSH_DIR_GROUP)):
@@ -879,6 +919,14 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
         if runtime_env.is_file():
             run("chown", "root:srrange", str(runtime_env), check=False)
             run("chmod", "0640", str(runtime_env), check=False)
+        # The MODEL credential belongs to the API identity alone (plan 18):
+        # 0640 root:srrange. Not the supervisor (srworker), not the bastion,
+        # not the broker; the API requests every model call through its own
+        # gateway, so no other identity needs it.
+        model_key = pathlib.Path(m.model_api_key_file)
+        if model_key.is_file():
+            run("chown", "root:srrange", str(model_key), check=False)
+            run("chmod", "0640", str(model_key), check=False)
     services: dict = {}
     if not lay.sandboxed and not dry_run:
         # The REAL service steps.  A sandbox install renders the same files
@@ -888,8 +936,18 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
         if not (source / "requirements.lock").is_file():
             raise InstallError(f"missing {source / 'requirements.lock'}")
         services["native_packages"] = svc.ensure_native_dependencies(run)
+        # Node BEFORE the web build (plan 18): Ubuntu 24.04's Node 18 cannot
+        # build or start Next 16; the pinned LTS is fetched, digest-checked
+        # and installed here rather than hand-installed mid-hand-off.
+        services["node"] = svc.ensure_node_runtime(run)
         services["venv"] = str(svc.ensure_venv(
             run, prefix=lay.prefix, source=source))
+        # A rendered unit is not a process (plan 18): every service identity
+        # must ACTUALLY execute what its unit execs, verified per real UID
+        # before apply claims success (the umask-027 venv passed every
+        # rendered check and still died 203/EXEC on first start).
+        services["runtime_verification"] = svc.verify_service_runtime(
+            run, pathlib.Path(services["venv"]))
         services["database"] = svc.ensure_database(
             run, prefix=lay.prefix, env_file=lay.etc / "control-plane.env")
         services["tls"] = svc.ensure_tls(
@@ -925,7 +983,7 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
                       + "\n", 0o644, os.getuid(), os.getgid())
     if not lay.sandboxed:
         run("systemctl", "daemon-reload", check=False)
-        run("systemd-sysctl", check=False)
+        _apply_sysctls(run)
         # Network artifacts are installed but not applied to the host by this
         # command: the operator applies them during the approved maintenance
         # window after reviewing the generated rules.
@@ -933,6 +991,46 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
             run("systemctl", "enable", unit, check=False)
     return {"changed": changed, "supervisor_token": token_action,
             "services": services, "dry_run": dry_run}
+
+
+def _resolve_binary(name: str) -> str | None:
+    """Locate a system binary by absolute path.
+
+    A bare lookup through the inherited PATH failed on the appliance
+    (live find 2026-10-23: `systemd-sysctl` is in /usr/bin, and the sudo
+    PATH of a non-login shell did not contain it).  Searching the standard
+    absolute locations never depends on the caller's PATH, and a failure
+    names the binary instead of dying inside exec with a bare
+    FileNotFoundError.
+    """
+    found = shutil.which(name)
+    if found:
+        return found
+    for base in ("/usr/bin", "/bin", "/usr/sbin", "/sbin"):
+        p = pathlib.Path(base) / name
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    return None
+
+
+def _apply_sysctls(run: Runner) -> None:
+    """Apply the system sysctl configuration by absolute path (plan 18).
+
+    Not fatal on failure (the same contract as the old bare call), but the
+    failure is LOUD and names the exact remediation, so a half-applied
+    network configuration is never mistaken for a complete one."""
+    binary = _resolve_binary("systemd-sysctl")
+    if binary is None:
+        print("WARNING: systemd-sysctl not found in PATH or /usr/bin; run "
+              "`systemd-sysctl` manually after installing systemd",
+              file=sys.stderr)
+        return
+    result = run(binary, check=False)
+    if result.returncode != 0:
+        print("WARNING: systemd-sysctl exited "
+              f"{result.returncode}: {(result.stderr or result.stdout)[-200:]}; "
+              "review /etc/sysctl.d/ before relying on those settings",
+              file=sys.stderr)
 
 
 # --------------------------------------------------------------------------- #
@@ -1028,21 +1126,36 @@ def firstboot_report(m: ApplianceManifest, layout: Layout) -> dict:
     The operator runs this in THEIR virtual machine: it answers "is the
     appliance actually up?" without guessing, and without printing anything
     secret.  Every check names what it looked at and what it saw.
+
+    Staged first boot (plan 18): the hand-off deliberately leaves the
+    bridge, the nftables rules and the service starts to the operator's
+    maintenance window.  While the bridge does not exist yet, every check
+    downstream of those manual steps is reported PENDING — visibly, with the
+    exact remediation — instead of a wall of FAILs that hides the two things
+    that are genuinely broken.  Once the manual steps are done, the same
+    checks become real pass/fail again; ``pending`` never folds into ``ok``.
     """
     import socket as _socket
     import urllib.error
     import urllib.request
 
     checks: list[dict] = []
+    bridge_ready = pathlib.Path("/sys/class/net/"
+                                f"{m.network.range_bridge}").exists()
 
-    def add(name: str, ok: bool, detail: str = "") -> None:
-        checks.append({"check": name, "ok": bool(ok), "detail": detail[:200]})
+    def add(name: str, ok: bool, detail: str = "",
+            pending_if_manual: bool = False) -> None:
+        pending = bool(pending_if_manual and not bridge_ready and not ok)
+        checks.append({"check": name, "ok": bool(ok) or pending,
+                       "pending": pending, "detail": detail[:200]})
 
     add("manifest", True, m.installation_id)
-    add("broker socket", pathlib.Path(m.broker_socket).exists(), m.broker_socket)
+    add("broker socket", pathlib.Path(m.broker_socket).exists(), m.broker_socket,
+        pending_if_manual=True)
     broker = _broker_status(m)
     add("broker answers", broker.get("ok", False),
-        "inventory" if broker.get("ok") else str(broker.get("error", ""))[:120])
+        "inventory" if broker.get("ok") else str(broker.get("error", ""))[:120],
+        pending_if_manual=True)
 
     def http(url: str) -> tuple[bool, str]:
         try:
@@ -1055,9 +1168,9 @@ def firstboot_report(m: ApplianceManifest, layout: Layout) -> dict:
             return False, f"{type(exc).__name__}"
 
     ok_health, body = http(m.internal_url.rstrip("/") + "/healthz")
-    add("api /healthz", ok_health, body)
+    add("api /healthz", ok_health, body, pending_if_manual=True)
     ok_ready, body = http(m.internal_url.rstrip("/") + "/readyz")
-    add("api /readyz", ok_ready, body)
+    add("api /readyz", ok_ready, body, pending_if_manual=True)
 
     def tcp(host: str, port: int) -> bool:
         try:
@@ -1069,16 +1182,28 @@ def firstboot_report(m: ApplianceManifest, layout: Layout) -> dict:
     ingest = m.network.ingest_address
     add("ingest listener",
         bool(ingest) and tcp(str(ingest), int(m.network.ingest_port)),
-        f"{ingest}:{m.network.ingest_port}" if ingest else "not configured")
-    bastion = m.network.bastion_address
-    add("bastion listener", bool(bastion) and tcp(str(bastion), 2222),
-        f"{bastion}:2222" if bastion else "not configured")
+        f"{ingest}:{m.network.ingest_port}" if ingest else "not configured",
+        pending_if_manual=True)
+    # The bastion listens on every appliance address, but the RANGE-side
+    # bastion address may name no local interface at all (it is a range
+    # planning address); the reachable check is the appliance's own LAN
+    # address (or loopback), the one members are told to use
+    # (live find 2026-10-23: `.2:2222` on the range never answers, so a
+    # healthy bastion failed firstboot forever).
+    bastion_probe = str(m.network.lan_address) if m.network.lan_address \
+        else "127.0.0.1"
+    add("bastion listener", tcp(bastion_probe, 2222),
+        f"{bastion_probe}:2222 "
+        f"(range-side {m.network.bastion_address}; members connect via the "
+        "LAN address)",
+        pending_if_manual=True)
     for unit in UNITS:
         state = _unit_state(unit)
-        add(f"unit {unit}", state == "active", state)
-    add("isolated bridge", pathlib.Path("/sys/class/net/"
-                                         f"{m.network.range_bridge}").exists(),
-        m.network.range_bridge)
+        add(f"unit {unit}", state == "active", state, pending_if_manual=True)
+    add("isolated bridge", bridge_ready,
+        m.network.range_bridge if bridge_ready else
+        f"{m.network.range_bridge} missing — apply step-6 networkd + reload",
+        pending_if_manual=True)
     add("nftables rules", shutil.which("nft") is not None,
         "nft is required for the range isolation rules")
     for role, image in sorted(m.images.items()):
@@ -1092,7 +1217,9 @@ def firstboot_report(m: ApplianceManifest, layout: Layout) -> dict:
     add("worker capability",
         (layout.etc / "secrets" / "worker-supervisor.token").is_file(),
         str(layout.etc / "secrets" / "worker-supervisor.token"))
-    return {"ok": all(c["ok"] for c in checks), "checks": checks,
+    return {"ok": all(c["ok"] for c in checks),
+            "pending": [c["check"] for c in checks if c.get("pending")],
+            "checks": checks,
             "installation_id": m.installation_id}
 
 
@@ -1409,10 +1536,18 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(report, indent=2, sort_keys=True))
             else:
                 for c in report["checks"]:
-                    print(("  [ok]  " if c["ok"] else "  [FAIL] ")
-                          + c["check"] + (f" - {c['detail']}" if c["detail"] else ""))
+                    mark = ("[PEND] " if c.get("pending")
+                            else ("[ok]   " if c["ok"] else "[FAIL] "))
+                    print(mark + c["check"]
+                          + (f" - {c['detail']}" if c["detail"] else ""))
             if not report["ok"]:
                 return 1
+            if report["pending"]:
+                print("firstboot PENDING: the operator manual steps "
+                      "(network reload, nft apply, service starts) are not "
+                      "complete; re-run firstboot after finishing them",
+                      file=sys.stderr)
+                return 3
         elif args.cmd == "verify":
             lay = _layout(args)
             out = verify_install(sandbox_manifest(m, lay.root), lay)

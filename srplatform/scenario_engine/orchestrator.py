@@ -33,7 +33,7 @@ from srplatform.db.models import (Deployment, Event, LoginToken, OperationClaim,
                                   ServiceToken,
                                   Session as SessionModel)
 from srplatform.scenario_engine.loader import load_scenario
-from srplatform.settings import get_settings
+from srplatform.settings import bastion_login_target, get_settings
 
 
 class LeaseConflict(RuntimeError):
@@ -252,7 +252,7 @@ def finalize_ready(db: Session, session_id, user_id, result) -> tuple[list, dict
                               hours=s.web_token_ttl_hours)))
         instructions.append({"host": r["host"], "ip": r["ip"],
                              "login_token": tok,
-                             "ssh": f"ssh {s.bastion_address} -p "
+                             "ssh": f"ssh {bastion_login_target(s)} -p "
                                     f"{s.bastion_listen_port} -l {tok}"})
     sess.status = "ready"
     db.add(Event(session_id=session_id, ts=_now(), actor="system",

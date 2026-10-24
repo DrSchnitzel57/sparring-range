@@ -148,6 +148,12 @@ class Settings(BaseSettings):
     # firewalls exactly this source (plus owned web guests + loopback).
     controller_range_ip: str = "10.66.0.1"
     bastion_address: str = "10.66.0.2"
+    # The address MEMBERS actually reach the bastion on (plan 18): the
+    # appliance's LAN address. The range-side bastion_address is a planning
+    # address that may name no reachable interface from a member's laptop,
+    # so every rendered SSH hint prefers this and falls back to the range
+    # address only when the installation did not name one.
+    bastion_public_address: str = ""
     # Management subnet whose NEW connections to the control plane stay allowed
     management_cidr: str = "10.0.0.0/24"
 
@@ -235,6 +241,11 @@ class Settings(BaseSettings):
     # --- LLM serving (OpenAI-compatible; swappable per Part 6.1) ---
     llm_base_url: str = "http://localhost:8001/v1"
     llm_api_key: str = "dummy"
+    # The model credential as a FILE reference (plan 18). The API is the
+    # ONLY identity that may hold it — workers reach the model through the
+    # API's gateway, never with a key of their own. A reference, never a
+    # value: secrets never travel through a shared environment file.
+    llm_api_key_file: str = ""
     llm_model_red: str = "qwen2.5-14b-instruct"
     llm_model_coach: str = "qwen2.5-32b-instruct"
     llm_timeout_s: int = 60   # per-call timeout (gateway policy, pilot step 3)
@@ -349,6 +360,33 @@ def _bastion_token(s: Settings) -> str:
         except OSError:
             return ""
     return ""
+
+
+def model_api_key(s: Settings) -> str:
+    """The API-only model credential (plan 18).
+
+    When ``llm_api_key_file`` names a file, that file is the credential:
+    it is read (never logged, never re-written) and an unreadable or empty
+    file resolves to NO credential — a model call then fails loudly with
+    the file named, never silently as the literal fallback. Without the
+    file setting, the legacy literal applies unchanged."""
+    if getattr(s, "llm_api_key_file", ""):
+        try:
+            return pathlib.Path(s.llm_api_key_file).read_text().strip()
+        except OSError:
+            return ""
+    return s.llm_api_key
+
+
+def bastion_login_target(s: Settings) -> str:
+    """The address a MEMBER's SSH hint must name (plan 18).
+
+    The range-side ``bastion_address`` is a planning address that may name
+    no interface reachable from a member's laptop; the appliance renders
+    the bastion on every address, so the reachable LAN address wins when
+    the installation named one, and the range address is the documented
+    fallback (pre-appliance deployments)."""
+    return getattr(s, "bastion_public_address", "") or s.bastion_address
 
 
 def validate_production(s: Settings, role: str = "controller") -> None:
@@ -526,6 +564,21 @@ def validate_production(s: Settings, role: str = "controller") -> None:
     if s.verifier_ssh_known_hosts == "":
         problems.append("verifier_ssh_known_hosts required (pinned management "
                         "host keys — no TOFU, audit N11)")
+    # The model credential (plan 18): when a file reference is configured it
+    # must actually carry a credential, and it must stay out of world's
+    # reach. The group bit is how the API identity reads its own root-owned
+    # file, so only the world bits are refused here.
+    if s.llm_api_key_file:
+        key_path = pathlib.Path(s.llm_api_key_file)
+        try:
+            if not key_path.read_text().strip():
+                problems.append("llm_api_key_file is empty — the model would "
+                                "refuse every completion")
+            if key_path.stat().st_mode & 0o007:
+                problems.append("llm_api_key_file is world-readable; the model "
+                                "credential belongs to the API identity alone")
+        except OSError as exc:
+            problems.append(f"llm_api_key_file unreadable: {exc}")
     # Parse-check configured private keys BEFORE effects (plan 13 phase 4):
     # a corrupt key must fail at startup, not mid-enrollment; the returned
     # fingerprint is what deployment compares against the role build

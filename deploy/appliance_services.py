@@ -4,8 +4,12 @@ The installer's plan lists what an installation does.  These are the actual
 effects, each with a verifiable outcome — the plan must never claim a step
 that does not happen:
 
-  * the pinned native packages (libvirt/QEMU, PostgreSQL, nginx, nftables);
-  * the LOCKED Python environment for the appliance prefix;
+  * the pinned native packages (libvirt/QEMU, PostgreSQL, nginx, nftables,
+    the distro libvirt Python bindings, and a Node runtime that satisfies
+    the frontend);
+  * the LOCKED Python environment for the appliance prefix, WITH the narrow
+    same-ABI native binding exposure the broker needs and with per-service
+    execution actually verified (not inferred from Type=exec uptime);
   * the database roles and the forward migrations, run as the OWNER role;
   * the TLS material for the public and ingest planes;
   * the local operator onboarding (the bastion's authorized keys and the
@@ -23,12 +27,43 @@ import shlex
 import subprocess
 
 # Pinned by the release.  The appliance needs no Proxmox client, no outer
-# token and no hypervisor tooling beyond these.
+# token and no hypervisor tooling beyond these.  python3-libvirt is the
+# broker's ONLY libvirt binding (plan 18: it was missing, and the isolated
+# venv cannot see the distro module without the narrow exposure below);
+# curl/ca-certificates/xz-utils serve the pinned Node provisioning.
 NATIVE_PACKAGES = (
     "libvirt-daemon-system", "libvirt-daemon-driver-qemu", "libvirt-clients",
-    "qemu-system-x86", "qemu-utils", "postgresql", "nginx", "nftables",
-    "git", "python3-venv", "python3-dev", "build-essential", "acl",
+    "python3-libvirt", "qemu-system-x86", "qemu-utils", "postgresql",
+    "nginx", "nftables", "git", "python3-venv", "python3-dev",
+    "build-essential", "acl", "curl", "ca-certificates", "xz-utils",
 )
+
+# The frontend's floor (package.json engines) and the runtime the appliance
+# provisions when the distro one is older.  Ubuntu 24.04 ships Node 18
+# (18.19.1); Next 16 needs >= 20.9 (live find 2026-10-23: the operator had
+# to install Node 22 by hand mid-hand-off).  Pinned, checksum-verified,
+# installed under /usr/local — the distro package is never fought over.
+NODE_MIN_VERSION = (20, 9)
+NODE_PIN_VERSION = "22.23.4"
+NODE_PIN_SHA256_LINUX_X64 = (
+    "1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce")
+NODE_URL_TEMPLATE = ("https://nodejs.org/dist/v{version}/"
+                     "node-v{version}-linux-x64.tar.xz")
+# Explicit runtime mode for the Node provisioning (plan 18: no silent
+# network dependency during an installation):
+#   auto     — keep a new-enough node, otherwise provision the pinned one
+#   require  — NEVER provision; refuse when the runtime is too old (the
+#              operator supplies Node out of band)
+#   provision— always install the pinned runtime, even if node is new
+NODE_MODE_ENV = "SR_APPLIANCE_NODE_MODE"
+
+# The distro modules the broker imports, and the binary module each one
+# loads (python3-libvirt ships libvirt.py + libvirtmod.<abi>.so and
+# libvirt_qemu.py + libvirtmod_qemu.<abi>.so — the names do not follow one
+# mechanical rule, so the pairing is explicit, not derived).
+NATIVE_BINDINGS = (("libvirt", "libvirtmod"),
+                   ("libvirt_qemu", "libvirtmod_qemu"))
+DIST_PACKAGES = pathlib.Path("/usr/lib/python3/dist-packages")
 
 
 def native_packages() -> list[str]:
@@ -43,12 +78,213 @@ def ensure_native_dependencies(run) -> list[str]:
     return list(NATIVE_PACKAGES)
 
 
+def _node_version() -> tuple[int, int] | None:
+    try:
+        out = subprocess.run(["node", "--version"], capture_output=True,
+                             text=True, timeout=30).stdout.strip()
+        parts = out.lstrip("v").split(".")
+        return (int(parts[0]), int(parts[1]))
+    except Exception:  # noqa: BLE001 — a missing node is reported, not guessed
+        return None
+
+
+def node_action(mode: str | None, version: tuple[int, int] | None) -> str:
+    """Pure runtime-mode decision: 'kept' | 'require' | 'provision'."""
+    mode = (mode or "auto").strip().lower()
+    if mode not in ("auto", "require", "provision"):
+        raise RuntimeError(
+            f"{NODE_MODE_ENV}={mode!r} is not one of auto|require|provision")
+    recent = version is not None and version >= NODE_MIN_VERSION
+    if mode == "provision":
+        return "provision"
+    if recent:
+        return "kept"
+    if mode == "require":
+        raise RuntimeError(
+            f"node {'is missing' if version is None else '.'.join(map(str, version))} "
+            f"does not satisfy the frontend floor {'.'.join(map(str, NODE_MIN_VERSION))}; "
+            f"{NODE_MODE_ENV}=require forbids provisioning — install a supported "
+            "Node (20.9+) out of band and re-run")
+    return "provision"
+
+
+def ensure_node_runtime(run, *, mode: str | None = None) -> dict:
+    """Guarantee a Node runtime the frontend can build and start with.
+
+    Ubuntu 24.04's Node (18.19.1) is older than Next 16's floor; the pinned
+    LTS is downloaded, SHA-256 verified against the release-pinned digest,
+    and installed under /usr/local/lib/nodejs with /usr/local/bin symlinks.
+    Nothing is fetched when the runtime is already sufficient, and the
+    mode makes even that dependency explicit (require = operator's job).
+    """
+    action = node_action(mode if mode is not None
+                         else os.environ.get(NODE_MODE_ENV), _node_version())
+    if action == "kept":
+        return {"node": "kept", "version": _node_version()}
+    version = NODE_PIN_VERSION
+    url = NODE_URL_TEMPLATE.format(version=version)
+    digest = NODE_PIN_SHA256_LINUX_X64
+    install_dir = f"/usr/local/lib/nodejs/node-v{version}-linux-x64"
+    tarball = f"/tmp/node-v{version}-linux-x64.tar.xz"
+    if not os.path.isdir(install_dir):
+        run("curl", "-fsSL", "--retry", "3", "-o", tarball, url)
+        # Integrity BEFORE extraction: a corrupted or substituted archive
+        # never touches the filesystem.  The digest is release-pinned, so a
+        # fetch from an untrusted mirror cannot change what is installed.
+        check = run("sha256sum", tarball, check=False)
+        actual = (check.stdout or "").split()[0] if check.stdout else ""
+        if check.returncode != 0 or actual != digest:
+            run("rm", "-f", tarball, check=False)
+            raise RuntimeError(
+                f"node download failed integrity: expected {digest}, "
+                f"got {actual or 'unreadable'} for {url}")
+        run("mkdir", "-p", "/usr/local/lib/nodejs")
+        run("tar", "-xJf", tarball, "-C", "/usr/local/lib/nodejs")
+        run("rm", "-f", tarball, check=False)
+    for name in ("node", "npm", "npx"):
+        run("ln", "-sfn", f"{install_dir}/bin/{name}",
+            f"/usr/local/bin/{name}")
+    after = _node_version()
+    if after is None or after < NODE_MIN_VERSION:
+        raise RuntimeError(
+            f"provisioned node still reports {after!r}; /usr/local/bin must "
+            "come before the distro node on PATH")
+    return {"node": "provisioned", "version": after, "pinned": version,
+            "sha256_verified": digest}
+
+
+def _venv_paths(venv: pathlib.Path) -> dict[str, str]:
+    """Ask the venv's own interpreter where its modules live and what ABI
+    tag it expects.  The answer comes from the interpreter, never from the
+    installer's python, so the ABI check compares like with like."""
+    probe = (
+        "import json, sys, sysconfig\n"
+        "print(json.dumps({"
+        "'purelib': sysconfig.get_paths()['purelib'],"
+        "'cache_tag': sys.implementation.cache_tag,"
+        "'executable': sys.executable}))\n"
+    )
+    out = subprocess.run([str(venv / "bin/python"), "-c", probe],
+                         capture_output=True, text=True, timeout=60)
+    if out.returncode != 0:
+        raise RuntimeError(f"cannot interrogate {venv}/bin/python: "
+                           f"{(out.stderr or out.stdout)[-300:]}")
+    import json
+    return json.loads(out.stdout)
+
+
+def _expose_native_bindings(run, venv: pathlib.Path) -> dict:
+    """Narrowly expose the distro libvirt bindings inside the venv (plan 18).
+
+    The broker unit runs the venv python and imports libvirt; the venv is
+    deliberately NOT created with --system-site-packages (that would hand
+    every distro module — and every future distro-module CVE surface — to
+    every appliance service).  Instead exactly the binding modules are
+    exposed, and only when the distro binary module's ABI tag matches the
+    venv's own cache tag: a mismatched libvirtmod would fail at import with
+    a confusing undefined-symbol, so a mismatch is refused with the exact
+    remediation instead.
+    """
+    paths = _venv_paths(venv)
+    purelib = pathlib.Path(paths["purelib"])
+    cache_tag = paths["cache_tag"]  # e.g. cpython-312
+    if not DIST_PACKAGES.is_dir():
+        raise RuntimeError(
+            f"{DIST_PACKAGES} is missing — install python3-libvirt")
+    exposed: dict[str, list[str]] = {}
+    for module, stem in NATIVE_BINDINGS:
+        pure = DIST_PACKAGES / f"{module}.py"
+        if not pure.is_file():
+            raise RuntimeError(
+                f"{pure} is missing — install python3-libvirt (the broker's "
+                "only libvirt binding); the venv stays isolated otherwise")
+        binaries = sorted(DIST_PACKAGES.glob(f"{stem}.{cache_tag}-*.so"))
+        if not binaries:
+            raise RuntimeError(
+                f"no {stem} binary module for ABI tag {cache_tag!r} in "
+                f"{DIST_PACKAGES} — python3-libvirt was built for a different "
+                "Python; install the build matching the appliance venv python")
+        targets = [pure] + binaries
+        for source in targets:
+            target = purelib / source.name
+            if target.is_symlink():
+                if target.readlink() == str(source):
+                    continue
+                target.unlink()
+            elif target.exists():
+                # A REAL file inside the venv belongs to the venv; never
+                # silently replace what pip installed.
+                continue
+            target.symlink_to(source)
+        exposed[module] = [t.name for t in targets]
+    # Prove it: the venv python must actually import both modules now.  An
+    # exposure that does not import is an installation failure, not a
+    # runtime surprise.
+    imp = "import " + ", ".join(m for m, _ in NATIVE_BINDINGS)
+    run(str(venv / "bin/python"), "-c", imp)
+    return {"cache_tag": cache_tag, "exposed": exposed,
+            "dist_packages": str(DIST_PACKAGES)}
+
+
+def verify_service_runtime(run, venv: pathlib.Path) -> dict:
+    """Verify the RUNTIME, per real UID: each service identity must be able
+    to execute what its unit will exec (plan 18; live find 2026-10-23: a
+    hand-off run under umask 027 produced a root-only 0750 .venv and every
+    unit but root's died with status=203/EXEC — service uptime was checked,
+    per-UID execution never was).
+
+    This makes the checks real: runuser executes as the actual identity.
+    A failure names the identity and the exact remediation."""
+    problems: list[str] = []
+    results: dict[str, str] = {}
+    python = str(venv / "bin/python")
+    for user in ("srrange", "srbroker", "sringest", "srworker", "srbastion",
+                 "srweb"):
+        probe = [python, "-c", "pass"]
+        code = run("runuser", "-u", user, "--", *probe, check=False).returncode
+        if code != 0:
+            problems.append(
+                f"{user} cannot execute {python} (exit {code}) — systemd "
+                "would fail with 203/EXEC; run "
+                f"`chmod a+rX` on the parent directories of {venv}")
+        results[user] = "exec" if code == 0 else f"exit {code}"
+    # the broker additionally imports its libvirt binding, as its own UID
+    code = run("runuser", "-u", "srbroker", "--", python, "-c",
+               "import libvirt, libvirt_qemu", check=False).returncode
+    if code != 0:
+        problems.append(
+            f"srbroker cannot import libvirt in {venv} (exit {code}) — the "
+            "native binding exposure failed")
+    results["srbroker/libvirt"] = "import" if code == 0 else f"exit {code}"
+    node = "/usr/local/bin/node" if os.path.exists("/usr/local/bin/node") \
+        else "/usr/bin/node"
+    code = run("runuser", "-u", "srweb", "--", node, "--version",
+               check=False).returncode
+    if code != 0:
+        problems.append(f"srweb cannot execute {node} (exit {code})")
+    results["srweb/node"] = "exec" if code == 0 else f"exit {code}"
+    if problems:
+        raise RuntimeError("service runtime verification failed:\n  - "
+                           + "\n  - ".join(problems))
+    return {"uid_checks": results}
+
+
 def ensure_venv(run, *, prefix: pathlib.Path, source: pathlib.Path) -> pathlib.Path:
     """Create the appliance's Python environment from the LOCKED requirements.
 
     The lock file is the only source of dependency versions: the installer
     never resolves floating versions, and the application itself is installed
-    without dependencies so the lock stays authoritative.
+    without dependencies so the lock stays authoritative.  Two runtime
+    contracts are then enforced (plan 18), because a rendered unit is not a
+    process:
+
+    * the venv tree must be traversable and readable BY THE SERVICE UIDS —
+      created under the caller's umask it was 0750 root-only and every
+      unit died 203/EXEC — so creation runs under an explicit 0o022 umask,
+      the tree is opened with a+rX (never write), and per-UID execution is
+      actually verified;
+    * the broker's libvirt binding is exposed narrowly (same ABI, named
+      modules only), not by enabling system site packages.
     """
     venv = prefix / ".venv"
     lock = source / "requirements.lock"
@@ -56,10 +292,20 @@ def ensure_venv(run, *, prefix: pathlib.Path, source: pathlib.Path) -> pathlib.P
         raise RuntimeError(f"missing {lock} — the locked dependency set is "
                            "required for an appliance installation")
     if not (venv / "bin/python").exists():
-        run("python3", "-m", "venv", str(venv))
+        old = os.umask(0o022)
+        try:
+            run("python3", "-m", "venv", str(venv))
+        finally:
+            os.umask(old)
     run(str(venv / "bin/pip"), "install", "--upgrade", "pip")
     run(str(venv / "bin/pip"), "install", "-r", str(lock))
     run(str(venv / "bin/pip"), "install", "--no-deps", "-e", str(source))
+    # Read/execute for every identity (never write): the venv contains no
+    # secret — credentials live under /etc and /var state with their own
+    # ownership. This is the exact, narrow repair for the umask-027 203/EXEC
+    # failure; it is deliberately NOT applied to anything else.
+    run("chmod", "-R", "a+rX", str(venv))
+    _expose_native_bindings(run, venv)
     return venv
 
 
@@ -225,7 +471,7 @@ def ensure_tls(run, *, etc: pathlib.Path, public_ip: str,
         "SR_TLS_DIR": str(tls_dir),
         "SR_SSH_DIR": str(ssh_dir),
         "SR_SSH_GROUP": "srbastion",
-        "HTTPS_IP": public_ip,
+        "HTTPS_IP": str(public_ip),
         "INGEST_SANS": ingest_sans,
         "SR_TLS_ROTATE": "0",
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),

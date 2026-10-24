@@ -10,8 +10,12 @@
 #        --installation-id "$(uuidgen)" \
 #        --lan-address 10.10.10.50 --range-cidr 10.66.0.0/24 \
 #        --public-url https://sr.example.edu \
-    --model-base-url http://127.0.0.1:8001/v1 --model-alias my-model
+#        --model-base-url http://127.0.0.1:8001/v1 --model-alias my-model
 #
+# (Every documentation line above MUST stay commented: this file executes
+# from line 1, and a bare `--model-base-url ...` line used to run as a
+# command before `set -e` ever existed — bash -n never sees it because the
+# command simply fails at execution time on a live hand-off.)
 # The internal and ingest URLs default to the loopback API and the
 # controller's range address; override them with --internal-url/--ingest-url
 # when the appliance is not the controller host.
@@ -37,7 +41,7 @@ MEMBER_USER="member"
 PYTHON="${SR_PYTHON:-python3}"
 
 usage() {
-  sed -n '2,20p' "$0" >&2
+  sed -n '2,21p' "$0" >&2
   exit 2
 }
 
@@ -79,6 +83,17 @@ say "1/7 verify the bundle"
 say "2/7 prepare the operator's keys and secrets"
 install -d -m 0750 "$KEYS_DIR"
 install -d -m 0700 "$SECRETS_DIR"
+# EARLY model-key preflight (plan 18): the manifest load and the production
+# settings both refuse a missing or empty model credential. Failing HERE —
+# before any key is generated, before rendering, before apply — replaces
+# the old mid-flight death after side effects. The credential is
+# provisioned out of band (never in Git, never in a log); the installer
+# never invents one and never leaves an empty placeholder behind.
+if [ ! -s "$SECRETS_DIR/model.key" ]; then
+  echo "  MODEL CREDENTIAL MISSING: create $SECRETS_DIR/model.key with the" >&2
+  echo "  model API key inside (mode 0600) and re-run this hand-off." >&2
+  exit 1
+fi
 for role in runner bastion mgmt; do
   if [ ! -f "$KEYS_DIR/$role" ]; then
     ssh-keygen -q -t ed25519 -N '' -f "$KEYS_DIR/$role"
@@ -93,11 +108,8 @@ if [ ! -f "$KEYS_DIR/$MEMBER_USER" ]; then
   echo "  generated $KEYS_DIR/$MEMBER_USER (the member's login '$MEMBER_USER';"
   echo "  keep the PRIVATE half safe — it is the member's SSH key)"
 fi
-if [ ! -f "$SECRETS_DIR/model.key" ]; then
-  install -m 0600 /dev/null "$SECRETS_DIR/model.key"
-  echo "  created $SECRETS_DIR/model.key - put the model credential in it"
-fi
-# The SCHEMA OWNER credential and the RUNTIME credential are separate files.
+# The MODEL credential must already exist (preflight above). The schema
+# owner credential and the RUNTIME credential are separate files.
 # The owner URL is used ONLY to run the migrations and lives in a root-only
 # file that no service loads; the runtime URL goes into the env the API,
 # the ingest listener and the bastion load.  Never put the owner URL in
@@ -167,7 +179,21 @@ in a maintenance window.
 NOTE
 
 say "7/7 check that the appliance came up"
-"$PYTHON" deploy/appliance.py firstboot --manifest "$MANIFEST"
+# Staged firstboot (plan 18): step 6 deliberately leaves the bridge and the
+# nftables rules UNAPPLIED and the services ENABLED-BUT-UNSTARTED until the
+# operator completes them in the maintenance window. A first run of
+# firstboot before that window is therefore PENDING, not broken: the
+# installer distinguishes the two (exit 3 = pending manual steps) and this
+# hand-off reports it honestly instead of a confusing all-FAIL report.
+"$PYTHON" deploy/appliance.py firstboot --manifest "$MANIFEST" && FB=0 || FB=$?
+
+if [ "$FB" = "3" ]; then
+  printf '\nfirstboot is PENDING: complete the step-6 manual sequence first,\n'
+  printf 'then re-run it. It exits 3 until the bridge, the nft rules and the\n'
+  printf 'service starts from step 6 are actually in place.\n'
+  exit 3
+fi
+[ "$FB" = "0" ] || exit "$FB"
 
 printf '\nhand-off complete: the manual rehearsal (fresh launch, member SSH,\n'
 printf 'sudo, reconnect, replay, cleanup, second fresh launch) is still yours.\n'
