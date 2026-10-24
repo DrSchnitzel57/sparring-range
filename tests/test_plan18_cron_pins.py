@@ -329,8 +329,14 @@ def test_capture_from_verify_markers_parses_the_clean_boot():
 
     with pytest.raises(ValueError, match="no SR-GUEST-CRON-PIN"):
         cb.capture_from_verify_markers(["SR-GUEST-DONE"])
-    with pytest.raises(ValueError, match="not JSON"):
+    with pytest.raises(ValueError, match="invalid"):
         cb.capture_from_verify_markers(["SR-GUEST-CRON-PIN {broken"])
+    # the double emission survives ONE corrupted line, never bad trust
+    good = json.dumps({"files": {"e2scrub_all": _sha(CLEAN_CRON.encode())},
+                       "root_crontab_sha256": None}, sort_keys=True)
+    parsed = cb.capture_from_verify_markers(
+        ["SR-GUEST-CRON-PIN {trunc", f"SR-GUEST-CRON-PIN {good}"])
+    assert parsed["files"]["e2scrub_all"] == _sha(CLEAN_CRON.encode())
     with pytest.raises(ValueError, match="invalid entry"):
         cb.capture_from_verify_markers(
             ['SR-GUEST-CRON-PIN {"files": {"x": "nothash"}}'])

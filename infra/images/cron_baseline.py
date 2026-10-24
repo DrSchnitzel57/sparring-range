@@ -70,23 +70,31 @@ def capture_from_verify_markers(markers: list[str]) -> dict:
     sanctioned runtime-side capture source: the boot is offline, before
     any lab use, and the same harness that proves the artifact also proves
     its cron state. Absent or malformed markers raise — never a guess."""
+    last_error: Exception | None = None
     for line in markers:
-        if line.startswith("SR-GUEST-CRON-PIN "):
-            payload = line[len("SR-GUEST-CRON-PIN "):].strip()
-            try:
-                inv = json.loads(payload)
-            except ValueError as exc:
-                raise ValueError(f"cron pin marker is not JSON: {exc}") from exc
+        if not line.startswith("SR-GUEST-CRON-PIN "):
+            continue
+        payload = line[len("SR-GUEST-CRON-PIN "):].strip()
+        try:
+            inv = json.loads(payload)
             files = inv.get("files")
             if not isinstance(files, dict):
-                raise ValueError("cron pin marker has no files object")
+                raise ValueError("no files object")
             for name, sha in files.items():
                 if not _NAME.fullmatch(name) or not _HEX.fullmatch(str(sha)):
-                    raise ValueError("cron pin marker has an invalid entry")
+                    raise ValueError("invalid entry")
             tab = inv.get("root_crontab_sha256")
             if tab is not None and not _HEX.fullmatch(str(tab)):
-                raise ValueError("cron pin marker has an invalid root crontab")
-            return {"files": dict(files), "root_crontab_sha256": tab}
+                raise ValueError("invalid root crontab hash")
+        except (ValueError, AttributeError) as exc:
+            # the harness emits every marker TWICE because serial noise can
+            # corrupt one line: a corrupt emission is RETRIED, never trusted;
+            # if none parse, the refusal is loud
+            last_error = exc
+            continue
+        return {"files": dict(files), "root_crontab_sha256": tab}
+    if last_error is not None:
+        raise ValueError(f"cron pin marker invalid: {last_error}")
     raise ValueError("no SR-GUEST-CRON-PIN marker in the verify boot")
 
 
