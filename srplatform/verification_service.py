@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from srplatform.db.models import Deployment, Event
 from srplatform.scenario_engine.loader import load_scenario
 from srplatform.settings import get_settings
+from srplatform.ssh_channel import SSH_ALIVE_OPTS
 from verifiers import registry
 from verifiers.base import Context
 
@@ -76,9 +77,14 @@ def _ssh_exec(host: str, command: str) -> tuple[int, str]:
            # maps that to `unknown`, never to a pass.
            "-o", "StrictHostKeyChecking=yes",
            "-o", f"UserKnownHostsFile={s.verifier_ssh_known_hosts}",
+           # bounded channel (plan 18): keepalives so a wedged guest fails
+           # loud and fast instead of hanging the verification round
+           *SSH_ALIVE_OPTS,
            "-i", s.verifier_ssh_key_path, f"{s.verifier_ssh_user}@{host}", command]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=s.verifier_exec_timeout_s)
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL,
+                           timeout=s.verifier_exec_timeout_s)
         return p.returncode, (p.stdout + p.stderr)[:8000]
     except (subprocess.TimeoutExpired, OSError) as e:
         return 124, f"[verifier-exec] {e}"

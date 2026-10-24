@@ -19,7 +19,9 @@ WITHOUT touching a model endpoint:
 from __future__ import annotations
 
 import ipaddress
+import os
 import pathlib
+import subprocess
 import tempfile
 
 import pytest
@@ -188,8 +190,87 @@ def test_native_packages_carry_the_broker_and_node_dependencies():
 
 
 # --------------------------------------------------------------------------- #
-# firstboot: PENDING is not broken, and never folds into success               #
+# bounded diagnostic SSH: keepalives + stdin=/dev/null on every platform call  #
 # --------------------------------------------------------------------------- #
+
+class _CapturingProc:
+    def __init__(self, *args, **kwargs):
+        _CapturingProc.last = (args, kwargs)
+        self.returncode = 0
+        self.pid = os.getpid()  # real pgid so _attach_proc can resolve it
+
+    def wait(self, timeout=None):
+        return 0
+
+    def communicate(self, timeout=None):
+        return "gone", ""
+
+    def poll(self):
+        return 0
+
+
+def _runner(tmp_path):
+    from srplatform.red_agent.runner import SshRunner
+    kh = tmp_path / "kh"
+    kh.write_text("10.66.0.9 ssh-ed25519 AAAA\n")
+    key = tmp_path / "runner_key"
+    key.write_text("k\n")
+    s = _settings(tmp_path, runner_transport="ssh",
+                  runner_ssh_target="runner@10.66.0.9",
+                  runner_ssh_key_path=str(key),
+                  runner_ssh_known_hosts=str(kh),
+                  sr_env="lab")
+    return SshRunner(s)
+
+
+def test_runner_ssh_channel_is_bounded(tmp_path, monkeypatch):
+    from srplatform.red_agent import runner as runner_mod
+    r = _runner(tmp_path)
+    base = r._base_cmd()
+    assert "ServerAliveInterval=5" in base and "ServerAliveCountMax=3" in base
+
+    monkeypatch.setattr(runner_mod.subprocess, "Popen", _CapturingProc)
+    r._control("status", "op-1", timeout=5)
+    _args, kwargs = _CapturingProc.last
+    assert kwargs.get("stdin") is subprocess.DEVNULL
+
+    monkeypatch.setattr(runner_mod, "_bounded_reader",
+                        lambda *a, **k: (b"out", False))
+    res = r.run("id", timeout=5)
+    _args, kwargs = _CapturingProc.last
+    assert kwargs.get("stdin") is subprocess.DEVNULL
+    assert res.exit_code == 0
+
+
+def test_verifier_exec_channels_are_bounded(tmp_path, monkeypatch):
+    import srplatform.verification_service as vs
+    from srplatform.red_agent.sandbox import KaliSandbox
+
+    captured: list[dict] = []
+
+    def _fake_run(cmd, **kwargs):
+        captured.append({"cmd": cmd, **kwargs})
+        return subprocess.CompletedProcess(cmd, 0, stdout="x", stderr="")
+
+    monkeypatch.setattr("srplatform.red_agent.sandbox.subprocess.run", _fake_run)
+    KaliSandbox().verifier_exec("10.66.0.10", "true")
+    monkeypatch.setattr(vs.subprocess, "run", _fake_run)
+    kh = tmp_path / "vkh"
+    kh.write_text("10.66.0.10 ssh-ed25519 AAAA\n")
+    key = tmp_path / "vk"
+    key.write_text("k\n")
+    monkeypatch.setattr(vs, "get_settings", lambda: _settings(
+        tmp_path, verifier_ssh_key_path=str(key),
+        verifier_ssh_known_hosts=str(kh)))
+    vs._ssh_exec("10.66.0.10", "true")
+
+    assert len(captured) == 2
+    for call in captured:
+        assert "ServerAliveInterval=5" in call["cmd"]
+        assert "ServerAliveCountMax=3" in call["cmd"]
+        assert call.get("stdin") is subprocess.DEVNULL
+        assert call.get("timeout"), "outer command timeout must stay"
+
 
 def _firstboot_exit(monkeypatch, report):
     from deploy import appliance as ap

@@ -53,6 +53,7 @@ import threading
 from dataclasses import dataclass
 
 from srplatform.settings import Settings, get_settings
+from srplatform.ssh_channel import SSH_ALIVE_OPTS
 
 # --------------------------------------------------------------- supervision
 # Command handles are supervised HERE (in the worker process), so that the
@@ -432,9 +433,13 @@ class SshRunner(Runner):
 
     def _base_cmd(self) -> list[str]:
         s = self.s
+        # Bounded channel (plan 18, live find): keepalives turn a wedged
+        # guest (TCP established, daemon stuck) into a loud ssh exit 255
+        # in ~15 s instead of an eternal silent hang.
         return ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
                 "-o", f"UserKnownHostsFile={s.runner_ssh_known_hosts}",
-                "-o", "ConnectTimeout=10", "-i", s.runner_ssh_key_path,
+                "-o", "ConnectTimeout=10", *SSH_ALIVE_OPTS,
+                "-i", s.runner_ssh_key_path,
                 "--", s.runner_ssh_target]
 
     # --- runner-side supervisor control channel -------------------------------
@@ -455,6 +460,7 @@ class SshRunner(Runner):
         proc = subprocess.Popen(self._base_cmd() +
                                 [f"{shlex.quote(self._supervisor_bin())} {verb} "
                                  f"{shlex.quote(op_id)}"],
+                                stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, start_new_session=True)
         try:
@@ -504,7 +510,8 @@ class SshRunner(Runner):
                       f"-- bash -lc {shlex.quote(command)}")
         full = self._base_cmd() + [remote_cmd]
         try:
-            proc = subprocess.Popen(full, stdout=subprocess.PIPE,
+            proc = subprocess.Popen(full, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT,
                                     start_new_session=True)
         except OSError as e:
@@ -623,7 +630,9 @@ class LocalDevRunner(Runner):
         op_id = op_id or _new_op_id()
         _register(op_id, {"kind": "local", "state": "pending", "remote": False})
         try:
-            proc = subprocess.Popen(["/bin/bash", "-lc", command], stdout=subprocess.PIPE,
+            proc = subprocess.Popen(["/bin/bash", "-lc", command],
+                                    stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT,
                                     start_new_session=True)
         except OSError as e:
