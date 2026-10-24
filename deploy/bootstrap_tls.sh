@@ -21,6 +21,7 @@ SR_SSH_DIR="${SR_SSH_DIR:-/etc/sparring-range/ssh}"
 # ssh-keygen mints root-only 0600, which silently denies the entitled
 # service consumer — the group must be explicit, never assumed).
 SR_SSH_GROUP="${SR_SSH_GROUP:-srrange}"
+SR_INGEST_GROUP="${SR_INGEST_GROUP:-sringest}"
 BROKER_HOST="${BROKER_HOST:-broker.range.internal}"   # how the API dials the broker
 API_HOST="${API_HOST:-control-plane}"                 # client-cert identity label
 HTTPS_IP="${HTTPS_IP:-}"                              # control-plane LAN IP
@@ -173,8 +174,9 @@ chmod 0644 "$SR_SSH_DIR/bastion_ed25519.pub"
 chmod 0600 ./*.key 2>/dev/null || true
 if [ -f ingest-server.key ]; then
   # The ingest listener (sringest) serves this pair: group-readable,
-  # never world-readable. A missing group fails LOUD, never silent.
-  chown root:"${SR_INGEST_GROUP:?SR_INGEST_GROUP required}" \
+  # never world-readable. A missing group fails LOUD at the chown,
+  # never silently (set -e).
+  chown root:"$SR_INGEST_GROUP" \
     ingest-server.key ingest-server.crt
   chmod 0640 ingest-server.key ingest-server.crt
 fi

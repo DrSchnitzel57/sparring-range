@@ -74,9 +74,9 @@ def test_bootstrap_assigns_named_ownership_not_blanket_chmods():
             / "deploy" / "bootstrap_tls.sh").read_text()
     assert "chmod 640 ./*.crt" not in text, "blanket crt chmod is back"
     assert "chmod 0600 ./*.key" in text, "private keys must default 0600"
-    # the ingest pair: named group, LOUD if unset or missing
-    assert "SR_INGEST_GROUP:?" in text, "ingest group must fail loud"
-    assert 'chown root:"${SR_INGEST_GROUP' in text
+    # the ingest pair: named group; a missing group fails LOUD at chown
+    assert 'SR_INGEST_GROUP="${SR_INGEST_GROUP:-sringest}"' in text
+    assert 'chown root:"$SR_INGEST_GROUP"' in text
     assert "chmod 0640 ingest-server.key ingest-server.crt" in text
     # public trust material readable; CA signing keys NOT among them
     assert "chmod 0644 ca.crt api-ca.crt https.crt" in text
