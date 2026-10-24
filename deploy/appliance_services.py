@@ -24,7 +24,9 @@ from __future__ import annotations
 import os
 import pathlib
 import shlex
+import shutil
 import subprocess
+import tempfile
 
 # Pinned by the release.  The appliance needs no Proxmox client, no outer
 # token and no hypervisor tooling beyond these.  python3-libvirt is the
@@ -125,22 +127,32 @@ def ensure_node_runtime(run, *, mode: str | None = None) -> dict:
     url = NODE_URL_TEMPLATE.format(version=version)
     digest = NODE_PIN_SHA256_LINUX_X64
     install_dir = f"/usr/local/lib/nodejs/node-v{version}-linux-x64"
-    tarball = f"/tmp/node-v{version}-linux-x64.tar.xz"
     if not os.path.isdir(install_dir):
-        run("curl", "-fsSL", "--retry", "3", "-o", tarball, url)
-        # Integrity BEFORE extraction: a corrupted or substituted archive
-        # never touches the filesystem.  The digest is release-pinned, so a
-        # fetch from an untrusted mirror cannot change what is installed.
-        check = run("sha256sum", tarball, check=False)
-        actual = (check.stdout or "").split()[0] if check.stdout else ""
-        if check.returncode != 0 or actual != digest:
-            run("rm", "-f", tarball, check=False)
-            raise RuntimeError(
-                f"node download failed integrity: expected {digest}, "
-                f"got {actual or 'unreadable'} for {url}")
-        run("mkdir", "-p", "/usr/local/lib/nodejs")
-        run("tar", "-xJf", tarball, "-C", "/usr/local/lib/nodejs")
-        run("rm", "-f", tarball, check=False)
+        # PRIVATE staging (review finding): a predictable shared-temp path
+        # downloaded AS ROOT before verification is a symlink/overwrite and
+        # cross-application collision hazard — another app's runtime file
+        # (or a planted symlink) must never be what curl writes through or
+        # sha256sum reads.  mkdtemp is 0700, owned by this invocation and
+        # unguessable; the staging dir is removed whatever happens.
+        staging = tempfile.mkdtemp(prefix="sr-node-")
+        os.chmod(staging, 0o700)
+        tarball = os.path.join(staging, f"node-v{version}-linux-x64.tar.xz")
+        try:
+            run("curl", "-fsSL", "--retry", "3", "-o", tarball, url)
+            # Integrity BEFORE extraction: a corrupted or substituted
+            # archive never touches the filesystem.  The digest is
+            # release-pinned, so a fetch from an untrusted mirror cannot
+            # change what is installed.
+            check = run("sha256sum", tarball, check=False)
+            actual = (check.stdout or "").split()[0] if check.stdout else ""
+            if check.returncode != 0 or actual != digest:
+                raise RuntimeError(
+                    f"node download failed integrity: expected {digest}, "
+                    f"got {actual or 'unreadable'} for {url}")
+            run("mkdir", "-p", "/usr/local/lib/nodejs")
+            run("tar", "-xJf", tarball, "-C", "/usr/local/lib/nodejs")
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
     for name in ("node", "npm", "npx"):
         run("ln", "-sfn", f"{install_dir}/bin/{name}",
             f"/usr/local/bin/{name}")

@@ -2,7 +2,7 @@
 migrations run Alembic as the schema-OWNER role (the app role lacks DDL and its
 append-only revocations would fight the migrator).
 """
-import hashlib
+from contextlib import contextmanager
 import os
 import subprocess
 import sys
@@ -126,15 +126,30 @@ def _alembic_config(root: Path) -> str:
         body = "\n".join(lines) + "\n"
     else:
         body = _FALLBACK_INI.format(root=migrations, pkgroot=root)
-    digest = hashlib.sha256(str(migrations).encode()).hexdigest()[:12]
-    path = Path(tempfile.gettempdir()) / f"sr-alembic-{digest}.ini"
-    if not path.is_file() or path.read_text() != body:
-        fd, tmp = tempfile.mkstemp(dir=tempfile.gettempdir(),
-                                   prefix=".sr-alembic-")
-        with os.fdopen(fd, "w") as fh:
-            fh.write(body)
-        os.replace(tmp, path)
-    return str(path)
+    # no cached shared-temp copy (review finding): a predictable
+    # /tmp/sr-alembic-<digest>.ini invites another local user to pre-plant
+    # content we would then TRUST (the reuse check read whatever was there)
+    # or a symlink to aim our writes.  The config is a few hundred bytes:
+    # write a fresh 0600 file OWNED by this invocation (mkstemp is O_EXCL,
+    # unguessable) and remove it when the caller is done.
+    fd, raw = tempfile.mkstemp(prefix="sr-alembic-", suffix=".ini")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(body)
+    return raw
+
+
+@contextmanager
+def _alembic_config_path(root: Path):
+    """Context form of _alembic_config: the private config exists exactly
+    for the duration of the alembic invocation."""
+    path = _alembic_config(root)
+    try:
+        yield path
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass  # already gone: nothing else may own our mkstemp name
 
 
 @app.command("migrate")
@@ -145,12 +160,13 @@ def migrate():
                "DB_APP_ROLE": s.db_app_role}
     env = {**os.environ, **env_var}
     root = _alembic_root()
-    result = subprocess.run(
-        [sys.executable, "-m", "alembic", "-c", _alembic_config(root),
-         "upgrade", "head"],
-        cwd=str(root),
-        env=env,
-    )
+    with _alembic_config_path(root) as cfg:
+        result = subprocess.run(
+            [sys.executable, "-m", "alembic", "-c", cfg,
+             "upgrade", "head"],
+            cwd=str(root),
+            env=env,
+        )
     raise typer.Exit(result.returncode)
 
 
@@ -161,7 +177,8 @@ def status():
     env = {**os.environ, "POSTGRES_URL_OWNER": s.postgres_url_owner,
            "DB_APP_ROLE": s.db_app_role}
     root = _alembic_root()
-    result = subprocess.run(
-        [sys.executable, "-m", "alembic", "-c", _alembic_config(root), "current"],
-        cwd=str(root), env=env)
+    with _alembic_config_path(root) as cfg:
+        result = subprocess.run(
+            [sys.executable, "-m", "alembic", "-c", cfg, "current"],
+            cwd=str(root), env=env)
     raise typer.Exit(result.returncode)

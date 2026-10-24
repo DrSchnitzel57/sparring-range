@@ -58,12 +58,15 @@ def _run(args: list[str], cwd: pathlib.Path, installed: pathlib.Path,
 
 
 _RESOLVE = (
-    "import srplatform, rangectl;"
+    "import pathlib, srplatform, rangectl;"
     "assert srplatform.__file__ != %r, 'imported the checkout, not the copy';"
-    "from rangectl.commands.db import _alembic_root, _alembic_config;"
+    "from rangectl.commands.db import _alembic_root, _alembic_config_path;"
     "root=_alembic_root();"
     "assert str(root) == %r, f'root lookup resolved to {root}';"
-    "print(_alembic_config(root))"
+    "ctx = _alembic_config_path(root); p = ctx.__enter__();"
+    "body = pathlib.Path(p).read_text(); ctx.__exit__(None, None, None);"
+    "assert not pathlib.Path(p).exists(), 'private config leaked past its context';"
+    "print(body, end='')"
 )
 
 
@@ -80,9 +83,15 @@ def test_installed_config_reaches_migrations_outside_checkout(tmp_path,
                           str(installed))],
              elsewhere, installed)
     assert r.returncode == 0, r.stderr
-    cfg = r.stdout.strip().splitlines()[-1]
-    assert cfg and pathlib.Path(cfg).is_file()
-    text = pathlib.Path(cfg).read_text()
+    # the resolve printed the CONFIG BODY and cleaned its own private temp
+    # file; the test re-materialises it in ITS OWN directory (never a
+    # shared-temp path it did not create)
+    assert r.stdout.startswith("[alembic]") or "script_location" in r.stdout, \
+        r.stdout
+    cfg_file = elsewhere / "resolved-alembic.ini"
+    cfg_file.write_text(r.stdout)
+    cfg = str(cfg_file)
+    text = cfg_file.read_text()
     assert "script_location = " in text
     line = [l for l in text.splitlines()
             if l.startswith("script_location")][0]
