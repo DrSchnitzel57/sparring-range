@@ -237,9 +237,11 @@ def render_control_env(m: ApplianceManifest, *, etc: pathlib.Path = DEFAULT_ETC,
         ("SR_INTERNAL_API_URL", m.internal_url),
         ("SR_TELEMETRY_INGEST_URL", m.ingest_url),
         # The ingest server certificate is issued by the API CA, so that is
-        # the trust anchor the guests are enrolled with.
+        # the trust anchor the guests are enrolled with — and the telemetry
+        # client pins it.  The API-plane anchor is nginx's own surface
+        # (https.crt), NOT api-ca: they sign different certificates.
         ("SR_TELEMETRY_CA_FILE", str(etc / "tls/api-ca.crt")),
-        ("SR_API_TLS_CA_FILE", str(etc / "tls/api-ca.crt")),
+        ("SR_API_TLS_CA_FILE", str(etc / "tls/https.crt")),
         ("SR_RECORDINGS_DIR", m.recordings_dir),
         ("SR_SAFETY_STATE_FILE", str(pathlib.Path(m.state_dir) / "controller" / "safety_state.json")),
         ("SR_BASTION_HOST_KEY_PATH", str(etc / "ssh/bastion_ed25519")),
@@ -359,7 +361,12 @@ def render_bastion_env(m: ApplianceManifest, *,
         ("SR_ENV", "production"),
         ("SR_API_BASE_URL", m.public_url),
         ("SR_API_ROUTE_PREFIX", "/api"),
-        ("SR_API_TLS_CA_FILE", str(etc / "tls/api-ca.crt")),
+        # The trust anchor MUST be what the API surface actually presents:
+        # public_url is served by nginx with the self-signed tls/https.crt,
+        # while api-ca.crt signs only the ingest listener's certificate.
+        # Anchoring the bastion on api-ca made every callback fail the TLS
+        # handshake (plan 18 review); the telemetry anchor stays api-ca.
+        ("SR_API_TLS_CA_FILE", str(etc / "tls/https.crt")),
         ("SR_BASTION_AUTHORIZED_KEYS_FILE", str(etc / "ssh/authorized_keys")),
         ("SR_BASTION_HOST_KEY_PATH", str(etc / "ssh/bastion_ed25519")),
         ("SR_BASTION_CLIENT_KEY_PATH", str(etc / "ssh/bastion_client_ed25519")),
@@ -827,8 +834,21 @@ def _ids(name: str) -> tuple[int, int]:
 
 
 def _ensure_dirs(m: ApplianceManifest, run: Runner, lay: Layout) -> None:
-    for path, mode, user, group in (
-            (pathlib.Path(m.state_dir), 0o750, "srrange", "srrange"),
+    # The state directory is SHARED (plan 18 review): the broker creates and
+    # journals its ledger directly inside, the API reads anchors/pins and
+    # writes only inside its own 0700 controller / 0755 known_hosts
+    # subtrees, and runner/bastion/worker merely TRAVERSE to world-readable
+    # pins (the API chmods published pins 0644).  0751 owner srbroker =
+    # write for the ledger, traverse-without-enumeration for everyone else
+    # — narrow, and it widens no group.  When the ledger lives elsewhere the
+    # shared parent is left ALONE and the ledger directory gets its own
+    # srbroker-owned entry; two entries must never fight over one
+    # directory's ownership on every apply.
+    ledger_parent = pathlib.Path(m.broker_ledger).parent
+    ledger_in_state = ledger_parent.resolve() == pathlib.Path(
+        m.state_dir).resolve()
+    entries = [
+            (pathlib.Path(m.state_dir), 0o751, "srbroker", "srrange"),
             (pathlib.Path(m.images_dir), 0o755, "root", "root"),
             (pathlib.Path(m.recordings_dir), 0o750, "srbastion", "srbastion"),
             # The secrets directory is traversable by the two identities
@@ -836,8 +856,6 @@ def _ensure_dirs(m: ApplianceManifest, run: Runner, lay: Layout) -> None:
             # every file inside keeps its own 0600 ownership.
             (pathlib.Path(m.secrets_dir), SECRET_DIR_MODE, "root",
              SECRET_DIR_GROUP),
-            (pathlib.Path(m.broker_ledger).parent, 0o750, "srbroker",
-              "sr-broker-clients"),
             (pathlib.Path(m.state_dir) / "controller", 0o700, "srrange", "srrange"),
             # Runtime host pins live under state (plan 18): the API is the
             # only writer (ProtectSystem=strict makes /etc read-only for it),
@@ -847,7 +865,11 @@ def _ensure_dirs(m: ApplianceManifest, run: Runner, lay: Layout) -> None:
              "srrange"),
             (lay.run, 0o750, "srbroker", "sr-broker-clients"),
             (lay.etc / "tls", 0o755, "root", "root"),
-            (lay.etc / "ssh", SSH_DIR_MODE, "root", SSH_DIR_GROUP)):
+            (lay.etc / "ssh", SSH_DIR_MODE, "root", SSH_DIR_GROUP)]
+    if not ledger_in_state:
+        entries.append((ledger_parent, 0o750, "srbroker",
+                        "sr-broker-clients"))
+    for path, mode, user, group in entries:
         if lay.sandboxed:
             # A sandbox install cannot create system identities; the mode is
             # still enforced so the receipt describes the intended layout.

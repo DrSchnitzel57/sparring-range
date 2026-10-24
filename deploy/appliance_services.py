@@ -483,14 +483,91 @@ def ensure_tls(run, *, etc: pathlib.Path, public_ip: str,
         "SR_TLS_DIR": str(tls_dir),
         "SR_SSH_DIR": str(ssh_dir),
         "SR_SSH_GROUP": "srbastion",
+        "SR_INGEST_GROUP": "sringest",
         "HTTPS_IP": str(public_ip),
         "INGEST_SANS": ingest_sans,
         "SR_TLS_ROTATE": "0",
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
     }
     run("bash", str(_bootstrap_script()), env=env)
+    problems, deferred = tls_readiness_problems(etc)
+    if problems:
+        raise RuntimeError("TLS material is not service-readable: "
+                           + "; ".join(problems))
     return {"tls_dir": str(tls_dir), "ssh_dir": str(ssh_dir),
-            "ingest_sans": ingest_sans}
+            "ingest_sans": ingest_sans,
+            "tls_readability": "verified",
+            "tls_readability_deferred": deferred}
+
+
+# The trust map every service unit was rendered against: (identity, files)
+# that identity must be able to READ with its real uid/gid — not root's.
+TLS_TRUST_MAP: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # the ingest listener terminates TLS for enrolled guests
+    ("sringest", ("ingest-server.key", "ingest-server.crt", "api-ca.crt")),
+    # the API pins its telemetry + API-plane anchors
+    ("srrange", ("api-ca.crt", "https.crt", "ca.crt")),
+    # the bastion pins the API surface it reports to (nginx's https.crt)
+    ("srbastion", ("api-ca.crt", "https.crt")),
+    # the frontend's proxy and the web identity need no TLS material
+)
+
+
+def _service_membership(name: str) -> tuple[int, int, set[int]] | None:
+    """(uid, gid, groups) of a service identity, or None when the identity
+    does not exist on this machine (sandbox install, dev box)."""
+    import grp
+    import pwd
+    try:
+        pw = pwd.getpwnam(name)
+    except KeyError:
+        return None
+    groups = {g.gr_gid for g in grp.getgrall() if name in g.gr_mem}
+    return pw.pw_uid, pw.pw_gid, groups
+
+
+# POSIX access-bit semantics shared by the readability math below.
+import stat as _STAT
+
+
+def _posix_readable(st, uid: int, gid: int, groups: set[int]) -> bool:
+    """Real POSIX access-bit logic for a service identity — owner bits,
+    then group bits, then other bits.  This is deliberately NOT
+    os.access(): as root, os.access lies about every file on disk."""
+    mode = _STAT.S_IMODE(st.st_mode)
+    if st.st_uid == uid:
+        return bool(mode & _STAT.S_IRUSR)
+    if st.st_gid == gid or st.st_gid in groups:
+        return bool(mode & _STAT.S_IRGRP)
+    return bool(mode & _STAT.S_IROTH)
+
+
+def tls_readiness_problems(etc: pathlib.Path) -> tuple[list[str], list[str]]:
+    """Validate, for each REAL service identity on this machine, that the
+    rendered trust map is actually readable by that identity.  Returns
+    (problems, deferred): identities that do not exist yet (sandbox) are
+    reported as deferred, never silently passed."""
+    problems: list[str] = []
+    deferred: list[str] = []
+    for identity, files in TLS_TRUST_MAP:
+        member = _service_membership(identity)
+        if member is None:
+            deferred.append(identity)
+            continue
+        uid, gid, groups = member
+        for fname in files:
+            path = pathlib.Path(etc) / "tls" / fname
+            try:
+                st = path.stat()
+            except OSError:
+                problems.append(f"{identity} cannot stat tls/{fname}")
+                continue
+            if not _posix_readable(st, uid, gid, groups):
+                problems.append(
+                    f"{identity} (uid {uid}) cannot read tls/{fname} "
+                    f"(owner {st.st_uid}:{st.st_gid}, mode "
+                    f"{_STAT.S_IMODE(st.st_mode):#o})")
+    return problems, deferred
 
 
 def _bootstrap_script() -> pathlib.Path:
