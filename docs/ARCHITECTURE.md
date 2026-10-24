@@ -1043,6 +1043,21 @@ unknown attribution/timing stays unknown. New provenance is authenticated at the
 controller/operation boundary, not asserted by compromised guest audit alone.
 No model reasoning text is required to establish scores or trusted evidence.
 
+### Plan 18 review-round decisions (2026-10-24, branch `practice-upgrades-18-21`)
+
+Independent review at `168a9e1` returned FIX with seven findings; each
+repaired decision is recorded here (replacements are explicit — the
+superseded row above stays as history).
+
+| Chosen | Rejected | Why |
+|---|---|---|
+| Netrules loader has NO stop teardown: the table outlives unit stop; reload is the single atomic `nft -f` batch; removal is operator-only in the maintenance window | `ExecStop=nft delete table inet sr_appliance` (superseded row above) | Stopping the unit (package upgrade, maintenance, crash-restart ordering) while guests were alive DELETED the range's isolation — the exact hazard the loader exists to remove. A stop must never open a window. |
+| Broker daemon exit drains ONLY with active claims: same latched, read-back-confirmed cessation (`drain_on_shutdown` wired into brokerd's finally BEFORE the libvirt handle closes); clean idle exit does not latch | Silent exit (range outlives its watchdog); latching every restart (poisons idle maintenance) | The broker is the only lease watchdog and libvirt holder; a live guest must never survive its daemon unwatched, but an idle appliance stop is ordinary. |
+| Cron-pin trust binds to the artifact the deployment RUNS ON: deploy freezes role+template+image-digest from the installer manifest into the immutable resource (`appliance_manifest_file`, unset ⇒ record nothing ⇒ UNKNOWN); injection (both `check_objective` and `build_scorecard`) requires pin==recorded identity; malformed pin values (type-checked before any regex) behave exactly like an absent pin | Template-ID-only trust (superseded row above); caching a digest-pinned config at predictable shared paths; trusting pre-existing `$TMPDIR` content | A template number survives rebuilds, so template-only trust honoured hashes for bytes never deployed (a wrong-digest pin passed the real verifier). Frozen deploy-time identity means replacing the pin file can only REVOKE, never forge, a pass. (Reviewer-reproduced.) |
+| TLS material per-file ownership: ingest pair root:sringest 0640 (group default, missing group fails loud at chown), public CA/anchors 0644, CA signing keys 0600; `ensure_tls` VALIDATES per-identity POSIX readability after bootstrap (real owner/group/other math, never root-os.access) and fails closed; sandbox defers loudly | Blanket `chmod 0600 *.key / 0640 *.crt` (installed nobody could actually read what its units served); os.access as root | The blanket chmod made the install internally inconsistent for every identity but root; anchoring the bastion/controller on api-ca while nginx presents the self-signed https.crt failed every API callback — anchors now name the surface actually presented (telemetry keeps api-ca for the ingest cert it signs). |
+| Shared state directory installed EXACTLY once: 0751 srbroker:srrange — write for its one writer (broker ledger journals there), traverse-without-enumeration for every other identity; a ledger outside state gets its own dedicated entry | Two `_ensure_dirs` entries fighting over the ledger parent on every apply; 0750 srrange (blocked the very clients reading published 0644 pins) | Ownership must converge, not oscillate; narrow traversal is not group-widening (no service group changes). |
+| Private owned staging for every root-fetch-then-verify download and every CLI config: `mkdtemp` 0700 staging for the Node tarball (removed whatever happens), per-invocation `mkstemp` 0600 alembic config with guaranteed cleanup | Predictable `/tmp/node-v<VER>.tar.xz` written through before hashing (root); shared `$TMPDIR/sr-alembic-<digest>.ini` cache trusting planted content | A predictable shared-temp path invites symlink/overwrite attacks and cross-application collisions; content in someone else's file is never trusted. |
+
 ### Plan 18 implementation decisions (2026-10-24, branch `practice-upgrades-18-21`)
 
 | Chosen | Rejected | Why |

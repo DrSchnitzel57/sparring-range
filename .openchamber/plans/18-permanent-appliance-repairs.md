@@ -1,5 +1,9 @@
 # 18 — Permanent appliance and recovery repairs
 
+> Review round (2026-10-24): review at `168a9e1` → FIX, seven findings, all
+> repaired with regressions in `806d239`…`dfaa954`; evidence in FINDINGS
+> "Plan-18 review round". Milestone 18 UNTICKED pending re-review.
+
 ## Steps
 - [x] Reproduce baselines and reconcile retained defects.
 - [x] Repair bootstrap, native/runtime provisioning, identities and trust.

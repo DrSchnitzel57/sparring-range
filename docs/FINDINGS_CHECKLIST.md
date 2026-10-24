@@ -1,5 +1,75 @@
 # Current findings and validation evidence
-# Current findings and validation evidence
+
+## Plan-18 review round — 2026-10-24, branch `practice-upgrades-18-21`
+
+The independent review of the section below (at base `168a9e1`) returned
+**FIX with seven findings**. Two were substantive: the firewall loader's
+`ExecStop` deleted `inet sr_appliance` on unit stop while guests were
+alive (HIGH — removing the isolation the unit exists to guarantee), and
+cron-pin trust keyed on template ID alone, which let a wrong-digest pin
+PASS the real verifier (the criterion-5 gate had therefore passed for
+the wrong artifact; its old claim of "digest + template binding" in the
+runtime was an overclaim — only the pure helper was digest-aware).
+The five others: malformed pin values crashed scoring (TypeError);
+shared-temp predictability (Node tarball fetched through `/tmp` as root;
+`$TMPDIR` alembic-config cache trusting planted content); blanket TLS
+chmods left every service identity unable to read what its own unit
+served, the bastion anchored on a CA that never signs the API surface,
+and `_ensure_dirs` fought twice over the shared state directory while
+0750 blocked the pin readers it documented; plus the firstboot report's
+JSON claimed `ok` while pending, and a module-import key leak in tests.
+
+All seven repaired with behavioral regressions in `806d239` `71812ea`
+`d33dccd` `e6bf1b9` `fe55f0d` `6dfe245` `57ff8f7` `dfaa954` — decisions
+superseded and corrected are recorded in the architecture ("Plan 18
+review-round decisions"). Cancellation of the first correction attempt
+was the user's action, not an independent failure; this section records
+the completed pass.
+
+Exact automated attempts on the final tree (same container: Debian 13,
+**no `/dev/kvm`**, no root, docker available; image cache warm):
+
+- `.venv/bin/python -m pytest -q -ra -p no:cacheprovider` (no DB admin)
+  — exit 0: **625 passed / 286 deselected / 0 failed / 0 skipped /
+  4 warnings**, 72.3 s (same four pre-existing warnings; +21 tests over
+  the pre-review count, all review-round regressions and pins).
+- `infra/dev/acceptance.py install` — **PASS**: the real sequences with
+  the corrected per-file TLS bootstrap (ingest pair `root:sringest 0640`,
+  group default fails loud at chown), single-owner state directory, and
+  bootstrap-reissue/rotation preservation checks.
+- `infra/dev/acceptance.py authority` — **PASS: 35 passed / 0 skipped**
+  (was 32; +3 real-service shutdown-drain regressions: drain with active
+  claims stops-with-read-back and latches, idle drain never latches,
+  cessation blow-up never propagates).
+- `infra/dev/acceptance.py containment` — **PASS: 26 passed / 0 skipped**,
+  no leaked run-owned cgroups.
+- `infra/dev/acceptance.py images` — **PASS: 19 passed / 0 skipped**,
+  309.3 s warm-cache (software emulation, **no `/dev/kvm`** — not
+  nested-KVM acceptance). The web-local verify test now exercises the
+  PRODUCTION injection (`with_cron_baseline` against the deploy-recorded
+  artifact identity) instead of the digest-aware helper alone.
+- `infra/dev/acceptance.py selection` — **PASS**, every test classified.
+- `infra/dev/acceptance.py db` — **PASS**: exit 0, **187 passed / 724
+  deselected / 0 skipped** in required mode (disposable PostgreSQL 16),
+  489.3 s; owned DB resources and the fixture container/volume were
+  removed by the gate. Includes the three new deploy-recorded-artifact
+  regressions plus every pre-existing DB-layer scenario.
+- Reviewer reproductions now proven by test: wrong-digest pin through the
+  REAL verifier ⇒ UNKNOWN (was PASS); post-launch pin replacement can
+  only revoke, never forge; hostile pin documents (int/null/nested
+  digests, bogus types) behave exactly like an absent pin, never crash;
+  planted shared-temp content and a planted symlink at the old alembic
+  cache path are ignored and left untouched; private staging cleaned on
+  success and on digest failure.
+
+Unchanged open gates (operator, NOT claimed): `packet` (root+`nft`),
+`journey` (installed appliance), the installed UID/TLS/boot/KVM rechecks
+— now additionally including the bootstrap per-file ownership and the
+`ensure_tls` per-identity readability validation on the real appliance —
+and independent adversarial qualification of the broader AppArmor
+profile `9e03696`. Milestone 18 remains UNTICKED pending independent
+re-review of this correction pass.
+
 
 ## Plan-18 implementation evidence — 2026-10-24, branch `practice-upgrades-18-21`
 
@@ -54,6 +124,9 @@ no root, docker available):
   marker and asserted digest + template binding (wrong template, wrong
   role, rebuilt digest and tampered documents all yield NO trust) plus the
   pin-document round-trip; absent/tampered-pins-never-pass is proven by
+  *(corrected by the review round above: that run's RUNTIME honoured pins
+  on template ID alone — digest awareness existed only in the unused
+  helper, so the wrong-artifact PASS was real; fixed in `e6bf1b9`.)*
   `tests/test_plan18_cron_pins.py` against the real verifier v3 (clean +
   matching pin → passed; content-tampered file → failed deterministically;
   no pin → UNKNOWN).

@@ -121,19 +121,21 @@ historical 14–17. Implementation waits for the user's new worktree:
   TLS/config/firewall reproducibility, packaged CLI migrations, cessation-safe
   teardown/obligation tooling, trusted cron image pins and adversarial containment
   regression fixtures. Preserve completed commissioning evidence.
-  *Status 2026-10-24 (branch `practice-upgrades-18-21`, implementation —
-  independent review pending):* all seven plan acceptance criteria were
-  reproduced or repaired with automated evidence: fast 604/0/0; `install`,
-  `authority` (32), `containment` (26, incl. five new inside-boundary
-  adversarial negatives), `db` (184, incl. installed-CLI migrate/status
-  reaching head outside the checkout) and `selection` PASS; `images` PASS
-  (19) with the artifact-bound cron-pin test under TCG (software emulation,
-  no `/dev/kvm`). Commits `2a162d9`…`9885f87`; decisions in the architecture
-  and exact attempts in the findings checklist. Pending operator gates stay
-  open and are NOT claimed here: `packet` (root+`nft`), `journey` (installed
-  appliance), the installed UID/TLS/boot/KVM rechecks affected by these
-  changes, and independent adversarial qualification of the broader
-  AppArmor profile `9e03696`.
+  *Status 2026-10-24 (branch `practice-upgrades-18-21`, implementation +
+  review round — independent RE-REVIEW pending):* implementation `2a162d9`
+  …`9885f87` passed its own gates, but the independent review at `168a9e1`
+  returned **FIX** with seven findings — including a HIGH (the firewall
+  loader's `ExecStop` deleted range isolation on unit stop while guests
+  were alive) and a scoring-integrity defect (cron pins trusted on
+  template ID alone let a wrong-digest pin PASS the real verifier). Every
+  finding was repaired with lifecycle regressions (`806d239`…`dfaa954`);
+  the superseded decisions and the corrections are recorded in the
+  architecture. Milestone stays unticked until the parent re-review
+  accepts the correction pass. Operator gates still open and NOT claimed:
+  `packet` (root+`nft`), `journey` (installed appliance), the installed
+  UID/TLS/boot/KVM rechecks (now including the new bootstrap ownership and
+  per-identity TLS-readability validation), and independent adversarial
+  qualification of the broader AppArmor profile `9e03696`.
 - [ ] **19 — Conversational agent and model administration.**
   [Plan](../.openchamber/plans/19-conversation-and-model-admin.md). Pydantic AI slim,
   protected versioned profiles/role overrides/thinking mappings, context-aware
