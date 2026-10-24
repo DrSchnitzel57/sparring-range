@@ -180,8 +180,7 @@ class RedAgentLoop:
         # summaries recursively summarize their own diagnostics on every turn.
         self._log("red", "agent_note", {"activity": "compression", "state": "started",
                                         "upto_event_id": upto_event_id})
-        blob = "\n".join(f"[{e['event_id']}] {e['actor']}/{e['action_type']} @{e.get('host')}: "
-                         f"{str(e['payload'])[:200]}" for e in events
+        blob = "\n".join(self._memory_text(e, compact=True) for e in events
                          if not self._compression_note(e))
         try:
             summary = self.llm.complete(
@@ -201,6 +200,41 @@ class RedAgentLoop:
     def _compression_note(event: dict) -> bool:
         return (event.get("action_type") == "agent_note"
                 and (event.get("payload") or {}).get("activity") == "compression")
+
+    @classmethod
+    def _memory_events(cls, events: list[dict]) -> list[dict]:
+        """Agent memory is not the bulk audit stream.
+
+        Preserve the full append-only audit through the API, but do not let
+        auditd/service-probe traffic displace the agent's own action/result
+        pairs or consume summarization calls. Only trusted-backend verdicts
+        supplement runner-owned observations; telemetry cannot forge them.
+        """
+        return [e for e in events if (
+            e.get("actor") == "red"
+            and e.get("action_type") in ("action_intent", "action_result", "agent_note")
+            and not cls._compression_note(e)
+        ) or (
+            e.get("actor") == "system"
+            and e.get("action_type") in ("verifier", "detection")
+        )]
+
+    @staticmethod
+    def _memory_text(event: dict, compact: bool = False) -> str:
+        # Keep enough of the actual command and its result to distinguish a
+        # successful observation from missing tools. Bound both independently:
+        # JSON key order must not let a long output hide the command or exit.
+        payload = event.get("payload") or {}
+        if event.get("action_type") in ("action_intent", "action_result"):
+            command_limit, output_limit = (300, 600) if compact else (1000, 1200)
+            text = (f"command={str(payload.get('command', ''))[:command_limit]} "
+                    f"exit_code={payload.get('exit_code')} "
+                    f"timed_out={payload.get('timed_out')} "
+                    f"error={str(payload.get('error') or '')[:200]} "
+                    f"output={str(payload.get('output') or '')[:output_limit]}")
+        else:
+            text = str(payload)[:400]
+        return f"[{event['event_id']}] {event['actor']}/{event['action_type']} {text}"
 
     # --------------------------------------------------------------------- run
     def _deadline_passed(self) -> bool:
@@ -271,10 +305,8 @@ class RedAgentLoop:
                 break
 
             recent = self.transport.events_since(self.session_id, summary_upto)
-            recent_tail = [e for e in recent if not self._compression_note(e)][-self.keep_recent:]
-            recent_txt = "\n".join(
-                f"[{e['event_id']}] {e['actor']}/{e['action_type']} {str(e['payload'])[:200]}"
-                for e in recent_tail) or "(none yet)"
+            recent_tail = self._memory_events(recent)[-self.keep_recent:]
+            recent_txt = "\n".join(self._memory_text(e) for e in recent_tail) or "(none yet)"
 
             if all_ids and self.achieved >= all_ids:
                 match_state = ("ALL objectives are currently verifier-confirmed. "
@@ -407,11 +439,22 @@ class RedAgentLoop:
 
             # rolling memory: compress events beyond the keep-recent window,
             # carrying the previous summary forward; checkpoint only on success
-            all_new = self.transport.events_since(self.session_id, summary_upto)
+            all_new = self._memory_events(
+                self.transport.events_since(self.session_id, summary_upto))
             if len(all_new) > self.compress_after:
                 # Bound each request even after repeated failures; never advance
                 # over substantive events that were not supplied to the model.
                 window = all_new[: max(0, len(all_new) - self.keep_recent)][:64]
+                # Preserve the cursor invariant while bounding prompt size:
+                # never checkpoint beyond events actually sent for summary.
+                bounded, size = [], 0
+                for event in window:
+                    length = len(self._memory_text(event, compact=True)) + 1
+                    if bounded and size + length > 18000:
+                        break
+                    bounded.append(event)
+                    size += length
+                window = bounded
                 if window:
                     compressed = self.compress(summary, window[-1]["event_id"], window)
                     if compressed:
