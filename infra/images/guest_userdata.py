@@ -243,6 +243,30 @@ def _build_runcmd(role: str, packages: list[str]) -> list[str]:  # pragma: no co
     raise AssertionError("retired: setup now ships as one script item")
 
 
+#: Clean-artifact cron inventory probe (plan 18). The verify boot is a
+#: CLEAN BUILT ARTIFACT boot (offline, before any lab use), so it is the
+#: only legitimate place to learn what clean cron state is. The emitted
+#: single-line JSON is captured at release-build time by
+#: `infra/images/cron_baseline` and bound to the artifact digest; pins
+#: are NEVER learned from a running or compromised guest.
+_CRON_PIN_PY = r"""
+import hashlib, json, os
+def _sha(path):
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+d = "/etc/cron.d"
+files = {}
+for name in sorted(os.listdir(d)):
+    path = os.path.join(d, name)
+    if os.path.islink(path) or not os.path.isfile(path):
+        continue
+    files[name] = _sha(path)
+tab = "/var/spool/cron/crontabs/root"
+out = {"files": files,
+       "root_crontab_sha256": _sha(tab) if os.path.isfile(tab) else None}
+print(json.dumps(out, sort_keys=True, separators=(",", ":")))
+"""
+
 def _verify_checks(role: str) -> str:
     # Plan 13 phase 3: role-separated verification. The DB tier proves the
     # DATABASE contract (mysql data + capture + firewall), never the web
@@ -278,6 +302,8 @@ chk SEEDS bash -c 'python3 -c "import json;d=json.load(open(\\"/srv/mojang-web/s
             "mysql 2>/dev/null'\n")
     return _HARNESS_HEADER + f"""
 chk UNITS-ACTIVE bash -c 'systemctl is-active --quiet {units}'
+chk CRON-STATE bash -c 'python3 /srv/sr-cron-pin.py >/dev/null'
+say "CRON-PIN $(python3 /srv/sr-cron-pin.py 2>/dev/null | tr -d '\n')"
 {web_checks}chk AUDITD-RULES bash -c 'auditctl -l | grep -q sparring_cmd'
 chk SHIPPER-UNIT bash -c 'grep -q "^User=srshipper" /etc/systemd/system/sparring-shipper.service && grep -q adm /etc/systemd/system/sparring-shipper.service'
 chk SHIPPER-SPOOL bash -c 'test -d /var/lib/sparring-range/shipper'
@@ -361,6 +387,8 @@ def verify_user_data(role: str, payload: dict[str, str],
     has no web app, so it gets no app config at all."""
     files = (_write_file_entry("/srv/sr-chain-checks.sh", _chain_script(),
                                perms="0755") +
+             _write_file_entry("/srv/sr-cron-pin.py", _CRON_PIN_PY,
+                               perms="0644") +
              _write_file_entry("/srv/sr-verify-checks.sh",
                                _verify_checks(role), perms="0755"))
     if role != "mojang-web-db":

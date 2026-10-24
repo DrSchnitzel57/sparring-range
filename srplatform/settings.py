@@ -148,6 +148,12 @@ class Settings(BaseSettings):
     # firewalls exactly this source (plus owned web guests + loopback).
     controller_range_ip: str = "10.66.0.1"
     bastion_address: str = "10.66.0.2"
+    # Trusted cron-content pins (plan 18): a release artifact captured from
+    # the CLEAN BUILT IMAGE, bound to its digest. The verifier only receives
+    # content hashes while this file's pin matches the template the
+    # deployment actually cloned from; absent/stale/corrupt pins leave the
+    # cron check UNKNOWN. Never generated from a running guest.
+    cron_baseline_file: str = ""
     # The address MEMBERS actually reach the bastion on (plan 18): the
     # appliance's LAN address. The range-side bastion_address is a planning
     # address that may name no reachable interface from a member's laptop,

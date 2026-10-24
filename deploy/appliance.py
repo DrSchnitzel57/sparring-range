@@ -298,6 +298,12 @@ def render_control_env(m: ApplianceManifest, *, etc: pathlib.Path = DEFAULT_ETC,
         # that may name no interface at all. Rendered hints use this.
         ("SR_BASTION_PUBLIC_ADDRESS",
          str(m.network.lan_address) if m.network.lan_address else ""),
+        # Trusted cron pins (plan 18): a release artifact bound to the
+        # built-image digest. The path is always named; a missing file is
+        # honest UNKNOWN, never a filename-based guess. The release build
+        # places it via `python3 -m infra.images.cron_baseline capture`.
+        ("SR_CRON_BASELINE_FILE",
+         str(pathlib.Path(m.state_dir) / "cron-baselines.json")),
         # The match scheduler (ready expiry, deadline cleanup, startup
         # reconciliation) is part of a working appliance, not an option.
         ("SR_MATCH_SCHEDULER_ENABLED", "1"),

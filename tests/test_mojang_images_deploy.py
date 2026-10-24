@@ -102,7 +102,7 @@ def _verify_markers(record: dict, *required: str) -> None:
     assert "SR-GUEST-DONE rc=0" in markers, markers
 
 
-def test_images_ubuntu_verify_web_local(web_local_overlay):
+def test_images_ubuntu_verify_web_local(web_local_overlay, tmp_path):
     """Real offline boot (`-net none`) of the WEB artifact: local-data
     catalogue, live diagnostic flaw + service-preserving fix, auditd/shipper/
     users/firewall, and MySQL NOT enabled — all on the installed guest."""
@@ -120,7 +120,37 @@ def test_images_ubuntu_verify_web_local(web_local_overlay):
                     "DIAG-FLAW", "ROOT-FLAW", "MAINT-HELPER", "MAINT-FIX",
                     "DIAG-FIX", "AUDITD-RULES",
                     "SHIPPER-UNIT", "SHIPPER-SPOOL", "SEEDS", "USERS",
-                    "FIREWALL", "NO-MYSQL-ENABLED")
+                    "FIREWALL", "NO-MYSQL-ENABLED", "CRON-STATE")
+    # Plan 18 criterion 5: the CLEAN verify boot of the BUILT artifact is
+    # the capture source for trusted cron hashes, bound to this exact
+    # artifact's digest. A changed artifact (different digest) or the
+    # wrong template must never inherit trust from this pin.
+    import hashlib as _hl
+
+    from infra.images import cron_baseline
+    capture = cron_baseline.capture_from_verify_markers(rec["markers"])
+    digest = _hl.sha256(overlay.read_bytes()).hexdigest()
+    pin = cron_baseline.build_pin("mojang-web-local", artifact_sha256=digest,
+                                  artifact_version=digest, template_id=9011,
+                                  capture=capture)
+    # the clean ubuntu base ships e2scrub_all — that is exactly the file
+    # the scenarios declare as baseline, and the pin now carries its hash
+    assert "e2scrub_all" in pin["files"], sorted(pin["files"])
+    pins = {"mojang-web-local": pin}
+    assert cron_baseline.trusted_hashes_for_template(
+        pins, "mojang-web-local", 9011) == pin["files"]
+    # wrong template or wrong role: no trust, verifier stays UNKNOWN
+    assert cron_baseline.trusted_hashes_for_template(
+        pins, "mojang-web-local", 9012) == {}
+    assert cron_baseline.trusted_hashes_for_template(
+        pins, "mojang-web-db", 9011) == {}
+    # digest binding: a rebuilt artifact must not match this pin
+    assert cron_baseline.trusted_hashes(pins, "mojang-web-local",
+                                        "0" * 64) == {}
+    # round-trip through the pin document validates and preserves
+    doc = tmp_path / "cron-baselines.json"
+    cron_baseline.dump_pins(doc, pins)
+    assert cron_baseline.load_pins(doc) == pins
 
 
 def test_images_ubuntu_verify_web_db(db_overlay):

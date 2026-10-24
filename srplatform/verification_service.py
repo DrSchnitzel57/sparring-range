@@ -272,6 +272,55 @@ def readiness_checks(db: Session, session_id) -> dict:
             "reason": "; ".join(reasons) or None}
 
 
+# --------------------------------------------------------------------------- #
+# trusted cron pins (plan 18)                                                  #
+# --------------------------------------------------------------------------- #
+
+def cron_template_map(db: Session, session_id) -> dict[str, int]:
+    """host -> template VMID, from the same positively-owned active rows
+    host_map_for trusts (never from YAML or from a stale generation)."""
+    dep = active_deployment(db, session_id)
+    if not dep:
+        return {}
+    return {r["host"]: int(r["template_vmid"])
+            for r in (dep.resources or [])
+            if r.get("host") and r.get("template_vmid")
+            and r.get("state") == "created"}
+
+
+def load_cron_pins() -> dict:
+    """Read the release pins file; anything unreadable or invalid behaves
+    exactly like an absent file (UNKNOWN stays UNKNOWN)."""
+    s = get_settings()
+    if not s.cron_baseline_file:
+        return {}
+    from infra.images.cron_baseline import load_pins
+    return load_pins(s.cron_baseline_file)
+
+
+def with_cron_baseline(args: dict, *, verifier_id: str, host: str | None,
+                       templates: dict[str, int],
+                       pins: dict) -> dict:
+    """Inject the pinned clean-cron hashes into a cron check — and ONLY
+    while the deployment's template matches the pin. The scenario snapshot
+    keeps declaring its filename baseline (historical meaning preserved);
+    the injected map adds the CONTENT truth of the artifact this session's
+    hosts were cloned from. An explicit baseline_file_sha256 in the
+    snapshot always wins (append-only snapshots stay authoritative)."""
+    if verifier_id != "cron_persistence_present" or not pins:
+        return args
+    if "baseline_file_sha256" in args:
+        return args
+    from infra.images.cron_baseline import trusted_hashes_for_template
+    from infra.images.specs import TEMPLATE_ROLES
+    tid = templates.get(host or "")
+    role = TEMPLATE_ROLES.get(tid) if tid is not None else None
+    hashes = trusted_hashes_for_template(pins, role, tid)
+    if not hashes:
+        return args
+    return {**args, "baseline_file_sha256": hashes}
+
+
 def check_objective(db: Session, session_id, objective_id: str) -> dict:
     """Run ONE red objective's verifier and append the trusted event.
     Returns {objective, status, passed, evidence, event_id}."""
@@ -280,10 +329,15 @@ def check_objective(db: Session, session_id, objective_id: str) -> dict:
     if obj is None:
         return {"error": f"unknown objective '{objective_id}'"}
     exec_fn = _exec_override or _ssh_exec
-    ctx = Context(exec=_resolve(exec_fn, host_map_for(db, session_id)),
-                  hosts=host_map_for(db, session_id))
+    hmap = host_map_for(db, session_id)
+    ctx = Context(exec=_resolve(exec_fn, hmap), hosts=hmap)
     v = registry.get(obj["verifier"])
-    outcome = v.evaluate(ctx, **(obj.get("args") or {}))   # typed: passed/failed/unknown
+    args = with_cron_baseline(dict(obj.get("args") or {}),
+                              verifier_id=obj["verifier"],
+                              host=(obj.get("args") or {}).get("host"),
+                              templates=cron_template_map(db, session_id),
+                              pins=load_cron_pins())
+    outcome = v.evaluate(ctx, **args)   # typed: passed/failed/unknown
     ev = Event(session_id=session_id, ts=datetime.now(timezone.utc), actor="system",
                host=(obj.get("args") or {}).get("host"), action_type="verifier",
                payload={"objective": objective_id, "verifier": obj["verifier"],
@@ -325,6 +379,10 @@ def build_scorecard(db: Session, session_id) -> dict:
                            "live rescore refused (historical score_snapshot remains "
                            "read-only available); no SSH attempted")
     ctx = Context(exec=_resolve(exec_fn, hmap), hosts=hmap)
+    # trusted cron content pins: loaded ONCE per scorecard build so every
+    # cron check in this snapshot sees the same truth (plan 18)
+    cron_templates = cron_template_map(db, session_id)
+    cron_pins = load_cron_pins()
 
     items, earned, total = [], 0, 0
     status_seen = []
@@ -337,6 +395,9 @@ def build_scorecard(db: Session, session_id) -> dict:
         # reward the vulnerability and penalize its removal (audit R09).
         args = {k: val for k, val in chk.items()
                 if k not in ("verifier", "points", "domain", "description")}
+        args = with_cron_baseline(args, verifier_id=chk["verifier"],
+                                  host=chk.get("host"),
+                                  templates=cron_templates, pins=cron_pins)
         outcome = v.evaluate(ctx, **args)
         awarded = points if outcome.status == "passed" else 0
         earned += awarded
