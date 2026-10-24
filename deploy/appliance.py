@@ -630,6 +630,16 @@ def render_netrules_unit(lay: Layout) -> str:
     installer's own render, validated at render time (see
     netrules.nft_scope_problems).
 
+    There is deliberately NO ExecStop: stopping this unit while guest VMs
+    are alive would delete the table and silently remove the range's
+    isolation — the exact failure mode this unit exists to prevent.  The
+    table persists past a unit stop; the only way the rules change is a
+    re-`ExecStart`, and `nft -f` of a file that declares the table replaces
+    the whole table atomically in one batch, so a reload is never a
+    delete-then-add window.  Removal of the table is an explicit operator
+    action in the maintenance window, never a side effect of `systemctl
+    stop` or a package upgrade.
+
     It is deliberately root: nft needs CAP_NET_ADMIN; no service identity
     of the range may hold it."""
     nft = lay.nftables_dir / "sr-appliance.nft"
@@ -646,9 +656,11 @@ RemainAfterExit=yes
 # it the broker, which Requires it), never boot into a half-loaded range.
 ExecStartPre=/usr/sbin/nft -c -f {nft}
 # Table-scoped by construction: the file adds/deletes ONLY inet
-# sr_appliance. There is no flush-ruleset path in this installation.
+# sr_appliance, and `nft -f` applies it as ONE atomic batch — a reload
+# replaces the table in a single kernel transaction. There is no
+# flush-ruleset path and no stop-time teardown in this installation:
+# isolation outlives unit stop, so a stop can never open a window.
 ExecStart=/usr/sbin/nft -f {nft}
-ExecStop=/usr/sbin/nft delete table inet sr_appliance
 TimeoutStartSec=30
 NoNewPrivileges=true
 ProtectSystem=strict

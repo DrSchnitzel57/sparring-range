@@ -634,6 +634,27 @@ class BrokerService:
         return {"latched": True, "reason": reason, **results,
                 "open_obligations": len(self.ledger.open_obligations())}
 
+    def drain_on_shutdown(self, reason: str) -> dict | None:
+        """Daemon-exit drain: if ANY owned VM is still claimed at shutdown,
+        the range must not outlive its broker — run the same latched,
+        read-back-confirmed cessation as the lease watchdog.  Latching with
+        active claims is intentional: a daemon restart is not a reason to
+        leave guests running unwatched, and the operator releases the latch
+        explicitly after reconciling.  With zero active claims nothing is
+        latched — a clean stop of an idle appliance must not poison the
+        next boot.  Never raises: shutdown cleanup continues regardless."""
+        try:
+            if not self.ledger.active_claims():
+                return None
+            return self.hard_stop_all(reason)
+        except Exception as exc:  # noqa: BLE001 — shutdown path
+            try:
+                self.ledger.audit("drain-on-shutdown-failed",
+                                  {"reason": reason, "error": str(exc)})
+            except Exception:  # noqa: BLE001
+                pass
+            return {"drain_failed": str(exc), "reason": reason}
+
     # ------------------------------------------------------------------ lease ---
     def renew_lease(self, holder: str) -> dict:
         st = self.ledger.get_latch()

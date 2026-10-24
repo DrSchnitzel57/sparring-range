@@ -634,6 +634,54 @@ def test_hard_stop_spares_recycled_vmid(tmp_path):
     assert any(o["vmid"] == 210 for o in service.ledger.open_obligations())
 
 
+# --------------------------------------------------------------------------- #
+# 5b. plan 18 review: daemon-exit drain must not orphan live guests           #
+# --------------------------------------------------------------------------- #
+
+def test_shutdown_drain_stops_live_guests_and_latches(tmp_path):
+    """A broker process exit while VMs are claimed runs the SAME latched,
+    read-back-confirmed cessation as the lease watchdog — the range never
+    outlives its broker unwatched, and the operator must release."""
+    client, service, http = _mk(tmp_path)
+    _clone(client)
+    _place(client)
+    client.start_and_wait(NODE, 210)
+    report = service.drain_on_shutdown("broker-daemon-exit")
+    assert report and report["latched"] and report["stopped"] == [210]
+    assert http.vms[210]["status"] == "stopped", "cessation needs read-back"
+    with pytest.raises(BrokerLatched):
+        client.clone_and_wait(NODE, 9001, 211, "sr-web02-x",
+                              session_id="s", generation="g")
+    # all stops confirmed -> no obligations, operator can release normally
+    assert service.ledger.open_obligations() == []
+    assert service.release_latch("operator")["released"]
+
+
+def test_shutdown_drain_of_idle_broker_does_not_latch(tmp_path):
+    """Zero active claims: a clean stop of an idle appliance is ordinary
+    maintenance — it must not latch and poison the next boot."""
+    client, service, http = _mk(tmp_path)
+    assert service.drain_on_shutdown("broker-daemon-exit") is None
+    assert not service.ledger.get_latch()["latched"]
+    # the next session starts cleanly with no operator release
+    _clone(client)
+    assert service.ledger.get_claim(210) is not None
+    assert not service.ledger.get_latch()["latched"]
+
+
+def test_shutdown_drain_never_raises_from_cessation_errors(tmp_path):
+    """Shutdown cleanup continues regardless: a cessation blow-up is
+    reported, not propagated into the daemon's finally path."""
+    client, service, http = _mk(tmp_path)
+    _clone(client)
+
+    def boom(_reason):
+        raise RuntimeError("ledger exploded")
+    service.hard_stop_all = boom
+    report = service.drain_on_shutdown("broker-daemon-exit")
+    assert report and report.get("drain_failed") == "ledger exploded"
+
+
 def test_cross_session_and_unowned_mutation_refused(tmp_path):
     client, service, http = _mk(tmp_path)
     _clone(client)

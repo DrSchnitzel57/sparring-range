@@ -57,6 +57,10 @@ def test_loader_unit_and_broker_order(tmp_path):
     assert str(lay.nftables_dir / "sr-appliance.nft") in loader
     assert "/usr/sbin/nft -c -f" in loader, "validate-before-load missing"
     assert "flush ruleset" not in loader.lower()
+    # Review finding: a unit stop must NEVER tear the table down — deleting
+    # isolation while guests are alive is the exact hazard the loader fixes.
+    # Reload is atomic (`nft -f` batch); teardown is operator-only.
+    assert "ExecStop" not in loader, "loader stop must not delete the table"
     # broker is fail-closed ordered on the loader: no guest may exist
     # before the range isolation table is loaded.
     broker = by_name["sr-appliance-broker.service"].content
