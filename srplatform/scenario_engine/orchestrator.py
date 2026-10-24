@@ -1056,13 +1056,39 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
                     _enroll_host_telemetry(db, dep, res, resources, session_id,
                                            host["name"], res.get("ip"), s, enrollments)
                 continue  # already owned & completed — resume skips the clone
+            # CRON ARTIFACT IDENTITY (plan 18 review): freeze WHICH artifact
+            # bytes this host is cloned from — role + image SHA-256 from the
+            # installer's own manifest — into the deployment resource at
+            # clone time. Cron-pin trust later binds to this immutable fact,
+            # so swapping the pin file (or rebuilding the template) after
+            # the session started can only revoke trust, never forge a
+            # pass. No manifest configured => nothing recorded => the cron
+            # check honestly stays UNKNOWN.
+            from srplatform import verification_service as _vs
+
+            def _record_artifact(row):
+                if row.get("cron_artifact"):
+                    return False
+                art = _vs.resolve_deployed_cron_artifact(
+                    int(host["template_vmid"]))
+                if art is None:
+                    return False
+                row["cron_artifact"] = art
+                return True
+
             if res and res.get("vmid"):
                 vmid = int(res["vmid"])          # reuse the pending intent's VMID
+                # an intent created before the identity existed still gets
+                # it recorded THIS deploy run, before the clone executes
+                if _record_artifact(res):
+                    dep.resources = resources
+                    flag_modified(dep, "resources")
             else:
                 vmid = int(broker.next_vmid(node, s.deploy_vmid_base + i,
                                              session_id=session_id))
                 res = {"vmid": vmid, "node": node, "name": name, "host": host["name"],
                        "template_vmid": host["template_vmid"], "state": "pending"}
+                _record_artifact(res)
                 resources.append(res)
                 by_host[host["name"]] = res
                 dep.resources = resources

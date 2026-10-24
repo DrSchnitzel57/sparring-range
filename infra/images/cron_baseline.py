@@ -81,10 +81,12 @@ def capture_from_verify_markers(markers: list[str]) -> dict:
             if not isinstance(files, dict):
                 raise ValueError("no files object")
             for name, sha in files.items():
-                if not _NAME.fullmatch(name) or not _HEX.fullmatch(str(sha)):
+                if not isinstance(name, str) or not isinstance(sha, str) \
+                        or not _NAME.fullmatch(name) or not _HEX.fullmatch(sha):
                     raise ValueError("invalid entry")
             tab = inv.get("root_crontab_sha256")
-            if tab is not None and not _HEX.fullmatch(str(tab)):
+            if tab is not None and (not isinstance(tab, str)
+                                    or not _HEX.fullmatch(tab)):
                 raise ValueError("invalid root crontab hash")
         except (ValueError, AttributeError) as exc:
             # the harness emits every marker TWICE because serial noise can
@@ -106,9 +108,12 @@ def _validate_pin(role: str, pin: dict) -> None:
         bad("must be an object")
     if pin.get("schema") != SCHEMA:
         bad(f"unsupported schema {pin.get('schema')!r}")
-    digest = pin.get("artifact_sha256", "")
-    if not _HEX.fullmatch(digest):
-        bad("artifact_sha256 must be a SHA-256 hex digest")
+    # TYPE checks before any regex: a hostile or truncated pin must
+    # DEGRADE TO UNKNOWN through ValueError, never crash the loader with a
+    # TypeError the callers do not expect (review finding).
+    digest = pin.get("artifact_sha256")
+    if not isinstance(digest, str) or not _HEX.fullmatch(digest):
+        bad("artifact_sha256 must be a SHA-256 hex digest string")
     version = pin.get("artifact_version")
     if not isinstance(version, str) or not version:
         bad("artifact_version must be a non-empty string")
@@ -120,9 +125,14 @@ def _validate_pin(role: str, pin: dict) -> None:
     if not isinstance(files, dict):
         bad("files must be an object")
     for name, sha in files.items():
-        if not _NAME.fullmatch(name) or name in {".", ".."} \
-                or not _HEX.fullmatch(str(sha)):
+        if (not isinstance(name, str) or not isinstance(sha, str)
+                or not _NAME.fullmatch(name) or name in {".", ".."}
+                or not _HEX.fullmatch(sha)):
             bad("files entries must be bare names with SHA-256 hashes")
+    tab = pin.get("root_crontab_sha256")
+    if tab is not None and (not isinstance(tab, str)
+                            or not _HEX.fullmatch(tab)):
+        bad("root_crontab_sha256 must be null or a SHA-256 hex digest")
     src = pin.get("captured_from")
     if src != "clean-built-artifact":
         bad("captured_from must be 'clean-built-artifact' (pins may never "
@@ -157,9 +167,14 @@ def load_pins(path: pathlib.Path) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for role, pin in pins.items():
         try:
+            if not isinstance(role, str):
+                raise ValueError("role keys must be strings")
             _validate_pin(role, pin)
-        except ValueError:
-            return {}          # one bad pin invalidates the document
+        except (ValueError, TypeError):
+            # one bad pin invalidates the WHOLE document, and no malformed
+            # value — int digests, null digests, nested junk — may ever
+            # escape this loader as a crash or a half-trusted pin
+            return {}
         out[role] = pin
     return out
 
@@ -188,17 +203,32 @@ def trusted_hashes(pins: dict[str, dict], role: str | None,
     return dict(pin["files"])
 
 
-def trusted_hashes_for_template(pins: dict[str, dict], role: str | None,
-                                template_vmid: int | None) -> dict[str, str]:
-    """Runtime lookup: the deployment resource knows WHICH TEMPLATE its
-    host was cloned from; a pin is honoured only for the exact role AND
-    the exact template ID it was built for. A rebuilt artifact (new
-    digest, new pin) or a scenario running on an unexpected template
-    yields {} — the cron check then reports UNKNOWN, never a pass."""
-    if not pins or not role or template_vmid is None:
+def trusted_hashes_for_deployment(pins: dict[str, dict], role: str | None, *,
+                                  artifact_sha256: str | None,
+                                  template_vmid: int | None) -> dict[str, str]:
+    """Runtime lookup bound to the DEPLOYED artifact (review finding):
+    template identity alone is stable across rebuilds, so honouring a pin
+    on template ID trusted hashes for bytes the deployment never ran.  A
+    pin is honoured only when the deployment resource positively records
+    ALL of: the exact role, the exact template ID, AND the artifact digest
+    the appliance manifest named when this session's host was cloned.
+    A rebuilt artifact (new digest, new pin), an artifact the pins never
+    covered, or a scenario on an unexpected template yields {} — the cron
+    check reports UNKNOWN, never a pass.  Replacing the pin file can only
+    ever REVOKE trust for a running session (digest stops matching),
+    never forge it."""
+    if not pins or not role or template_vmid is None \
+            or not artifact_sha256:
         return {}
     pin = pins.get(role)
-    if pin is None or pin["template_id"] != int(template_vmid):
+    if pin is None:
+        return {}
+    if pin["template_id"] != int(template_vmid):
+        return {}
+    if pin["artifact_sha256"] != str(artifact_sha256).lower():
+        return {}
+    if not isinstance(pin.get("artifact_version"), str) \
+            or not pin["artifact_version"]:
         return {}
     return dict(pin["files"])
 

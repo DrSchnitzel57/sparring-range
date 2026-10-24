@@ -276,16 +276,49 @@ def readiness_checks(db: Session, session_id) -> dict:
 # trusted cron pins (plan 18)                                                  #
 # --------------------------------------------------------------------------- #
 
-def cron_template_map(db: Session, session_id) -> dict[str, int]:
-    """host -> template VMID, from the same positively-owned active rows
-    host_map_for trusts (never from YAML or from a stale generation)."""
+def cron_artifact_map(db: Session, session_id) -> dict[str, dict]:
+    """host -> the artifact identity recorded AT DEPLOY TIME into the
+    immutable deployment resource (role + template VMID + artifact
+    digest). From the same positively-owned active rows host_map_for
+    trusts — never from YAML, never from a stale generation, and never
+    re-derived from the CURRENT pin file (which could change after the
+    session started). Resources deployed before the identity existed
+    simply have no entry: their cron checks stay UNKNOWN."""
     dep = active_deployment(db, session_id)
     if not dep:
         return {}
-    return {r["host"]: int(r["template_vmid"])
-            for r in (dep.resources or [])
-            if r.get("host") and r.get("template_vmid")
-            and r.get("state") == "created"}
+    out: dict[str, dict] = {}
+    for r in dep.resources or []:
+        art = r.get("cron_artifact")
+        if (r.get("host") and r.get("state") == "created"
+                and isinstance(art, dict) and art.get("role")
+                and art.get("artifact_sha256") and art.get("template_vmid")):
+            out[r["host"]] = art
+    return out
+
+
+def resolve_deployed_cron_artifact(template_vmid):
+    """Resolve the artifact identity THIS appliance deploys TEMPLATE_VMID
+    from, as recorded by the installer's own manifest: which role image,
+    and which SHA-256 the installed template was built from. Deploy calls
+    this at clone time and freezes the answer into the deployment
+    resource; cron-pin trust later binds to that frozen fact. Unset
+    manifest path, unreadable/invalid manifest, or an unknown template
+    yields None — cron checks then honestly stay UNKNOWN."""
+    s = get_settings()
+    if not s.appliance_manifest_file:
+        return None
+    try:
+        from infra.appliance.manifest import ApplianceManifest
+        m = ApplianceManifest.load(s.appliance_manifest_file)
+    except Exception:  # noqa: BLE001 — a missing/invalid manifest is UNKNOWN
+        return None
+    for spec in m.images.values():
+        if spec.template_id == int(template_vmid):
+            return {"role": spec.role,
+                    "template_vmid": int(template_vmid),
+                    "artifact_sha256": spec.sha256}
+    return None
 
 
 def load_cron_pins() -> dict:
@@ -299,23 +332,31 @@ def load_cron_pins() -> dict:
 
 
 def with_cron_baseline(args: dict, *, verifier_id: str, host: str | None,
-                       templates: dict[str, int],
+                       artifacts: dict[str, dict],
                        pins: dict) -> dict:
     """Inject the pinned clean-cron hashes into a cron check — and ONLY
-    while the deployment's template matches the pin. The scenario snapshot
-    keeps declaring its filename baseline (historical meaning preserved);
-    the injected map adds the CONTENT truth of the artifact this session's
-    hosts were cloned from. An explicit baseline_file_sha256 in the
-    snapshot always wins (append-only snapshots stay authoritative)."""
+    while the pin binds to the artifact THIS deployment actually runs on:
+    the role, the template ID AND the artifact digest recorded at clone
+    time into the immutable deployment resource must all match the pin
+    (review finding: template identity survives rebuilds, so template-
+    only trust would honour hashes for bytes that were never deployed).
+    The scenario snapshot keeps declaring its filename baseline
+    (historical meaning preserved); the injected map adds the CONTENT
+    truth of the artifact this session's hosts were cloned from. An
+    explicit baseline_file_sha256 in the snapshot always wins
+    (append-only snapshots stay authoritative)."""
     if verifier_id != "cron_persistence_present" or not pins:
         return args
     if "baseline_file_sha256" in args:
         return args
-    from infra.images.cron_baseline import trusted_hashes_for_template
-    from infra.images.specs import TEMPLATE_ROLES
-    tid = templates.get(host or "")
-    role = TEMPLATE_ROLES.get(tid) if tid is not None else None
-    hashes = trusted_hashes_for_template(pins, role, tid)
+    from infra.images.cron_baseline import trusted_hashes_for_deployment
+    art = artifacts.get(host or "")
+    if not art:
+        return args
+    hashes = trusted_hashes_for_deployment(
+        pins, art.get("role"),
+        artifact_sha256=art.get("artifact_sha256"),
+        template_vmid=art.get("template_vmid"))
     if not hashes:
         return args
     return {**args, "baseline_file_sha256": hashes}
@@ -335,7 +376,7 @@ def check_objective(db: Session, session_id, objective_id: str) -> dict:
     args = with_cron_baseline(dict(obj.get("args") or {}),
                               verifier_id=obj["verifier"],
                               host=(obj.get("args") or {}).get("host"),
-                              templates=cron_template_map(db, session_id),
+                              artifacts=cron_artifact_map(db, session_id),
                               pins=load_cron_pins())
     outcome = v.evaluate(ctx, **args)   # typed: passed/failed/unknown
     ev = Event(session_id=session_id, ts=datetime.now(timezone.utc), actor="system",
@@ -381,7 +422,7 @@ def build_scorecard(db: Session, session_id) -> dict:
     ctx = Context(exec=_resolve(exec_fn, hmap), hosts=hmap)
     # trusted cron content pins: loaded ONCE per scorecard build so every
     # cron check in this snapshot sees the same truth (plan 18)
-    cron_templates = cron_template_map(db, session_id)
+    cron_artifacts = cron_artifact_map(db, session_id)
     cron_pins = load_cron_pins()
 
     items, earned, total = [], 0, 0
@@ -397,7 +438,7 @@ def build_scorecard(db: Session, session_id) -> dict:
                 if k not in ("verifier", "points", "domain", "description")}
         args = with_cron_baseline(args, verifier_id=chk["verifier"],
                                   host=chk.get("host"),
-                                  templates=cron_templates, pins=cron_pins)
+                                  artifacts=cron_artifacts, pins=cron_pins)
         outcome = v.evaluate(ctx, **args)
         awarded = points if outcome.status == "passed" else 0
         earned += awarded

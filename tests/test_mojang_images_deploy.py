@@ -137,16 +137,28 @@ def test_images_ubuntu_verify_web_local(web_local_overlay, tmp_path):
     # the scenarios declare as baseline, and the pin now carries its hash
     assert "e2scrub_all" in pin["files"], sorted(pin["files"])
     pins = {"mojang-web-local": pin}
-    assert cron_baseline.trusted_hashes_for_template(
-        pins, "mojang-web-local", 9011) == pin["files"]
-    # wrong template or wrong role: no trust, verifier stays UNKNOWN
-    assert cron_baseline.trusted_hashes_for_template(
-        pins, "mojang-web-local", 9012) == {}
-    assert cron_baseline.trusted_hashes_for_template(
-        pins, "mojang-web-db", 9011) == {}
-    # digest binding: a rebuilt artifact must not match this pin
-    assert cron_baseline.trusted_hashes(pins, "mojang-web-local",
-                                        "0" * 64) == {}
+    # Exercise the PRODUCTION injection (review finding: testing only the
+    # pure helper proved template-only trust, which the runtime must never
+    # apply).  A deployment records the artifact identity it cloned from
+    # at clone time; scoring injects hashes ONLY for that exact identity.
+    import srplatform.verification_service as vs
+    deployed = {"role": "mojang-web-local", "template_vmid": 9011,
+                "artifact_sha256": digest}
+    base = {"host": "web01", "baseline_files": ["e2scrub_all"]}
+    injected = vs.with_cron_baseline(
+        dict(base), verifier_id="cron_persistence_present", host="web01",
+        artifacts={"web01": deployed}, pins=pins)
+    assert injected["baseline_file_sha256"] == pin["files"]
+
+    def _refuse(**over):
+        art = dict(deployed, **over)
+        out = vs.with_cron_baseline(
+            dict(base), verifier_id="cron_persistence_present",
+            host="web01", artifacts={"web01": art}, pins=pins)
+        assert out == base, over
+    _refuse(artifact_sha256="0" * 64)          # rebuilt artifact
+    _refuse(template_vmid=9012)                # unexpected template
+    _refuse(role="mojang-web-db")              # wrong role
     # round-trip through the pin document validates and preserves
     doc = tmp_path / "cron-baselines.json"
     cron_baseline.dump_pins(doc, pins)
