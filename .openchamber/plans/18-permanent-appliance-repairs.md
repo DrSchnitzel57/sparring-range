@@ -1,10 +1,10 @@
 # 18 — Permanent appliance and recovery repairs
 
 ## Steps
-- [ ] Reproduce baselines and reconcile retained defects.
-- [ ] Repair bootstrap, native/runtime provisioning, identities and trust.
-- [ ] Implement safe latched teardown and audited obligation recovery.
-- [ ] Bind clean cron evidence to images; qualify scoped containment.
+- [x] Reproduce baselines and reconcile retained defects.
+- [x] Repair bootstrap, native/runtime provisioning, identities and trust.
+- [x] Implement safe latched teardown and audited obligation recovery.
+- [x] Bind clean cron evidence to images; qualify scoped containment.
 - [ ] Run acceptance; update findings, tick 18 on its gates and update architecture if changed.
 
 ## Goal and context
