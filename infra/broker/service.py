@@ -3,7 +3,9 @@
 Every externally visible operation follows the same discipline:
 
   1. LATCH CHECK   — while cessation is latched, only stop/status/lease/
-                     inventory operations proceed.
+                     inventory operations AND the ownership-checked,
+                     identity-confirmed destroy (cessation-safe teardown)
+                     proceed; starts, clones and lease renewal are refused.
   2. POLICY CHECK  — node, template, bounded VMID, clone mode, exact NIC,
                      closed config keys, range-network provisioning, tag and
                      name shapes, aggregate capacity.
@@ -459,18 +461,93 @@ class BrokerService:
 
     def destroy_and_wait(self, node: str, vmid: int, force_stop_timeout: int = 60,
                          session_id: str | None = None) -> str:
-        self._require_unlatched("destroy_and_wait")
+        """Destroy a broker-owned VM, confirmed by read-back.
+
+        While cessation is latched, destroy is CESSATION-SAFE and therefore
+        allowed — but only for a POSITIVELY re-identified resource (live
+        practice find 2026-10-23: refusing it left every latched teardown
+        stranded with `lease_released:false`, and the operator's only way
+        out was manual hypervisor surgery, which is exactly the unaccepted
+        path). The rules under latch:
+
+        * the ledger claim must exist and the session must match (the same
+          ownership discipline as the unlatched path);
+        * the backend identity is RE-READ before any effect: confirmed
+          absence completes the destroy; an exact name match authorises it;
+          anything else (foreign name, unreadable, nameless claim) is
+          RETAINED — an obligation records it and the destroy is refused;
+        * confirming the destroy RESOLVES the cessation-class obligations
+          for that VMID (a stopped-or-gone machine cannot still be running)
+          with an audit entry each; foreign/vmid-recycled obligations are
+          NEVER resolved here — only the offline operator tool resolves
+          those, with independent read-back proof.
+
+        Starts, clones and lease renewal stay refused while latched."""
+        latched = self.ledger.get_latch()["latched"]
         self._node(node)
         vmid = int(vmid)
         with self._op_lock:
-            self._active_claim(vmid, session_id)
+            claim = self._active_claim(vmid, session_id)
+            if latched:
+                self._require_positive_identity_under_latch(node, vmid, claim)
             outcome = self.pve.destroy_and_wait(node, vmid,
                                                 force_stop_timeout=force_stop_timeout)
             if outcome in ("destroyed", "already-absent"):
                 self.ledger.upsert_claim(vmid, node=node, state="destroyed")
                 self.ledger.audit("destroy-confirmed", {"vmid": vmid,
-                                                        "outcome": outcome})
+                                                        "outcome": outcome,
+                                                        "latched": latched})
+                if latched:
+                    self._resolve_cessation_obligations(vmid)
             return outcome
+
+    def _require_positive_identity_under_latch(self, node: str, vmid: int,
+                                               claim: dict) -> None:
+        """Refuse the latched destroy unless the resource is proven ours.
+
+        Returns None when the destroy may proceed (name match) or is a
+        no-op (confirmed absence — the backend destroy call will report
+        'already-absent'). Raises after RETAINING the obligation otherwise."""
+        cfg = self.pve.try_lookup_config(node, vmid)
+        if cfg is None:
+            return  # confirmed absent: nothing to harm, claim completes below
+        if "_unavailable" in cfg:
+            raise BrokerUnavailable(
+                f"identity of VMID {vmid} uncertain under cessation "
+                f"({cfg['_unavailable']}) — destroy refused, resource retained")
+        expected = claim.get("name")
+        found = cfg.get("name")
+        if expected and found == expected:
+            return  # positively ours
+        reason = (f"claimed {expected!r}, found {found!r}" if expected
+                  else f"nameless claim, found {found!r}")
+        self.ledger.upsert_claim(vmid, node=node, state="unknown",
+                                 name=expected,
+                                 session_id=claim.get("session_id"),
+                                 generation=claim.get("generation", 1),
+                                 kind=claim.get("kind", "clone"),
+                                 detail={"latched-destroy-refused": reason})
+        self.ledger.add_obligation(
+            "vmid-recycled-no-destroy", vmid,
+            f"cessation-latched destroy refused: {reason}")
+        self.ledger.audit("latched-destroy-refused", {"vmid": vmid, "why": reason})
+        raise BrokerConflict(
+            f"VMID {vmid} identity does not positively match the claim "
+            f"({reason}) — destroy refused under cessation, obligation retained")
+
+    # Obligations that assert a resource may still exist or run. A CONFIRMED
+    # destroy is proof that they can no longer hold; the operator still has
+    # to resolve anything that says the resource is NOT ours.
+    CESSATION_OBLIGATIONS = ("vm-stop-unconfirmed", "boot-marker-uncertain",
+                             "boot-never-finished")
+
+    def _resolve_cessation_obligations(self, vmid: int) -> None:
+        for ob in self.ledger.open_obligations():
+            if ob["vmid"] == vmid and ob["kind"] in self.CESSATION_OBLIGATIONS:
+                self.ledger.resolve_obligation(ob["id"])
+                self.ledger.audit("obligation-resolved-by-destroy",
+                                  {"vmid": vmid, "obligation": ob["id"],
+                                   "kind": ob["kind"]})
 
     def disown(self, node: str, vmid: int, session_id: str | None = None,
                reason: str = "") -> dict:
