@@ -22,7 +22,6 @@ import ipaddress
 import os
 import pathlib
 import subprocess
-import tempfile
 
 import pytest
 
@@ -81,18 +80,35 @@ def test_llm_construction_reads_key_file_and_fails_naming_it(tmp_path,
 # production validation of the credential file                                 #
 # --------------------------------------------------------------------------- #
 
-def _real_key() -> str:
+_REAL_KEY = ""
+
+
+@pytest.fixture(scope="module", autouse=True)
+def real_verifier_key(tmp_path_factory):
+    """Owned lifecycle (review finding): production validation needs a
+    REAL parseable verifier key, but generating one at MODULE IMPORT into
+    an anonymous temp dir left a private key in the system temp folder
+    forever — module import is not a lifecycle. The key now lives in the
+    fixture's own directory and its removal after the module is VERIFIED,
+    not assumed."""
+    global _REAL_KEY
+    import shutil
+
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import ed25519
     key = ed25519.Ed25519PrivateKey.generate()
-    f = pathlib.Path(tempfile.mkdtemp()) / "verifier"
+    d = pathlib.Path(str(tmp_path_factory.mktemp("verifier-key")))
+    f = d / "verifier"
     f.write_bytes(key.private_bytes(
         serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH,
         serialization.NoEncryption()))
-    return str(f)
-
-
-_REAL_KEY = _real_key()
+    f.chmod(0o600)
+    _REAL_KEY = str(f)
+    try:
+        yield f
+    finally:
+        shutil.rmtree(d)
+        assert not d.exists(), "fixture leaked its key directory"
 
 
 def _prod(**over):
