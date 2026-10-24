@@ -32,14 +32,27 @@ def _manifest(tmp_path: pathlib.Path) -> tuple[pathlib.Path, str]:
     # image map to bind our role to the template this scenario clones.
     path = seq.build_manifest(tmp_path / "materials")
     doc = json.loads(pathlib.Path(path).read_text())
-    doc["images"] = {
-        "custom-web-role": {
-            "template_id": 9001, "path": str(img), "sha256": digest,
-            "size_bytes": img.stat().st_size, "disk_gb": 12,
-            "memory_mb": 2048, "vcpus": 2,
-        }}
+    # keep the manifest's required roles (the loader demands all three);
+    # re-bind ONE of them to the template this scenario clones so the
+    # resolver has exactly one honest answer to give.
+    doc["images"]["mojang-web-local"] = {
+        "template_id": 9001, "path": str(img), "sha256": digest,
+        "size_bytes": img.stat().st_size, "disk_gb": 12,
+        "memory_mb": 2048, "vcpus": 2,
+    }
     path.write_text(json.dumps(doc))
     return path, digest
+
+
+def _settings_with(monkeypatch, manifest_path: str):
+    """verification_service.get_settings overridden on a COPY of the real
+    settings — the launch path uses many other fields; only the manifest
+    knob changes."""
+    import srplatform.verification_service as vs
+    from srplatform.settings import get_settings
+    fake = get_settings().model_copy(
+        update={"appliance_manifest_file": manifest_path})
+    monkeypatch.setattr(vs, "get_settings", lambda: fake)
 
 
 def _resources(session_id):
@@ -56,8 +69,7 @@ def test_deploy_records_cron_artifact_identity_from_manifest(
         client, users, fake_broker, tmp_path, monkeypatch):
     import srplatform.verification_service as vs
     manifest, digest = _manifest(tmp_path)
-    monkeypatch.setattr(vs, "get_settings", lambda: type(
-        "S", (), {"appliance_manifest_file": str(manifest)}))
+    _settings_with(monkeypatch, str(manifest))
 
     sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
                       headers=users["member"]).json()["session_id"]
@@ -65,17 +77,16 @@ def test_deploy_records_cron_artifact_identity_from_manifest(
 
     web = next(r for r in _resources(sid) if r.get("host") == "web01")
     assert web["cron_artifact"] == {
-        "role": "custom-web-role", "template_vmid": 9001,
+        "role": "mojang-web-local", "template_vmid": 9001,
         "artifact_sha256": digest}
     # the scoring-side dataflow reads exactly this back for its host
     from srplatform.db.session import db as dbf
     with dbf() as s:
         amap = vs.cron_artifact_map(s, sid)
     assert amap["web01"]["artifact_sha256"] == digest
-    # unknown templates in the scenario (db01 = 9004) record NOTHING
-    # rather than guessing an identity
-    db_res = next(r for r in _resources(sid) if r.get("host") == "db01")
-    assert "cron_artifact" not in db_res
+    # a template the manifest does not name resolves to NOTHING rather
+    # than a guessed identity
+    assert vs.resolve_deployed_cron_artifact(9099) is None
 
 
 def test_deploy_without_manifest_records_nothing(
@@ -84,8 +95,7 @@ def test_deploy_without_manifest_records_nothing(
     map stays empty, and cron checks therefore stay UNKNOWN — deploy
     must NOT invent an identity from pins or scenario YAML."""
     import srplatform.verification_service as vs
-    monkeypatch.setattr(vs, "get_settings", lambda: type(
-        "S", (), {"appliance_manifest_file": ""}))
+    _settings_with(monkeypatch, "")
     sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
                       headers=users["member"]).json()["session_id"]
     launch_and_wait(client, users["member"], sid)
@@ -98,11 +108,9 @@ def test_deploy_without_manifest_records_nothing(
 
 def test_broken_manifest_records_nothing_never_crashes_deploy(
         client, users, fake_broker, tmp_path, monkeypatch):
-    import srplatform.verification_service as vs
     bad = tmp_path / "bad.json"
     bad.write_text("{not json")
-    monkeypatch.setattr(vs, "get_settings", lambda: type(
-        "S", (), {"appliance_manifest_file": str(bad)}))
+    _settings_with(monkeypatch, str(bad))
     sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
                       headers=users["member"]).json()["session_id"]
     launch_and_wait(client, users["member"], sid)   # deploy still succeeds
