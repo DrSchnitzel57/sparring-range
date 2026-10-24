@@ -335,7 +335,12 @@ python3 deploy/appliance.py firstboot --manifest /etc/sparring-range/appliance-m
 ```
 
 Every check is named and reported; the command exits non-zero if any of them
-fails. It is read-only and prints no secret.
+fails. It is read-only and prints no secret. In the staged first boot the
+manual-window checks are reported `pending` and the command exits **3** with
+the remediation hint — that is "not your window yet", not a failure; exit
+**1** means something is genuinely broken. The JSON report never claims
+`ok` while anything is pending, and names genuine breakage separately in
+`failed`.
 
 ### 6. Prove it, and keep the evidence
 

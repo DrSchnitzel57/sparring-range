@@ -1248,7 +1248,14 @@ def firstboot_report(m: ApplianceManifest, layout: Layout) -> dict:
     downstream of those manual steps is reported PENDING — visibly, with the
     exact remediation — instead of a wall of FAILs that hides the two things
     that are genuinely broken.  Once the manual steps are done, the same
-    checks become real pass/fail again; ``pending`` never folds into ``ok``.
+    checks become real pass/fail again.  Machine-readable semantics
+    (review finding: the CLI's exit 3 was honest, the JSON was not): a
+    pending check reports ``ok: false`` WITH ``pending: true`` — pending is
+    never folded into ok.  The overall ``ok`` is true ONLY when every check
+    genuinely passed; ``failed`` names the genuine failures separately from
+    ``pending``, so a consumer reading only ``ok`` can never mistake a
+    half-installed appliance for a healthy one, and one reading ``failed``
+    can tell "broken" from "not my window yet".
     """
     import socket as _socket
     import urllib.error
@@ -1261,7 +1268,7 @@ def firstboot_report(m: ApplianceManifest, layout: Layout) -> dict:
     def add(name: str, ok: bool, detail: str = "",
             pending_if_manual: bool = False) -> None:
         pending = bool(pending_if_manual and not bridge_ready and not ok)
-        checks.append({"check": name, "ok": bool(ok) or pending,
+        checks.append({"check": name, "ok": bool(ok),
                        "pending": pending, "detail": detail[:200]})
 
     add("manifest", True, m.installation_id)
@@ -1333,6 +1340,8 @@ def firstboot_report(m: ApplianceManifest, layout: Layout) -> dict:
         (layout.etc / "secrets" / "worker-supervisor.token").is_file(),
         str(layout.etc / "secrets" / "worker-supervisor.token"))
     return {"ok": all(c["ok"] for c in checks),
+            "failed": [c["check"] for c in checks
+                       if not c["ok"] and not c.get("pending")],
             "pending": [c["check"] for c in checks if c.get("pending")],
             "checks": checks,
             "installation_id": m.installation_id}
@@ -1655,7 +1664,7 @@ def main(argv: list[str] | None = None) -> int:
                             else ("[ok]   " if c["ok"] else "[FAIL] "))
                     print(mark + c["check"]
                           + (f" - {c['detail']}" if c["detail"] else ""))
-            if not report["ok"]:
+            if report["failed"]:
                 return 1
             if report["pending"]:
                 print("firstboot PENDING: the operator manual steps "
@@ -1663,6 +1672,7 @@ def main(argv: list[str] | None = None) -> int:
                       "complete; re-run firstboot after finishing them",
                       file=sys.stderr)
                 return 3
+            return 0
         elif args.cmd == "verify":
             lay = _layout(args)
             out = verify_install(sandbox_manifest(m, lay.root), lay)

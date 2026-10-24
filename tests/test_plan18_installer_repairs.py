@@ -281,12 +281,22 @@ def _firstboot_exit(monkeypatch, report):
 
 
 def test_firstboot_exit_codes_distinguish_pending_from_broken(monkeypatch):
-    checks = [{"check": "x", "ok": True, "pending": True, "detail": ""}]
-    assert _firstboot_exit(monkeypatch, {"ok": True, "pending": ["x"],
+    """CLI contract, tested separately from the report's JSON semantics:
+    pending manual steps are exit 3 (with a remediation line), genuine
+    failures are exit 1, and only a fully real pass is exit 0."""
+    checks = [{"check": "x", "ok": False, "pending": True, "detail": ""}]
+    assert _firstboot_exit(monkeypatch, {"ok": False, "failed": [],
+                                         "pending": ["x"],
                                          "checks": checks}) == 3
-    assert _firstboot_exit(monkeypatch, {"ok": True, "pending": [],
+    assert _firstboot_exit(monkeypatch, {"ok": True, "failed": [],
+                                         "pending": [],
                                          "checks": []}) == 0
-    assert _firstboot_exit(monkeypatch, {"ok": False, "pending": [],
+    assert _firstboot_exit(monkeypatch, {"ok": False, "failed": ["broker"],
+                                         "pending": [],
+                                         "checks": []}) == 1
+    # a genuine failure outranks pending work
+    assert _firstboot_exit(monkeypatch, {"ok": False, "failed": ["images"],
+                                         "pending": ["x"],
                                          "checks": []}) == 1
 
 
@@ -328,12 +338,30 @@ def test_firstboot_report_marks_manual_window_checks_pending(tmp_path,
     # no bridge under /sys/class/net in the test environment: the manual
     # window has not run, so every dependent check is pending.
     report = ap.firstboot_report(sm, lay)
-    assert report["ok"] is True, report
     pending = set(report["pending"])
     assert {"api /healthz", "bastion listener", "isolated bridge"} <= pending
+    # Review finding (machine-readable honesty): while the operator's
+    # manual window is incomplete the report may NOT claim ok — the CLI
+    # already exited 3, the JSON must be just as truthful.
+    assert report["ok"] is False, report
+    assert report["failed"] == [], report
+    for c in report["checks"]:
+        if c["check"] in pending:
+            assert c["pending"] and c["ok"] is False, c
+        else:
+            assert c["ok"] is True, c
     # the image/TLS/token checks are REAL checks and passed for real
     names = {c["check"] for c in report["checks"]}
     assert "image attacker" in names and "TLS material" in names
     assert "image attacker" not in pending and not any(
         c["check"] == "image attacker" and not c["ok"]
         for c in report["checks"])
+    # a genuine breakage stays visible as `failed` even while other
+    # checks are pending: pending and failed never mix into one bucket
+    victim = next(pathlib.Path(i.path) for r, i in sm.images.items()
+                  if r == "attacker")
+    victim.unlink()
+    report2 = ap.firstboot_report(sm, lay)
+    assert report2["failed"] == ["image attacker"], report2["failed"]
+    assert report2["ok"] is False
+    assert "isolated bridge" in report2["pending"], "still pending separately"
