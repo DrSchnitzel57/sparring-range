@@ -134,7 +134,9 @@ def test_browser_model_administration(browser, web_app, ports, migrated_db,
         assert "retired" in rows and "active" in rows
 
         # ---- probe = queue member; survives reload ---------------------------
-        srv.script([text_response("pong")], hang_s=2.0)
+        # a LONG hang: the cancel must arrive while the call is genuinely
+        # live (a fast answer would race the GUI past the obligation)
+        srv.script([text_response("pong")], hang_s=15.0)
         pw("click", 'tr:has-text("ui-profile") button:has-text("probe")')
         _body_has(pw, "probe queued")
         # cancel the live job from the GUI — the button exists exactly while
@@ -154,7 +156,7 @@ def test_browser_model_administration(browser, web_app, ports, migrated_db,
                                "not durable from the operator's view"
         # wait for the cancellation/cessation to resolve, then confirm it is
         # still visible after ANOTHER reload
-        deadline = time.time() + 30
+        deadline = time.time() + 45
         while time.time() < deadline:
             pw("reload")
             body = pw("--raw", "eval", "document.body.innerText").stdout

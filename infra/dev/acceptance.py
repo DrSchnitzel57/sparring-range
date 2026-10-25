@@ -1005,12 +1005,12 @@ def check_browser() -> None:
     try:
         env = {"SR_PG_ADMIN_URL": fx.admin_url(),
                "SR_REQUIRE_BROWSER": "1", "SR_REQUIRE_DB": "1"}
-        r, counts = pytest_run(["tests/test_stage5_browser_e2e.py", "-m", "browser"],
-                               env=env, timeout=3600)
+        r, counts = pytest_run(["-m", "browser"], env=env, timeout=3600)
+        require_selection(counts, "browser")
         if r.returncode != 0:
-            fail("isolated real-browser workflow/replay",
+            fail("isolated real-browser workflow/replay + model-admin GUI",
                  f"exit {r.returncode}, counts {counts}:\n{r.stdout[-6000:]}")
-        ok("isolated real-browser workflow + replay pass",
+        ok("isolated real-browser workflows pass (required mode)",
            f"{counts.get('passed', 0)} passed, {counts.get('skipped', 0)} skipped")
     finally:
         problems = fx.cleanup()

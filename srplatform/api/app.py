@@ -2496,6 +2496,11 @@ def _startup():
     healthy.
     """
     from srplatform.settings import get_settings as _gs0
+    # Origins are read at STARTUP — and a process may serve several
+    # lifespans (uvicorn reload, or test harnesses): force the middleware
+    # stack to rebuild so THIS lifespan's configured origins apply, never
+    # the ones frozen by the first lifespan of the process.
+    app.middleware_stack = None
     ingest_only = _gs0().api_ingest_only
     if ingest_only:
         return
