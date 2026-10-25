@@ -1,0 +1,193 @@
+"""Scripted OpenAI-compatible fake provider (plan 19).
+
+The local protocol server for conversational-agent acceptance: it is the
+SAME fixture the agent gate uses, so fast regressions and required-mode
+gates exercise the real HTTP wire, the real Authorization header policy
+and the real pydantic-AI request encoding — never a monkeypatched
+stand-in for the model layer. It is NOT a model-competence claim: every
+response is scripted by the test.
+
+Capabilities: scripted responses (text / native tool calls / parallel
+calls / forged names), truncation (finish_reason=length), empty
+content, SSE streaming, per-request auth enforcement, injected hangs
+(bounded sleeps that make the client time out) and CONCURRENT-REQUEST
+tracking so a test can prove the single admission slot with the
+provider itself, not just in-process counters.
+"""
+from __future__ import annotations
+
+import json
+import threading
+import time
+import http.server
+import socketserver
+from dataclasses import dataclass, field
+
+
+def tool_call(call_id: str, name: str, arguments: dict) -> dict:
+    return {"id": call_id, "type": "function",
+            "function": {"name": name, "arguments": json.dumps(arguments)}}
+
+
+def text_response(text: str, *, finish: str = "stop",
+                  usage: dict | None = None) -> dict:
+    return {"index": 0, "message": {"role": "assistant", "content": text},
+            "finish_reason": finish, "usage": usage}
+
+
+def tool_response(calls: list[dict], *, finish: str = "tool_calls",
+                  usage: dict | None = None, content: str | None = None) -> dict:
+    return {"index": 0, "message": {"role": "assistant", "content": content,
+                                    "tool_calls": calls},
+            "finish_reason": finish, "usage": usage}
+
+
+@dataclass
+class _State:
+    script: list = field(default_factory=list)
+    auth: str | None = None          # required Authorization value
+    hang_s: float = 0.0              # sleep BEFORE responding (client timeout)
+    requests: list = field(default_factory=list)
+    live: int = 0
+    max_live: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+class FakeModelServer:
+    def __init__(self):
+        outer = self
+        state = _State()
+        self.state = state
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                n = int(self.headers.get("Content-Length") or 0)
+                try:
+                    body = json.loads(self.rfile.read(n))
+                except ValueError:
+                    body = {}
+                with state.lock:
+                    state.live += 1
+                    state.max_live = max(state.max_live, state.live)
+                    state.requests.append({
+                        "path": self.path, "body": body,
+                        "auth": self.headers.get("Authorization"),
+                        "ts": time.monotonic()})
+                try:
+                    self._respond(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    # the hang script makes clients abandon mid-response;
+                    # a dead socket is the test's doing, not a defect
+                    pass
+                finally:
+                    with state.lock:
+                        state.live -= 1
+
+            def _respond(self, body):
+                if state.auth is not None and \
+                        self.headers.get("Authorization") != state.auth:
+                    payload = json.dumps({"error": {"message":
+                        "invalid api key"}}).encode()
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                if state.script:
+                    item = state.script[0]
+                    if len(state.script) > 1:
+                        state.script.pop(0)
+                else:
+                    item = None
+                if item is None:
+                    outer_err = json.dumps({"error": {"message":
+                        "fake model script exhausted"}}).encode()
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(outer_err)))
+                    self.end_headers()
+                    self.wfile.write(outer_err)
+                    return
+                if state.hang_s:
+                    time.sleep(state.hang_s)
+                status = item.get("_status", 200)
+                if item.get("_stream"):
+                    self._sse(item["_stream"], body)
+                    return
+                choice = dict(item.get("_choice", item))
+                # on the real wire, usage is TOP-LEVEL on the completion,
+                # not inside the choice — script authors pass it per-item
+                # and it is lifted here so the SDK sees real shapes
+                usage = choice.pop("usage", None)
+                envelope = {
+                    "id": "chatcmpl-fake", "object": "chat.completion",
+                    "created": 0, "model": body.get("model", "fake"),
+                    "choices": [choice]}
+                if usage:
+                    envelope["usage"] = usage
+                payload = json.dumps(envelope).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def _sse(self, chunks, body):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                for chunk in chunks:
+                    envelope = {"id": "chatcmpl-stream",
+                                "object": "chat.completion.chunk",
+                                "created": 0,
+                                "model": body.get("model", "fake"),
+                                "choices": [chunk]}
+                    self.wfile.write(
+                        b"data: " + json.dumps(envelope).encode() + b"\n\n")
+                    self.wfile.flush()
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
+            def log_message(self, *a):  # silence
+                pass
+
+        self._server = socketserver.ThreadingTCPServer(("127.0.0.1", 0),
+                                                        Handler)
+        self._server.daemon_threads = True
+        self._thread = threading.Thread(target=self._server.serve_forever,
+                                        daemon=True)
+
+    # -- lifecycle ----------------------------------------------------------
+    def start(self) -> "FakeModelServer":
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self._server.server_address[1]}/v1"
+
+    # -- scripting -----------------------------------------------------------
+    def script(self, items: list, *, auth: str | None = None,
+               hang_s: float = 0.0) -> None:
+        self.state.script = list(items)
+        self.state.auth = auth
+        self.state.hang_s = hang_s
+
+    @property
+    def requests(self) -> list:
+        with self.state.lock:
+            return list(self.state.requests)
+
+    @property
+    def max_concurrent(self) -> int:
+        with self.state.lock:
+            return self.state.max_live
+
+    def request_bodies(self) -> list:
+        return [r["body"] for r in self.requests]
