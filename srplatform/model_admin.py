@@ -201,7 +201,13 @@ def ensure_bootstrap_profile(db: Session) -> bool:
                          note="bootstrapped from environment configuration",
                          **base)
     db.add_all([red, coach])
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError:
+        # first start of TWO processes at once: the unique indexes pick the
+        # winner; the loser contributes nothing and the database is correct
+        db.rollback()
+        return False
     db.add_all([
         ModelRoleOverride(role="attacker", profile_name=red.name),
         ModelRoleOverride(role="coach", profile_name=coach.name),

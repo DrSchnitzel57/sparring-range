@@ -2502,6 +2502,18 @@ def _startup():
     issues: list[str] = []
     app.state.startup_issues = issues
     app.state.controller = False
+    # plan 19 foundation: profile bootstrap is IDEMPOTENT and race-safe (the
+    # one-ACTIVE / (name,version) unique indexes decide any concurrent winner),
+    # so it runs on EVERY process start: a process that lost the controller
+    # lock must still serve model traffic. Only reconciling crashed-live
+    # jobs is controller duty (below) — it must never stamp another live
+    # process's in-flight calls.
+    try:
+        from srplatform import model_admin as _ma
+        with db() as _s:
+            _ma.ensure_bootstrap_profile(_s)
+    except Exception as exc:  # noqa: BLE001 - reported, never hidden
+        issues.append(f"model admin bootstrap: {type(exc).__name__}: {exc}")
     lock = ControllerLock()
     app.state.controller_lock = lock
     try:
@@ -2523,21 +2535,18 @@ def _startup():
     except Exception as exc:  # noqa: BLE001 - reported, never hidden
         issues.append(f"reconcile on startup: {type(exc).__name__}: {exc}")
     try:
-        # plan 19: model administration foundation — mirror the environment
-        # into a bootstrap profile ONCE, expose crashed-live model calls as
-        # cessation_unknown obligations, and run this process's scheduler
-        # for the durable one-slot queue.
-        from srplatform import model_admin as _ma
+        # plan 19: expose crashed-live model calls as cessation_unknown
+        # obligations (controller-only: never stamp another live process's
+        # in-flight calls). Profile bootstrap already ran above, on every
+        # start. The scheduler starts LAZILY on this process's first enqueue
+        # (see model_jobs.enqueue): a process that never queues model work
+        # never polls the queue, and workers — which only POST — never run.
         from srplatform import model_jobs as _mj
         with db() as _s:
-            _ma.ensure_bootstrap_profile(_s)
             _unknown = _mj.reconcile_startup(_s)
         if _unknown:
             issues.append(f"model jobs: {_unknown} live call(s) left "
                           "cessation_unknown after restart")
-        # the scheduler starts LAZILY on this process's first enqueue (see
-        # model_jobs.enqueue): a process that never queues model work never
-        # polls the queue, and workers — which only POST — never run one.
     except Exception as exc:  # noqa: BLE001 - reported, never hidden
         issues.append(f"model admin startup: {type(exc).__name__}: {exc}")
     try:
