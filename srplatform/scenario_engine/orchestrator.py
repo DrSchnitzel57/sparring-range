@@ -1056,22 +1056,28 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
                     _enroll_host_telemetry(db, dep, res, resources, session_id,
                                            host["name"], res.get("ip"), s, enrollments)
                 continue  # already owned & completed — resume skips the clone
-            # CRON ARTIFACT IDENTITY (plan 18 review): freeze WHICH artifact
-            # bytes this host is cloned from — role + image SHA-256 from the
-            # installer's own manifest — into the deployment resource at
-            # clone time. Cron-pin trust later binds to this immutable fact,
-            # so swapping the pin file (or rebuilding the template) after
-            # the session started can only revoke trust, never forge a
-            # pass. No manifest configured => nothing recorded => the cron
+            # CRON ARTIFACT IDENTITY (plan 18 reviews): freeze WHICH
+            # artifact bytes this host is cloned from — the identity the
+            # BROKER (the clone authority) confirms for this template,
+            # from the manifest it itself verified the image against —
+            # plus the clean-baseline FROZEN from the pins binding that
+            # identity at this moment, into the deployment resource
+            # before any scoring uses either. Cron-pin trust later reads
+            # only this frozen evidence: swapping the pin file or the
+            # on-disk manifest afterwards can only revoke trust (identity
+            # stops binding), never redefine what was clean for a running
+            # session, and never record bytes the broker did not deploy.
+            # No broker-side identity => nothing recorded => the cron
             # check honestly stays UNKNOWN.
             from srplatform import verification_service as _vs
 
             def _record_artifact(row):
                 if row.get("cron_artifact"):
                     return False
-                art = _vs.resolve_deployed_cron_artifact(
-                    int(host["template_vmid"]))
-                if art is None:
+                art = _vs.recorded_cron_artifact(
+                    broker.artifact_for_template(int(host["template_vmid"])),
+                    _vs.load_cron_pins())
+                if not art:
                     return False
                 row["cron_artifact"] = art
                 return True

@@ -267,6 +267,28 @@ class BrokerService:
         self._node(node)
         return self.pve.vm_status(node, int(vmid))
 
+    def artifact_for_template(self, template_vmid: int) -> dict | None:
+        """The clone authority's confirmed artifact identity for
+        TEMPLATE_VMID — role, template and the image SHA-256 the broker's
+        OWN loaded manifest names and verifies the clone image against
+        (review finding: a config re-read by the caller is not proof of
+        deployed bytes). Adapters with no artifact manifests (legacy PVE)
+        answer None; so does an unknown template. None is never guessed
+        around: the caller leaves cron checks UNKNOWN."""
+        fn = getattr(self.pve, "artifact_for_template", None)
+        if fn is None:
+            return None
+        ident = fn(int(template_vmid))
+        if not isinstance(ident, dict):
+            return None
+        from infra.appliance.manifest import validate_identity
+        if not validate_identity(ident,
+                                 expect_template=int(template_vmid)):
+            return None
+        return {"role": ident["role"],
+                "template_vmid": int(ident["template_vmid"]),
+                "artifact_sha256": ident["artifact_sha256"]}
+
     def inventory(self) -> dict:
         return {"claims": self.ledger.all_claims(),
                 "obligations": self.ledger.open_obligations(),

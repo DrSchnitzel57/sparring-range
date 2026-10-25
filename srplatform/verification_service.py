@@ -278,12 +278,15 @@ def readiness_checks(db: Session, session_id) -> dict:
 
 def cron_artifact_map(db: Session, session_id) -> dict[str, dict]:
     """host -> the artifact identity recorded AT DEPLOY TIME into the
-    immutable deployment resource (role + template VMID + artifact
-    digest). From the same positively-owned active rows host_map_for
-    trusts — never from YAML, never from a stale generation, and never
-    re-derived from the CURRENT pin file (which could change after the
-    session started). Resources deployed before the identity existed
-    simply have no entry: their cron checks stay UNKNOWN."""
+    immutable deployment resource: role + template VMID + artifact
+    digest CONFIRMED BY THE BROKER for that clone, plus the clean-baseline
+    FROZEN from the pins binding that identity before first use. From the
+    same positively-owned active rows host_map_for trusts — never from
+    YAML, never from a stale generation, and never re-derived from the
+    CURRENT pin file (which may change after the session started; that
+    was the review finding). Resources deployed before the identity or
+    the frozen baseline existed simply carry no baseline: their cron
+    checks stay UNKNOWN."""
     dep = active_deployment(db, session_id)
     if not dep:
         return {}
@@ -297,28 +300,34 @@ def cron_artifact_map(db: Session, session_id) -> dict[str, dict]:
     return out
 
 
-def resolve_deployed_cron_artifact(template_vmid):
-    """Resolve the artifact identity THIS appliance deploys TEMPLATE_VMID
-    from, as recorded by the installer's own manifest: which role image,
-    and which SHA-256 the installed template was built from. Deploy calls
-    this at clone time and freezes the answer into the deployment
-    resource; cron-pin trust later binds to that frozen fact. Unset
-    manifest path, unreadable/invalid manifest, or an unknown template
-    yields None — cron checks then honestly stay UNKNOWN."""
-    s = get_settings()
-    if not s.appliance_manifest_file:
-        return None
-    try:
-        from infra.appliance.manifest import ApplianceManifest
-        m = ApplianceManifest.load(s.appliance_manifest_file)
-    except Exception:  # noqa: BLE001 — a missing/invalid manifest is UNKNOWN
-        return None
-    for spec in m.images.values():
-        if spec.template_id == int(template_vmid):
-            return {"role": spec.role,
-                    "template_vmid": int(template_vmid),
-                    "artifact_sha256": spec.sha256}
-    return None
+def recorded_cron_artifact(identity, pins: dict) -> dict:
+    """Normalize the identity the BROKER confirmed for a clone and freeze
+    the clean baseline into it (review findings 1+2: the clone authority
+    and the immutable freeze are the only legitimate sources).
+
+    ``identity`` comes from the typed broker boundary — the role, template
+    and image SHA-256 of the manifest the broker ACTUALLY loaded and
+    verified the clone image against; a re-read of the on-disk manifest
+    here would record bytes the broker may never deploy. Missing or
+    malformed identity returns {} — cron checks honestly stay UNKNOWN.
+    The baseline is frozen from the pins binding that identity AT THIS
+    MOMENT; scoring later never re-reads pin content, and a pin whose
+    identity drifts can only revoke."""
+    if not isinstance(identity, dict):
+        return {}
+    from infra.appliance.manifest import validate_identity
+    if not validate_identity(identity):
+        return {}
+    art = {"role": identity["role"],
+           "template_vmid": int(identity["template_vmid"]),
+           "artifact_sha256": identity["artifact_sha256"]}
+    from infra.images import cron_baseline
+    baseline = cron_baseline.freeze_baseline(
+        pins, art["role"], artifact_sha256=art["artifact_sha256"],
+        template_vmid=art["template_vmid"])
+    if baseline:
+        art["baseline"] = baseline
+    return art
 
 
 def load_cron_pins() -> dict:
@@ -334,31 +343,38 @@ def load_cron_pins() -> dict:
 def with_cron_baseline(args: dict, *, verifier_id: str, host: str | None,
                        artifacts: dict[str, dict],
                        pins: dict) -> dict:
-    """Inject the pinned clean-cron hashes into a cron check — and ONLY
-    while the pin binds to the artifact THIS deployment actually runs on:
-    the role, the template ID AND the artifact digest recorded at clone
-    time into the immutable deployment resource must all match the pin
-    (review finding: template identity survives rebuilds, so template-
-    only trust would honour hashes for bytes that were never deployed).
+    """Inject the pinned clean-cron hashes into a cron check — from the
+    baseline FROZEN into the immutable deployment resource at clone time
+    (second review, finding 1: the pin file's CURRENT content hashes must
+    never decide what was clean for an already-running session; an
+    in-place edit of pins[role]["files"] under an unchanged digest would
+    otherwise turn a persisted FAILED into a PASSED on rescore).
+
+    Conditions, all fail-closed to UNKNOWN (never a pass, never a guess):
+    the session's resource must carry the broker-confirmed artifact
+    identity AND a frozen baseline whose integrity reference verifies;
+    and the CURRENT pins must still bind that identity — an identity
+    drift (rebuild, template move, pin removed) REVOKEs trust, while a
+    pin edited in place changes nothing for existing sessions.
     The scenario snapshot keeps declaring its filename baseline
-    (historical meaning preserved); the injected map adds the CONTENT
-    truth of the artifact this session's hosts were cloned from. An
-    explicit baseline_file_sha256 in the snapshot always wins
-    (append-only snapshots stay authoritative)."""
+    (historical meaning preserved); an explicit baseline_file_sha256 in
+    the snapshot always wins (append-only snapshots stay authoritative)."""
     if verifier_id != "cron_persistence_present" or not pins:
         return args
     if "baseline_file_sha256" in args:
         return args
-    from infra.images.cron_baseline import trusted_hashes_for_deployment
     art = artifacts.get(host or "")
     if not art:
         return args
-    hashes = trusted_hashes_for_deployment(
-        pins, art.get("role"),
-        artifact_sha256=art.get("artifact_sha256"),
-        template_vmid=art.get("template_vmid"))
+    from infra.images import cron_baseline
+    if not cron_baseline.artifact_binding_ok(
+            pins, art.get("role"),
+            artifact_sha256=art.get("artifact_sha256"),
+            template_vmid=art.get("template_vmid")):
+        return args                                # revoked → UNKNOWN
+    hashes = cron_baseline.frozen_hashes(art.get("baseline") or {})
     if not hashes:
-        return args
+        return args                                # absent/corrupt → UNKNOWN
     return {**args, "baseline_file_sha256": hashes}
 
 

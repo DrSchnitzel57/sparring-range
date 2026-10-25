@@ -106,8 +106,12 @@ def _validate_pin(role: str, pin: dict) -> None:
 
     if not isinstance(pin, dict):
         bad("must be an object")
-    if pin.get("schema") != SCHEMA:
-        bad(f"unsupported schema {pin.get('schema')!r}")
+    # explicit integer schema: Python equality would otherwise accept
+    # ``true`` and ``1.0`` as version 1 (review finding)
+    schema = pin.get("schema")
+    if isinstance(schema, bool) or not isinstance(schema, int) \
+            or schema != SCHEMA:
+        bad(f"unsupported schema {schema!r}")
     # TYPE checks before any regex: a hostile or truncated pin must
     # DEGRADE TO UNKNOWN through ValueError, never crash the loader with a
     # TypeError the callers do not expect (review finding).
@@ -159,7 +163,10 @@ def load_pins(path: pathlib.Path) -> dict[str, dict]:
         raw = json.loads(pathlib.Path(path).read_text())
     except (OSError, ValueError):
         return {}
-    if not isinstance(raw, dict) or raw.get("schema") != SCHEMA:
+    if not isinstance(raw, dict):
+        return {}
+    top = raw.get("schema")
+    if isinstance(top, bool) or not isinstance(top, int) or top != SCHEMA:
         return {}
     pins = raw.get("pins")
     if not isinstance(pins, dict):
@@ -231,6 +238,94 @@ def trusted_hashes_for_deployment(pins: dict[str, dict], role: str | None, *,
             or not pin["artifact_version"]:
         return {}
     return dict(pin["files"])
+
+
+# --------------------------------------------------------------------------- #
+# FROZEN baselines (second review, finding 1)                                    #
+#                                                                               #
+# ``trusted_hashes_for_deployment`` freezes the ARTIFACT identity but still      #
+# reads the pin's FILE HASHES from the current file at scoring time: editing     #
+# pins[role]["files"] in place (role/template/digest untouched) rewrote what     #
+# "clean" meant for a session ALREADY RUNNING and re-scores its stored bytes.   #
+# A root-controlled mutable file is not a session snapshot.  The accepted        #
+# baseline must therefore be frozen INTO the immutable per-deployment evidence   #
+# before it is ever used, and scoring may only ever read THAT version.  A        #
+# post-launch pin replacement can then only REVOKE the artifact (identity        #
+# stops binding -> UNKNOWN); it can never adopt new hashes for that session.     #
+# --------------------------------------------------------------------------- #
+
+
+def artifact_binding_ok(pins: dict[str, dict], role: str | None, *,
+                        artifact_sha256: str | None,
+                        template_vmid: int | None) -> bool:
+    """Whether the CURRENT pins still positively bind the deployment's
+    frozen artifact identity (role + template + digest + version).  This
+    is the REVOCATION channel only: it never returns hashes.  A pin edited
+    in place keeps binding (which is exactly why hashes must be frozen);
+    a pin whose identity drifts (rebuilt digest, moved template) revokes
+    trust for the session."""
+    if not pins or not role or template_vmid is None \
+            or not artifact_sha256:
+        return False
+    pin = pins.get(role)
+    if pin is None:
+        return False
+    if pin.get("template_id") != int(template_vmid):
+        return False
+    if pin.get("artifact_sha256") != str(artifact_sha256).lower():
+        return False
+    return bool(isinstance(pin.get("artifact_version"), str)
+                and pin["artifact_version"])
+
+
+def baseline_digest(files: dict, root_crontab_sha256: str | None) -> str:
+    """Integrity reference of one frozen baseline (canonical JSON)."""
+    blob = json.dumps({"files": dict(files),
+                       "root_crontab_sha256": root_crontab_sha256},
+                      sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(blob).hexdigest()
+
+
+def freeze_baseline(pins: dict[str, dict], role: str | None, *,
+                    artifact_sha256: str | None,
+                    template_vmid: int | None) -> dict:
+    """Freeze the CLEAN baseline this artifact's pin currently vouches for
+    — called at CLONE/DEPLOY time, BEFORE any scoring uses it.  Returns
+    {} when no pin binds this exact identity (the session then stays
+    honestly UNKNOWN forever; a pin appearing later is a NEW deployment's
+    business, never this session's)."""
+    if not artifact_binding_ok(pins, role,
+                               artifact_sha256=artifact_sha256,
+                               template_vmid=template_vmid):
+        return {}
+    pin = pins[role]
+    files = dict(pin["files"])
+    tab = pin.get("root_crontab_sha256")
+    return {"files": files, "root_crontab_sha256": tab,
+            "artifact_version": pin["artifact_version"],
+            "baseline_sha256": baseline_digest(files, tab)}
+
+
+def frozen_hashes(baseline: dict) -> dict[str, str]:
+    """The hashes to inject for a session — from its FROZEN baseline only.
+    A missing or corrupt (digest-mismatched) baseline yields {} — the cron
+    check stays UNKNOWN; frozen evidence is never partially trusted."""
+    if not isinstance(baseline, dict) or not baseline:
+        return {}
+    files = baseline.get("files")
+    if not isinstance(files, dict) or not files:
+        return {}
+    tab = baseline.get("root_crontab_sha256")
+    if tab is not None and (not isinstance(tab, str)
+                            or not _HEX.fullmatch(tab)):
+        return {}
+    if baseline.get("baseline_sha256") != baseline_digest(files, tab):
+        return {}
+    for name, sha in files.items():
+        if not isinstance(name, str) or not isinstance(sha, str) \
+                or not _NAME.fullmatch(name) or not _HEX.fullmatch(sha):
+            return {}
+    return dict(files)
 
 
 def main(argv: list[str] | None = None) -> int:

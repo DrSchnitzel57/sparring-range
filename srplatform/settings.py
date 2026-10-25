@@ -155,13 +155,12 @@ class Settings(BaseSettings):
     # absent/stale/corrupt pins leave the cron check UNKNOWN. Never
     # generated from a running guest.
     cron_baseline_file: str = ""
-    # The installer's appliance manifest (path, never a secret). Deploy
-    # records the artifact identity THIS installation runs each template
-    # from (role + image digest) into the immutable deployment resource,
-    # so cron-pin trust binds to the bytes actually deployed — not to a
-    # template number that survives rebuilds. Unset => no recording =>
-    # cron checks stay UNKNOWN (fail-safe, never a guess).
-    appliance_manifest_file: str = ""
+    # NOTE: there is deliberately NO appliance-manifest setting here. The
+    # deployed-artifact identity comes from the typed broker boundary
+    # (BrokerService.artifact_for_template — the clone authority's own
+    # loaded manifest); an API-side path to the operator manifest was the
+    # review finding: it was never rendered into the API environment and
+    # a re-read is not proof of deployed bytes.
     # The address MEMBERS actually reach the bastion on (plan 18): the
     # appliance's LAN address. The range-side bastion_address is a planning
     # address that may name no reachable interface from a member's laptop,
