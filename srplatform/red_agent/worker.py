@@ -48,12 +48,30 @@ def main() -> int:
     # gateway orders it against interactive hints/AARs across processes. The
     # worker holds NO model endpoint credential at all.
     class ApiModel:
+        """The worker's ENTIRE model surface: scoped internal HTTP calls.
+        No endpoint URL, no credential — the API queues each call through
+        the durable one-slot job store against the session's PINNED profile
+        version (plan 19). complete() serves compression summaries
+        (summarizer pin); turn() is one step of the durable structured
+        conversation (attacker pin)."""
+
         def complete(self, system, user):
             r = httpx.post(f"{api}/internal/model/complete",
-                           json={"name": "red-turn", "system": system, "user": user},
+                           json={"name": "red-turn", "system": system,
+                                 "user": user, "role": "summarizer"},
                            headers={"Authorization": f"Bearer {token}"}, timeout=900)
             r.raise_for_status()
             return r.json()["text"]
+
+        def turn(self, *, system: str, user: str, tool_result: dict | None = None) -> dict:
+            r = httpx.post(f"{api}/internal/model/turn",
+                           json={"name": "red-turn", "system": system,
+                                 "user": user, "tool_result": tool_result},
+                           headers={"Authorization": f"Bearer {token}"}, timeout=1800)
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"model turn failed ({r.status_code}): {r.text[:300]}")
+            return r.json()
 
     loop = RedAgentLoop(session_id, scenario_id, transport, ApiModel(), runner,
                         throttle_s=_pace_seconds(),

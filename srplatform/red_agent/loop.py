@@ -33,7 +33,8 @@ import uuid as uuidlib
 from datetime import datetime, timezone
 
 from srplatform.red_agent.phases import PhaseMachine
-from srplatform.red_agent.schema import TOOL_SCHEMA_DOC, parse_tool_call
+from srplatform.red_agent.schema import (TOOL_SCHEMA_DOC, ToolCall,
+                                         parse_tool_call)
 
 SYSTEM_PROMPT = """You are the RED agent in an isolated CCDC sparring range (no internet, lab only).
 You have ONE tool: shell, executed on your isolated Linux attacker VM against the range network.
@@ -106,6 +107,10 @@ class RedAgentLoop:
         # cap for tests/CLI bounded practice.
         self.max_steps = max_steps
         self.compress_after = compress_after
+        # structured conversation return state (plan 19): the answered tool
+        # call id and the executed result awaiting the NEXT turn
+        self._turn_call_id: str | None = None
+        self._pending_tool_result: dict | None = None
         self.keep_recent = keep_recent
         # Per-action dispatch throttle (seconds between dispatches), read
         # from the SESSION SNAPSHOT at worker start (30 s default, 0 = no
@@ -323,30 +328,69 @@ class RedAgentLoop:
                 match_state=match_state,
                 summary=summary or "(no summary yet)", recent=recent_txt)
 
-            # ONE model call; strict parse with a single retry (Part 6.4 tuning)
-            try:
-                raw = self.llm.complete(prompt, "next action")
-            except Exception as e:  # model outage is a first-class outcome (F18)
-                self._log("red", "agent_note", {"model_error": str(e)[:300]}, phase=pm.phase)
-                outcome = "model_unavailable"
-                break
-            try:
-                tc = parse_tool_call(raw)
-            except ValueError:
+            # ONE model TURN (plan 19): on the structured conversation stack
+            # the model proposes a native range_command call through
+            # llm.turn(); plain text still goes through the SAME strict
+            # action schema, and legacy doubles without .turn keep the
+            # original prompt+JSON path unchanged (single retry preserved).
+            turn = None
+            if hasattr(self.llm, "turn"):
+                tool_result = self._pending_tool_result
+                self._pending_tool_result = None
                 try:
-                    raw = self.llm.complete(prompt + "\n\nREMINDER: JSON ONLY, exact schema.",
-                                            "next action")
+                    turn = self.llm.turn(system=prompt, user="next action",
+                                         tool_result=tool_result)
+                except Exception as e:  # model outage is a first-class outcome (F18)
+                    self._log("red", "agent_note", {"model_error": str(e)[:300]}, phase=pm.phase)
+                    outcome = "model_unavailable"
+                    break
+            else:
+                try:
+                    turn = {"kind": "text",
+                            "text": self.llm.complete(prompt, "next action")}
                 except Exception as e:
                     self._log("red", "agent_note", {"model_error": str(e)[:300]}, phase=pm.phase)
                     outcome = "model_unavailable"
                     break
+
+            def _retry_turn():
+                if hasattr(self.llm, "turn"):
+                    return self.llm.turn(
+                        system=prompt + "\n\nREMINDER: JSON ONLY, exact schema.",
+                        user="next action", tool_result=None)
+                return {"kind": "text",
+                        "text": self.llm.complete(
+                            prompt + "\n\nREMINDER: JSON ONLY, exact schema.",
+                            "next action")}
+
+            if turn.get("kind") == "tool_call":
+                call = turn.get("tool_call") or {}
+                self._turn_call_id = call.get("call_id") or None
+                tc = ToolCall(thought=str(call.get("thought") or ""),
+                              args={"command": str(call.get("command") or "")})
+            else:
+                raw = turn.get("text") or ""
                 try:
                     tc = parse_tool_call(raw)
-                except ValueError as e:
-                    self._log("red", "agent_note", {"error": f"model output rejected twice: {e}"[:300],
-                                                       "raw": raw[:500]}, phase=pm.phase)
-                    steps_run += 1
-                    continue
+                except ValueError:
+                    # one strict retry (Part 6.4 tuning) — and the CALL
+                    # failure stays distinct from the PARSE failure: an
+                    # outage mid-retry is model_unavailable, never a quiet
+                    # "rejected twice" step
+                    try:
+                        turn2 = _retry_turn()
+                    except Exception as e:
+                        self._log("red", "agent_note", {"model_error": str(e)[:300]}, phase=pm.phase)
+                        outcome = "model_unavailable"
+                        break
+                    raw = turn2.get("text") or ""
+                    try:
+                        tc = parse_tool_call(raw)
+                    except ValueError as e:
+                        self._log("red", "agent_note", {"error": f"model output rejected twice: {e}"[:300],
+                                                           "raw": raw[:500]}, phase=pm.phase)
+                        steps_run += 1
+                        continue
 
             # DONE never ENDS a sustained match (pilot step 3). A confirmed-
             # all DONE is recorded and the agent keeps pressing; a false DONE
@@ -354,6 +398,17 @@ class RedAgentLoop:
             # progress in between is a stall guard (no_progress), not an
             # objective-completion exit.
             if tc.command.strip() == "DONE":
+                # DONE is a CLAIM, not a command: it never reaches the
+                # runner. On the structured stack the call id must still be
+                # ANSWERED (protocol completeness) or the next turn would
+                # carry an unanswered tool call.
+                if self._turn_call_id is not None:
+                    self._pending_tool_result = {
+                        "call_id": self._turn_call_id, "exit_code": None,
+                        "output": "(not executed: DONE is a claim; verifiers "
+                                  "decide completion)",
+                        "timed_out": False, "error": None}
+                    self._turn_call_id = None
                 before = set(self.achieved)
                 self._check_objectives(pm.phase)
                 if self.achieved != before:
@@ -416,9 +471,29 @@ class RedAgentLoop:
                                      detail=(getattr(res, "note", None)
                                              or getattr(res, "error", None)))
 
+            # structured conversation return (plan 19): the executed action
+            # goes back as a typed tool_result on the NEXT turn (never a
+            # prompt-string rebuild); legacy doubles simply ignore it.
+            if self._turn_call_id is not None:
+                self._pending_tool_result = {
+                    "call_id": self._turn_call_id, "exit_code": code,
+                    "output": out[:20000],
+                    "timed_out": bool(getattr(res, "timed_out", False)),
+                    "error": getattr(res, "error", None)}
+                self._turn_call_id = None
+
             # audit T01: an UNCONFIRMED remote cancellation halts the loop —
             # further commands against a range with unknown live work are
             # forbidden; the worker reports the run as cancel_unconfirmed.
+            if cancel_state == "unknown" and self._turn_call_id is not None:
+                # halt keeps protocol-complete history: the call is answered
+                # with an honest unknown, never left dangling
+                self._pending_tool_result = {
+                    "call_id": self._turn_call_id, "exit_code": code,
+                    "output": out[:20000],
+                    "timed_out": bool(getattr(res, "timed_out", False)),
+                    "error": "cessation unconfirmed — result not trusted"}
+                self._turn_call_id = None
             if cancel_state == "unknown":
                 self._log("red", "agent_note",
                           {"op_uuid": op_uuid,

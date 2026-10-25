@@ -25,7 +25,7 @@ from srplatform.api.auth import Principal
 from srplatform.coach.aar import build_aar, build_hint
 from srplatform.db.models import Event, Session as SessionModel
 from srplatform.db.session import db as _db_ctx  # explicit sessions around model waits
-from srplatform.model_gateway import PRIORITY_AAR, PRIORITY_HINT, QueueFull, get_model_gateway
+from srplatform.model_gateway import PRIORITY_AAR, PRIORITY_HINT
 
 router = APIRouter()
 
@@ -34,8 +34,10 @@ from srplatform.api.deps import DbSession  # the ONE function-scoped session
 
 _principal, any_member, _operator, _service = make_auth_dependencies()
 
-# coach model; injectable for tests (set_coach_llm). Outage handling: fall back
-# to the deterministic report and RETRY PERIODICALLY (no permanent poisoning).
+# coach model DOUBLE; injectable for tests (set_coach_llm). Production uses
+# JobCoachModel below — durable jobs, ONE admission slot, no out-of-queue
+# probe. Outage handling: the hint/AAR fallbacks stay honest; the failure is
+# visible in the job list, never a silently poisoned endpoint.
 _coach_llm = None
 _coach_retry_at = 0.0
 
@@ -47,24 +49,63 @@ def set_coach_llm(llm) -> None:
 
 
 def get_coach_llm():
-    global _coach_llm, _coach_retry_at
-    if _coach_llm is None or (_coach_llm is False and time.monotonic() >= _coach_retry_at):
-        try:
-            from srplatform.red_agent.llm import LLM
-            from srplatform.settings import get_settings
+    """Test/dev double injection point. Production NEVER probes the model
+    endpoint out of queue (the old ping consumed an admission slot without
+    being one): liveness is now a job outcome — a probe queued through the
+    single slot, or the visible failure of the hint/AAR call itself."""
+    return _coach_llm if _coach_llm else None
 
-            llm = LLM(model=get_settings().llm_model_coach, role="coach")
-            # Endpoint liveness probe OUTSIDE the gateway (audit Stage 5):
-            # probing THROUGH the scheduler would make the probe itself wait
-            # behind queued red turns, inflating the interactive hint bound
-            # it is supposed to protect.
-            llm.complete("ping", "ping")  # prove the endpoint answers or fall back
-            _coach_llm = llm
-        except Exception:
-            from srplatform.settings import get_settings
-            _coach_llm = False
-            _coach_retry_at = time.monotonic() + get_settings().model_recovery_interval_s
-    return _coach_llm or None
+
+class JobCoachModel:
+    """The production coach ``.complete()`` surface: every call becomes a
+    DURABLE job admitted through the ONE slot at the caller's priority.
+    Model-side failures surface as CompletionRejected so the existing hint
+    and AAR fallbacks stay honest (a hint says it could not consult the
+    model — it never invents one)."""
+
+    def __init__(self, session_id, *, priority: int, wait_s: float | None = None):
+        self.session_id = session_id
+        self.priority = priority
+        self.wait_s = wait_s
+
+    def complete(self, system: str, user: str) -> str:
+        from srplatform import model_admin as ma
+        from srplatform import model_jobs
+        from srplatform.db.session import db as _db
+        from srplatform.red_agent.llm import CompletionRejected
+        from srplatform.settings import get_settings as _gs
+        bound = self.wait_s or _gs().model_hint_max_wait_s
+        try:
+            with _db() as s:
+                _pin, prof = ma.bind_for(s, self.session_id, "coach")
+                job = model_jobs.enqueue(
+                    s, kind="coach-text", priority=self.priority,
+                    payload={"mode": "text", "system": system, "user": user},
+                    session_id=self.session_id, profile=prof, actor="coach")
+                jid = job.job_id
+        except ma.ProfileProblem as exc:
+            raise CompletionRejected(f"coach model unavailable: {exc}") from exc
+        except model_jobs.QueueFull as exc:
+            raise CompletionRejected("coach model queue saturated") from exc
+        try:
+            with _db() as s:
+                try:
+                    job = model_jobs.wait(s, jid, bound)
+                except TimeoutError:
+                    # the caller's bound wins: request cessation, never let
+                    # a late completion answer a request that gave up
+                    try:
+                        model_jobs.cancel(s, jid, actor="coach wait bound")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise CompletionRejected(
+                        "coach model exceeded its declared wait bound") from None
+        except TimeoutError:  # pragma: no cover — converted above
+            raise
+        if job.state != "succeeded":
+            raise CompletionRejected(
+                f"coach model call failed: {(job.error or job.state)[:300]}")
+        return (job.result or {}).get("text") or ""
 
 
 def _events_of(db: Session, sid: uuid.UUID) -> list[dict]:
@@ -102,15 +143,10 @@ def hint(session_id: uuid.UUID, body: HintIn, p: Principal = Depends(any_member)
         events = [filter_event(db, sess, p, e)
                   for e in _events_of(db, session_id)]
 
-    llm = get_coach_llm()
-    try:
-        fut = get_model_gateway().submit(PRIORITY_HINT, f"hint-{session_id}",
-                                         build_hint, events, body.question, llm)
-        result = get_model_gateway().wait(fut, get_settings().model_hint_max_wait_s)
-    except QueueFull:
-        raise HTTPException(503, "model gateway saturated — try again shortly")
-    except TimeoutError:
-        raise HTTPException(504, "hint exceeded its declared wait bound")
+    llm = get_coach_llm() or JobCoachModel(session_id, priority=PRIORITY_HINT)
+    # build_hint runs inline; its llm.complete call IS the queue admission
+    # (durable job, interactive priority) — no separate scheduler hop.
+    result = build_hint(events, body.question, llm)
 
     with _db_ctx() as db:
         db.add(Event(session_id=session_id, ts=datetime.now(timezone.utc), actor="system",
@@ -169,31 +205,36 @@ def aar_post(session_id: uuid.UUID, body: AarIn, p: Principal = Depends(any_memb
     events = _events_of(db, session_id)
     scorecard = _latest_scorecard(db, session_id)
 
-    def _gen():
-        llm = get_coach_llm()
-        narrative = None
-        if llm and body.narrative:
-            from srplatform.coach.timeline import compress_timeline
-            timeline, _ = compress_timeline(events, max_lines=40)
-            from srplatform.red_agent.llm import CompletionRejected
-            try:
-                narrative = llm.complete(
-                    "You are a CCDC coach writing the narrative section of a graded AAR. "
-                    "Cite only events you were given (as #<event_id>). Be blunt and specific.",
-                    f"Timeline:\n{timeline}")
-            except CompletionRejected:
-                # A missing/truncated optional narrative cannot erase the
-                # deterministic evidence-linked report or invent model advice.
-                narrative = None
-        return build_aar(events, spec, scorecard, narrative=narrative)
-
-    try:
-        fut = get_model_gateway().submit(PRIORITY_AAR, f"aar-{session_id}", _gen)
-        report = get_model_gateway().wait(fut, 300)
-    except QueueFull:
-        raise HTTPException(503, "model gateway saturated — try again shortly")
-    except TimeoutError:
-        raise HTTPException(504, "AAR generation exceeded its bound")
+    llm = get_coach_llm()
+    narrative = None
+    if llm and body.narrative:
+        from srplatform.coach.timeline import compress_timeline
+        timeline, _ = compress_timeline(events, max_lines=40)
+        from srplatform.red_agent.llm import CompletionRejected
+        try:
+            narrative = llm.complete(
+                "You are a CCDC coach writing the narrative section of a graded AAR. "
+                "Cite only events you were given (as #<event_id>). Be blunt and specific.",
+                f"Timeline:\n{timeline}")
+        except CompletionRejected:
+            # A missing/truncated optional narrative cannot erase the
+            # deterministic evidence-linked report or invent model advice.
+            narrative = None
+    if llm is None and body.narrative:
+        # production path: the narrative rides a durable job at AAR
+        # priority (batches yield to hints and turns by design)
+        from srplatform.coach.timeline import compress_timeline
+        timeline, _ = compress_timeline(events, max_lines=40)
+        from srplatform.red_agent.llm import CompletionRejected
+        try:
+            narrative = JobCoachModel(session_id, priority=PRIORITY_AAR,
+                                      wait_s=300).complete(
+                "You are a CCDC coach writing the narrative section of a graded AAR. "
+                "Cite only events you were given (as #<event_id>). Be blunt and specific.",
+                f"Timeline:\n{timeline}")
+        except CompletionRejected:
+            narrative = None
+    report = build_aar(events, spec, scorecard, narrative=narrative)
 
     version = 1 + db.execute(select(Event).where(Event.session_id == session_id,
                                                   Event.action_type == "aar")).scalars().all().__len__()

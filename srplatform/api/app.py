@@ -1212,33 +1212,186 @@ class ModelCompleteIn(BaseModel):
     name: str = "red-turn"
     system: str
     user: str
+    role: str = "summarizer"   # plan 19: compression rides the summarizer pin
+
+
+def _model_job_wait(s, jid, bound: float):
+    """Wait on a durable job within the caller's bound. Exceeding the bound
+    requests cessation (queued rows die; a live call is cancelled when it
+    returns) — a request that timed out is NEVER left to silently complete
+    later and never replayed."""
+    from srplatform import model_jobs
+    try:
+        return model_jobs.wait(s, jid, bound)
+    except TimeoutError:
+        try:
+            model_jobs.cancel(s, jid, actor="request wait bound")
+        except Exception:  # noqa: BLE001 — the 504 below is the point
+            pass
+        raise HTTPException(504, "model call exceeded its declared bound")
+
+
+def _model_job_http(job):
+    """Terminal job state → visible HTTP outcome (never a silent success)."""
+    if job.state == "succeeded":
+        return job.result
+    if job.state == "cancelled":
+        raise HTTPException(502, f"model call cancelled: {(job.error or '')[:400]}")
+    raise HTTPException(502, f"model call failed: {(job.error or job.state)[:400]}")
 
 
 @app.post("/internal/model/complete")
 def internal_model_complete(body: ModelCompleteIn, p: Principal = Depends(service("runner"))):
-    """ONE SHARED MODEL SCHEDULER (audit Stage 5): the worker's red turns are
-    scheduled through the SAME gateway that serves interactive hints and AARs
-    in this process — an interactive hint jumps the queue ahead of queued red
-    turns ACROSS PROCESSES. The run-scoped capability is the authorization;
-    no direct model credential ever reaches the worker. A running request is
-    never preempted (documented bound); queue overflow is a visible 503."""
-    from srplatform.model_gateway import PRIORITY_RED, QueueFull, get_model_gateway
-    from srplatform.red_agent.llm import CompletionRejected, LLM
+    """WORKER TEXT CALLS (compaction summaries) queue through the DURABLE
+    JOBS store — the same single admission slot as turns, hints and AARs
+    (the slot is a database invariant now, not one process's courtesy).
+    The run-scoped capability is the authorization; no model credential
+    ever reaches the worker: the profile version is pinned per session and
+    its key lives only in this process' database."""
+    from srplatform import model_admin as ma
+    from srplatform import model_jobs
     if len(body.system) + len(body.user) > 200_000:
         raise HTTPException(413, "model request too large")
-    s = get_settings()
-    llm = LLM()
+    s0 = get_settings()
     try:
-        fut = get_model_gateway().submit(PRIORITY_RED, f"{p.session_id}:{body.name}",
-                                         llm.complete, body.system, body.user)
-        text = get_model_gateway().wait(fut, s.llm_timeout_s + s.model_hint_max_wait_s + 60)
-    except QueueFull:
-        raise HTTPException(503, "model gateway saturated — retry the turn shortly")
-    except TimeoutError:
-        raise HTTPException(504, "model turn exceeded its bound")
-    except CompletionRejected as e:
-        raise HTTPException(502, str(e)) from e
-    return {"text": text}
+        with db() as s:
+            _pin, prof = ma.bind_for(s, p.session_id, body.role)
+            job = model_jobs.enqueue(
+                s, kind=f"text:{body.name}", priority=model_jobs.PRIORITY_RED,
+                payload={"mode": "text", "system": body.system,
+                         "user": body.user},
+                session_id=p.session_id, profile=prof, actor="worker")
+            jid = job.job_id
+    except ma.ProfileProblem as e:
+        raise HTTPException(503, str(e)) from e
+    except model_jobs.QueueFull:
+        raise HTTPException(503, "model queue saturated — retry the turn shortly")
+    with db() as s:
+        job = _model_job_wait(s, jid,
+                              s0.llm_timeout_s + s0.model_hint_max_wait_s + 60)
+        result = _model_job_http(job)
+    return {"text": result["text"]}
+
+
+class ModelTurnIn(BaseModel):
+    name: str = "red-turn"
+    system: str
+    user: str
+    tool_result: dict | None = None
+
+
+SUMMARIZE_SYSTEM = (
+    "You compress a red-team engagement conversation into a concise "
+    "situation report for the attacker agent continuing it: what is "
+    "confirmed, what access is held, promising leads, dead ends to avoid, "
+    "and defender activity observed. Reference ONLY what the conversation "
+    "shows. Under 350 words.")
+
+
+@app.post("/internal/model/turn")
+def internal_model_turn(body: ModelTurnIn, p: Principal = Depends(service("runner"))):
+    """ONE STRUCTURED TURN of the session's DURABLE conversation (plan 19):
+    history is reconstructed from append-only revisions, the request joins
+    the pinned attacker profile's queue as a durable job, the answer is
+    persisted (structured messages, usage, finish reason) IN THE JOB'S
+    terminal transaction, and the reply carries the typed action. The
+    worker still holds no credential and executes nothing itself: a tool
+    call is a PROPOSAL; the loop dispatches it on the runner and returns
+    the result as a tool_result on the next turn.
+
+    Compaction is a separate visible job (summarizer pin): its checkpoint
+    COVERS the revision range and never deletes history; it is never run
+    while a tool call stands unanswered (that would break protocol)."""
+    from pydantic_ai.messages import (ModelRequest, SystemPromptPart,
+                                      UserPromptPart)
+    from srplatform import conversation_store as store
+    from srplatform import model_admin as ma
+    from srplatform import model_jobs
+    from srplatform.red_agent import conversation as conv
+    if len(body.system) + len(body.user) > 200_000:
+        raise HTTPException(413, "model request too large")
+    sid = p.session_id
+    s0 = get_settings()
+    # ---- rebuild thread + append this turn's request ----
+    try:
+        with db() as s:
+            _pin, prof = ma.bind_for(s, sid, "attacker")
+            msgs, _cp, _covered = store.load_thread(s, sid)
+            if body.tool_result is not None:
+                tr = body.tool_result
+                msgs = conv.append_tool_return(
+                    msgs, str(tr.get("call_id") or ""),
+                    {"exit_code": tr.get("exit_code"),
+                     "output": str(tr.get("output") or "")[:60_000],
+                     "timed_out": bool(tr.get("timed_out")),
+                     "error": tr.get("error")})
+            else:
+                parts = []
+                if not msgs:      # system framing belongs to the FIRST turn
+                    parts.append(SystemPromptPart(content=body.system))
+                parts.append(UserPromptPart(content=body.user))
+                msgs = msgs + [ModelRequest(parts=parts)]
+            blob = conv.dump_messages(msgs)
+            import json as _json
+            if len(_json.dumps(blob)) > 4_000_000:
+                raise HTTPException(413, "conversation exceeds its serialization bound")
+            job = model_jobs.enqueue(
+                s, kind="turn", priority=model_jobs.PRIORITY_RED,
+                payload={"mode": "turn", "messages": blob,
+                         "persist": {"session_id": str(sid)}},
+                session_id=sid, profile=prof, actor="worker")
+            jid = job.job_id
+    except ma.ProfileProblem as e:
+        raise HTTPException(503, str(e)) from e
+    except model_jobs.QueueFull:
+        raise HTTPException(503, "model queue saturated — retry the turn shortly")
+    # ---- wait for the durable turn ----
+    with db() as s:
+        job = _model_job_wait(s, jid, prof.timeout_s + s0.model_hint_max_wait_s + 60)
+        result = _model_job_http(job)
+    # ---- compaction cycle (visible, retryable, never mid-tool-call) ----
+    needs_compaction = False
+    compaction_error = None
+    sjid = None
+    with db() as s:
+        full_msgs, _cp, _c = store.load_thread(s, sid)
+        pressure = conv.context_pressure(full_msgs, prof, store.last_usage(s, sid))
+        if pressure["compact"] and result["kind"] != "tool_call":
+            needs_compaction = True
+            text = store.render_thread_for_summary(s, sid)
+            try:
+                _spin, sprof = ma.bind_for(s, sid, "summarizer")
+                sj = model_jobs.enqueue(
+                    s, kind="summarize", priority=model_jobs.PRIORITY_RED,
+                    payload={"mode": "text", "system": SUMMARIZE_SYSTEM,
+                             "user": text},
+                    session_id=sid, profile=sprof, actor="worker")
+                sjid = sj.job_id
+            except (ma.ProfileProblem, model_jobs.QueueFull) as e:
+                compaction_error = (f"compaction deferred: {str(e)[:200]} "
+                                    "— the next turn retries it")
+    if sjid is not None:
+        with db() as s:
+            sj = _model_job_wait(s, sjid, 300)
+            if sj.state == "succeeded":
+                covered_to = store.thread_max_revision(s, sid)
+                store.append_checkpoint(s, sid,
+                                        summary=sj.result["text"],
+                                        covers_through=covered_to,
+                                        profile_id=sj.profile_id)
+                needs_compaction = False
+            else:
+                needs_compaction = True
+                compaction_error = (f"compaction failed: "
+                                    f"{(sj.error or sj.state)[:200]} — the "
+                                    "next turn retries it")
+    return {"kind": result["kind"], "text": result.get("text"),
+            "tool_call": result.get("tool_call"),
+            "usage": result.get("usage"),
+            "finish_reason": result.get("finish_reason"),
+            "profile": {"name": prof.name, "version": prof.version},
+            "needs_compaction": needs_compaction,
+            "compaction_error": compaction_error}
 
 
 # --- separate-UID worker supervisor (milestone 15) ---------------------------
@@ -1901,6 +2054,211 @@ def create_service_token(body: ServiceTokenIn, p: Principal = Depends(operator),
             if body.session_id else None, "host": body.host}
 
 
+# --- model administration (plan 19) -----------------------------------------
+# Operator-only: profiles carry provider credentials, so NOTHING here is
+# reachable by members or services, and every response goes through the
+# masked shapes — an API key never leaves the database by any read path.
+
+class ProfileIn(BaseModel):
+    name: str
+    base_url: str | None = None      # required on CREATE; omit to keep on REVISE
+    model_name: str | None = None    # required on CREATE; omit to keep on REVISE
+    api_key: str | None = None
+    thinking_level: str | None = None
+    thinking_map: dict | None = None
+    generation_kwargs: dict | None = None
+    context_window: int | None = None
+    max_completion_tokens: int | None = None
+    timeout_s: int | None = None
+    note: str | None = None
+
+
+class RoleOverrideIn(BaseModel):
+    role: str
+    profile_name: str
+
+
+class RebindIn(BaseModel):
+    role: str
+
+
+class RevokeIn(BaseModel):
+    reason: str = "revoked by operator"
+
+
+def _actor_name(p: Principal) -> str:
+    return getattr(p, "username", None) or "operator"
+
+
+@app.get("/admin/model/profiles")
+def admin_model_profiles(all_versions: bool = False,
+                         p: Principal = Depends(operator), db: DbSession = None):
+    from srplatform import model_admin as ma
+    from srplatform.db.models import ModelProfile
+    rows = db.execute(select(ModelProfile).order_by(
+        ModelProfile.name, ModelProfile.version.desc())).scalars().all()
+    if not all_versions:
+        rows = [r for r in rows if r.status == "active"]
+    return {"profiles": [ma.masked(r) for r in rows],
+            "roles": ma.role_overrides(db)}
+
+
+@app.post("/admin/model/profiles", status_code=201)
+def admin_model_profile_create(body: ProfileIn,
+                               p: Principal = Depends(operator), db: DbSession = None):
+    """Create profile version 1 (or the NEXT version of an existing name —
+    edits of a serving profile go through /revise so the demotion of the
+    previous version and the cancellation duty over its references happen
+    together)."""
+    from srplatform import model_admin as ma
+    try:
+        prof = ma.create_profile(
+            db, name=body.name, base_url=body.base_url,
+            model_name=body.model_name, api_key=body.api_key or "",
+            thinking_level=body.thinking_level, thinking_map=body.thinking_map,
+            generation_kwargs=body.generation_kwargs,
+            context_window=body.context_window,
+            max_completion_tokens=body.max_completion_tokens,
+            timeout_s=body.timeout_s, actor=_actor_name(p), note=body.note)
+    except ma.ProfileProblem as e:
+        raise HTTPException(422, str(e)) from e
+    return ma.masked(prof)
+
+
+@app.post("/admin/model/profiles/{name}/revise")
+def admin_model_profile_revise(name: str, body: ProfileIn,
+                               p: Principal = Depends(operator), db: DbSession = None):
+    """Rotation = a NEW version + demotion of the old one + visible
+    cancellation of queued jobs bound to it. Sessions pinned to the old
+    version FAIL until an operator rebinds them — never substituted."""
+    from srplatform import model_admin as ma
+    changes = {k: v for k, v in {
+        "base_url": body.base_url, "model_name": body.model_name,
+        "thinking_level": body.thinking_level,
+        "thinking_map": body.thinking_map,
+        "generation_kwargs": body.generation_kwargs,
+        "context_window": body.context_window,
+        "max_completion_tokens": body.max_completion_tokens,
+        "timeout_s": body.timeout_s, "note": body.note}.items()
+        if v is not None}
+    try:
+        prof = ma.revise(db, name, api_key=body.api_key,
+                         actor=_actor_name(p), **changes)
+    except ma.ProfileProblem as e:
+        raise HTTPException(422, str(e)) from e
+    return ma.masked(prof)
+
+
+@app.post("/admin/model/profiles/{profile_id}/revoke")
+def admin_model_profile_revoke(profile_id: uuid.UUID, body: RevokeIn,
+                               p: Principal = Depends(operator), db: DbSession = None):
+    from srplatform import model_admin as ma
+    try:
+        prof = ma.revoke(db, profile_id, actor=_actor_name(p),
+                         reason=body.reason)
+    except ma.ProfileProblem as e:
+        raise HTTPException(422, str(e)) from e
+    return ma.masked(prof)
+
+
+@app.put("/admin/model/roles")
+def admin_model_role_set(body: RoleOverrideIn,
+                         p: Principal = Depends(operator), db: DbSession = None):
+    """Role selection lives HERE — never in the process environment."""
+    from srplatform import model_admin as ma
+    try:
+        ma.set_role_override(db, body.role, body.profile_name,
+                             actor=_actor_name(p))
+    except ma.ProfileProblem as e:
+        raise HTTPException(422, str(e)) from e
+    return {"role": body.role, "profile_name": body.profile_name}
+
+
+@app.post("/admin/model/probe")
+def admin_model_probe(body: RoleOverrideIn,
+                      p: Principal = Depends(operator), db: DbSession = None):
+    """A probe is a QUEUE MEMBER like any other call (never an out-of-queue
+    ping): it admits through the single slot and its state is visible in
+    the job list. Runs the ROLE's current active profile, un-pinned."""
+    from srplatform import model_admin as ma
+    from srplatform import model_jobs
+    if body.role not in ma.ROLES:
+        raise HTTPException(422, f"role must be one of {', '.join(ma.ROLES)}")
+    prof = ma.active_profile(db, body.profile_name)
+    if prof is None:
+        raise HTTPException(422, f"no active profile named {body.profile_name!r}")
+    try:
+        job = model_jobs.enqueue(
+            db, kind="probe", priority=model_jobs.PRIORITY_HINT,
+            payload={"mode": "text", "system": "ping", "user": "ping"},
+            profile=prof, actor=_actor_name(p))
+    except model_jobs.QueueFull:
+        raise HTTPException(503, "model queue saturated — try again shortly")
+    return {"job_id": str(job.job_id), "state": job.state,
+            "profile": {"name": prof.name, "version": prof.version}}
+
+
+@app.get("/admin/model/jobs")
+def admin_model_jobs(limit: int = 50, p: Principal = Depends(operator),
+                     db: DbSession = None):
+    from srplatform.db.models import ModelJob
+    from sqlalchemy import func as _f
+    limit = max(1, min(limit, 200))
+    rows = db.execute(select(ModelJob).order_by(
+        ModelJob.requested_at.desc()).limit(limit)).scalars().all()
+    counts = dict(db.execute(select(ModelJob.state, _f.count())
+                             .group_by(ModelJob.state)).all())
+    return {"jobs": [{
+        "job_id": str(j.job_id), "kind": j.kind, "priority": j.priority,
+        "state": j.state, "session_id": str(j.session_id) if j.session_id else None,
+        "profile_name": j.profile_name, "attempt": j.attempt,
+        "parent_job": str(j.parent_job) if j.parent_job else None,
+        "cancel_requested": j.cancel_requested, "actor": j.actor,
+        "error": j.error,
+        "requested_at": j.requested_at.isoformat() if j.requested_at else None,
+        "started_at": j.started_at.isoformat() if j.started_at else None,
+        "finished_at": j.finished_at.isoformat() if j.finished_at else None,
+    } for j in rows], "counts": counts}
+
+
+@app.post("/admin/model/jobs/{job_id}/cancel")
+def admin_model_job_cancel(job_id: uuid.UUID, p: Principal = Depends(operator),
+                           db: DbSession = None):
+    from srplatform import model_jobs
+    try:
+        job = model_jobs.cancel(db, job_id, actor=_actor_name(p))
+    except model_jobs.JobProblem as e:
+        raise HTTPException(404, str(e)) from e
+    return {"job_id": str(job.job_id), "state": job.state,
+            "cancel_requested": job.cancel_requested, "error": job.error}
+
+
+@app.get("/admin/model/sessions/{session_id}/pins")
+def admin_model_pins(session_id: uuid.UUID, p: Principal = Depends(operator),
+                     db: DbSession = None):
+    from srplatform.db.models import SessionModelPin
+    rows = db.execute(select(SessionModelPin).where(
+        SessionModelPin.session_id == session_id)).scalars().all()
+    return {"pins": [{
+        "role": r.role, "profile_id": str(r.profile_id), "config": r.config,
+        "bound_at": r.bound_at.isoformat() if r.bound_at else None,
+    } for r in rows]}
+
+
+@app.post("/admin/model/sessions/{session_id}/rebind")
+def admin_model_rebind(session_id: uuid.UUID, body: RebindIn,
+                       p: Principal = Depends(operator), db: DbSession = None):
+    """The ONLY way a session continues on models after its pinned version
+    was replaced/revoked — explicit, audited, never automatic."""
+    from srplatform import model_admin as ma
+    try:
+        pin = ma.rebind(db, session_id, body.role, actor=_actor_name(p))
+    except ma.ProfileProblem as e:
+        raise HTTPException(422, str(e)) from e
+    return {"role": pin.role, "profile_id": str(pin.profile_id),
+            "config": pin.config}
+
+
 def dial_pin_for(resources, target_host):
     """The FULL pinned guest host key for the dial target, or None.
 
@@ -2107,6 +2465,22 @@ def _log_event(db: Session, session_id, actor, host, action_type, payload, phase
 # run the match scheduler: those belong to the single internal instance,
 # and a listener restart would otherwise interrupt live operations and
 # remove their serialization. The listener serves ingest routes only.
+@app.on_event("shutdown")
+def _shutdown():
+    """Graceful exit releases the controller seat instead of waiting for a
+    session timeout: a successor process (or the next test client) must be
+    able to take over duties immediately. Crash safety is unchanged — a
+    dead process's advisory lock dies with its database session."""
+    lock = getattr(app.state, "controller_lock", None)
+    if lock is not None:
+        try:
+            lock._stop.set()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            lock.release()
+        except Exception:  # noqa: BLE001
+            pass
 @app.on_event("startup")
 def _startup():
     """Start the controller duties - ONCE, and visibly.
@@ -2148,6 +2522,24 @@ def _startup():
         runs_svc.reconcile_on_startup()
     except Exception as exc:  # noqa: BLE001 - reported, never hidden
         issues.append(f"reconcile on startup: {type(exc).__name__}: {exc}")
+    try:
+        # plan 19: model administration foundation — mirror the environment
+        # into a bootstrap profile ONCE, expose crashed-live model calls as
+        # cessation_unknown obligations, and run this process's scheduler
+        # for the durable one-slot queue.
+        from srplatform import model_admin as _ma
+        from srplatform import model_jobs as _mj
+        with db() as _s:
+            _ma.ensure_bootstrap_profile(_s)
+            _unknown = _mj.reconcile_startup(_s)
+        if _unknown:
+            issues.append(f"model jobs: {_unknown} live call(s) left "
+                          "cessation_unknown after restart")
+        # the scheduler starts LAZILY on this process's first enqueue (see
+        # model_jobs.enqueue): a process that never queues model work never
+        # polls the queue, and workers — which only POST — never run one.
+    except Exception as exc:  # noqa: BLE001 - reported, never hidden
+        issues.append(f"model admin startup: {type(exc).__name__}: {exc}")
     try:
         # durable operation claims only have meaning while THIS process serves;
         # anything left over belongs to a dead request (crash recovery).

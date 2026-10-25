@@ -124,6 +124,7 @@ class FakeLLM:
     def __init__(self, script: list):
         self.script = list(script)
         self.calls: list[tuple[str, str]] = []
+        self.turns: list[tuple[str, str, dict | None]] = []
 
     def complete(self, system: str, user: str) -> str:
         self.calls.append((system, user))
@@ -135,6 +136,37 @@ class FakeLLM:
         if isinstance(item, BaseException):  # KeyboardInterrupt is BaseException
             raise item
         return item
+
+    def turn(self, *, system: str, user: str, tool_result: dict | None = None) -> dict:
+        """Structured-turn surface (plan 19): the scripted legacy JSON — the
+        exact same scripts every loop test already writes — becomes a TYPED
+        native tool call when it matches the schema, plain text otherwise.
+        The loop's strict-parse/retry semantics are preserved either way,
+        so behavior tests stay meaningful on the new protocol."""
+        self.calls.append((system, user))
+        self.turns.append((system, user, tool_result))
+        if not self.script:
+            raise AssertionError("FakeLLM script exhausted")
+        item = self.script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        import json as _json
+        text = str(item)
+        stripped = text.strip().strip("`")
+        if stripped.startswith("json"):
+            stripped = stripped[4:]
+        try:
+            obj = _json.loads(stripped)
+        except ValueError:
+            obj = None
+        if (isinstance(obj, dict) and obj.get("tool", "shell") == "shell"
+                and isinstance(obj.get("args"), dict)
+                and "command" in obj["args"]):
+            return {"kind": "tool_call", "text": None,
+                    "tool_call": {"call_id": f"fake-{len(self.turns)}",
+                                  "command": str(obj["args"]["command"]),
+                                  "thought": str(obj.get("thought") or "")}}
+        return {"kind": "text", "text": text, "tool_call": None}
 
 
 class FakeDatapath:

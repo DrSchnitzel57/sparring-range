@@ -138,12 +138,12 @@ def validate_profile_fields(*, base_url: str, model_name: str,
 
 
 def _append_admin_note(db: Session, action: str, payload: dict) -> None:
-    """Admin actions are auditable. Events.session_id is NOT NULL, so a
-    global note anchors on the zero UUID — an explicit, recognizable
-    marker rather than a fake session."""
-    db.add(Event(session_id=uuid.UUID("00000000-0000-0000-0000-000000000000"),
-                 ts=datetime.now(timezone.utc), actor="operator",
-                 action_type=f"model_admin.{action}", payload=payload))
+    """Admin actions are auditable: events.session_id is nullable, so a
+    global note is a SESSIONLESS event — honest provenance rather than a
+    fake session. Session-scoped actions (rebind) carry their session."""
+    db.add(Event(session_id=None, ts=datetime.now(timezone.utc),
+                 actor="operator", action_type=f"model_admin.{action}",
+                 payload=payload))
 
 
 # --------------------------------------------------------------------------- #
@@ -292,12 +292,15 @@ def revise(db: Session, name: str, *, api_key: str | None = None,
     unknown = set(changes) - set(merged)
     if unknown:
         raise ProfileProblem(f"unknown profile fields: {sorted(unknown)}")
+    # demote FIRST: the one-ACTIVE partial index forbids two active rows
+    # even mid-transaction, and the visible cancellation duty over the old
+    # version's queued jobs must be established before its replacement.
+    demote(db, current, reason="replaced by rotation", actor=actor)
     new = create_profile(db, name=name,
                          api_key=current.api_key if api_key is None else api_key,
                          actor=actor,
                          note=changes.get("note", f"rotation of {name} v{current.version}"),
                          **merged)
-    demote(db, current, reason="replaced by rotation", actor=actor)
     return new
 
 

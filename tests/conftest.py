@@ -251,6 +251,13 @@ def _reset_singletons() -> None:
         coach_routes.set_coach_llm(None)
     except Exception:
         pass
+    try:
+        # plan 19: the job scheduler thread must not outlive a settings/DB
+        # swap (it polls through the engine that is about to be reset)
+        from srplatform import model_jobs
+        model_jobs.stop_model_jobs()
+    except Exception:
+        pass
 
 
 @pytest.fixture
