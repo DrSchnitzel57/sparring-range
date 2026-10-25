@@ -1,5 +1,109 @@
 # Current findings and validation evidence
 
+## Plan-19 independent review round — 2026-10-25, branch `practice-upgrades-18-21`
+
+The independent review of plan 19 returned **VERDICT: FIX** at `2bb5305`
+with eleven findings. Every finding was reproduced, then repaired at root
+with real-HTTP / real-DB regressions in commits `8660a49` (conversation
+wire), `8b8ab87` (jobs/secrets/gating/freeze), `e41f9ce` (routes/finalization),
+`de3ea24` (db regressions), `ed24173` (GUI + browser). Applied migration
+0020 was NOT touched; all schema work is forward-only in 0021.
+
+### Reproduced original failures (before the repair, exact output)
+
+- **Dead endpoint misclassified as uncertain (findings 2/3 classifier):**
+  against `http://127.0.0.1:1/v1` the pre-fix chain classified the
+  never-opened connect as an uncertain cessation — the rewritten
+  hint-chain test failed with
+  `expected the full bounded attempt chain, got [('cessation_unknown', 1)]`.
+  Root cause: the pinned openai client rides **httpx2/httpcore2**;
+  `isinstance(x, httpx.ConnectError)` never matches, so the definite
+  branch was unreachable. Post-fix the same probe reports
+  `retryable: True uncertain: False` and the 1→2→3 attempt chain is
+  visible, all failed, none retry-worthy past the bound.
+- **App role could read the new secret table (finding 8):** the real
+  role probe failed with `AssertionError: app role CAN read the secret
+  table` — migrations 0016/0017 established owner DEFAULT PRIVILEGES
+  that auto-grant `SELECT, INSERT` on every new table to the app role,
+  so `CREATE TABLE model_profile_secrets` alone handed the keys to the
+  ingestion plane. 0021 now issues an explicit per-table
+  `REVOKE ALL … FROM <app role>`; the probe passes in both directions
+  (app role denied on secrets; the secret role denied on
+  events/sessions/model_jobs).
+- **Cancellation never reached the wire (finding 2):** the old suite's
+  `"discarded" in error or "returned" in error` assertions encoded the
+  OBSOLETE semantics (flag the row, wait out the call, discard the
+  answer). With the watcher closing the live SDK call, a cancel of a
+  3 s scripted hang now terminates in <2 s as `cessation_unknown`
+  ("provider-side cessation cannot be confirmed"), HOLDS the slot
+  (the blocked job provably stays queued; the fake provider records
+  `max_concurrent == 1` throughout), and only the audited
+  `POST /admin/model/jobs/{id}/resolve-cessation` releases the queue.
+- **Obsolete assertions rewritten as the semantics moved (proof the old
+  tests were testing the wrong contract):** status `retired` vs the new
+  secret-axis `superseded`/`revoked` split (finding 9); the
+  system-absent assertion (`not any(role == "system")` on turn 2) that
+  ENCODED the durable-replay defect finding 1 repaired — rewritten to
+  demand the permanent framing be replayed exactly once as system with
+  tool returns paired by call id; the post-hoc compaction/coverage
+  assertions (finding 4) rewritten to demand pre-request evaluation,
+  enqueue-time coverage capture, `depends_on` gating and an execution-
+  time-reconstructed (compacted) wire request; the head-0020 chain and
+  readyz assertions (now 0021).
+
+### Corrected proofs (all personally run at the committed HEAD)
+
+| Finding | Where proven |
+|---|---|
+| 1 replay/wire fidelity | `test_three_turn_thread_replays_system_and_tool_returns_on_wire` (≥3 real turns: system once, call ids paired, 6 ledger rows) + rewritten multi-turn ledger test |
+| 2 obligations hold the slot | `test_cancellation_reaches_the_live_call_and_obligation_blocks_then_releases`, `test_timeout_holds_the_slot_and_never_admits_a_second_request`, `test_restart_reconcile_blocks_claims_until_resolved` + migration-0021 partial unique slot index |
+| 3 credential non-observability | `test_leaky_provider_401_never_shows_the_key_on_any_surface` (fake 401 echoes Authorization; key absent from worker 502, job.error, admin/member lists; exactly one request) + source redaction + secret-store role probes |
+| 4 pre-request compaction | rewritten `test_compaction_covers_a_range_and_history_survives_it` (gated turn, enqueue coverage, compacted reconstruction, checkpoint-only summarize output, labeled digest never system authority) |
+| 5 concurrency at the provider | slot test asserting `srv.max_concurrent == 1` while five jobs queue through one slot |
+| 6 thinking encoding | wire tests asserting `chat_template_kwargs.thinking` for standard levels and the custom-level mapping limited to `reasoning_effort`/`chat_template_kwargs`; broken `settings["thinking"]` no-op deleted |
+| 7 strict terminal state | `_StrictFinishOpenAIChatModel` refusals: missing finish reason, text ≠ `stop`, abnormal finish answers ALL call ids, args validated pre-execution, >4000-char command refused not truncated |
+| 8 secret isolation | real role probes (both directions) in the db suite; `api_key` column dropped; `secret_store` own engine, fail closed; masked `api_key_set` None = honest unknown |
+| 9 whole-session freeze | `test_first_use_pins_the_whole_role_set_and_later_overrides_are_ignored`, `test_profile_lifecycle_respects_the_pinned_whole_session_freeze` (supersede vs revoke, rebind fenced by queued work) |
+| 10 no silent truncation | `test_long_final_answer_survives_the_durable_turn` (>7000-char answer end to end) + removed `text[:4000]` |
+| 11 durable async + deadlines | `test_async_turn_submit_and_status_follow_the_durable_job`, `test_match_deadline_caps_admission_and_kills_stale_queue_items`, `test_run_finalization_cancels_the_sessions_queued_model_work`, `test_async_hint_completes_after_the_request_and_persists_once` + the rewritten browser test for the resolve UI |
+
+### Gate receipts for this round (all run personally, serialized)
+
+- Fast default (infrastructure-free): exit 0 — **647 passed, 0 failed,
+  0 skipped, 356 deselected, 6 warnings**, 83.09 s.
+- `acceptance.py selection` — **PASS** (146.2 s);
+  `acceptance.py python` — **PASS** (4.0 s).
+- `acceptance.py agent` — **PASS**: 66 passed, 0 failed, 0 skipped,
+  937 deselected (80.8 s).
+- `acceptance.py db` — **PASS**: **219 passed, 0 skipped, 784
+  deselected** on disposable PostgreSQL 16, fixture container and all
+  `srtest_*`/`sr_*` databases and roles cleaned (578.5 s).
+- `acceptance.py authority` — **PASS** (35 passed, 23.9 s);
+  `acceptance.py containment` — **PASS** (19.7 s).
+- `acceptance.py frontend` — **PASS** (production build; audit
+  moderate=0 low=0, zero high/critical, 6.6 s).
+- `acceptance.py browser` — **PASS**: 2 passed, 0 skipped (106.5 s) —
+  supersede-vs-revoke statuses, catalog discovery, mapping-less custom
+  refusal, and cancel → `cessation_unknown` → GUI resolve → 
+  `cessation_resolved` across reloads on the real Next build.
+
+### Deployment note and limits of this evidence
+
+- **Operator prerequisite:** the owner must create the dedicated secret
+  role (migration env `DB_SECRET_ROLE`, default `sr_secret`) and set
+  `SR_PG_SECRET_URL` BEFORE applying migration 0021 (it grants at
+  migration time; conftest models this ordering). With the store
+  unconfigured the env bootstrap refuses (audited reason, no fallback
+  to the app role) and every credential read fails closed.
+- The wire fixtures are the scripted fake OpenAI server: they prove OUR
+  side of the protocol (payloads, headers, terminal-state handling,
+  redaction), not that a real Strata endpoint behaves identically —
+  that stays a supervised live check.
+- DB-role isolation is not encryption at rest; it removes the
+  application plane's read path, which is the documented threat model.
+- `packet`, `journey`, and every installed-appliance check remain the
+  operator's manual gates; nothing in this round simulates them.
+
 ## Plan-19 implementation evidence — 2026-10-25, branch `practice-upgrades-18-21`
 
 Conversational agent on the pinned Pydantic AI layer + model administration.
