@@ -11,6 +11,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
@@ -447,3 +448,193 @@ class Recording(Base):
     status: Mapped[str] = mapped_column(Text, nullable=False, default="recording")
     bytes: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ModelProfile(Base):
+    """Versioned named model profile (plan 19). An edit creates a NEW
+    version and demotes the old one (partial unique index: one ACTIVE
+    per name); sessions pin a specific version and keep it for their
+    whole life. ``api_key`` is the provider credential and lives ONLY
+    here — no API response, event payload, log line or export ever
+    carries it; every read path must use ``masked()``. Lifecycle only
+    mutates (active → retired/revoked): rotation/revocation is a
+    visible transition, never an in-place model or key swap."""
+
+    __tablename__ = "model_profiles"
+
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="active")
+    base_url: Mapped[str] = mapped_column(Text, nullable=False)
+    model_name: Mapped[str] = mapped_column(Text, nullable=False)
+    api_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    thinking_level: Mapped[str] = mapped_column(Text, nullable=False, default="none")
+    thinking_map: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    generation_kwargs: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    context_window: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="262144")
+    max_completion_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="32768")
+    timeout_s: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="900")
+    capabilities: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("name", "version", name="uq_model_profiles_name_version"),
+        Index("uq_model_profiles_one_active", "name", unique=True,
+              postgresql_where=text("status = 'active'")),
+    )
+
+    def masked(self) -> dict:
+        """The ONLY serialization shape: presence, never value."""
+        return {
+            "profile_id": str(self.profile_id), "name": self.name,
+            "version": self.version, "status": self.status,
+            "base_url": self.base_url, "model_name": self.model_name,
+            "api_key_set": bool(self.api_key),
+            "thinking_level": self.thinking_level,
+            "thinking_map": self.thinking_map,
+            "generation_kwargs": self.generation_kwargs,
+            "context_window": self.context_window,
+            "max_completion_tokens": self.max_completion_tokens,
+            "timeout_s": self.timeout_s, "capabilities": self.capabilities,
+            "note": self.note,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "retired_at": self.retired_at.isoformat() if self.retired_at else None,
+        }
+
+    def public_config(self) -> dict:
+        """The exact non-secret configuration a session pin freezes."""
+        return {
+            "name": self.name, "version": self.version,
+            "base_url": self.base_url, "model_name": self.model_name,
+            "thinking_level": self.thinking_level,
+            "thinking_map": self.thinking_map,
+            "generation_kwargs": self.generation_kwargs,
+            "context_window": self.context_window,
+            "max_completion_tokens": self.max_completion_tokens,
+            "timeout_s": self.timeout_s,
+        }
+
+
+class ModelRoleOverride(Base):
+    """Role → profile-name selection (plan 19). Roles are exactly
+    attacker/coach/summarizer; a missing row means the bootstrap
+    profile. Selecting a profile never changes global environment
+    configuration — overrides live only here."""
+
+    __tablename__ = "model_role_overrides"
+
+    role: Mapped[str] = mapped_column(Text, primary_key=True)
+    profile_name: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_by: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class SessionModelPin(Base):
+    """The version a session RUNS ON (plan 19): created when the session
+    first uses a role, honored for the session's whole life. ``config``
+    freezes the exact masked configuration so a generation can state
+    what it ran on without re-reading mutable profile state. Replacing
+    a pin is an explicit operator rebind (the old version was revoked),
+    never an automatic substitution."""
+
+    __tablename__ = "session_model_pins"
+
+    pin_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.session_id"), nullable=False)
+    role: Mapped[str] = mapped_column(Text, nullable=False)
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("model_profiles.profile_id"),
+        nullable=False)
+    config: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    bound_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("session_id", "role",
+                         name="uq_session_model_pins_session_role"),
+    )
+
+
+class ModelJob(Base):
+    """Durable record of every model admission (plan 19): primary turns,
+    hints, AAR narratives, compaction, probes, tests and visible retry
+    attempts are ALL rows, so the ONE slot, the queue state, and the
+    obligations of a cancelled-but-possibly-live call survive reloads
+    and restarts. The partial unique index on state='running' is the
+    database-enforced single admission slot."""
+
+    __tablename__ = "model_jobs"
+
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.session_id"))
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False)
+    # queued | running | succeeded | failed | cancelled | cessation_unknown
+    state: Mapped[str] = mapped_column(Text, nullable=False, default="queued")
+    profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    profile_name: Mapped[str | None] = mapped_column(Text)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    parent_job: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    payload: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    result: Mapped[dict | None] = mapped_column(JSONB)
+    error: Mapped[str | None] = mapped_column(Text)
+    cancel_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false"))
+    actor: Mapped[str | None] = mapped_column(Text)
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("uq_model_jobs_single_running", "state", unique=True,
+              postgresql_where=text("state = 'running'")),
+        Index("ix_model_jobs_queue", "state", "priority", "requested_at"),
+        Index("ix_model_jobs_session", "session_id"),
+    )
+
+
+class ConversationRevision(Base):
+    """Append-only structured conversation history (plan 19). ``kind``
+    is ``messages`` (a serialized pydantic-AI ModelMessage list — the
+    structured turn, tool calls, returns, usage, finish reasons) or
+    ``checkpoint`` (a compaction summary that COVERS a revision range —
+    it never replaces or deletes history). The DB trigger and grants
+    make mutation impossible; a checkpoint therefore cannot hide what
+    it compacted, and replay can reconstruct what the model saw."""
+
+    __tablename__ = "conversation_revisions"
+
+    revision_id: Mapped[int] = mapped_column(BigInteger, primary_key=True,
+                                             autoincrement=True)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.session_id"), nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    usage: Mapped[dict | None] = mapped_column(JSONB)
+    finish_reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_conversation_revisions_session", "session_id", "revision_id"),
+    )

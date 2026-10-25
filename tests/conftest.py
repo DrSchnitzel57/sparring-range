@@ -323,7 +323,8 @@ def wipe_data(db_url_owner: str) -> None:
     eng = create_engine(db_url_owner)
     tables = ("events", "sessions", "agent_state", "login_tokens", "service_tokens",
               "deployments", "runs", "safety_records", "safety_state", "recordings",
-              "range_lease", "users")
+              "range_lease", "users", "model_jobs", "conversation_revisions",
+              "session_model_pins", "model_role_overrides", "model_profiles")
     with eng.begin() as c:
         c.execute(text("TRUNCATE " + ", ".join(tables) + " CASCADE"))
     eng.dispose()
