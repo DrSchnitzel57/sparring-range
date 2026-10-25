@@ -5,8 +5,11 @@ import { api } from "../../lib/api";
 // credential is WRITE-ONLY and DB-role-isolated (secret store): the list
 // shows set / — / unknown — presence as far as the APP role knows, never
 // the value. Profile edits create NEW versions; a NON-secret edit marks
-// the old one SUPERSEDED (pinned sessions keep running), a key rotation
-// REVOKES it (pinned sessions fail visibly until an explicit rebind).
+// the old one SUPERSEDED (pinned sessions keep running), a key
+// replacement REVOKES EVERY version carrying the replaced credential
+// (pinned sessions fail visibly until an explicit rebind). The thinking
+// wire preset declares HOW levels encode (none disables via the
+// chat-template toggle, graded levels send distinct reasoning_effort);
 // Custom thinking levels must DECLARE how they reach the wire — the form
 // only offers the two permitted request fields (reasoning_effort,
 // chat_template_kwargs); anything else is refused server-side. Cessation
@@ -19,8 +22,13 @@ function isOperator() {
 
 const STD_LEVELS = ["none", "low", "medium", "high"];
 const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "none"];
+// Known thinking-encoding presets (server THINKING_PRESETS). The preset
+// decides HOW a level reaches the wire (distinct field values, verified
+// per level); an unknown name is refused before any request.
+const WIRE_PRESETS = ["", "llama.cpp"];
 const emptyDraft = { name: "", base_url: "", model_name: "", api_key: "",
                      max_completion_tokens: "", thinking_level: "none",
+                     wire_preset: "",
                      custom_level: "", custom_effort: "", custom_kwargs: "",
                      context_window: "", timeout_s: "",
                      compaction_ratio: "" };
@@ -90,6 +98,9 @@ export default function AdminModels() {
       name: draft.name, base_url: draft.base_url, model_name: draft.model_name,
       api_key: draft.api_key,
       ...thinking,
+      ...(draft.wire_preset
+          ? { capabilities: { thinking: { wire_preset: draft.wire_preset } } }
+          : {}),
       max_completion_tokens: num(draft.max_completion_tokens),
       context_window: num(draft.context_window),
       compaction_ratio: num(draft.compaction_ratio),
@@ -98,7 +109,8 @@ export default function AdminModels() {
   });
 
   const rotate = (name) => run(rotateKey
-    ? "credential REPLACED: old version revoked (its queued jobs cancelled); "
+    ? "credential REPLACED: every version carrying the replaced credential "
+      + "is revoked (queued jobs cancelled, running ones asked to cease); "
       + "pinned sessions fail visibly until an explicit rebind"
     : "non-secret edit: old version SUPERSEDED — sessions already pinned to "
       + "it keep running on it; new sessions get the new version",
@@ -108,6 +120,9 @@ export default function AdminModels() {
       return api(`/admin/model/profiles/${name}/revise`, { method: "POST", body: {
         name, model_name: draft.model_name || undefined,
         ...thinking,
+        ...(draft.wire_preset
+            ? { capabilities: { thinking: { wire_preset: draft.wire_preset } } }
+            : {}),
         max_completion_tokens: num(draft.max_completion_tokens),
         context_window: num(draft.context_window),
         compaction_ratio: num(draft.compaction_ratio),
@@ -201,7 +216,10 @@ export default function AdminModels() {
                     <td>
                       {p.status === "active" && (
                         <button disabled={busy} data-testid={`rotate-${p.name}`}
-                                onClick={() => setRotateFor(p.name)}>rotate</button>)}
+                                onClick={() => {
+                                  setDraft({ ...draft, wire_preset: "" });
+                                  setRotateFor(p.name);
+                                }}>rotate</button>)}
                       {p.status === "active" && (
                         <button disabled={busy} onClick={() => revoke(p)}>revoke</button>)}
                       {p.status === "active" && (
@@ -248,6 +266,12 @@ export default function AdminModels() {
                 <select data-testid="field-thinking" value={draft.thinking_level}
                         onChange={e => setDraft({ ...draft, thinking_level: e.target.value })}>
                   {[...STD_LEVELS, "custom…"].map(l => <option key={l}>{l}</option>)}
+                </select></label>
+              <label>thinking wire preset
+                <select data-testid="field-wire-preset" value={draft.wire_preset}
+                        onChange={e => setDraft({ ...draft, wire_preset: e.target.value })}>
+                  <option value="">(default: llama.cpp)</option>
+                  {WIRE_PRESETS.filter(x => x).map(x => <option key={x}>{x}</option>)}
                 </select></label>
               {draft.thinking_level === "custom…" && (<>
                 <label>custom level name <input data-testid="field-custom-level"
