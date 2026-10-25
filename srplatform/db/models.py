@@ -20,6 +20,7 @@ from sqlalchemy import (
     SmallInteger,
     Text,
     UniqueConstraint,
+    case,
     func,
     text,
 )
@@ -493,6 +494,11 @@ class ModelProfile(Base):
     capabilities: Mapped[dict] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb"))
     note: Mapped[str | None] = mapped_column(Text)
+    # one-way identity of the credential VALUE (round-2 finding 2): a
+    # rotation invalidates EVERY version carrying the replaced digest,
+    # not just the version active at rotation time. NULL = predates
+    # digests (never matches, never false-revokes).
+    credential_digest: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False)
     retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -642,15 +648,24 @@ class ModelJob(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # round-2 finding 7: the member-visible OUTCOME (coach hint / AAR
+    # event) is claimed once per logical request by whichever writer
+    # closes the chain — never per attempt row.
+    outcome_persisted: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false")
 
     __table_args__ = (
         # ONE admission slot, and an UNCERTAIN cessation holds it too
-        # (review finding 2): a call whose provider-side stop cannot be
-        # confirmed keeps the slot occupied until an operator resolves
-        # the obligation — never quietly admitted past.
-        Index("uq_model_jobs_slot", "state", unique=True,
-              postgresql_where=text(
-                  "state IN ('running', 'cessation_unknown')")),
+        # (review finding 2 + round-2 finding 12). The key is the
+        # CONSTANT 0 for every occupying state and NULL otherwise —
+        # indexing ``state`` itself let one ``running`` plus one
+        # ``cessation_unknown`` coexist, because two DIFFERENT values
+        # are unique against each other. NULLs never conflict, so this
+        # index enforces the actually-advertised invariant: at most ONE
+        # occupying row (migration 0022).
+        Index("uq_model_jobs_occupied",
+              case((text("state IN ('running', 'cessation_unknown')"), 0)),
+              unique=True),
         Index("ix_model_jobs_queue", "state", "priority", "requested_at"),
         Index("ix_model_jobs_session", "session_id"),
         Index("ix_model_jobs_parent", "parent_job"),

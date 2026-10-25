@@ -22,6 +22,7 @@ Trust model:
 """
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import datetime, timezone
 
@@ -34,6 +35,71 @@ from srplatform.db.models import (Event, ModelProfile, ModelRoleOverride,
 
 BOOTSTRAP_NAME = "environment"
 ROLES = ("attacker", "coach", "summarizer")
+
+
+def _credential_digest(api_key: str | None) -> str | None:
+    """Non-reversible identity of a credential VALUE (round-2 finding 2).
+    A one-way digest of a high-entropy key leaks nothing, and it is what
+    makes "replace this credential" mean "invalidate EVERY version that
+    carries this credential" — not just whichever version happens to be
+    active when the operator rotates. Versions created before digests
+    existed carry NULL and never match (no false revocations)."""
+    if not api_key:
+        return None
+    return "sha256:" + hashlib.sha256(api_key.encode()).hexdigest()
+
+
+def _track_secret_writes_against_rollback(db: Session, profile_id) -> None:
+    """Compensation across the protected store (round-2 finding 11): the
+    secret store is a SEPARATE database and commits immediately, so a
+    profile row whose transaction later rolls back would leave an
+    unowned secret. Register a per-request rollback guard ONCE that
+    deletes secrets written for rows the transaction discarded. Keys
+    RESTORED as compensation target pre-existing rows and are
+    deliberately not tracked."""
+    if profile_id is not None:
+        db.info.setdefault("sr_secret_rollback_cleanups", []).append(
+            profile_id)
+    if db.info.get("sr_secret_guard_installed"):
+        return
+    from sqlalchemy import event as sa_event
+
+    def _cleanup(session: Session) -> None:
+        # SQLAlchemy 2.1 dispatches after_rollback with ONE argument
+        # (proven empirically: a two-argument listener makes
+        # Session.rollback() itself raise TypeError before the handler
+        # runs, silently killing this exact compensation)
+        from srplatform import secret_store
+        for pid in session.info.get("sr_secret_rollback_cleanups", []):
+            try:
+                secret_store.delete_key(pid)
+            except Exception:  # noqa: BLE001 — best effort, already failing
+                pass
+        session.info["sr_secret_rollback_cleanups"] = []
+        for pid, value in session.info.get("sr_secret_rollback_restores", []):
+            try:
+                secret_store.set_key(pid, value)
+            except Exception:  # noqa: BLE001 — best effort, already failing
+                pass
+        session.info["sr_secret_rollback_restores"] = []
+
+    sa_event.listen(db, "after_rollback", _cleanup)
+    db.info["sr_secret_guard_installed"] = True
+
+
+def _track_secret_delete_against_rollback(db: Session, profile_id,
+                                          value: str | None) -> None:
+    """A COMMITTED secret delete whose profile-status transaction later
+    rolls back would destroy a working credential (round-2 finding 11).
+    Record the value so the rollback guard puts it back; the guard is
+    the SAME one that removes rolled-back writes, so one request sees
+    one consistent compensation story no matter where the rollback
+    happens (inside revise, or at the route after revise returned)."""
+    if value is not None:
+        db.info.setdefault("sr_secret_rollback_restores", []).append(
+            (profile_id, value))
+    if not db.info.get("sr_secret_guard_installed"):
+        _track_secret_writes_against_rollback(db, None)
 
 #: generation kwargs the operator may pin, with validators. Anything
 #: else — messages, tools, auth, model, stream destinations, secret
@@ -327,7 +393,12 @@ def ensure_bootstrap_profile(db: Session) -> bool:
         return False
     for prof in (red, coach):
         if src["api_key"]:
+            # the env-held key MOVES here: digest recorded, value behind
+            # the secret identity, rollback-guarded like every other
+            # credential write
+            prof.credential_digest = _credential_digest(src["api_key"])
             secret_store.set_key(prof.profile_id, src["api_key"])
+            _track_secret_writes_against_rollback(db, prof.profile_id)
     db.add_all([
         ModelRoleOverride(role="attacker", profile_name=red.name),
         ModelRoleOverride(role="coach", profile_name=coach.name),
@@ -361,13 +432,21 @@ def create_profile(db: Session, *, name: str, base_url: str, model_name: str,
                    capabilities: dict | None = None,
                    actor: str = "operator",
                    note: str | None = None,
+                   credential_digest: str | None = None,
                    _status: str = "active") -> ModelProfile:
     """Create the NEXT version of a profile (version 1 when the name is
     new). ``api_key`` is write-only by construction: it goes straight
     into the secret store and is never echoed. An empty key means "no
     credential yet" — the profile exists but every call on it fails
     visibly until a credential is supplied (callers who mean "keep the
-    current one" must use :func:`revise` with ``api_key=None``)."""
+    current one" must use :func:`revise` with ``api_key=None``).
+
+    Round-2 finding 11: ALL validation happens before ANY effect; the
+    secret write is the LAST step after the row is flushed, a failed
+    secret write removes the row, and a rolled-back request transaction
+    removes the secret again through the rollback guard — a version can
+    never persist without its (intended) secret, and no secret can
+    outlive its version."""
     if not name or len(name) > 64 or any(c in name for c in " \t/"):
         raise ProfileProblem("profile name must be a short token")
     fields = validate_profile_fields(
@@ -380,7 +459,11 @@ def create_profile(db: Session, *, name: str, base_url: str, model_name: str,
     top = db.execute(select(_func.coalesce(_func.max(ModelProfile.version), 0))
                      .where(ModelProfile.name == name)).scalar_one()
     prof = ModelProfile(name=name, version=int(top) + 1, status=_status,
-                        note=note, **fields)
+                        note=note,
+                        credential_digest=(credential_digest
+                                           if credential_digest is not None
+                                           else _credential_digest(api_key)),
+                        **fields)
     db.add(prof)
     try:
         db.flush()
@@ -398,6 +481,7 @@ def create_profile(db: Session, *, name: str, base_url: str, model_name: str,
             raise ProfileProblem(
                 "the credential could not be stored in the secret store; "
                 "the profile was not created") from exc
+        _track_secret_writes_against_rollback(db, prof.profile_id)
     _append_admin_note(db, "profile.create",
                        {"name": name, "version": prof.version,
                         "model_name": prof.model_name, "by": actor,
@@ -406,22 +490,30 @@ def create_profile(db: Session, *, name: str, base_url: str, model_name: str,
 
 
 def revise(db: Session, name: str, *, api_key: str | None = None,
-           actor: str = "operator", **changes) -> ModelProfile:
+           actor: str = "operator", note: str | None = None,
+           **changes) -> ModelProfile:
     """Create the next version from the current active one, overriding
     only what the operator supplied. The SECRET axis decides the old
-    version's fate (review finding 9):
+    versions' fate (review finding 9 + round-2 finding 2):
 
     * ``api_key=None`` (non-secret edit — thinking, timeouts, budgets):
       the old version becomes ``superseded``. Sessions PINNED to it
       KEEP working (that is what makes a thinking-level edit safe to
       make mid-match); new sessions get the new version. No job is
-      cancelled, nothing is interrupted.
-    * a supplied key (credential replacement): the old version becomes
-      ``revoked`` and its stored credential is DELETED immediately —
-      pinned sessions' work then FAILS visibly until an operator
-      rebinds. Queued jobs are cancelled; running ones get a visible
-      cessation request.
-    """
+      cancelled, nothing is interrupted. The credential VALUE carries
+      over (same digest — the lineage stays traceable).
+    * a supplied key (credential replacement): every version that
+      carries the REPLACED credential — the active one AND every
+      superseded version a non-secret edit copied it forward to — is
+      REVOKED at once, its stored credential deleted, its queued jobs
+      cancelled and its running jobs asked to cease. Pinned sessions
+      then FAIL visibly until an operator rebinds. Replacing a
+      credential because it is compromised must not leave a live copy
+      behind in an older version.
+
+    Round-2 finding 11: validation completes BEFORE any secret or
+    status effect, and every effect is compensated on failure — an
+    invalid rotation can never destroy the working credential."""
     current = active_profile(db, name)
     if current is None:
         raise ProfileProblem(f"no active profile named {name!r}")
@@ -444,29 +536,58 @@ def revise(db: Session, name: str, *, api_key: str | None = None,
     if unknown:
         raise ProfileProblem(f"unknown profile fields: {sorted(unknown)}")
     rotating_key = api_key is not None
-    # demote FIRST: the one-ACTIVE partial index forbids two active rows
-    # even mid-transaction.
+    # ---- validate EVERYTHING before any effect (finding 11) ----------
+    fields = validate_profile_fields(**merged)
+    from srplatform import secret_store
+    old_secret = secret_store.get_key(current.profile_id)  # read only
+    replaced_digest = current.credential_digest
+    new_digest = _credential_digest(api_key) if rotating_key \
+        else current.credential_digest
     demote(db, current,
            reason="credential replaced" if rotating_key
                   else "non-secret edit; pinned sessions continue",
            actor=actor, revoked=rotating_key)
-    new = create_profile(db, name=name,
-                         api_key=(api_key or "") if rotating_key else "",
-                         actor=actor,
-                         note=changes.get("note",
-                                          f"rotation of {name} v{current.version}"
-                                          if rotating_key else
-                                          f"edit of {name} v{current.version}"),
-                         **merged)
+    try:
+        new = create_profile(db, name=name,
+                             api_key=(api_key or "") if rotating_key else
+                                      (old_secret or ""),
+                             credential_digest=new_digest,
+                             actor=actor,
+                             note=note or (
+                                 f"rotation of {name} v{current.version}"
+                                 if rotating_key else
+                                 f"edit of {name} v{current.version}"),
+                             **fields)
+        if rotating_key and replaced_digest:
+            # invalidate the WHOLE replaced-credential lineage, not just
+            # the version that was active (finding 2)
+            siblings = db.execute(select(ModelProfile).where(
+                ModelProfile.credential_digest == replaced_digest,
+                ModelProfile.status != "revoked")).scalars().all()
+            for sib in siblings:
+                if sib.profile_id == current.profile_id:
+                    continue
+                sib.status = "revoked"
+                sib.retired_at = datetime.now(timezone.utc)
+                _delete_secret_tracked(db, sib.profile_id)
+                _cancel_jobs_for(db, sib, reason="credential replaced")
+            _append_admin_note(db, "profile.lineage_revoke", {
+                "name": name, "new_version": new.version,
+                "revoked_versions": [s.version for s in siblings
+                                     if s.profile_id != current.profile_id],
+                "effect": "every version carrying the replaced credential "
+                          "is revoked; pinned sessions fail visibly until "
+                          "an operator rebinds", "by": actor})
+    except Exception:
+        # No manual compensation is needed — and none would be correct:
+        # the transaction rolls back (restoring every status change,
+        # even at route level after this function returned), and the
+        # SAME rollback guard deletes the new version's written secret
+        # and restores every secret this request deleted with its
+        # recorded value. One consistent story for every failure point
+        # (round-2 finding 11).
+        raise
     if not rotating_key:
-        # carry the credential forward for NEW sessions (the old version
-        # keeps its own until it is revoked; both point at the same
-        # secret value but rows are independent so revocation later
-        # cannot orphan a replacement mid-flight)
-        from srplatform import secret_store
-        existing = secret_store.get_key(current.profile_id)
-        if existing:
-            secret_store.set_key(new.profile_id, existing)
         _append_admin_note(db, "profile.supersede", {
             "name": name, "old_version": current.version,
             "new_version": new.version,
@@ -490,9 +611,19 @@ def demote(db: Session, prof: ModelProfile, *, reason: str,
     prof.retired_at = datetime.now(timezone.utc)
     db.flush()
     if revoked:
-        from srplatform import secret_store
-        secret_store.delete_key(prof.profile_id)
+        _delete_secret_tracked(db, prof.profile_id)
         _cancel_jobs_for(db, prof, reason=reason)
+
+
+def _delete_secret_tracked(db: Session, profile_id) -> None:
+    """Delete a stored credential WITH rollback compensation (finding 11):
+    the secret store commits immediately, so the value is captured first
+    and the transaction's rollback guard restores it if the status
+    change that justified the delete never commits."""
+    from srplatform import secret_store
+    value = secret_store.get_key(profile_id)
+    secret_store.delete_key(profile_id)
+    _track_secret_delete_against_rollback(db, profile_id, value)
 
 
 def _cancel_jobs_for(db: Session, prof: ModelProfile, *, reason: str) -> None:
@@ -535,7 +666,6 @@ def revoke(db: Session, profile_id: uuid.UUID, *, actor: str = "operator",
         raise ProfileProblem("profile version not found")
     if prof.status == "revoked":
         raise ProfileProblem("profile version is already revoked")
-    from srplatform import secret_store
     if prof.status == "active":
         demote(db, prof, reason=reason, actor=actor, revoked=True)
     else:
@@ -544,7 +674,7 @@ def revoke(db: Session, profile_id: uuid.UUID, *, actor: str = "operator",
         db.flush()
         # revocation of an already-superseded/retired version invalidates
         # its credential too — that is the whole point of revoking it
-        secret_store.delete_key(prof.profile_id)
+        _delete_secret_tracked(db, prof.profile_id)
     # References are cancelled too: every not-yet-terminal job bound to
     # this version (any state except the terminal ones) fails visibly.
     jobs = db.execute(select(ModelJob).where(
