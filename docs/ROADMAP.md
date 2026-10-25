@@ -116,7 +116,7 @@ The user approved all four plans on 2026-10-24 after full-sequence planning here
 The whole backlog remains in scope; these supplement, not falsely complete,
 historical 14–17. Implementation waits for the user's new worktree:
 
-- [ ] **18 — Permanent appliance and recovery repairs.**
+- [x] **18 — Permanent appliance and recovery repairs.**
   [Plan](../.openchamber/plans/18-permanent-appliance-repairs.md). Installer/native/UID/
   TLS/config/firewall reproducibility, packaged CLI migrations, cessation-safe
   teardown/obligation tooling, trusted cron image pins and adversarial containment
@@ -153,6 +153,14 @@ historical 14–17. Implementation waits for the user's new worktree:
   next independent review; the same operator gates remain open and the
   missing libvirt-fixture hypervisor/access recheck stays an explicit
   promotion limitation (NOT PASS — no env attestation substitutes).
+  *Accepted 2026-10-25:* independent review at `c58ef6a` → **SHIP**,
+  all seven criteria passed on re-run (fast 646/0, install, authority
+  35/0, containment 26/0, images 19/0 warm TCG, db 190/0, persisted
+  file-backed scoring probes, peer-UID artifact RPC drift probe, wheel
+  migration). **Software acceptance only** — the operator gates and
+  installed-system qualifications above remain open and are carried
+  into milestone 21's promotion checks. Milestone 19 implementation
+  starts from this base.
 - [ ] **19 — Conversational agent and model administration.**
   [Plan](../.openchamber/plans/19-conversation-and-model-admin.md). Pydantic AI slim,
   protected versioned profiles/role overrides/thinking mappings, context-aware

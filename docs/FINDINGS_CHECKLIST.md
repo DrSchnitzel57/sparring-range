@@ -110,8 +110,31 @@ Open gates unchanged (operator, NOT claimed): `packet` (root+`nft`),
 AppArmor `9e03696` adversarial qualification, and — in THIS worktree —
 the libvirt-debs-backed `hypervisor`/`access` rechecks are **NOT PASS:
 the fixture is absent**, so the changed broker/identity surfaces have
-no hypervisor-level re-execution receipt here. Milestone 18 stays
-UNTICKED pending independent re-review.
+no hypervisor-level re-execution receipt here.
+
+### Independent acceptance (2026-10-25): SOFTWARE acceptance at `c58ef6a`
+
+The parent independently RE-RAN everything at `c58ef6a` (source
+remained `c58ef6a`; all owned fixtures cleaned) and returned **VERDICT:
+SHIP — milestone-18 SOFTWARE acceptance passed all 7 criteria**: fast
+**646 passed / 289 deselected / 0 skipped / 4 warnings**, 76.40 s;
+install **PASS** 11.2 s (fresh=18 files, rerun=0, drift repaired);
+authority **35 passed / 0 skipped** (27.8 s); containment **26 passed /
+0 skipped** (23.5 s); images **19 passed / 0 skipped**, 315.5 s TCG warm;
+db **190 passed / 745 deselected / 0 skipped**, 496.0 s. Additional
+independent probes: persisted file-backed scoring **2 passed / 7.35 s**
+(same-digest malicious baseline edits remain FAILED 0 points; frozen
+clean stays 10; absent/corrupt/revoked/late pins UNKNOWN 0); real
+peer-UID Unix artifact RPC returned broker manifest A after the on-disk
+B swap; 77 hostile parser cases refused; worker-directory 0777→0750
+drift repaired; Node unit/build/probe congruent; actual installed wheel
+migrate/status/rerun at 0019-head passed.
+
+This is **SOFTWARE acceptance ONLY**: installed systemd/UID/TLS reality,
+AppArmor `9e03696` adversarial qualification, the libvirt-fixture
+hypervisor/access rechecks, `packet`, `journey`, and the real
+appliance/model gates stay explicit pending limitations. Milestone 18
+is ticked for its software gates with those limitations retained.
 
 
 ## Plan-18 review round — 2026-10-24, branch `practice-upgrades-18-21`
