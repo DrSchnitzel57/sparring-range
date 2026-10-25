@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
@@ -1270,19 +1270,29 @@ def internal_model_complete(body: ModelCompleteIn, p: Principal = Depends(servic
     try:
         with db() as s:
             _pin, prof = ma.bind_for(s, p.session_id, body.role)
+            # TEXT calls carry the SAME server-authoritative deadline as
+            # turns and coach work (round-2 finding 8): a match that has
+            # already expired cannot buy a fresh provider call through
+            # the text endpoint — enqueue itself refuses admission, and
+            # a still-live match bounds the wait at its own end.
+            deadline = _match_deadline(s, p.session_id)
             job = model_jobs.enqueue(
                 s, kind=f"text:{body.name}", priority=model_jobs.PRIORITY_RED,
                 payload={"mode": "text", "system": body.system,
                          "user": body.user},
-                session_id=p.session_id, profile=prof, actor="worker")
+                session_id=p.session_id, profile=prof, actor="worker",
+                deadline_at=deadline)
             jid = job.job_id
     except ma.ProfileProblem as e:
         raise HTTPException(503, str(e)) from e
     except model_jobs.QueueFull:
         raise HTTPException(503, "model queue saturated — retry the turn shortly")
+    bound = s0.llm_timeout_s + s0.model_hint_max_wait_s + 60
+    if deadline is not None:
+        remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
+        bound = min(bound, max(1.0, remaining + 30))
     with db() as s:
-        job = _model_job_wait(s, jid,
-                              s0.llm_timeout_s + s0.model_hint_max_wait_s + 60)
+        job = _model_job_wait(s, jid, bound)
         result = _model_job_http(job)
     return {"text": result["text"]}
 
@@ -1423,26 +1433,47 @@ def internal_model_turn(body: ModelTurnIn, p: Principal = Depends(service("runne
             if pressure["compact"]:
                 compaction_error = _compaction_deferral(s, sid, pressure)
                 if compaction_error is None:
-                    try:
-                        _spin, sprof = ma.bind_for(s, sid, "summarizer")
-                        text, covers = store.render_summary_input(s, sid)
-                        sj = model_jobs.enqueue(
-                            s, kind="summarize",
-                            priority=model_jobs.PRIORITY_RED,
-                            payload={"mode": "text",
-                                     "system": SUMMARIZE_SYSTEM,
-                                     "user": text,
-                                     "persist": {"session_id": str(sid)},
-                                     "covers_through": covers,
-                                     "used_at_enqueue":
-                                         int(pressure["used_tokens"])},
-                            session_id=sid, profile=sprof, actor="worker",
-                            deadline_at=deadline)
-                        turn_depends = sj.job_id
-                    except (ma.ProfileProblem, model_jobs.QueueFull) as e:
-                        compaction_error = (f"compaction deferred: "
-                                            f"{str(e)[:200]} — the next "
-                                            "turn retries it")
+                    # the covered range must end at a PROTOCOL-COMPLETE
+                    # boundary: a tool call whose result has not been
+                    # persisted yet may never be covered (round-2
+                    # finding 1 — the result would replay after the
+                    # checkpoint as an orphan, strict-400)
+                    boundary = store.pair_safe_coverage_end(s, sid)
+                    _cp_now = store.latest_checkpoint(s, sid)
+                    covered_now = int((_cp_now.payload or {}).get(
+                        "covers_through") or 0) if _cp_now else 0
+                    if boundary <= covered_now:
+                        compaction_error = (
+                            "no protocol-complete compaction boundary "
+                            "yet: the newest tool call has no persisted "
+                            "result, and compaction may never split a "
+                            "call from its return — the turn proceeds "
+                            "and compaction retries once the pair "
+                            "completes")
+                    else:
+                        try:
+                            _spin, sprof = ma.bind_for(s, sid, "summarizer")
+                            text, covers = store.render_summary_input(
+                                s, sid, through=boundary)
+                            sj = model_jobs.enqueue(
+                                s, kind="summarize",
+                                priority=model_jobs.PRIORITY_RED,
+                                payload={"mode": "text",
+                                         "system": SUMMARIZE_SYSTEM,
+                                         "user": text,
+                                         "persist": {"session_id": str(sid)},
+                                         "covers_through": covers,
+                                         "used_at_enqueue":
+                                             int(pressure["used_tokens"])},
+                                session_id=sid, profile=sprof,
+                                actor="worker",
+                                deadline_at=deadline)
+                            turn_depends = sj.job_id
+                        except (ma.ProfileProblem,
+                                model_jobs.QueueFull) as e:
+                            compaction_error = (f"compaction deferred: "
+                                                f"{str(e)[:200]} — the "
+                                                "next turn retries it")
             job = model_jobs.enqueue(
                 s, kind="turn", priority=model_jobs.PRIORITY_RED,
                 payload={"mode": "turn", "messages": blob,
@@ -1487,31 +1518,41 @@ def internal_model_turn(body: ModelTurnIn, p: Principal = Depends(service("runne
             "compaction_error": compaction_error}
 
 
+def _chain_status_body(s, job_id: uuid.UUID, *, errors: bool) -> dict:
+    """Delegates to the ONE job serializer (see srplatform/api/job_views)."""
+    from srplatform.api.job_views import chain_status_body
+    return chain_status_body(s, job_id, errors=errors)
+
+
+def _own_job_or_404(s, job_id: uuid.UUID, p: Principal):
+    from srplatform.db.models import ModelJob
+    job = s.get(ModelJob, job_id)
+    if job is None or str(job.session_id) != str(p.session_id):
+        raise HTTPException(404, "job not found")
+
+
 @app.get("/internal/model/jobs/{job_id}")
 def internal_model_job_status(job_id: uuid.UUID,
                               p: Principal = Depends(service("runner"))):
     """Async job status for the worker (run-scoped: only this session's
-    own jobs are visible; finding 11 reload-recovery)."""
-    from srplatform import model_jobs
-    from srplatform.db.models import ModelJob
+    own jobs are visible; finding 11 reload-recovery, round-2 finding 6
+    chain-aware finality)."""
     with db() as s:
-        job = s.get(ModelJob, job_id)
-        if job is None or str(job.session_id) != str(p.session_id):
-            raise HTTPException(404, "job not found")
-        done = job.state in model_jobs.TERMINAL_STATES \
-            or job.state == "cessation_unknown"
-        body = {"job_id": str(job.job_id), "state": job.state,
-                "kind": job.kind, "done": done}
-        if done and job.state == "succeeded":
-            r = job.result or {}
-            body.update({"kind": r.get("kind") or job.kind,
-                         "text": r.get("text"),
-                         "tool_call": r.get("tool_call"),
-                         "usage": r.get("usage"),
-                         "finish_reason": r.get("finish_reason")})
-        elif done:
-            body["error"] = model_jobs.redact_error(job.error or "")[:500]
-        return body
+        _own_job_or_404(s, job_id, p)
+        return _chain_status_body(s, job_id, errors=True)
+
+
+@app.get("/internal/model/jobs/{job_id}/stream")
+def internal_model_job_stream(job_id: uuid.UUID,
+                              p: Principal = Depends(service("runner"))):
+    """Bounded progress/result stream for the worker's own session."""
+    s0 = get_settings()
+    with db() as s:
+        _own_job_or_404(s, job_id, p)
+    from srplatform.api.job_views import job_event_stream
+    return job_event_stream(db, job_id, errors=True,
+                            bound_s=s0.llm_timeout_s
+                            + s0.model_hint_max_wait_s + 120)
 
 
 # --- separate-UID worker supervisor (milestone 15) ---------------------------
@@ -2261,9 +2302,13 @@ def admin_model_profile_create(body: ProfileIn,
             compaction_ratio=body.compaction_ratio,
             timeout_s=body.timeout_s, capabilities=body.capabilities,
             actor=_actor_name(p), note=body.note)
+        return ma.masked(prof, key_present=bool(body.api_key))
     except ma.ProfileProblem as e:
+        db.rollback()
         raise HTTPException(422, str(e)) from e
-    return ma.masked(prof, key_present=bool(body.api_key))
+    except Exception:
+        db.rollback()
+        raise
 
 
 @app.post("/admin/model/profiles/{name}/revise")
@@ -2285,17 +2330,26 @@ def admin_model_profile_revise(name: str, body: ProfileIn,
         "context_window": body.context_window,
         "max_completion_tokens": body.max_completion_tokens,
         "compaction_ratio": body.compaction_ratio,
-        "timeout_s": body.timeout_s, "capabilities": body.capabilities,
-        "note": body.note}.items()
+        "timeout_s": body.timeout_s, "capabilities": body.capabilities}.items()
         if v is not None}
     try:
+        # NOTE the explicit rollback: the secret store commits outside
+        # this transaction, and the rollback guard that restores/deletes
+        # secrets fires on Session.rollback — which must NOT depend on
+        # how the framework propagates an unexpected error into the
+        # dependency teardown. Any failure after a secret effect rolls
+        # the transaction back HERE (round-2 finding 11).
         prof = ma.revise(db, name, api_key=body.api_key,
-                         actor=_actor_name(p), **changes)
+                         actor=_actor_name(p), note=body.note, **changes)
+        return ma.masked(prof,
+                         key_present=(body.api_key is not None
+                                      and bool(body.api_key) or None))
     except ma.ProfileProblem as e:
+        db.rollback()
         raise HTTPException(422, str(e)) from e
-    return ma.masked(prof,
-                     key_present=(body.api_key is not None
-                                  and bool(body.api_key) or None))
+    except Exception:
+        db.rollback()
+        raise
 
 
 @app.post("/admin/model/profiles/{profile_id}/revoke")
@@ -2305,9 +2359,13 @@ def admin_model_profile_revoke(profile_id: uuid.UUID, body: RevokeIn,
     try:
         prof = ma.revoke(db, profile_id, actor=_actor_name(p),
                          reason=body.reason)
+        return ma.masked(prof)
     except ma.ProfileProblem as e:
+        db.rollback()
         raise HTTPException(422, str(e)) from e
-    return ma.masked(prof)
+    except Exception:
+        db.rollback()
+        raise
 
 
 @app.put("/admin/model/roles")
@@ -2374,6 +2432,22 @@ def admin_model_jobs(limit: int = 50, p: Principal = Depends(operator),
         "started_at": j.started_at.isoformat() if j.started_at else None,
         "finished_at": j.finished_at.isoformat() if j.finished_at else None,
     } for j in rows], "counts": counts}
+
+
+@app.get("/admin/model/jobs/{job_id}")
+def admin_model_job_detail(job_id: uuid.UUID,
+                           p: Principal = Depends(operator),
+                           db: DbSession = None):
+    """ONE logical request, chain-aware (round-2 finding 6): whichever
+    attempt id the operator clicked, the detail is the chain's final
+    outcome plus every attempt row with its own redacted diagnostic —
+    the GUI never has to guess whether it is looking at a superseded
+    failed attempt."""
+    from srplatform import model_jobs
+    try:
+        return _chain_status_body(db, job_id, errors=True)
+    except model_jobs.JobProblem as e:
+        raise HTTPException(404, str(e)) from e
 
 
 @app.post("/admin/model/jobs/{job_id}/resolve-cessation")

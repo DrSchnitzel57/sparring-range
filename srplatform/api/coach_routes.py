@@ -329,30 +329,107 @@ AAR_NARRATIVE_SYSTEM = (
     "Cite only events you were given (as #<event_id>). Be blunt and specific.")
 
 
+def _jobs_root_ids(db, session_id, *, sealed: bool) -> list:
+    from srplatform.db.models import ModelJob
+    stmt = select(ModelJob).where(ModelJob.session_id == session_id)
+    if sealed:
+        # Competition visibility is ENFORCED in the API (finding 4 +
+        # the standing boundary "enforce in APIs, not just the UI"):
+        # during a sealed match the attacker's model work — including
+        # the existence of turns/summaries and any diagnostic that
+        # could echo the conversation — is not member-visible at all.
+        stmt = stmt.where(ModelJob.kind.in_(
+            ("hint", "aar-narrative")))
+    return list(db.execute(stmt.order_by(
+        ModelJob.requested_at.desc())).scalars().all())
+
+
 @router.get("/sessions/{session_id}/model-jobs")
 def model_jobs_list(session_id: uuid.UUID, limit: int = 25,
                     p: Principal = Depends(any_member), db: DbSession = None):
-    """The member-visible ASYNC surface (finding 11): durable state and
-    timing of the session's model jobs — for "is my hint/report still
-    running?" after a reload. Deliberately NO result payloads: turn
-    transcripts may contain sealed attack data; outcome texts are
-    persisted through the normal evidence channels instead."""
-    _check_access(db, p, session_id)
+    """The member-visible ASYNC surface (finding 11 + round-2 finding 4):
+    durable state and timing of the session's model jobs — for "is my
+    hint/report still running?" after a reload. NO result payloads and
+    NO raw error text, ever: a diagnostic is provider-supplied and may
+    echo sealed conversation content even after secret redaction, so
+    members get the NEUTRAL classification (cancelled / model_call_failed
+    / cessation_unresolved); the redacted diagnostic is operator-only.
+    During a sealed match the member's own coach work is all that shows."""
     from srplatform import model_jobs
-    from srplatform.db.models import ModelJob
+    from srplatform.api.visibility import competition_sealed
+    sess = _check_access(db, p, session_id)
+    sealed = competition_sealed(db, sess, p)
     limit = max(1, min(limit, 100))
-    rows = db.execute(select(ModelJob).where(
-        ModelJob.session_id == session_id)
-        .order_by(ModelJob.requested_at.desc()).limit(limit)
-    ).scalars().all()
+    rows = _jobs_root_ids(db, session_id, sealed=sealed)[:limit]
     return {"jobs": [{
-        "job_id": str(j.job_id), "kind": j.kind, "state": j.state,
+        "job_id": str(j.job_id),
+        "kind": j.kind if not sealed else "model-work",
+        "state": j.state,
         "cancel_requested": j.cancel_requested,
-        "error": model_jobs.redact_error(j.error)[:300] if j.error else None,
+        "error_kind": model_jobs.error_kind(j),
         "requested_at": j.requested_at.isoformat() if j.requested_at else None,
         "started_at": j.started_at.isoformat() if j.started_at else None,
         "finished_at": j.finished_at.isoformat() if j.finished_at else None,
     } for j in rows]}
+
+
+@router.get("/sessions/{session_id}/model-jobs/{job_id}")
+def model_job_detail(session_id: uuid.UUID, job_id: uuid.UUID,
+                     p: Principal = Depends(any_member), db: DbSession = None):
+    """Chain-aware member detail (round-2 findings 4/6): final outcome
+    for the ONE logical request under any attempt id, neutral errors,
+    no result payloads; sealed sessions only see their own coach work."""
+    from srplatform.api.job_views import (chain_status_body, strip_results,
+                                          strip_sealed)
+    from srplatform.api.visibility import competition_sealed
+    sess = _check_access(db, p, session_id)
+    sealed = competition_sealed(db, sess, p)
+    from srplatform.db.models import ModelJob
+    job = db.get(ModelJob, job_id)
+    if job is None or str(job.session_id) != str(session_id):
+        raise HTTPException(404, "job not found")
+    if sealed and job.kind not in ("hint", "aar-narrative"):
+        raise HTTPException(404, "job not found")
+    body = chain_status_body(db, job_id, errors=False, result_kind=False)
+    return strip_sealed(body) if sealed else strip_results(body)
+
+
+@router.get("/sessions/{session_id}/model-jobs/{job_id}/stream")
+def model_job_stream(session_id: uuid.UUID, job_id: uuid.UUID,
+                     p: Principal = Depends(any_member)):
+    """Member job stream (round-2 finding 13): bounded SSE of state and
+    timing ONLY — progress ticks plus a terminal event that carries at
+    most the neutral error classification (result payloads never ride
+    this surface; they arrive as filtered evidence events). Reconnect
+    replays the terminal state from the durable row; closing the stream
+    does not touch the job."""
+    from srplatform.api.job_views import (job_event_stream, strip_results,
+                                          strip_sealed)
+    from srplatform.api.visibility import competition_sealed
+    s0 = None
+    with _db_ctx() as s:
+        sess = _check_access(s, p, session_id)
+        sealed = competition_sealed(s, sess, p)
+        from srplatform.db.models import ModelJob
+        job = s.get(ModelJob, job_id)
+        if job is None or str(job.session_id) != str(session_id):
+            raise HTTPException(404, "job not found")
+        if sealed and job.kind not in ("hint", "aar-narrative"):
+            raise HTTPException(404, "job not found")
+    from srplatform.settings import get_settings
+    s0 = get_settings()
+
+    def _filter(s, body):
+        # member surface: never any result payload, neutral kinds when
+        # sealed (the kind of a row is immutable, so a job visible when
+        # unsealed never newly hides; a job hidden while sealed stayed
+        # 404 above)
+        return strip_sealed(body) if sealed else strip_results(body)
+
+    return job_event_stream(_db_ctx, job_id, errors=False,
+                            bound_s=s0.model_hint_max_wait_s + 120,
+                            sealed_filter=_filter, results=False,
+                            result_kind=False)
 
 
 # --------------------------------------------------------------------------- #
