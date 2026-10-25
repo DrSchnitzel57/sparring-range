@@ -1,5 +1,82 @@
 # Current findings and validation evidence
 
+## Plan-19 implementation evidence — 2026-10-25, branch `practice-upgrades-18-21`
+
+Conversational agent on the pinned Pydantic AI layer + model administration.
+Commits (this branch, nothing pushed): `f4cfad3` pin
+`pydantic-ai-slim[openai]==2.61.0` · `14d37d3` migration 0020 (profiles,
+pins, jobs, conversation history) · `0cfb5e1` conversation core +
+model-admin service · `2dc54b9` durable one-slot jobs, turn/complete
+routes, admin API, loop on typed turns, shutdown lock release ·
+`51236c9` required-mode agent gate + compaction/flood proofs ·
+`eefdbdc` operator admin GUI + browser acceptance · `54d883e` waiters
+release sessions between polls + GUI advanced limits · (fixes) bootstrap
+on every start / head-agnostic app-role assertion / r01 env order ·
+per-lifespan CORS origins + browser-gate generalization.
+
+Receipts (each personally run on this final code, revision at commit
+`HEAD` at writing; disposable PostgreSQL 16 containers, run-owned):
+
+- Fast default: `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD
+  PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -ra -p
+  no:cacheprovider` — exit 0: **647 passed, 0 failed, 0 skipped,
+  325 deselected, 6 warnings** (~83 s). The 4→6 warning increase is the
+  new `on_event("shutdown")` handler and its framework wrapper — both
+  `on_event` DeprecationWarnings; the stack-wide lifespan migration is
+  out of plan-19 scope and harmless.
+- `agent` gate: `…/acceptance.py agent` — **PASS**, 35 passed / 0 failed
+  / 0 skipped / 937 deselected (32.6 s). New required-mode layer
+  (marker + exclusion + `SR_REQUIRE_AGENT` + selection coverage): real
+  SDK wire against the scripted OpenAI-compatible server, one-slot
+  serialization proven AT THE PROVIDER (max_concurrent==1), auth-header-
+  only credentials, rotation→visible 503→explicit rebind, unique-running
+  index, priority/FIFO claims, cancellation obligations (queued un-run;
+  running keeps the slot until return), cessation_unknown reconcile,
+  bounded visible retries, compaction checkpoint covering a range (next
+  request resumes from the summary; raw bulk never resent), 200k flood
+  bounded on the wire, probe-is-a-queue-member.
+- `db` gate: **PASS** — 209 passed / 0 failed / 0 skipped, 763
+  deselected (514.8 s) including all plan-19 db-layer suites plus the
+  previously-green stage5/r01/app-role regressions on the jobs path.
+- `authority` **PASS** 35/0/0 (25 s); `containment` **PASS** 26/0/0
+  (20 s); `python` **PASS** (fresh locked env, 4 entrypoint imports);
+  `selection` **PASS** (972 tests classified incl. new `agent` layer);
+  `frontend` **PASS** (next build + zero high/critical audit).
+- `browser` gate generalized to the whole layer: **PASS** — 2 passed / 0
+  skipped (99.6 s): the stage5 workflow+replay AND the plan-19 admin GUI
+  (members refused; created credential never reappears in DOM or rendered
+  text; rotation v2-active/v1-retired; probe job row SURVIVES reloads;
+  GUI cancellation resolves as a visible obligation).
+
+Full-run gate passes exposed three real defects, each repaired at the
+source, never by weakening an invariant:
+
+1. **Bootstrap behind the controller lock** — a process that lost the
+   advisory-lock race (or started while a predecessor's shutdown still
+   held it) served NO model profiles (red turns 503, hints queued
+   nothing). Profile bootstrap is idempotent and race-safe (unique
+   indexes pick winners; losing first-start rolls back) and now runs on
+   EVERY start; crashed-live reconciliation stays controller-only.
+   (`tests/test_app_role_live.py`'s migration-head literal became
+   head-agnostic; the chain guard still pins the exact head. `r01`'s
+   env must precede the settings build that bootstraps — the
+   frozen-at-bootstrap contract production relies on.)
+2. **Middleware stack (CORS origins) built once per process** — the
+   second lifespan silently refused the new web origin (login "Failed
+   to fetch" only when two real-browser tests shared a process).
+   Startup now rebuilds the stack per lifespan; production reads at
+   boot unchanged.
+3. **Controller advisory lock leaked on graceful exit** — it previously
+   lingered on the pooled connection until process exit, which had been
+   silently skipping startup duties/bootstrap on the 2nd+ TestClient in
+   a process. `_shutdown` now releases it (crash safety unchanged).
+
+Not claimed: the deployed-Strata compatibility check (operator Manual
+check); the scripted fake proves protocol shape, not a live provider;
+gateway-era `test_pilot_sustained_attacker` covers the in-process
+gateway class (retained untouched) — the HTTP admission path is covered
+by the agent gate instead.
+
 ## Plan-18 second review round — 2026-10-25, branch `practice-upgrades-18-21`
 
 The independent re-review at `41d8df9` returned **FIX** with six
