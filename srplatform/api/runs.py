@@ -112,8 +112,23 @@ def guarded_terminal_update(db: Session, run_id, values: dict,
             .where(Run.run_id == run_id, *extra_where, ~_unresolved_ops_exists())
             .values(**values))
     res = db.execute(stmt)
+    rc = res.rowcount
     db.commit()
-    return res.rowcount
+    if rc and values.get("status") in TERMINAL:
+        # PLAN 19 REVIEW: run finalization must REACH model work. A
+        # queued turn dispatched after the match ended, or a live call
+        # still burning its 900 s profile timeout, is cancelled HERE —
+        # queued rows die, a live call gets the cessation request that
+        # closes it inside the watcher interval.
+        from sqlalchemy import select as _select
+        row = db.execute(_select(Run.session_id).where(
+            Run.run_id == run_id)).first()
+        if row is not None and row[0] is not None:
+            from srplatform import model_jobs
+            model_jobs.cancel_session_jobs(
+                db, row[0], actor=f"run {values['status']}")
+            db.commit()
+    return rc
 
 
 class RunConflict(RuntimeError):

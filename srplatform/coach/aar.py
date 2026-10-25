@@ -196,20 +196,38 @@ Do NOT give the answer command; ask the question that leads them there, using
 the CONTEXT (timestamps are real; reference them). Keep it under 5 sentences."""
 
 
-def build_hint(events: list[dict], question: str, llm) -> dict:
-    """Socratic hint grounded in the live log, with HONEST state (F12): we say
-    'no correlated response observed', not 'you ignored it'."""
+def hint_prompt(events: list[dict], question: str) -> tuple[str, str, str]:
+    """Build the hint request EXACTLY once (system, user, state_line).
+    The synchronous path AND the durable-async enqueue share this
+    builder — two prompt constructions would drift, and a member's
+    async hint must be grounded in the same evidence view as the sync
+    one."""
     timeline, idx = compress_timeline(events[-200:], max_lines=25)
     n_miss, n_gap = len(idx["misses"]), len(idx["telemetry_gaps"])
     state_line = (f"Status: {n_miss} confirmed red items without a correlated response; "
                   f"{n_gap} with telemetry gaps (visibility unknown).")
     user = (f"DEFENDER QUESTION: {question or '(none — tell me where to look next)'}\n\n"
             f"CONTEXT (live log):\n{timeline}\n\n{state_line}")
+    return HINT_SYSTEM, user, state_line
+
+
+def hint_fallback(reason: str, state_line: str) -> str:
+    return (f"{reason} — deterministic guidance (not an AI-generated hint). "
+            f"{state_line} Which recent event can you corroborate with a second "
+            "log source, and where is visibility still missing? "
+            "No diagnosis or successful remediation is inferred.")
+
+
+def build_hint(events: list[dict], question: str, llm) -> dict:
+    """Socratic hint grounded in the live log, with HONEST state (F12): we say
+    'no correlated response observed', not 'you ignored it'."""
+    system, user, state_line = hint_prompt(events, question)
+    n_tail = [e["event_id"] for e in events[-5:]] if events else []
     fallback_reason = "No model available"
     text = None
     if llm:
         try:
-            text = llm.complete(user=user, system=HINT_SYSTEM)
+            text = llm.complete(user=user, system=system)
         except CompletionRejected:
             fallback_reason = "Model response was empty, incomplete, or rejected"
         # Test doubles/alternative adapters may not enforce the shared client's
@@ -218,8 +236,5 @@ def build_hint(events: list[dict], question: str, llm) -> dict:
             fallback_reason = "Model response was empty, incomplete, or rejected"
             text = None
     if text is None:
-        text = (f"{fallback_reason} — deterministic guidance (not an AI-generated hint). "
-                f"{state_line} Which recent event can you corroborate with a second "
-                "log source, and where is visibility still missing? "
-                "No diagnosis or successful remediation is inferred.")
-    return {"hint": text, "context_events": [e["event_id"] for e in events[-5:]] if events else []}
+        text = hint_fallback(fallback_reason, state_line)
+    return {"hint": text, "context_events": n_tail}

@@ -368,6 +368,18 @@ class RedAgentLoop:
                 self._turn_call_id = call.get("call_id") or None
                 tc = ToolCall(thought=str(call.get("thought") or ""),
                               args={"command": str(call.get("command") or "")})
+            elif turn.get("kind") in ("tool_rejected", "forged_tool"):
+                # PLAN 19 REVIEW: the conversation layer refused the model's
+                # ENVELOPE (abnormal finish, malformed args, forged tool…)
+                # and already answered every call id in the durable history
+                # — the model reads its own refusal on the next request.
+                # Nothing executes; this is NOT a parse failure, so no JSON
+                # reminder retry (which would re-ask the same envelope).
+                self._log("red", "agent_note",
+                          {"model_envelope_refused":
+                           (turn.get("text") or "")[:300]}, phase=pm.phase)
+                steps_run += 1
+                continue
             else:
                 raw = turn.get("text") or ""
                 try:

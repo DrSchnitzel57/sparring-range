@@ -1216,10 +1216,12 @@ class ModelCompleteIn(BaseModel):
 
 
 def _model_job_wait(s, jid, bound: float):
-    """Wait on a durable job within the caller's bound. Exceeding the bound
-    requests cessation (queued rows die; a live call is cancelled when it
-    returns) — a request that timed out is NEVER left to silently complete
-    later and never replayed."""
+    """Wait on a durable job (following its retry chain to ONE final
+    result) within the caller's bound. Exceeding the bound requests
+    cessation — the live call is CANCELLED (the watcher closes it), and
+    if its cessation cannot be confirmed the row stays a visible
+    obligation holding the slot; a request that timed out is never left
+    to silently complete later and never replayed."""
     from srplatform import model_jobs
     try:
         return model_jobs.wait(s, jid, bound)
@@ -1232,12 +1234,24 @@ def _model_job_wait(s, jid, bound: float):
 
 
 def _model_job_http(job):
-    """Terminal job state → visible HTTP outcome (never a silent success)."""
+    """Terminal job state → visible HTTP outcome (never a silent
+    success). An unconfirmed cessation is reported AS ONE: the caller
+    must know the provider may still be working and the slot is held
+    pending operator resolution."""
+    from srplatform import model_jobs
     if job.state == "succeeded":
         return job.result
+    if job.state == "cessation_unknown":
+        raise HTTPException(502, (
+            "model call cessation cannot be confirmed (the request timed "
+            "out or was closed mid-flight); the provider may still be "
+            "working and the admission slot is held until an operator "
+            "resolves the obligation — do not retry automatically"))
     if job.state == "cancelled":
-        raise HTTPException(502, f"model call cancelled: {(job.error or '')[:400]}")
-    raise HTTPException(502, f"model call failed: {(job.error or job.state)[:400]}")
+        raise HTTPException(502, "model call cancelled: "
+                            f"{model_jobs.redact_error(job.error or '')[:400]}")
+    raise HTTPException(502, "model call failed: "
+                        f"{model_jobs.redact_error(job.error or job.state)[:400]}")
 
 
 @app.post("/internal/model/complete")
@@ -1278,32 +1292,89 @@ class ModelTurnIn(BaseModel):
     system: str
     user: str
     tool_result: dict | None = None
+    wait: bool = True
+    deadline_at: str | None = None    # ISO-8601; the worker's clock for
+    #                                  the match is NOT authority — the
+    #                                      server also caps at the match row
 
 
 SUMMARIZE_SYSTEM = (
     "You compress a red-team engagement conversation into a concise "
     "situation report for the attacker agent continuing it: what is "
     "confirmed, what access is held, promising leads, dead ends to avoid, "
-    "and defender activity observed. Reference ONLY what the conversation "
-    "shows. Under 350 words.")
+    "defender activity observed, and FAILED attempts with their results "
+    "(do not repeat them). Reference ONLY what the conversation shows. "
+    "Under 350 words.")
+
+
+def _parse_deadline(value: str | None):
+    if not value:
+        return None
+    from datetime import datetime
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(422, "deadline_at must be ISO-8601") from None
+    if dt.tzinfo is None:
+        from datetime import timezone
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _match_deadline(db, session_id):
+    """Authoritative match end — single implementation in model_jobs."""
+    from srplatform import model_jobs
+    return model_jobs.match_deadline(db, session_id)
+
+
+def _compaction_deferral(db, session_id, pressure) -> str | None:
+    """Bounded failure backoff (finding 4): if the most recent
+    summarize job for this session did NOT succeed and context has not
+    grown materially (5% of the budget) since it was enqueued, the
+    SAME window is not re-summarized every turn — the turn proceeds
+    with a visibly deferred compaction instead of an identical retry
+    loop against a broken summarizer."""
+    from srplatform.db.models import ModelJob
+    last = db.execute(select(ModelJob).where(
+        ModelJob.session_id == session_id, ModelJob.kind == "summarize")
+        .order_by(ModelJob.requested_at.desc())).scalars().first()
+    if last is None or last.state == "succeeded":
+        return None
+    if last.state in ("queued", "running"):
+        return None  # a live summarize gates the turn via depends_on
+    used_before = int((last.payload or {}).get("used_at_enqueue") or 0)
+    growth = pressure["used_tokens"] - used_before
+    if growth < 0.05 * pressure["budget_tokens"]:
+        return ("compaction backoff: the last summarize attempt ended "
+                f"{last.state} and context has not grown materially — "
+                "retrying the identical window would only repeat the "
+                "failure; the turn proceeds and compaction retries as "
+                "history grows (operator: see the job list)")
+    return None
 
 
 @app.post("/internal/model/turn")
 def internal_model_turn(body: ModelTurnIn, p: Principal = Depends(service("runner"))):
-    """ONE STRUCTURED TURN of the session's DURABLE conversation (plan 19):
-    history is reconstructed from append-only revisions, the request joins
-    the pinned attacker profile's queue as a durable job, the answer is
-    persisted (structured messages, usage, finish reason) IN THE JOB'S
-    terminal transaction, and the reply carries the typed action. The
-    worker still holds no credential and executes nothing itself: a tool
-    call is a PROPOSAL; the loop dispatches it on the runner and returns
-    the result as a tool_result on the next turn.
+    """ONE STRUCTURED TURN of the session's DURABLE conversation (plan
+    19 review round):
 
-    Compaction is a separate visible job (summarizer pin): its checkpoint
-    COVERS the revision range and never deletes history; it is never run
-    while a tool call stands unanswered (that would break protocol)."""
+    * history is reconstructed from append-only revisions INCLUDING the
+      system framing and every tool return; this turn's INPUT messages
+      are persisted transactionally with its OUTPUT (finding 1) — the
+      wire never sees a conversation the ledger does not contain, and
+      the ledger never holds a message the wire did not see;
+    * token pressure is checked BEFORE the request at a protocol-
+      complete boundary; when compaction is due a summarize job covering
+      the range CAPTURED NOW is enqueued and this turn is GATED behind
+      it via depends_on (finding 4) — the next request never leaves with
+      an over-budget context;
+    * the request joins the pinned attacker profile's queue as a durable
+      job; ``wait=false`` returns the job id immediately and
+      ``GET /internal/model/jobs/{id}`` follows it (finding 11);
+    * the worker holds no credential and executes nothing: a tool call
+      is a PROPOSAL, dispatched by the loop, returned as tool_result."""
     from pydantic_ai.messages import (ModelRequest, SystemPromptPart,
-                                      UserPromptPart)
+                                      ToolReturnPart, UserPromptPart)
     from srplatform import conversation_store as store
     from srplatform import model_admin as ma
     from srplatform import model_jobs
@@ -1312,86 +1383,135 @@ def internal_model_turn(body: ModelTurnIn, p: Principal = Depends(service("runne
         raise HTTPException(413, "model request too large")
     sid = p.session_id
     s0 = get_settings()
-    # ---- rebuild thread + append this turn's request ----
+    requested_deadline = _parse_deadline(body.deadline_at)
+    # ---- rebuild thread + append this turn's input + compaction plan ----
     try:
         with db() as s:
             _pin, prof = ma.bind_for(s, sid, "attacker")
             msgs, _cp, _covered = store.load_thread(s, sid)
             if body.tool_result is not None:
                 tr = body.tool_result
-                msgs = conv.append_tool_return(
-                    msgs, str(tr.get("call_id") or ""),
-                    {"exit_code": tr.get("exit_code"),
-                     "output": str(tr.get("output") or "")[:60_000],
-                     "timed_out": bool(tr.get("timed_out")),
-                     "error": tr.get("error")})
+                new_input = [ModelRequest(parts=[ToolReturnPart(
+                    tool_name=conv.RANGE_TOOL_NAME,
+                    content={"exit_code": tr.get("exit_code"),
+                             "output": str(tr.get("output") or "")[:60_000],
+                             "timed_out": bool(tr.get("timed_out")),
+                             "error": tr.get("error")},
+                    tool_call_id=str(tr.get("call_id") or ""))])]
             else:
                 parts = []
                 if not msgs:      # system framing belongs to the FIRST turn
                     parts.append(SystemPromptPart(content=body.system))
                 parts.append(UserPromptPart(content=body.user))
-                msgs = msgs + [ModelRequest(parts=parts)]
-            blob = conv.dump_messages(msgs)
+                new_input = [ModelRequest(parts=parts)]
+            msgs_full = msgs + new_input
+            blob = conv.dump_messages(msgs_full)
+            input_new = conv.dump_messages(new_input)
             import json as _json
             if len(_json.dumps(blob)) > 4_000_000:
                 raise HTTPException(413, "conversation exceeds its serialization bound")
+            deadline = requested_deadline
+            md = _match_deadline(s, sid)
+            deadline = min(x for x in (deadline, md) if x is not None) \
+                if (deadline or md) else None
+            # pressure BEFORE the request — the boundary is protocol-
+            # complete: any previous tool call was answered by the loop
+            pressure = conv.context_pressure(
+                msgs_full, prof, store.last_usage(s, sid))
+            turn_depends = None
+            compaction_error = None
+            if pressure["compact"]:
+                compaction_error = _compaction_deferral(s, sid, pressure)
+                if compaction_error is None:
+                    try:
+                        _spin, sprof = ma.bind_for(s, sid, "summarizer")
+                        text, covers = store.render_summary_input(s, sid)
+                        sj = model_jobs.enqueue(
+                            s, kind="summarize",
+                            priority=model_jobs.PRIORITY_RED,
+                            payload={"mode": "text",
+                                     "system": SUMMARIZE_SYSTEM,
+                                     "user": text,
+                                     "persist": {"session_id": str(sid)},
+                                     "covers_through": covers,
+                                     "used_at_enqueue":
+                                         int(pressure["used_tokens"])},
+                            session_id=sid, profile=sprof, actor="worker",
+                            deadline_at=deadline)
+                        turn_depends = sj.job_id
+                    except (ma.ProfileProblem, model_jobs.QueueFull) as e:
+                        compaction_error = (f"compaction deferred: "
+                                            f"{str(e)[:200]} — the next "
+                                            "turn retries it")
             job = model_jobs.enqueue(
                 s, kind="turn", priority=model_jobs.PRIORITY_RED,
                 payload={"mode": "turn", "messages": blob,
-                         "persist": {"session_id": str(sid)}},
-                session_id=sid, profile=prof, actor="worker")
+                         "persist": {"session_id": str(sid),
+                                     "input_new": input_new}},
+                session_id=sid, profile=prof, actor="worker",
+                depends_on=turn_depends, deadline_at=deadline)
             jid = job.job_id
     except ma.ProfileProblem as e:
         raise HTTPException(503, str(e)) from e
     except model_jobs.QueueFull:
         raise HTTPException(503, "model queue saturated — retry the turn shortly")
-    # ---- wait for the durable turn ----
+    # ---- durable async surface (finding 11) ----
+    if not body.wait:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=202, content={
+            "job_id": str(jid), "state": "queued",
+            "status_url": f"/internal/model/jobs/{jid}"})
+    # ---- wait for the durable turn (chain-following, bounded) ----
+    bound = prof.timeout_s + s0.model_hint_max_wait_s + 60
+    if deadline is not None:
+        from datetime import datetime, timezone
+        remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
+        bound = min(bound, max(1.0, remaining + 30))
     with db() as s:
-        job = _model_job_wait(s, jid, prof.timeout_s + s0.model_hint_max_wait_s + 60)
+        job = _model_job_wait(s, jid, bound)
         result = _model_job_http(job)
-    # ---- compaction cycle (visible, retryable, never mid-tool-call) ----
+    # ---- post-turn pressure report ----
     needs_compaction = False
-    compaction_error = None
-    sjid = None
     with db() as s:
         full_msgs, _cp, _c = store.load_thread(s, sid)
-        pressure = conv.context_pressure(full_msgs, prof, store.last_usage(s, sid))
-        if pressure["compact"] and result["kind"] != "tool_call":
-            needs_compaction = True
-            text = store.render_thread_for_summary(s, sid)
-            try:
-                _spin, sprof = ma.bind_for(s, sid, "summarizer")
-                sj = model_jobs.enqueue(
-                    s, kind="summarize", priority=model_jobs.PRIORITY_RED,
-                    payload={"mode": "text", "system": SUMMARIZE_SYSTEM,
-                             "user": text},
-                    session_id=sid, profile=sprof, actor="worker")
-                sjid = sj.job_id
-            except (ma.ProfileProblem, model_jobs.QueueFull) as e:
-                compaction_error = (f"compaction deferred: {str(e)[:200]} "
-                                    "— the next turn retries it")
-    if sjid is not None:
-        with db() as s:
-            sj = _model_job_wait(s, sjid, 300)
-            if sj.state == "succeeded":
-                covered_to = store.thread_max_revision(s, sid)
-                store.append_checkpoint(s, sid,
-                                        summary=sj.result["text"],
-                                        covers_through=covered_to,
-                                        profile_id=sj.profile_id)
-                needs_compaction = False
-            else:
-                needs_compaction = True
-                compaction_error = (f"compaction failed: "
-                                    f"{(sj.error or sj.state)[:200]} — the "
-                                    "next turn retries it")
+        pressure = conv.context_pressure(full_msgs, prof,
+                                         store.last_usage(s, sid))
+        needs_compaction = bool(pressure["compact"])
     return {"kind": result["kind"], "text": result.get("text"),
             "tool_call": result.get("tool_call"),
             "usage": result.get("usage"),
             "finish_reason": result.get("finish_reason"),
+            "job_id": str(jid),
             "profile": {"name": prof.name, "version": prof.version},
             "needs_compaction": needs_compaction,
             "compaction_error": compaction_error}
+
+
+@app.get("/internal/model/jobs/{job_id}")
+def internal_model_job_status(job_id: uuid.UUID,
+                              p: Principal = Depends(service("runner"))):
+    """Async job status for the worker (run-scoped: only this session's
+    own jobs are visible; finding 11 reload-recovery)."""
+    from srplatform import model_jobs
+    from srplatform.db.models import ModelJob
+    with db() as s:
+        job = s.get(ModelJob, job_id)
+        if job is None or str(job.session_id) != str(p.session_id):
+            raise HTTPException(404, "job not found")
+        done = job.state in model_jobs.TERMINAL_STATES \
+            or job.state == "cessation_unknown"
+        body = {"job_id": str(job.job_id), "state": job.state,
+                "kind": job.kind, "done": done}
+        if done and job.state == "succeeded":
+            r = job.result or {}
+            body.update({"kind": r.get("kind") or job.kind,
+                         "text": r.get("text"),
+                         "tool_call": r.get("tool_call"),
+                         "usage": r.get("usage"),
+                         "finish_reason": r.get("finish_reason")})
+        elif done:
+            body["error"] = model_jobs.redact_error(job.error or "")[:500]
+        return body
 
 
 # --- separate-UID worker supervisor (milestone 15) ---------------------------
@@ -2069,7 +2189,9 @@ class ProfileIn(BaseModel):
     generation_kwargs: dict | None = None
     context_window: int | None = None
     max_completion_tokens: int | None = None
+    compaction_ratio: float | None = None
     timeout_s: int | None = None
+    capabilities: dict | None = None
     note: str | None = None
 
 
@@ -2086,6 +2208,11 @@ class RevokeIn(BaseModel):
     reason: str = "revoked by operator"
 
 
+class ResolveIn(BaseModel):
+    resolution: str
+    action: str = "release"
+
+
 def _actor_name(p: Principal) -> str:
     return getattr(p, "username", None) or "operator"
 
@@ -2099,7 +2226,19 @@ def admin_model_profiles(all_versions: bool = False,
         ModelProfile.name, ModelProfile.version.desc())).scalars().all()
     if not all_versions:
         rows = [r for r in rows if r.status == "active"]
-    return {"profiles": [ma.masked(r) for r in rows],
+    # api_key_set comes from the SECRET STORE membership — the profile
+    # row cannot answer it (and must not; finding 8). If the secret
+    # identity is unreachable the field reports None, never a guess.
+    keyed: set[str] | None
+    try:
+        from srplatform import secret_store
+        keyed = secret_store.keyed_profile_ids()
+    except Exception:  # noqa: BLE001 — honest unknown, not a failure here
+        keyed = None
+    return {"profiles": [ma.masked(r, key_present=(str(r.profile_id) in keyed
+                                                   if keyed is not None
+                                                   else None))
+                         for r in rows],
             "roles": ma.role_overrides(db)}
 
 
@@ -2119,18 +2258,24 @@ def admin_model_profile_create(body: ProfileIn,
             generation_kwargs=body.generation_kwargs,
             context_window=body.context_window,
             max_completion_tokens=body.max_completion_tokens,
-            timeout_s=body.timeout_s, actor=_actor_name(p), note=body.note)
+            compaction_ratio=body.compaction_ratio,
+            timeout_s=body.timeout_s, capabilities=body.capabilities,
+            actor=_actor_name(p), note=body.note)
     except ma.ProfileProblem as e:
         raise HTTPException(422, str(e)) from e
-    return ma.masked(prof)
+    return ma.masked(prof, key_present=bool(body.api_key))
 
 
 @app.post("/admin/model/profiles/{name}/revise")
 def admin_model_profile_revise(name: str, body: ProfileIn,
                                p: Principal = Depends(operator), db: DbSession = None):
-    """Rotation = a NEW version + demotion of the old one + visible
-    cancellation of queued jobs bound to it. Sessions pinned to the old
-    version FAIL until an operator rebinds them — never substituted."""
+    """Rotation semantics split on the SECRET axis: omitting ``api_key``
+    is a NON-secret edit — the old version becomes SUPERSEDED and
+    sessions pinned to it keep running (edits never break matches).
+    Supplying a key REPLACES the credential: the old version is revoked
+    immediately, its stored key deleted, its queued jobs cancelled and
+    its running jobs asked to cease; pinned sessions then fail visibly
+    until an operator rebinds them."""
     from srplatform import model_admin as ma
     changes = {k: v for k, v in {
         "base_url": body.base_url, "model_name": body.model_name,
@@ -2139,14 +2284,18 @@ def admin_model_profile_revise(name: str, body: ProfileIn,
         "generation_kwargs": body.generation_kwargs,
         "context_window": body.context_window,
         "max_completion_tokens": body.max_completion_tokens,
-        "timeout_s": body.timeout_s, "note": body.note}.items()
+        "compaction_ratio": body.compaction_ratio,
+        "timeout_s": body.timeout_s, "capabilities": body.capabilities,
+        "note": body.note}.items()
         if v is not None}
     try:
         prof = ma.revise(db, name, api_key=body.api_key,
                          actor=_actor_name(p), **changes)
     except ma.ProfileProblem as e:
         raise HTTPException(422, str(e)) from e
-    return ma.masked(prof)
+    return ma.masked(prof,
+                     key_present=(body.api_key is not None
+                                  and bool(body.api_key) or None))
 
 
 @app.post("/admin/model/profiles/{profile_id}/revoke")
@@ -2201,6 +2350,7 @@ def admin_model_probe(body: RoleOverrideIn,
 @app.get("/admin/model/jobs")
 def admin_model_jobs(limit: int = 50, p: Principal = Depends(operator),
                      db: DbSession = None):
+    from srplatform import model_jobs
     from srplatform.db.models import ModelJob
     from sqlalchemy import func as _f
     limit = max(1, min(limit, 200))
@@ -2213,12 +2363,82 @@ def admin_model_jobs(limit: int = 50, p: Principal = Depends(operator),
         "state": j.state, "session_id": str(j.session_id) if j.session_id else None,
         "profile_name": j.profile_name, "attempt": j.attempt,
         "parent_job": str(j.parent_job) if j.parent_job else None,
+        "depends_on": str(j.depends_on) if j.depends_on else None,
+        "deadline_at": j.deadline_at.isoformat() if j.deadline_at else None,
         "cancel_requested": j.cancel_requested, "actor": j.actor,
-        "error": j.error,
+        # defense-in-depth redaction at every display surface (finding 3)
+        "error": model_jobs.redact_error(j.error) if j.error else None,
+        "resolution": j.resolution,
+        "resolved_by": j.resolved_by,
         "requested_at": j.requested_at.isoformat() if j.requested_at else None,
         "started_at": j.started_at.isoformat() if j.started_at else None,
         "finished_at": j.finished_at.isoformat() if j.finished_at else None,
     } for j in rows], "counts": counts}
+
+
+@app.post("/admin/model/jobs/{job_id}/resolve-cessation")
+def admin_model_job_resolve(job_id: uuid.UUID, body: ResolveIn,
+                            p: Principal = Depends(operator),
+                            db: DbSession = None):
+    """The BOUNDED resolution for an unknown-cessation obligation: the
+    operator confirms from the outside world what happened to the call
+    (finished/stopped out-of-band) and releases the slot. Audited;
+    there is deliberately no automatic expiry (finding 2)."""
+    from srplatform import model_admin as ma
+    from srplatform import model_jobs
+    try:
+        job = model_jobs.resolve_cessation(
+            db, job_id, actor=_actor_name(p), resolution=body.resolution,
+            action=body.action)
+    except model_jobs.JobProblem as e:
+        raise HTTPException(422, str(e)) from e
+    db.add(Event(session_id=job.session_id, ts=datetime.now(timezone.utc),
+                 actor="operator", action_type="model_admin.job.resolve",
+                 payload={"job_id": str(job.job_id), "kind": job.kind,
+                          "resolution": body.resolution[:500],
+                          "by": _actor_name(p)}))
+    return {"job_id": str(job.job_id), "state": job.state}
+
+
+@app.get("/admin/model/profiles/{profile_id}/discover")
+def admin_model_discover(profile_id: uuid.UUID,
+                         p: Principal = Depends(operator), db: DbSession = None):
+    """Capability discovery: ask the endpoint itself what models it
+    serves (GET {base}/models), server-side with the profile's stored
+    credential. This is an admin-facing catalog read, NOT a completion:
+    it never enters the admission queue (no slot semantics) and never
+    sends messages/tools. The response is catalog ids only — a claim
+    about thinking support still requires the operator to record
+    capabilities deliberately; discovery alone cannot authorize a
+    level (finding 6)."""
+    from srplatform import model_admin as ma
+    from srplatform.db.models import ModelProfile
+    prof = db.get(ModelProfile, profile_id)
+    if prof is None:
+        raise HTTPException(404, "profile version not found")
+    import httpx
+    try:
+        key = ma.resolve_credential(prof)
+    except ma.ProfileProblem as e:
+        raise HTTPException(422, str(e)) from e
+    url = prof.base_url.rstrip("/") + "/models"
+    try:
+        r = httpx.get(url, headers={"Authorization": f"Bearer {key}"},
+                      timeout=10.0)
+    except httpx.HTTPError as exc:
+        from srplatform.red_agent.conversation import redact_secrets
+        raise HTTPException(502, redact_secrets(
+            f"discovery request failed: {type(exc).__name__}")) from exc
+    if r.status_code != 200:
+        raise HTTPException(502, f"discovery endpoint returned HTTP {r.status_code}")
+    try:
+        data = r.json().get("data") or []
+    except ValueError as exc:
+        raise HTTPException(502, "discovery response was not JSON") from exc
+    return {"models": [d.get("id") for d in data if isinstance(d, dict)
+                       and d.get("id")],
+            "note": "record capabilities deliberately; the catalog alone "
+                    "does not prove thinking support"}
 
 
 @app.post("/admin/model/jobs/{job_id}/cancel")
