@@ -1,8 +1,7 @@
 # 18 — Permanent appliance and recovery repairs
 
-> Review round (2026-10-24): review at `168a9e1` → FIX, seven findings, all
-> repaired with regressions in `806d239`…`dfaa954`; evidence in FINDINGS
-> "Plan-18 review round". Milestone 18 UNTICKED pending re-review.
+> Reviews: `168a9e1`→FIX (seven, `806d239`…`dfaa954`); `41d8df9`→FIX
+> (six, `e20604a`/`cd19b1d`). Receipts: FINDINGS "Plan-18 second review round".
 
 ## Steps
 - [x] Reproduce baselines and reconcile retained defects.

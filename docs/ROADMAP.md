@@ -136,6 +136,23 @@ historical 14–17. Implementation waits for the user's new worktree:
   UID/TLS/boot/KVM rechecks (now including the new bootstrap ownership and
   per-identity TLS-readability validation), and independent adversarial
   qualification of the broader AppArmor profile `9e03696`.
+  *Status 2026-10-25 (second review round):* the independent re-review at
+  `41d8df9` again returned **FIX** — six findings, all root-dataflow or
+  installation-wiring: same-digest pin edits could rewrite an existing
+  session's verified score (HIGH — the round-1 freeze stopped at the
+  identity); artifact identity came from an API-side manifest re-read
+  instead of the clone authority (MEDIUM — config drift recorded bytes
+  the broker would not deploy); the resolver setting was never rendered
+  into the API env (HIGH — wiring only real under monkeypatch); the
+  supervisor's required `worker` directory was never provisioned (HIGH);
+  the web unit exec'd the distro Node while provisioning installed the
+  pinned one (HIGH); schema accepted `true`/`1.0` as version 1 (LOW).
+  All six repaired in `e20604a`/`cd19b1d` with reproductions at both
+  test layers (see FINDINGS "second review round" and the architecture's
+  second-round table). Milestone stays UNTICKED pending the parent's
+  next independent review; the same operator gates remain open and the
+  missing libvirt-fixture hypervisor/access recheck stays an explicit
+  promotion limitation (NOT PASS — no env attestation substitutes).
 - [ ] **19 — Conversational agent and model administration.**
   [Plan](../.openchamber/plans/19-conversation-and-model-admin.md). Pydantic AI slim,
   protected versioned profiles/role overrides/thinking mappings, context-aware

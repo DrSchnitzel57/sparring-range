@@ -1,5 +1,119 @@
 # Current findings and validation evidence
 
+## Plan-18 second review round — 2026-10-25, branch `practice-upgrades-18-21`
+
+The independent re-review at `41d8df9` returned **FIX** with six
+findings. The reviewer independently reproduced the round-1 totals
+(fast 625/0, install/authority/containment/images/db green, the original
+wrong-digest probe UNKNOWN, 73 hostile pin cases refused) — those
+receipts stand — but showed the existing gates did not cover six real
+defects, so plan-18 criteria 5 and 7 were FAIL at that base:
+
+1. **HIGH — same-digest pin edits rewrote an existing session's
+   verified score.** Scoring re-read the CURRENT pin file's content
+   hashes each build; editing only `pins[role]['files']` (role/template/
+   digest untouched) turned the persisted FAILED 0-point verdict into
+   PASSED 10 points when re-scoring the same stored guest bytes.
+   Repaired (`e20604a`): the clean baseline (files + integrity reference
+   + version) is FROZEN into the immutable deployment resource at clone
+   time, before any scoring uses it; scoring reads only that frozen,
+   integrity-gated version. A post-launch pin document can only REVOKE
+   (identity drift or absence ⇒ UNKNOWN — trust degraded, never
+   redefined); it can never adopt new hashes for an existing session.
+   Historical/absent/corrupt freezes stay UNKNOWN; baselines are
+   per-session isolated.
+2. **MEDIUM — artifact identity was not confirmed by the clone
+   authority.** The API re-read the on-disk manifest at deploy time
+   while the broker verified images against its own separately loaded
+   manifest; the reviewer made the backend verify A while the API
+   recorded B. Repaired (`e20604a`): `artifact_for_template` answers
+   over the typed broker boundary from the broker's own loaded manifest
+   (whose SHA-256 the clone-image verification enforces), the service
+   validates the shape, and no manifest path, secret or libvirt access
+   crosses. Adapters without artifact manifests answer None — honest
+   UNKNOWN, never a guess.
+3. **LOW — schema `true`/`1.0` accepted as version 1** (Python
+   equality). Repaired (`e20604a`): explicit non-bool integer schema
+   required at the document top level AND per pin; hostile matrix
+   extended; every such document behaves exactly like an absent one.
+4. **HIGH — the supervisor's required directory was never
+   provisioned.** `sr-worker-supervisor.service` requires
+   `ReadWritePaths=<state>/worker` (no `-` marker, no `StateDirectory=`)
+   while `_ensure_dirs` never created it; the parent 0751 is traversal
+   only. Repaired (`cd19b1d`): dedicated 0750 `srworker:srworker` entry
+   provisioned exactly once (drift-repairing), and the unit is rendered
+   with `ReadWritePaths` bound to the configured state path
+   (byte-identical for the default layout).
+5. **HIGH — the provisioned Node binary was not the unit binary.**
+   `ensure_node_runtime` installed the pinned 22 under
+   `/usr/local/lib/nodejs` while `sr-web.service` exec'd `/usr/bin/node`
+   — fresh Ubuntu's Node 18 stayed the production runtime behind green
+   provisioning/probe checks. Repaired (`cd19b1d`): `node_runtime_plan`
+   selects ONE binary; the build (front of PATH), the actual
+   `ExecStart` and the per-UID verification name that exact path;
+   provisioning never clobbers a foreign `/usr/local/bin/node`.
+6. **HIGH — the artifact-resolver setting was never supplied to the
+   API.** `render_control_env` emitted no `SR_APPLIANCE_MANIFEST_FILE`,
+   and the existing db tests monkeypatched the missing setting away.
+   Repaired (`e20604a`) at the root: the setting and the on-disk
+   resolver are DELETED (finding 2 makes them unnecessary — the API
+   needs no manifest access); tests drive renderer → real Settings →
+   real deploy flow with no patch of a nonexistent knob.
+
+Quality: `tls_readiness_problems` is now documented as POSIX
+permission-bit math (not installed-service access proof); installed-
+systemd/TLS/AppArmor/KVM limits stay explicit.
+
+Exact automated attempts on the corrected tree (same container: Debian
+13, **no `/dev/kvm`**, no root, docker available; warm image cache):
+
+- `.venv/bin/python -m pytest -q -ra -p no:cacheprovider` (no DB admin)
+  — exit 0: **646 passed / 289 deselected / 0 failed / 0 skipped /
+  4 warnings**, 75.7 s (+21 tests: frozen-baseline, boundary, worker-
+  dir, node-runtime regressions).
+- `infra/dev/acceptance.py install` — **PASS after 7.4 s**: real
+  sequences (clean=18 files, rerun=0 changed, upgrade=1, drift repaired)
+  with the worker directory and the selected-runtime unit render.
+- `infra/dev/acceptance.py authority` — **PASS: 35 passed / 0 skipped**,
+  25.4 s. `containment` — **PASS: 26 passed / 0 skipped**, 21.1 s.
+- `infra/dev/acceptance.py selection` — **PASS after 164.1 s**, every
+  test classified (new files/marks included).
+- `infra/dev/acceptance.py db` — **PASS**: exit 0, **190 passed /
+  745 deselected / 0 skipped** in required mode (disposable PostgreSQL
+  16), 511.4 s; owned DB resources and the fixture container/volume
+  removed by the gate (re-verified: no `sr-acc*` resources remain).
+  Includes the six rewritten broker-identity/frozen-baseline db-layer
+  regressions plus every pre-existing DB scenario.
+- `infra/dev/acceptance.py images` — **PASS after 312.3 s**: **19
+  passed / 0 skipped** (software emulation, warm cache — not nested-KVM
+  acceptance), DB fixture removed, no QEMU run-dir leaks. The web-local
+  verify test exercises the PRODUCTION frozen-baseline injection against
+  the deploy-recorded identity, including the same-digest pin-edit case
+  (its pre-fix shallow-copy text made that assertion vacuous — one gate
+  attempt failed on it before `89d38c0` made it real; this receipt is
+  the committed tree).
+- Reviewer reproductions now proven by test: at the fast layer
+  (`test_plan18_cron_pins.py`) and through the REAL persisted
+  `build_scorecard` with synthetic guest replies on disposable
+  PostgreSQL (`test_plan18_deploy_artifact.py`) — same-digest pin edits
+  never turn bad content clean (absent pins then degrade to UNKNOWN);
+  config drift records the broker's manifest A, not the replaced
+  on-disk B; absent/corrupt/historical baselines and unknown templates
+  stay UNKNOWN; per-session frozen baselines are isolated; hostile
+  identities at the boundary are refused without crash; selection,
+  ExecStart, build and probe name ONE Node binary, foreign symlinks
+  survive, and the worker directory is provisioned, identity-bound and
+  drift-repaired.
+
+Open gates unchanged (operator, NOT claimed): `packet` (root+`nft`),
+`journey` (installed appliance), installed UID/TLS/boot/KVM rechecks,
+AppArmor `9e03696` adversarial qualification, and — in THIS worktree —
+the libvirt-debs-backed `hypervisor`/`access` rechecks are **NOT PASS:
+the fixture is absent**, so the changed broker/identity surfaces have
+no hypervisor-level re-execution receipt here. Milestone 18 stays
+UNTICKED pending independent re-review.
+
+
 ## Plan-18 review round — 2026-10-24, branch `practice-upgrades-18-21`
 
 The independent review of the section below (at base `168a9e1`) returned
@@ -55,12 +169,20 @@ Exact automated attempts on the final tree (same container: Debian 13,
   removed by the gate. Includes the three new deploy-recorded-artifact
   regressions plus every pre-existing DB-layer scenario.
 - Reviewer reproductions now proven by test: wrong-digest pin through the
-  REAL verifier ⇒ UNKNOWN (was PASS); post-launch pin replacement can
-  only revoke, never forge; hostile pin documents (int/null/nested
-  digests, bogus types) behave exactly like an absent pin, never crash;
-  planted shared-temp content and a planted symlink at the old alembic
-  cache path are ignored and left untouched; private staging cleaned on
-  success and on digest failure.
+  REAL verifier ⇒ UNKNOWN (was PASS); hostile pin documents (int/null/
+  nested digests, bogus types) behave exactly like an absent pin, never
+  crash; planted shared-temp content and a planted symlink at the old
+  alembic cache path are ignored and left untouched; private staging
+  cleaned on success and on digest failure.
+- CORRECTION (second review, 2026-10-25): this section's claim that
+  "post-launch pin replacement can only revoke, never forge" held ONLY
+  for identity-drift replacements.  Scoring still read the CURRENT pin
+  file's content hashes, so editing `pins[role]['files']` IN PLACE under
+  an unchanged role/template/digest rewrote what counted as clean and
+  turned a persisted FAILED (0 points) into a PASSED (10 points) on
+  rescore.  Reproduced by the reviewer through the real
+  `build_scorecard`, and repaired as described in the second-round
+  section above.
 
 Unchanged open gates (operator, NOT claimed): `packet` (root+`nft`),
 `journey` (installed appliance), the installed UID/TLS/boot/KVM rechecks
