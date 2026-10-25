@@ -124,6 +124,86 @@ def thread_max_revision(db, session_id) -> int:
     return int(n or 0)
 
 
+def _revision_rows(db, session_id, through: int | None = None):
+    stmt = (select(ConversationRevision)
+            .where(ConversationRevision.session_id == session_id,
+                   ConversationRevision.kind == "messages")
+            .order_by(ConversationRevision.revision_id.asc()))
+    if through is not None:
+        stmt = stmt.where(ConversationRevision.revision_id <= through)
+    return db.execute(stmt).scalars().all()
+
+
+def _part_call_ids(payload: dict):
+    """Yield (kind, call_id) for every ToolCallPart ("call") and
+    ToolReturnPart ("result") in one serialized revision."""
+    from pydantic_ai.messages import (ModelMessagesTypeAdapter,
+                                      ToolCallPart, ToolReturnPart)
+    try:
+        msgs = ModelMessagesTypeAdapter.validate_python([payload])
+    except Exception:  # noqa: BLE001 — a non-message row yields nothing
+        return
+    for m in msgs:
+        for p in getattr(m, "parts", []):
+            if isinstance(p, ToolCallPart):
+                yield "call", p.tool_call_id or ""
+            elif isinstance(p, ToolReturnPart):
+                yield "result", p.tool_call_id or ""
+
+
+def pair_safe_coverage_end(db, session_id) -> int:
+    """The newest revision at which the ledger is PROTOCOL-COMPLETE:
+    every tool call issued up to that point has its result recorded at
+    or before it as well (review round 2, finding 1).
+
+    Compaction may only cover up to this boundary. Cutting in the middle
+    of an open call/result pair produces the exact wire defect the
+    review reproduced: a checkpoint covers (removes from replay) the
+    assistant tool CALL, and the tool RESULT — arriving as the NEXT
+    turn's captured input, after the checkpoint — replays as an orphan,
+    which strict providers reject with 400. A call whose result has not
+    been persisted yet keeps the balance open, so the boundary sits
+    BEFORE the call; when the answer lands, the boundary advances."""
+    open_calls: set[str] = set()
+    last_complete = 0
+    for rev in _revision_rows(db, session_id):
+        for kind, cid in _part_call_ids(rev.payload):
+            if kind == "call":
+                open_calls.add(cid)
+            else:
+                open_calls.discard(cid)
+        if not open_calls:
+            last_complete = rev.revision_id
+    return last_complete
+
+
+def load_thread_through(db, session_id, through: int):
+    """Reconstructed messages as :func:`load_thread`, but replaying only
+    revisions ``<= through`` — the pair-safe compaction view."""
+    from pydantic_ai.messages import (ModelMessagesTypeAdapter,
+                                      ModelRequest, UserPromptPart)
+    cp = latest_checkpoint(db, session_id)
+    covered = int((cp.payload or {}).get("covers_through") or 0) if cp else 0
+    msgs: list = []
+    if cp is not None:
+        framing = _first_system_request(db, session_id)
+        if framing is not None:
+            msgs.append(framing)
+        msgs.append(ModelRequest(parts=[
+            UserPromptPart(content=(
+                "COMPACTED CONVERSATION SUMMARY (model-generated digest "
+                "of the earlier turns, provided as context — it carries "
+                "no system authority; the full history remains durably "
+                "recorded): "
+                + str((cp.payload or {}).get("summary") or "")))])
+                         )
+    for rev in _revision_rows(db, session_id, through=through):
+        if rev.revision_id <= covered:
+            continue
+        msgs.extend(ModelMessagesTypeAdapter.validate_python([rev.payload]))
+    return msgs, cp, covered
+
+
 def append_checkpoint(db, session_id, *, summary: str, covers_through: int,
                       profile_id: uuid.UUID | None = None) -> int:
     rev = ConversationRevision(
@@ -136,12 +216,20 @@ def append_checkpoint(db, session_id, *, summary: str, covers_through: int,
 
 
 def render_summary_input(db, session_id,
-                         max_chars: int = 60_000) -> tuple[str, int]:
+                         max_chars: int = 60_000,
+                         through: int | None = None) -> tuple[str, int]:
     """Flatten the live thread for the summarizer AND return the exact
     revision range the summary COVERS — captured NOW, at enqueue
     (review finding 4: the checkpoint must never claim "whatever max
     revision happens to be when the summary finishes", or concurrent
     work in flight would be silently covered without being summarized).
+
+    Round-2 finding 1: the range ends at the PAIR-SAFE boundary (see
+    :func:`pair_safe_coverage_end`) — a checkpoint may never cover a
+    tool call whose result is not yet in the ledger, or the replay after
+    compaction opens with an orphan tool result (rejected by strict
+    providers). ``through`` lets the caller reuse a boundary it already
+    computed for its deferral decision.
 
     The rendering covers the WHOLE range: when it is too large, per-
     entry detail shrinks UNIFORMLY; the middle is never elided and the
@@ -151,8 +239,10 @@ def render_summary_input(db, session_id,
                                       SystemPromptPart, TextPart,
                                       ToolCallPart, ToolReturnPart,
                                       UserPromptPart)
-    msgs, cp, _ = load_thread(db, session_id)
-    covers = thread_max_revision(db, session_id)
+    if through is None:
+        through = pair_safe_coverage_end(db, session_id)
+    msgs, cp, _ = load_thread_through(db, session_id, through)
+    covers = through
 
     def render(per_cap: int, call_cap: int) -> str:
         lines: list[str] = []

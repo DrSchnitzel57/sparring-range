@@ -25,6 +25,7 @@ never deleting history.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import math
 import re
 from dataclasses import dataclass, field
@@ -98,12 +99,19 @@ class WireFinishMissing(CompletionRejected):
 
 
 # --------------------------------------------------------------------------- #
-# secret redaction (review finding 3)                                          #
+# secret + content-safe failure diagnostics (review finding 3, round 2)         #
 # --------------------------------------------------------------------------- #
 
+#: The credential ACTUALLY SENT with the live request, captured at
+#: dispatch (round-2 finding 3: fetching the key again AFTER a revoke/
+#: delete mid-failure may no longer find the original value, and an
+#: opaque key of any length must still die from any diagnostic). Set
+#: around every provider call in this module; read by redaction only.
+_dispatch_credential: contextvars.ContextVar[str | None] = contextvars.ContextVar("sr_dispatch_credential", default=None)
+
 #: provider diagnostics can echo request material (401 pages naming the
-#: rejected credential are a real-world pattern). EVERY string built from
-#: a provider exception passes through here BEFORE it is persisted,
+#: rejected credential are a real-world pattern). EVERY string built
+#: from a provider exception passes through here BEFORE it is persisted,
 #: logged or returned — the saved key must never be observable anywhere.
 _SECRET_PATTERNS = (
     re.compile(r"sk-[A-Za-z0-9_\-]{4,}"),
@@ -114,13 +122,18 @@ _SECRET_PATTERNS = (
 
 
 def redact_secrets(text: str, secrets=()) -> str:
-    """Remove known-secret literals then secret-SHAPED material. Literal
-    removal happens first so a value with unusual characters still dies;
-    the patterns catch what the caller could not enumerate. The result is
-    bounded — diagnostics are never a channel for an unbounded body."""
+    """Remove KNOWN secret literals — at ANY length (a five-character
+    opaque key is still a key; a length floor was the round-2 leak) —
+    plus the credential dispatched on the current call, then secret-
+    SHAPED material. The result is bounded: diagnostics are never a
+    channel for an unbounded body."""
     out = text or ""
-    for secret in secrets:
-        if secret and len(secret) >= 6:
+    known = list(secrets)
+    live = _dispatch_credential.get()
+    if live:
+        known.append(live)
+    for secret in known:
+        if secret:
             out = out.replace(secret, "[REDACTED]")
     for pat in _SECRET_PATTERNS:
         out = pat.sub("[REDACTED]", out)
@@ -129,7 +142,9 @@ def redact_secrets(text: str, secrets=()) -> str:
 
 def _profile_secrets(profile) -> tuple:
     """The profile's live credential, for redaction only. Never returned
-    to callers, never logged — the value goes straight into replace()."""
+    to callers, never logged — the value goes straight into replace().
+    A revoked/absent credential raises nothing here (the dispatcher's
+    captured copy is the authoritative one)."""
     try:
         from srplatform.model_admin import resolve_credential
         key = resolve_credential(profile)
@@ -138,9 +153,67 @@ def _profile_secrets(profile) -> tuple:
         return ()
 
 
+def _exc_chain(exc: BaseException, depth: int = 8):
+    out = []
+    while exc is not None and len(out) < depth:
+        out.append(exc)
+        exc = (exc.__cause__ if exc.__cause__ is not None else
+               (exc.__context__ if not exc.__suppress_context__ else None))
+    return out
+
+
+def _status_codes(exc: BaseException) -> list[int]:
+    codes = []
+    for e in _exc_chain(exc):
+        code = getattr(e, "status_code", None)
+        if isinstance(code, int):
+            codes.append(code)
+    return codes
+
+
+def _is_connect_error(e: BaseException) -> bool:
+    # NOTE: this deployment's openai client rides httpx2/httpcore2 —
+    # identity checks against the plain ``httpx`` classes NEVER
+    # match, so connect errors are recognized by name+module.
+    return (type(e).__name__ in ("ConnectError", "ConnectTimeout")
+            and "httpx" in type(e).__module__)
+
+
+def _is_connect_deep(exc: BaseException) -> bool:
+    return any(_is_connect_error(e) for e in _exc_chain(exc))
+
+
 def _failure_text(profile, exc: BaseException) -> str:
-    return redact_secrets(f"{type(exc).__name__}: {exc}",
-                          _profile_secrets(profile))
+    """CLASS/STATUS-ONLY failure description (round-2 finding 3). A
+    provider error body can echo ANY request material — the credential
+    (any shape, any length) and the conversation itself (a competition
+    spoiler leak). So no provider-supplied text is carried into an error
+    string AT ALL; what remains is the exception class, the HTTP status
+    when the exchange produced one, and redaction as defense in depth."""
+    codes = _status_codes(exc)
+    cls = type(exc).__name__
+    what = f"{cls}: HTTP {codes[0]}" if codes else f"{cls}"
+    if _is_connect_deep(exc):
+        what += ": connection never opened"
+    elif codes:
+        what += " (provider diagnostic body withheld)"
+    else:
+        what += " (provider diagnostic withheld)"
+    return redact_secrets(what, _profile_secrets(profile))
+
+
+def _capture_dispatch_credential(profile):
+    """Resolve the credential ONCE at dispatch and keep it available to
+    redaction for the whole call (round-2 finding 3): a revocation that
+    lands mid-failure deletes the stored key, and redaction must still
+    know what value was actually on the wire. Returns the (token, key)
+    pair; callers reset the token in ``finally``."""
+    from srplatform.model_admin import resolve_credential
+    try:
+        key = resolve_credential(profile)
+    except Exception:      # noqa: BLE001 — build_model surfaces it visibly
+        key = None
+    return _dispatch_credential.set(key), key
 
 
 def range_tool_enabled() -> ModelRequestParameters:
@@ -174,19 +247,33 @@ class _StrictFinishOpenAIChatModel(OpenAIChatModel):
             "finish_reason (not reported as 'stop')")
 
 
-def build_model(profile, *, timeout_s: float | None = None):
+def build_model(profile, *, timeout_s: float | None = None,
+                api_key: str | None = None):
     from openai import AsyncOpenAI
 
     from srplatform.model_admin import resolve_credential
 
     timeout = float(timeout_s if timeout_s is not None else profile.timeout_s)
     client = AsyncOpenAI(base_url=profile.base_url,
-                         api_key=resolve_credential(profile),
+                         api_key=(api_key if api_key is not None
+                                  else resolve_credential(profile)),
                          timeout=timeout, max_retries=0)
     provider = OpenAIProvider(openai_client=client)
     model = _StrictFinishOpenAIChatModel(profile.model_name,
                                          provider=provider)
     return model, timeout
+
+
+def _http_failure(status: int, text: str) -> ProviderProblem:
+    """A definitive HTTP failure is retryable ONLY when the status says
+    the provider may answer differently next time (server-side, busy,
+    timeout). Re-sending identical bytes to 400/404/422 cannot help —
+    and on a one-slot admission, a pointless retry chain also starves
+    every other request."""
+    fail = ProviderDefiniteFailure(
+        f"model endpoint returned HTTP {status}: {text}")
+    fail.retryable = status in (408, 429) or status >= 500
+    return fail
 
 
 def _classify_provider_failure(profile, exc: BaseException) -> ProviderProblem:
@@ -196,112 +283,130 @@ def _classify_provider_failure(profile, exc: BaseException) -> ProviderProblem:
     mid-stream resets and local closes prove nothing about the provider's
     side, so they stay uncertain and the slot obligation survives.
 
-    The pinned SDK wraps openai's exceptions into
-    ``pydantic_ai.exceptions.ModelAPIError`` families, so the SDK shape
-    is consulted FIRST, then the underlying openai/httpx causes."""
+    Round-2 finding 3: classification reads STRUCTURE (exception types
+    and HTTP status codes along the cause chain) — never the message
+    text, which is provider-supplied and may echo credentials or the
+    conversation itself."""
+    import asyncio as _asyncio
+
     import httpx
     import openai
     from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
 
-    text = _failure_text(profile, exc)
-    lowered = text.lower()
+    chain = _exc_chain(exc)
+    codes = _status_codes(exc)
+    text = _failure_text(profile, exc)      # class/status-only, redacted
 
-    def _chain(e: BaseException, depth: int = 8):
-        out = []
-        while e is not None and len(out) < depth:
-            out.append(e)
-            e = (e.__cause__ if e.__cause__ is not None else
-                 (e.__context__ if not e.__suppress_context__ else None))
-        return out
+    def _timeout_in_chain() -> bool:
+        return any(isinstance(e, openai.APITimeoutError) or
+                   isinstance(e, httpx.TimeoutException) or
+                   (type(e).__name__ in ("TimeoutException", "ReadTimeout",
+                                         "ConnectTimeout")
+                    and "httpx" in type(e).__module__)
+                   for e in chain)
 
-    def _is_connect(e: BaseException) -> bool:
-        # NOTE: this deployment's openai client rides httpx2/httpcore2 —
-        # identity checks against the plain ``httpx`` classes NEVER
-        # match, so connect errors are recognized by name+module.
-        return (type(e).__name__ in ("ConnectError", "ConnectTimeout")
-                and "httpx" in type(e).__module__)
+    def _credential_rejected() -> ProviderProblem:
+        fail = ProviderProblem(
+            "model endpoint rejected the profile credential: "
+            f"HTTP {codes[0] if codes else '?'}")
+        fail.retryable = False
+        fail.uncertain = False
+        return fail
 
-    chain = _chain(exc)
-
-    def _classify_cause(default_uncertain: bool) -> ProviderProblem:
-        if any(isinstance(e, openai.APITimeoutError) or
-               (type(e).__name__ in ("TimeoutException", "ReadTimeout",
-                                     "ConnectTimeout")
-                and "httpx" in type(e).__module__)
-               for e in chain):
+    def _by_cause(default_uncertain: bool) -> ProviderProblem:
+        if _timeout_in_chain():
             return ProviderProblem(
                 f"model request timed out waiting for the provider: {text}")
         if any(isinstance(e, openai.APIConnectionError) for e in chain):
-            if any(_is_connect(e) for e in chain):
+            if any(_is_connect_error(e) for e in chain):
                 return ProviderDefiniteFailure(
-                    "model endpoint unreachable before the request was "
+                    f"model endpoint unreachable before the request was "
                     f"sent: {text}")
             return ProviderProblem(
                 f"model connection failed mid-exchange: {text}")
-        if any(isinstance(e, httpx.TimeoutException)
-               for e in chain):  # plain-httpx deployments
-            return ProviderProblem(f"model request timed out: {text}")
-        if any(_is_connect(e) for e in chain):
-            return ProviderDefiniteFailure(
-                f"model endpoint unreachable before sending: {text}")
-        if isinstance(exc, httpx.TimeoutException):
-            return ProviderProblem(f"model request timed out: {text}")
-        if _is_connect(exc):
+        if any(_is_connect_error(e) for e in chain):
             return ProviderDefiniteFailure(
                 f"model endpoint unreachable before sending: {text}")
         if default_uncertain:
             return ProviderProblem(f"model request failed: {text}")
         return ProviderDefiniteFailure(f"model request failed: {text}")
 
+    # a credential rejection carried by ANY wrapper wins over the shape
+    if 401 in codes or 403 in codes:
+        return _credential_rejected()
     if isinstance(exc, ModelHTTPError):
-        code = getattr(exc, "status_code", None)
-        if code in (401, 403):
-            fail = ProviderProblem(
-                "model endpoint rejected the profile credential: "
-                f"HTTP {code}")
-            fail.retryable = False
-            fail.uncertain = False
-            return fail
-        return ProviderDefiniteFailure(
-            f"model endpoint returned HTTP {code}: {text}")
-    if isinstance(exc, ModelAPIError):
-        return _classify_cause(default_uncertain=True)
+        # the SDK's own HTTP error: its status_code is wire truth
+        if exc.status_code in (401, 403):
+            return _credential_rejected()
+        return _http_failure(exc.status_code, text)
     if isinstance(exc, openai.APIStatusError):
         if exc.status_code in (401, 403):
-            fail = ProviderProblem(
-                "model endpoint rejected the profile credential: "
-                f"HTTP {exc.status_code}")
-            fail.retryable = False
-            fail.uncertain = False
-            return fail
-        return ProviderDefiniteFailure(
-            f"model endpoint returned HTTP {exc.status_code}: {text}")
+            return _credential_rejected()
+        return _http_failure(exc.status_code, text)
+    if isinstance(exc, ModelAPIError):
+        return _by_cause(default_uncertain=True)
     if isinstance(exc, openai.APITimeoutError):
         return ProviderProblem(
             f"model request timed out waiting for the provider: {text}")
     if isinstance(exc, openai.APIConnectionError):
-        return _classify_cause(default_uncertain=True)
-    if isinstance(exc, asyncio.TimeoutError):
-        return ProviderProblem(f"model request exceeded its bound: {text}")
-    if "401" in text or "403" in text or "unauthorized" in lowered \
-            or "invalid api key" in lowered:
-        fail = ProviderProblem(
-            f"model endpoint rejected the profile credential: {text}")
-        fail.retryable = False
-        fail.uncertain = False
-        return fail
-    return ProviderProblem(f"model request failed: {text}")
+        return _by_cause(default_uncertain=True)
+    if isinstance(exc, _asyncio.TimeoutError):
+        return ProviderProblem(
+            f"model request exceeded its bound: {text}")
+    if codes:
+        return _http_failure(codes[0], text)
+    return _by_cause(default_uncertain=True)
 
 
-#: thinking levels the platform understands without a mapping
+#: thinking levels the platform understands without an explicit mapping
 STANDARD_THINKING_LEVELS = ("none", "low", "medium", "high")
 
-#: request fields a custom level mapping may set (review finding 6).
+#: request fields a level mapping may set (review finding 6).
 #: Anything else — messages, tools, auth, destination — is refused at
 #: validation; the mapping can only shape the provider's thinking knobs.
 THINKING_WIRE_KEYS = ("reasoning_effort", "chat_template_kwargs")
 
 _EFFORT_WORDS = ("minimal", "low", "medium", "high", "xhigh", "none")
+
+#: VERSION 1 of the standard-level wire presets (round-2 finding 9).
+#: A BOOLEAN TOGGLE IS NOT A LEVEL: every standard level must map to a
+#: DISTINCT request state, or "low/medium/high" is a lie that survives
+#: a server that ignores the field. ``llama.cpp`` follows llama.cpp-
+#: style servers (the shape the operator's Strata/Qwen stack is served
+#: by): graded ``reasoning_effort`` per level, thinking disabled
+#: EXPLICITLY via the chat-template toggle (template default is ON;
+#: omission is not a disable). Earlier builds collapsed low/medium/high
+#: to one identical payload — that collapse is exactly what this
+#: replaces. Choosing a preset is a DECLARED capability of the profile
+#: (capabilities.thinking.wire_preset); the exact compatibility of an
+#: installed provider remains an operator-verified manual gate, and
+#: unknown presets are refused visibly.
+THINKING_PRESET_VERSION = "1"
+THINKING_PRESETS: dict[str, dict[str, dict]] = {
+    "llama.cpp": {
+        "none":   {"chat_template_kwargs": {"enable_thinking": False}},
+        "low":    {"reasoning_effort": "low"},
+        "medium": {"reasoning_effort": "medium"},
+        "high":   {"reasoning_effort": "high"},
+    },
+}
+DEFAULT_THINKING_PRESET = "llama.cpp"
+
+
+def thinking_preset_for(profile) -> str:
+    caps = getattr(profile, "capabilities", None) or {}
+    thinking = caps.get("thinking") if isinstance(caps, dict) else None
+    name = (thinking or {}).get("wire_preset") if isinstance(thinking, dict) \
+        else None
+    if name is None:
+        return DEFAULT_THINKING_PRESET
+    if name not in THINKING_PRESETS:
+        raise CompletionRejected(
+            f"thinking wire preset {name!r} is not implemented "
+            f"(known: {sorted(THINKING_PRESETS)} — version "
+            f"{THINKING_PRESET_VERSION}); refusing to guess how a "
+            "provider encodes thinking levels")
+    return name
 
 
 def thinking_encoding(profile) -> dict:
@@ -309,30 +414,48 @@ def thinking_encoding(profile) -> dict:
     actually reach the wire through the pinned SDK (verified against the
     installed pydantic-ai: ``ModelSettings["openai_reasoning_effort"]``
     is sent as ``reasoning_effort``; ``extra_body`` is forwarded and
-    caller keys win — a bare ``settings["thinking"]`` on a hand-built
-    request never reaches the wire, which is exactly the no-op the review
-    proved).
+    caller keys win — a bare ``settings["thinking"]`` never reaches
+    the wire).
 
-    - A custom level MUST have a mapping (an unencodable level is a
-      configuration error, never a silent omission).
-    - ``none`` EXPLICITLY disables thinking (Strata's template default
-      is ON; omission is not a disable).
-    - Legacy string mappings are level ALIASES (name → standard level)."""
+    Resolution order (round-2 finding 9):
+    1. an EXPLICIT per-level mapping on the profile (custom levels, or
+       an operator who declared their provider's exact fields);
+    2. the profile's declared wire PRESET (named, versioned, and every
+       standard level DISTINCT — no boolean collapse);
+    3. legacy string aliases (name → standard level), then the preset.
+    An unencodable level is a configuration error, never a silent
+    omission or a substitution."""
     level = profile.thinking_level or "none"
     tmap = profile.thinking_map or {}
     target = tmap.get(level)
-    if isinstance(target, str):          # legacy alias: name → standard
+    seen_alias = False
+    while isinstance(target, str) and not seen_alias:
+        seen_alias = True                    # alias once, then resolve
         level = target
-        target = None
+        target = tmap.get(level)
     if isinstance(target, dict):
         return {k: v for k, v in target.items() if k in THINKING_WIRE_KEYS}
-    if level not in STANDARD_THINKING_LEVELS:
-        raise CompletionRejected(
-            f"thinking level {level!r} has no request-field mapping — "
-            "refusing to send a request whose thinking state is unknown")
-    if level == "none":
-        return {"chat_template_kwargs": {"thinking": False}}
-    return {"chat_template_kwargs": {"thinking": True}}
+    if level in STANDARD_THINKING_LEVELS:
+        preset = THINKING_PRESETS[thinking_preset_for(profile)]
+        encoding = dict(preset[level])
+        # allow a per-level PARTIAL override to refine the preset (e.g.
+        # add budget kwargs on top of the effort), merged per field
+        override = tmap.get(f"override:{level}")
+        if isinstance(override, dict):
+            for k, v in override.items():
+                if k not in THINKING_WIRE_KEYS:
+                    continue
+                if k == "chat_template_kwargs" and isinstance(v, dict):
+                    merged = dict(encoding.get("chat_template_kwargs") or {})
+                    merged.update(v)
+                    encoding["chat_template_kwargs"] = merged
+                else:
+                    encoding[k] = v
+            return encoding
+        return encoding
+    raise CompletionRejected(
+        f"thinking level {level!r} has no request-field mapping — "
+        "refusing to send a request whose thinking state is unknown")
 
 
 def model_settings(profile, *, timeout_s: float | None = None) -> ModelSettings:
@@ -346,13 +469,10 @@ def model_settings(profile, *, timeout_s: float | None = None) -> ModelSettings:
     encoding = thinking_encoding(profile)
     extra_body: dict = {}
     if "reasoning_effort" in encoding:
-        effort = encoding["reasoning_effort"]
-        if effort == "none":
-            # explicit wire-disable; also suppresses the template toggle
-            settings["openai_reasoning_effort"] = "none"  # type: ignore[literal-required]
-            extra_body.setdefault("chat_template_kwargs", {})["thinking"] = False
-        else:
-            settings["openai_reasoning_effort"] = effort  # type: ignore[literal-required]
+        # the effort value reaches the wire verbatim (graded low/medium/
+        # high, or an explicit "none" disable) — no rewriting, no
+        # boolean substitution: the preset IS the declared encoding
+        settings["openai_reasoning_effort"] = encoding["reasoning_effort"]  # type: ignore[literal-required]
     if "chat_template_kwargs" in encoding:
         ctk = extra_body.setdefault("chat_template_kwargs", {})
         ctk.update(encoding["chat_template_kwargs"] or {})
@@ -582,138 +702,144 @@ async def run_turn_async(profile, messages: list, *,
     layer and assembles the SAME structured response; additionally the
     RAW wire terminal state must have been seen (the SDK's normalization
     of a finish-less stream to ``stop`` is refused — finding 7)."""
-    model, timeout = build_model(profile, timeout_s=timeout_s)
-    settings = model_settings(profile, timeout_s=timeout)
-    params = range_tool_enabled() if tools else ModelRequestParameters()
-
-    async def _request():
-        if not stream:
-            return await model.request(messages, settings, params)
-        async with model.request_stream(messages, settings, params) as sr:
-            async for _event in sr:
-                pass
-            final = sr.get()          # sync: assembled final response
-            if not getattr(sr, "_has_finish_reason", True):
-                # the SDK defaults a finish-less stream to stop; the wire
-                # never said stop, so it is NOT a completion
-                raise WireFinishMissing(
-                    "model completion rejected: streamed response ended "
-                    "without a terminal finish_reason on the wire")
-            return final
-
+    cred_token, dispatch_key = _capture_dispatch_credential(profile)
     try:
-        response = await _guarded(_request(), cancel_check,
-                                  deadline_monotonic)
-    except (CompletionRejected, LocalCancellation):
-        raise
-    except Exception as exc:  # provider transport/protocol error
-        raise _classify_provider_failure(profile, exc) from exc
 
-    finish = getattr(response, "finish_reason", None)
-    usage = usage_dict(response)
-    new_parts = list(response.parts)
-    texts = [p.content for p in new_parts if isinstance(p, TextPart)]
-    text = "\n".join(t for t in texts if isinstance(t, str) and t.strip()) \
-        or None
-    calls = [p for p in new_parts if isinstance(p, ToolCallPart)]
+        model, timeout = build_model(profile, timeout_s=timeout_s,
+                                 api_key=dispatch_key)
+        settings = model_settings(profile, timeout_s=timeout)
+        params = range_tool_enabled() if tools else ModelRequestParameters()
 
-    # ---- envelope gate: terminal state FIRST, nothing executable passes
-    if finish is None:
-        raise CompletionRejected(
-            "model completion rejected: no terminal finish_reason")
-    if finish == "length":
-        # Partial tool calls / partial reports are not completions;
-        # resending identical bytes cannot repair the budget.
-        raise CompletionRejected(
-            "model completion rejected: token budget exhausted")
-    if not new_parts:
-        raise CompletionRejected("model completion rejected: no content")
+        async def _request():
+            if not stream:
+                return await model.request(messages, settings, params)
+            async with model.request_stream(messages, settings, params) as sr:
+                async for _event in sr:
+                    pass
+                final = sr.get()          # sync: assembled final response
+                if not getattr(sr, "_has_finish_reason", True):
+                    # the SDK defaults a finish-less stream to stop; the wire
+                    # never said stop, so it is NOT a completion
+                    raise WireFinishMissing(
+                        "model completion rejected: streamed response ended "
+                        "without a terminal finish_reason on the wire")
+                return final
 
-    out_messages = list(messages) + [response]
-    if calls:
-        forged = [c for c in calls if c.tool_name != RANGE_TOOL_NAME]
-        if forged:
-            # A tool the range never exposed was "called": refuse and
-            # answer every call id so history stays protocol-complete.
-            rejected = _refusal_request(
-                calls, "forged or unknown tool call — only range_command "
-                       "exists")
-            return TurnResult(kind="forged_tool",
-                              text=f"refused tool calls: "
-                                   f"{sorted({c.tool_name for c in calls})}",
-                              pending_call_ids=[],
-                              messages=out_messages + [rejected],
-                              response_messages=[response, rejected],
-                              usage=usage, finish_reason=finish)
-        if finish not in _EXECUTABLE_TOOL_FINISHES:
-            # content_filter or any abnormal terminal state: the WHOLE
-            # envelope is refused, every call id answered (finding 7).
-            why = f"completion finished {finish!r}; no call executes"
-            rejected = _refusal_request(calls, why)
-            return TurnResult(kind="tool_rejected",
-                              text=f"refused tool calls: {why}",
-                              pending_call_ids=[],
-                              messages=out_messages + [rejected],
-                              response_messages=[response, rejected],
-                              usage=usage, finish_reason=finish)
-        ids = [c.tool_call_id or "" for c in calls]
-        if any(not i for i in ids) or len(set(ids)) != len(ids):
-            why = "tool calls missing or duplicating call ids"
-            rejected = _refusal_request(calls, why)
-            return TurnResult(kind="tool_rejected",
-                              text=f"refused tool calls: {why}",
-                              pending_call_ids=[],
-                              messages=out_messages + [rejected],
-                              response_messages=[response, rejected],
-                              usage=usage, finish_reason=finish)
-        # ALL argument envelopes validate BEFORE the first call may
-        # execute; one malformed call refuses the whole envelope.
         try:
-            parsed = [_call_to_dict(c) for c in calls]
-        except CompletionRejected as exc:
-            why = str(exc)
-            rejected = _refusal_request(calls, why)
-            return TurnResult(kind="tool_rejected",
-                              text=f"refused tool calls: {why}",
-                              pending_call_ids=[],
-                              messages=out_messages + [rejected],
-                              response_messages=[response, rejected],
-                              usage=usage, finish_reason=finish)
-        if len(calls) > 1:
-            # Parallel calls: the first executes after this turn; every
-            # call id gets an answer so the next request is valid.
-            extra = [ToolReturnPart(tool_name=c.tool_name, content=(
-                "REFUSED: actions are strictly sequential — one action at "
-                "a time; issue your next command in a later turn"),
-                tool_call_id=c.tool_call_id or "") for c in calls[1:]]
+            response = await _guarded(_request(), cancel_check,
+                                      deadline_monotonic)
+        except (CompletionRejected, LocalCancellation):
+            raise
+        except Exception as exc:  # provider transport/protocol error
+            raise _classify_provider_failure(profile, exc) from exc
+
+        finish = getattr(response, "finish_reason", None)
+        usage = usage_dict(response)
+        new_parts = list(response.parts)
+        texts = [p.content for p in new_parts if isinstance(p, TextPart)]
+        text = "\n".join(t for t in texts if isinstance(t, str) and t.strip()) \
+            or None
+        calls = [p for p in new_parts if isinstance(p, ToolCallPart)]
+
+        # ---- envelope gate: terminal state FIRST, nothing executable passes
+        if finish is None:
+            raise CompletionRejected(
+                "model completion rejected: no terminal finish_reason")
+        if finish == "length":
+            # Partial tool calls / partial reports are not completions;
+            # resending identical bytes cannot repair the budget.
+            raise CompletionRejected(
+                "model completion rejected: token budget exhausted")
+        if not new_parts:
+            raise CompletionRejected("model completion rejected: no content")
+
+        out_messages = list(messages) + [response]
+        if calls:
+            forged = [c for c in calls if c.tool_name != RANGE_TOOL_NAME]
+            if forged:
+                # A tool the range never exposed was "called": refuse and
+                # answer every call id so history stays protocol-complete.
+                rejected = _refusal_request(
+                    calls, "forged or unknown tool call — only range_command "
+                           "exists")
+                return TurnResult(kind="forged_tool",
+                                  text=f"refused tool calls: "
+                                       f"{sorted({c.tool_name for c in calls})}",
+                                  pending_call_ids=[],
+                                  messages=out_messages + [rejected],
+                                  response_messages=[response, rejected],
+                                  usage=usage, finish_reason=finish)
+            if finish not in _EXECUTABLE_TOOL_FINISHES:
+                # content_filter or any abnormal terminal state: the WHOLE
+                # envelope is refused, every call id answered (finding 7).
+                why = f"completion finished {finish!r}; no call executes"
+                rejected = _refusal_request(calls, why)
+                return TurnResult(kind="tool_rejected",
+                                  text=f"refused tool calls: {why}",
+                                  pending_call_ids=[],
+                                  messages=out_messages + [rejected],
+                                  response_messages=[response, rejected],
+                                  usage=usage, finish_reason=finish)
+            ids = [c.tool_call_id or "" for c in calls]
+            if any(not i for i in ids) or len(set(ids)) != len(ids):
+                why = "tool calls missing or duplicating call ids"
+                rejected = _refusal_request(calls, why)
+                return TurnResult(kind="tool_rejected",
+                                  text=f"refused tool calls: {why}",
+                                  pending_call_ids=[],
+                                  messages=out_messages + [rejected],
+                                  response_messages=[response, rejected],
+                                  usage=usage, finish_reason=finish)
+            # ALL argument envelopes validate BEFORE the first call may
+            # execute; one malformed call refuses the whole envelope.
+            try:
+                parsed = [_call_to_dict(c) for c in calls]
+            except CompletionRejected as exc:
+                why = str(exc)
+                rejected = _refusal_request(calls, why)
+                return TurnResult(kind="tool_rejected",
+                                  text=f"refused tool calls: {why}",
+                                  pending_call_ids=[],
+                                  messages=out_messages + [rejected],
+                                  response_messages=[response, rejected],
+                                  usage=usage, finish_reason=finish)
+            if len(calls) > 1:
+                # Parallel calls: the first executes after this turn; every
+                # call id gets an answer so the next request is valid.
+                extra = [ToolReturnPart(tool_name=c.tool_name, content=(
+                    "REFUSED: actions are strictly sequential — one action at "
+                    "a time; issue your next command in a later turn"),
+                    tool_call_id=c.tool_call_id or "") for c in calls[1:]]
+                return TurnResult(kind="tool_call",
+                                  tool_call=parsed[0],
+                                  pending_call_ids=[parsed[0]["call_id"]],
+                                  messages=out_messages
+                                           + [ModelRequest(parts=extra)],
+                                  response_messages=[
+                                      response, ModelRequest(parts=extra)],
+                                  usage=usage, finish_reason=finish)
             return TurnResult(kind="tool_call",
                               tool_call=parsed[0],
                               pending_call_ids=[parsed[0]["call_id"]],
-                              messages=out_messages
-                                       + [ModelRequest(parts=extra)],
-                              response_messages=[
-                                  response, ModelRequest(parts=extra)],
+                              messages=out_messages,
+                              response_messages=[response],
                               usage=usage, finish_reason=finish)
-        return TurnResult(kind="tool_call",
-                          tool_call=parsed[0],
-                          pending_call_ids=[parsed[0]["call_id"]],
-                          messages=out_messages,
-                          response_messages=[response],
-                          usage=usage, finish_reason=finish)
 
-    if not text:
-        raise CompletionRejected(
-            "model completion rejected: empty final content")
-    if finish != "stop":
-        # A TEXT answer is final only with explicit wire proof of a
-        # normal stop — abnormal finishes never become a final answer.
-        raise CompletionRejected(
-            f"model completion rejected: finish_reason={finish}")
-    # NO hidden truncation (finding 10): the complete answer is returned;
-    # bounds exist only where explicitly designed (max_tokens on the wire).
-    return TurnResult(kind="text", text=text, messages=out_messages,
-                      response_messages=[response], usage=usage,
-                      finish_reason=finish)
+        if not text:
+            raise CompletionRejected(
+                "model completion rejected: empty final content")
+        if finish != "stop":
+            # A TEXT answer is final only with explicit wire proof of a
+            # normal stop — abnormal finishes never become a final answer.
+            raise CompletionRejected(
+                f"model completion rejected: finish_reason={finish}")
+        # NO hidden truncation (finding 10): the complete answer is returned;
+        # bounds exist only where explicitly designed (max_tokens on the wire).
+        return TurnResult(kind="text", text=text, messages=out_messages,
+                          response_messages=[response], usage=usage,
+                          finish_reason=finish)
+    finally:
+        _dispatch_credential.reset(cred_token)
 
 
 def run_turn(profile, messages: list, *, timeout_s: float | None = None,
@@ -733,44 +859,50 @@ async def run_text_async(profile, system: str, user: str, *,
     """Single-shot structured text call (hints, AAR narrative,
     compaction summaries) — same message types, same client policy, no
     tools, same strict terminal-state and redaction rules."""
-    messages = [ModelRequest(parts=[
-        SystemPromptPart(content=system), UserPromptPart(content=user)])]
-    if max_tokens:
-        model, timeout = build_model(profile, timeout_s=timeout_s)
-        settings = model_settings(profile, timeout_s=timeout_s)
-        settings["max_tokens"] = max_tokens   # type: ignore[literal-required]
-        try:
-            response = await _guarded(
-                model.request(messages, settings,
-                              ModelRequestParameters()),
-                cancel_check, deadline_monotonic)
-        except (CompletionRejected, LocalCancellation):
-            raise
-        except Exception as exc:  # noqa: BLE001 — normalized below
-            raise _classify_provider_failure(profile, exc) from exc
-        finish = getattr(response, "finish_reason", None)
-        usage = usage_dict(response)
-        if finish is None:
-            raise CompletionRejected(
-                "model completion rejected: no terminal finish_reason")
-        if finish == "length":
-            raise CompletionRejected(
-                "model completion rejected: token budget exhausted")
-        if finish != "stop":
-            raise CompletionRejected(
-                f"model completion rejected: finish_reason={finish}")
-        text = "\n".join(p.content for p in response.parts
-                         if isinstance(p, TextPart)
-                         and isinstance(p.content, str) and p.content.strip())
-        if not text:
-            raise CompletionRejected(
-                "model completion rejected: empty final content")
-        return TurnResult(kind="text", text=text, messages=messages + [response],
-                          response_messages=[response], usage=usage,
-                          finish_reason=finish)
-    return await run_turn_async(profile, messages, timeout_s=timeout_s,
-                                tools=False, cancel_check=cancel_check,
-                                deadline_monotonic=deadline_monotonic)
+    cred_token, dispatch_key = _capture_dispatch_credential(profile)
+    try:
+
+        messages = [ModelRequest(parts=[
+            SystemPromptPart(content=system), UserPromptPart(content=user)])]
+        if max_tokens:
+            model, timeout = build_model(profile, timeout_s=timeout_s,
+                                 api_key=dispatch_key)
+            settings = model_settings(profile, timeout_s=timeout_s)
+            settings["max_tokens"] = max_tokens   # type: ignore[literal-required]
+            try:
+                response = await _guarded(
+                    model.request(messages, settings,
+                                  ModelRequestParameters()),
+                    cancel_check, deadline_monotonic)
+            except (CompletionRejected, LocalCancellation):
+                raise
+            except Exception as exc:  # noqa: BLE001 — normalized below
+                raise _classify_provider_failure(profile, exc) from exc
+            finish = getattr(response, "finish_reason", None)
+            usage = usage_dict(response)
+            if finish is None:
+                raise CompletionRejected(
+                    "model completion rejected: no terminal finish_reason")
+            if finish == "length":
+                raise CompletionRejected(
+                    "model completion rejected: token budget exhausted")
+            if finish != "stop":
+                raise CompletionRejected(
+                    f"model completion rejected: finish_reason={finish}")
+            text = "\n".join(p.content for p in response.parts
+                             if isinstance(p, TextPart)
+                             and isinstance(p.content, str) and p.content.strip())
+            if not text:
+                raise CompletionRejected(
+                    "model completion rejected: empty final content")
+            return TurnResult(kind="text", text=text, messages=messages + [response],
+                              response_messages=[response], usage=usage,
+                              finish_reason=finish)
+        return await run_turn_async(profile, messages, timeout_s=timeout_s,
+                                    tools=False, cancel_check=cancel_check,
+                                    deadline_monotonic=deadline_monotonic)
+    finally:
+        _dispatch_credential.reset(cred_token)
 
 
 def run_text(profile, system: str, user: str, *,
