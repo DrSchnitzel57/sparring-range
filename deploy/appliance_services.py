@@ -90,6 +90,69 @@ def _node_version() -> tuple[int, int] | None:
         return None
 
 
+def _node_at(binary: str) -> tuple[int, int] | None:
+    """Version of one EXPLICIT binary — the same question the unit will
+    answer at ExecStart time, never a PATH-dependent guess."""
+    try:
+        out = subprocess.run([binary, "--version"], capture_output=True,
+                             text=True, timeout=30).stdout.strip()
+        parts = out.lstrip("v").split(".")
+        return (int(parts[0]), int(parts[1]))
+    except Exception:  # noqa: BLE001 — absent/unusable binary is not a runtime
+        return None
+
+
+def dedicated_node_binary() -> str:
+    """The pinned runtime's own binary — the appliance NEVER depends on,
+    and never overwrites, another application's /usr/local/bin/node."""
+    return (f"/usr/local/lib/nodejs/node-v{NODE_PIN_VERSION}-linux-x64"
+            "/bin/node")
+
+
+def node_runtime_plan(mode: str | None = None, *,
+                      candidates: tuple[str, ...] | None = None,
+                      probe=None) -> dict:
+    """ONE explicitly selected Node runtime for the whole appliance
+    (second review, finding 5): the frontend build, the ACTUAL service
+    ExecStart and the per-UID identity verification must all name the
+    SAME supported binary. A path constant baked into a unit template is
+    not a runtime selection — provisioning Node 22 while the unit still
+    exec'd the distro's Node 18 rendered a green installer next to a
+    frontend that could never start.
+
+    ``provision`` mode → always the dedicated pinned runtime. Otherwise
+    the first candidate (dedicated pinned binary, then /usr/local/bin,
+    then /usr/bin) that ACTUALLY reports a supported version is kept;
+    when none does, ``require`` refuses and ``auto`` provisions.
+    ``candidates``/``probe`` are the fixture seam so the selection is
+    testable without mutating the real filesystem."""
+    probe = probe or _node_at
+    mode = (mode if mode is not None
+            else os.environ.get(NODE_MODE_ENV) or "auto").strip().lower()
+    if mode not in ("auto", "require", "provision"):
+        raise RuntimeError(
+            f"{NODE_MODE_ENV}={mode!r} is not one of auto|require|provision")
+    dedicated = dedicated_node_binary()
+    if mode != "provision":
+        for cand in (candidates
+                     or (dedicated, "/usr/local/bin/node", "/usr/bin/node")):
+            version = probe(cand)
+            if version and version >= NODE_MIN_VERSION:
+                return {"mode": mode, "action": "kept", "binary": cand,
+                        "version": version}
+        if mode == "require":
+            raise RuntimeError(
+                "no candidate runtime satisfies the frontend floor "
+                f"{node_version_str(NODE_MIN_VERSION)}; "
+                f"{NODE_MODE_ENV}=require forbids provisioning — install a "
+                "supported Node out of band and re-run")
+    return {"mode": mode, "action": "provision", "binary": dedicated}
+
+
+def node_version_str(version) -> str:
+    return ".".join(str(v) for v in version)
+
+
 def node_action(mode: str | None, version: tuple[int, int] | None) -> str:
     """Pure runtime-mode decision: 'kept' | 'require' | 'provision'."""
     mode = (mode or "auto").strip().lower()
@@ -111,18 +174,22 @@ def node_action(mode: str | None, version: tuple[int, int] | None) -> str:
 
 
 def ensure_node_runtime(run, *, mode: str | None = None) -> dict:
-    """Guarantee a Node runtime the frontend can build and start with.
+    """Guarantee the appliance's SELECTED Node runtime actually exists and
+    satisfies the frontend floor.
 
     Ubuntu 24.04's Node (18.19.1) is older than Next 16's floor; the pinned
     LTS is downloaded, SHA-256 verified against the release-pinned digest,
-    and installed under /usr/local/lib/nodejs with /usr/local/bin symlinks.
-    Nothing is fetched when the runtime is already sufficient, and the
-    mode makes even that dependency explicit (require = operator's job).
+    and installed under /usr/local/lib/nodejs.  Nothing is fetched when a
+    real candidate already satisfies, and the mode makes even that
+    dependency explicit (require = operator's job).  The /usr/local/bin
+    symlinks are operator CONVENIENCE only and never clobber a foreign
+    binary — the appliance unit execs the selected binary path directly
+    (second review, finding 5).
     """
-    action = node_action(mode if mode is not None
-                         else os.environ.get(NODE_MODE_ENV), _node_version())
-    if action == "kept":
-        return {"node": "kept", "version": _node_version()}
+    plan = node_runtime_plan(mode)
+    if plan["action"] == "kept":
+        return {"node": "kept", "version": plan["version"],
+                "binary": plan["binary"]}
     version = NODE_PIN_VERSION
     url = NODE_URL_TEMPLATE.format(version=version)
     digest = NODE_PIN_SHA256_LINUX_X64
@@ -154,15 +221,30 @@ def ensure_node_runtime(run, *, mode: str | None = None) -> dict:
         finally:
             shutil.rmtree(staging, ignore_errors=True)
     for name in ("node", "npm", "npx"):
-        run("ln", "-sfn", f"{install_dir}/bin/{name}",
-            f"/usr/local/bin/{name}")
-    after = _node_version()
+        link = f"/usr/local/bin/{name}"
+        target = f"{install_dir}/bin/{name}"
+        if os.path.islink(link):
+            # refresh OUR symlink; a foreign one (another application's
+            # runtime) is never replaced — the appliance unit execs the
+            # selected binary path directly, so it needs none of these.
+            if not os.readlink(link).startswith("/usr/local/lib/nodejs/"):
+                continue
+        elif os.path.exists(link):
+            continue
+        run("ln", "-sfn", target, link)
+    # Verify the SELECTED runtime (what the unit will exec), not whatever
+    # PATH happens to resolve.  When the dedicated tree really exists its
+    # own report is the only acceptable answer; the PATH probe remains the
+    # fallback for fixture/sandbox runs that record commands instead of
+    # executing them.
+    binary = plan["binary"]
+    after = _node_at(binary) if os.path.exists(binary) else _node_version()
     if after is None or after < NODE_MIN_VERSION:
         raise RuntimeError(
-            f"provisioned node still reports {after!r}; /usr/local/bin must "
-            "come before the distro node on PATH")
+            f"selected runtime {binary!r} still reports {after!r}; it does "
+            f"not satisfy the frontend floor {node_version_str(NODE_MIN_VERSION)}")
     return {"node": "provisioned", "version": after, "pinned": version,
-            "sha256_verified": digest}
+            "binary": binary, "sha256_verified": digest}
 
 
 def _venv_paths(venv: pathlib.Path) -> dict[str, str]:
@@ -238,7 +320,8 @@ def _expose_native_bindings(run, venv: pathlib.Path) -> dict:
             "dist_packages": str(DIST_PACKAGES)}
 
 
-def verify_service_runtime(run, venv: pathlib.Path) -> dict:
+def verify_service_runtime(run, venv: pathlib.Path, *,
+                           node_binary: str | None = None) -> dict:
     """Verify the RUNTIME, per real UID: each service identity must be able
     to execute what its unit will exec (plan 18; live find 2026-10-23: a
     hand-off run under umask 027 produced a root-only 0750 .venv and every
@@ -246,7 +329,11 @@ def verify_service_runtime(run, venv: pathlib.Path) -> dict:
     per-UID execution never was).
 
     This makes the checks real: runuser executes as the actual identity.
-    A failure names the identity and the exact remediation."""
+    A failure names the identity and the exact remediation.  For srweb
+    the probed binary is EXACTLY the one the web unit execs (the selected
+    appliance runtime), never a PATH-dependent stand-in — otherwise a
+    passing probe could certify a different binary than the service runs
+    (second review, finding 5)."""
     problems: list[str] = []
     results: dict[str, str] = {}
     python = str(venv / "bin/python")
@@ -268,8 +355,7 @@ def verify_service_runtime(run, venv: pathlib.Path) -> dict:
             f"srbroker cannot import libvirt in {venv} (exit {code}) — the "
             "native binding exposure failed")
     results["srbroker/libvirt"] = "import" if code == 0 else f"exit {code}"
-    node = "/usr/local/bin/node" if os.path.exists("/usr/local/bin/node") \
-        else "/usr/bin/node"
+    node = node_binary or node_runtime_plan()["binary"]
     code = run("runuser", "-u", "srweb", "--", node, "--version",
                check=False).returncode
     if code != 0:
@@ -278,7 +364,7 @@ def verify_service_runtime(run, venv: pathlib.Path) -> dict:
     if problems:
         raise RuntimeError("service runtime verification failed:\n  - "
                            + "\n  - ".join(problems))
-    return {"uid_checks": results}
+    return {"uid_checks": results, "node_binary": node}
 
 
 def ensure_venv(run, *, prefix: pathlib.Path, source: pathlib.Path) -> pathlib.Path:
@@ -543,10 +629,17 @@ def _posix_readable(st, uid: int, gid: int, groups: set[int]) -> bool:
 
 
 def tls_readiness_problems(etc: pathlib.Path) -> tuple[list[str], list[str]]:
-    """Validate, for each REAL service identity on this machine, that the
-    rendered trust map is actually readable by that identity.  Returns
-    (problems, deferred): identities that do not exist yet (sandbox) are
-    reported as deferred, never silently passed."""
+    """Owner/group/mode readability check of the rendered trust map for
+    every REAL service identity that already exists on this machine.
+
+    Scope honesty (second review): this is POSIX PERMISSION-BIT MATH on
+    the tls files themselves — it does NOT model parent-directory
+    traversal, ACLs, or the live mount namespace, so it is an install-
+    time consistency gate, NOT proof of installed-service access.  A
+    missing identity (sandbox) is reported as deferred, never silently
+    passed; real per-UID access on the appliance stays an explicit
+    installed-systemd recheck (the same boundary verify_service_runtime
+    draws for executability)."""
     problems: list[str] = []
     deferred: list[str] = []
     for identity, files in TLS_TRUST_MAP:
@@ -790,11 +883,15 @@ def ensure_service_keys(run, *, etc: pathlib.Path,
 
 
 def ensure_web_build(run, *, source: pathlib.Path,
-                     public_url: str = "") -> dict:
+                     public_url: str = "",
+                     node_binary: str | None = None) -> dict:
     """Build the frontend from its LOCKED dependencies.
 
     Next 16 needs a recent Node; the installer refuses an old runtime instead
-    of building something that cannot start.
+    of building something that cannot start.  The build runs with the
+    SELECTED appliance runtime at the FRONT of PATH — the same binary the
+    web unit execs — so a green build can never certify a different Node
+    than the service actually starts (second review, finding 5).
 
     ``NEXT_PUBLIC_API_URL`` is BAKED INTO the bundle at build time: without
     it the browser would talk to http://localhost:8000 — the operator's own
@@ -806,23 +903,33 @@ def ensure_web_build(run, *, source: pathlib.Path,
     if not lock.is_file():
         raise RuntimeError(f"missing {lock} — the frontend lock file is "
                            "required for an appliance installation")
-    version = _node_version()
+    binary = node_binary or node_runtime_plan()["binary"]
+    version = _node_at(binary)
     if version is None:
-        raise RuntimeError("node is not installed — the appliance needs Node "
-                           "20.9 or newer for the frontend build")
-    if version < (20, 9):
-        raise RuntimeError(f"node {version[0]}.{version[1]} is too old — the "
-                           "frontend needs Node 20.9 or newer")
+        raise RuntimeError(f"selected runtime {binary!r} is not runnable — "
+                           "the appliance needs Node "
+                           f"{node_version_str(NODE_MIN_VERSION)} or newer "
+                           "for the frontend build")
+    if version < NODE_MIN_VERSION:
+        raise RuntimeError(
+            f"selected runtime {binary!r} reports "
+            f"{node_version_str(version)} — the frontend needs "
+            f"{node_version_str(NODE_MIN_VERSION)} or newer")
     api_url = ""
     if public_url:
         api_url = public_url.rstrip("/") + "/api"
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    bindir = os.path.dirname(binary)
+    path_dirs = [bindir] + [d for d
+                            in os.environ.get("PATH",
+                                              "/usr/bin:/bin").split(":")
+                            if d and d != bindir]
+    env = {"PATH": ":".join(path_dirs)}
     if api_url:
         env["NEXT_PUBLIC_API_URL"] = api_url
     run("npm", "ci", cwd=str(web), env=env)
     run("npm", "run", "build", cwd=str(web), env=env)
-    return {"node": ".".join(str(v) for v in version), "lock": str(lock),
-            "next_public_api_url": api_url}
+    return {"node": node_version_str(version), "binary": binary,
+            "lock": str(lock), "next_public_api_url": api_url}
 
 
 def _node_version() -> tuple[int, int] | None:

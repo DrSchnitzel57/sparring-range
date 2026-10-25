@@ -548,11 +548,45 @@ WantedBy=multi-user.target
 """
 
 
-def render_web_unit(lay: Layout) -> str:
+def _appliance_node_binary() -> str:
+    """The SELECTED appliance Node runtime for unit rendering. Thin seam
+    so the renderer keeps its no-service-imports discipline; the plan and
+    its probe live in appliance_services, the single authority shared by
+    the build, the unit ExecStart and the per-UID verification."""
+    from deploy import appliance_services as svc
+    return svc.node_runtime_plan()["binary"]
+
+
+def render_worker_unit(m) -> str:
+    """The worker supervisor unit with its state directory bound to THIS
+    installation (plan 18 review): the unit REQUIRES the directory in its
+    mount namespace, _ensure_dirs provisions exactly this path, and a
+    silently diverging template would reintroduce the missing-directory
+    startup failure. For the default layout this is byte-identical to the
+    template."""
+    text = _unit_from_template("sr-worker-supervisor.service")
+    want = str(pathlib.Path(m.state_dir) / "worker")
+    lines, seen = [], False
+    for ln in text.splitlines():
+        if ln.startswith("ReadWritePaths="):
+            ln = f"ReadWritePaths={want}"
+            seen = True
+        lines.append(ln)
+    if not seen:
+        raise InstallError("sr-worker-supervisor.service lost its "
+                           "ReadWritePaths contract")
+    return "\n".join(lines) + "\n"
+
+
+def render_web_unit(lay: Layout, node_binary: str) -> str:
     """The Next.js frontend, served as its own service identity on loopback.
 
     nginx terminates TLS and routes /api/* to the API; the frontend never
     listens on the LAN and never holds an infrastructure credential.
+    ``node_binary`` is the SELECTED appliance runtime (node_runtime_plan)
+    — the exact binary the build used and per-UID verification probed
+    (second review, finding 5: provisioning Node 22 while this unit exec'd
+    another path shipped an unsupported frontend behind green checks).
     """
     return f"""[Unit]
 Description=sparring-range web frontend (Next.js, loopback only)
@@ -568,7 +602,7 @@ EnvironmentFile=-{lay.etc}/control-plane.env
 Environment=PORT=3000
 Environment=HOSTNAME=127.0.0.1
 Environment=NODE_ENV=production
-ExecStart=/usr/bin/node {lay.prefix}/web/node_modules/next/dist/bin/next start -p 3000 -H 127.0.0.1
+ExecStart={node_binary} {lay.prefix}/web/node_modules/next/dist/bin/next start -p 3000 -H 127.0.0.1
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
@@ -717,8 +751,7 @@ def render_files(m: ApplianceManifest, *,
         RenderedFile(lay.units_dir / "sr-appliance-ingest.service",
                      render_ingest_unit(m, etc=lay.etc, prefix=lay.prefix), 0o644),
         RenderedFile(lay.units_dir / "sr-worker-supervisor.service",
-                     _unit_from_template("sr-worker-supervisor.service"),
-                     0o644),
+                     render_worker_unit(m), 0o644),
         RenderedFile(lay.units_dir / "sr-api.service",
                      _unit_from_template("sr-api.service"), 0o644),
         RenderedFile(lay.units_dir / "sr-bastion.service",
@@ -728,7 +761,7 @@ def render_files(m: ApplianceManifest, *,
                          extra="Environment=SR_PROCESS_ROLE=bastion"),
                      0o644),
         RenderedFile(lay.units_dir / "sr-web.service",
-                     render_web_unit(lay), 0o644),
+                     render_web_unit(lay, _appliance_node_binary()), 0o644),
         RenderedFile(lay.nginx_dir / "sparring-range.conf",
                      render_nginx_site(m, lay), 0o644),
     ]
@@ -857,6 +890,15 @@ def _ensure_dirs(m: ApplianceManifest, run: Runner, lay: Layout) -> None:
             (pathlib.Path(m.secrets_dir), SECRET_DIR_MODE, "root",
              SECRET_DIR_GROUP),
             (pathlib.Path(m.state_dir) / "controller", 0o700, "srrange", "srrange"),
+            # The worker supervisor's private state directory (plan 18
+            # review): sr-worker-supervisor.service REQUIRES
+            # ReadWritePaths=<state>/worker — a missing directory breaks
+            # the unit's mount namespace before ExecStart, and the shared
+            # state parent (0751) only ever provides TRAVERSAL, never the
+            # child.  Dedicated, srworker-owned, 0750: nothing else may
+            # write what the supervisor will execute state from.
+            (pathlib.Path(m.state_dir) / "worker", 0o750, "srworker",
+             "srworker"),
             # Runtime host pins live under state (plan 18): the API is the
             # only writer (ProtectSystem=strict makes /etc read-only for it),
             # the runner/verifier/bastion clients only need read access, and
@@ -1082,7 +1124,8 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
         # before apply claims success (the umask-027 venv passed every
         # rendered check and still died 203/EXEC on first start).
         services["runtime_verification"] = svc.verify_service_runtime(
-            run, pathlib.Path(services["venv"]))
+            run, pathlib.Path(services["venv"]),
+            node_binary=services["node"]["binary"])
         services["database"] = svc.ensure_database(
             run, prefix=lay.prefix, env_file=lay.etc / "control-plane.env")
         services["tls"] = svc.ensure_tls(
@@ -1104,7 +1147,9 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
             access_keys={role: m.access_keys[role].path
                          for role in m.access_keys})
         services["web"] = svc.ensure_web_build(run, source=source,
-                                               public_url=m.public_url)
+                                               public_url=m.public_url,
+                                               node_binary=
+                                               services["node"]["binary"])
         # the public front door: enable the rendered site and reload nginx
         run("ln", "-sfn", str(lay.nginx_dir / "sparring-range.conf"),
             str(lay.nginx_dir.parent / "sites-enabled/sparring-range.conf"),

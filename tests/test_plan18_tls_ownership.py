@@ -282,3 +282,99 @@ def test_separate_ledger_dir_keeps_its_own_entry(tmp_path):
     ledger_parent_installs = [c for c in calls if c[0] == "install"
                               and parent.rstrip("/").split("/")[-1] in c[-1]]
     assert ledger_parent_installs, calls
+
+
+# --------------------------------------------------------------------------- #
+# the supervisor's required worker directory (second review, finding 4)         #
+# --------------------------------------------------------------------------- #
+
+def _ensure_dirs_real(manifest_path, root):
+    """Run _ensure_dirs with a REAL runner (as the current user, paths under
+    tmp): mode enforcement and drift repair become observable facts, not
+    recorded intentions."""
+    import subprocess
+
+    from deploy import appliance as ap
+    m = ap.ApplianceManifest.load(manifest_path)
+    lay = ap.default_layout(root=root)
+    sm = ap.sandbox_manifest(m, root)
+
+    def run(*cmd, check=True, **kw):
+        return subprocess.run([str(c) for c in cmd], check=check,
+                              capture_output=True)
+
+    ap._ensure_dirs(sm, run, lay)
+    return sm
+
+
+def test_supervisor_worker_directory_is_provisioned_once(tmp_path):
+    """sr-worker-supervisor.service requires ReadWritePaths=<state>/worker
+    WITHOUT the '-' optional marker and has no StateDirectory= — a missing
+    directory kills the unit in mount-namespace setup before ExecStart.
+    0751 on the shared state parent only provides TRAVERSAL; the child is
+    a distinct fact and must be provisioned as its own 0750 srworker
+    entry."""
+    root = tmp_path / "root"
+    sm, calls = _ensure_dirs_calls(_manifest(tmp_path), root)
+    worker = str(pathlib.Path(sm.state_dir) / "worker")
+    installs = _installs_for(calls, worker)
+    assert len(installs) == 1, installs
+    assert "750" in installs[0], installs[0]
+    # dedicated identity: the worker owns its own state directory
+    non_sandbox = _ensure_dirs_owner_args(_manifest(tmp_path), root)
+    me = [c for c in non_sandbox if c[-1] == worker]
+    assert me and "-o" in me[0] and "srworker" in me[0], me
+    assert "-g" in me[0] and "srworker" in me[0], me
+
+
+def test_worker_directory_mode_drift_is_repaired(tmp_path):
+    """A drifted (over-shared) worker directory is forced back to 0750 on
+    the next apply — the install is idempotently corrective, matching the
+    unit's contract."""
+    root = tmp_path / "root"
+    sm = _ensure_dirs_real(_manifest(tmp_path), root)
+    worker = pathlib.Path(sm.state_dir) / "worker"
+    assert stat.S_IMODE(worker.stat().st_mode) == 0o750
+    worker.chmod(0o777)                      # operator/accident drift
+    _ensure_dirs_real(_manifest(tmp_path), root)
+    assert stat.S_IMODE(worker.stat().st_mode) == 0o750
+
+
+def _ensure_dirs_owner_args(manifest_path, root):
+    """The install(1) argument lines the NON-sandbox branch would run —
+    the identity contract (-o/-g), asserted without root privileges."""
+    from types import SimpleNamespace
+
+    from deploy import appliance as ap
+    m = ap.ApplianceManifest.load(manifest_path)
+    sm = ap.sandbox_manifest(m, root)
+    lay = ap.default_layout(root=root)
+    lay = SimpleNamespace(sandboxed=False, run=lay.run, etc=lay.etc)
+    calls: list[tuple] = []
+
+    def run(*cmd, check=True, **kw):
+        calls.append(tuple(str(a) for a in cmd))
+        return _Res()
+
+    ap._ensure_dirs(sm, run, lay)
+    return calls
+
+
+def test_worker_unit_and_provisioned_directory_never_diverge(tmp_path):
+    """The rendered unit's ReadWritePaths names EXACTLY the directory
+    _ensure_dirs provisions — for the default layout byte-identical to the
+    template, for a relocated state_dir following the configuration."""
+    from deploy import appliance as ap
+    m = ap.ApplianceManifest.load(_manifest(tmp_path))
+    root = tmp_path / "root"
+    sm = ap.sandbox_manifest(m, root)
+    unit = ap.render_worker_unit(sm)
+    want = str(pathlib.Path(sm.state_dir) / "worker")
+    assert f"ReadWritePaths={want}\n" in unit, unit
+    assert "ReadWritePaths=-" not in unit
+    # default layout keeps the template byte-for-byte
+    unit_def = ap.render_worker_unit(m)
+    template = (pathlib.Path(__file__).resolve().parents[1]
+                / "deploy" / "systemd" / "sr-worker-supervisor.service")
+    if str(m.state_dir) == "/var/lib/sparring-range":
+        assert unit_def == template.read_text()
