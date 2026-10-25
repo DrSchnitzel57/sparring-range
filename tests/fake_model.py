@@ -61,6 +61,39 @@ class FakeModelServer:
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
+                self._handle(post=True)
+
+            def do_GET(self):  # noqa: N802
+                self._handle(post=False)
+
+            def _handle(self, *, post):
+                if not post:
+                    # model discovery: GET {base}/v1/models — auth-checked
+                    # like everything else; returns the model catalog only
+                    if state.auth is not None and \
+                            self.headers.get("Authorization") != state.auth:
+                        self.send_response(401)
+                        self.end_headers()
+                        return
+                    with state.lock:
+                        state.requests.append({"path": self.path, "body": {},
+                                               "auth": self.headers.get(
+                                                   "Authorization"),
+                                               "ts": time.monotonic()})
+                    if self.path.rstrip("/").endswith("/models"):
+                        payload = json.dumps({
+                            "object": "list",
+                            "data": [{"id": "gpt-4o", "object": "model"},
+                                     {"id": "coach-mini",
+                                      "object": "model"}]}).encode()
+                    else:
+                        payload = b'{"error": "not found"}'
+                    self.send_response(200 if payload != b'{"error": "not found"}' else 404)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 n = int(self.headers.get("Content-Length") or 0)
                 try:
                     body = json.loads(self.rfile.read(n))
@@ -86,8 +119,12 @@ class FakeModelServer:
             def _respond(self, body):
                 if state.auth is not None and \
                         self.headers.get("Authorization") != state.auth:
+                    # leaky-provider realism: some 401 diagnostics echo
+                    # the presented credential — the redaction layer must
+                    # survive exactly this
                     payload = json.dumps({"error": {"message":
-                        "invalid api key"}}).encode()
+                        "invalid api key; presented: "
+                        f"{self.headers.get('Authorization')}"}}).encode()
                     self.send_response(401)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(payload)))
@@ -111,6 +148,8 @@ class FakeModelServer:
                     return
                 if state.hang_s:
                     time.sleep(state.hang_s)
+                if item.get("_delay"):
+                    time.sleep(float(item["_delay"]))
                 status = item.get("_status", 200)
                 if item.get("_stream"):
                     self._sse(item["_stream"], body)
