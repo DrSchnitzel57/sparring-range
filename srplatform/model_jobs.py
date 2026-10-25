@@ -147,6 +147,19 @@ def enqueue(db, *, kind: str, priority: int, payload: dict,
                    state="queued")
     if run_at is not None:
         job.requested_at = run_at
+    if deadline_at is not None and deadline_at <= _now():
+        # An expired authority at ADMISSION is terminal before the queue:
+        # the provider is never contacted for a match that is already
+        # over, whatever path enqueued it (round-2 finding 8 — every
+        # route inherits this, not just the ones that remember).
+        job.state = "cancelled"
+        job.error = ("deadline elapsed before admission — nothing was "
+                     "sent to the provider")
+        job.finished_at = _now()
+        db.add(job)
+        db.flush()
+        _persist_logical_outcome(db, [job])
+        return job
     db.add(job)
     db.flush()
     start_model_jobs()      # backstop: whoever queues work ensures a runner
@@ -158,6 +171,104 @@ def _retry_child(db, job: ModelJob):
         select(ModelJob)
         .where(ModelJob.parent_job == job.job_id)
         .order_by(ModelJob.attempt.desc())).scalars().first()
+
+
+def _chain_rows(db, job_id: uuid.UUID) -> list[ModelJob]:
+    """ALL rows of the LOGICAL request (round-2 findings 5/6/7): walk up
+    to the chain root, then down through every retry descendant. Root
+    operations — cancellation, deadline cascades, status reporting,
+    outcome persistence — always operate on this whole closure, never
+    on one attempt row in isolation: "the request" is the chain."""
+    row = db.get(ModelJob, job_id)
+    if row is None:
+        raise JobProblem("job not found")
+    root = row
+    depth = 0
+    while root.parent_job is not None and depth < 16:
+        parent = db.get(ModelJob, root.parent_job)
+        if parent is None:
+            break
+        root = parent
+        depth += 1
+    rows = [root]
+    frontier = [root.job_id]
+    while frontier:
+        children = db.execute(select(ModelJob).where(
+            ModelJob.parent_job.in_(frontier))
+            .order_by(ModelJob.attempt.asc())).scalars().all()
+        rows.extend(children)
+        frontier = [c.job_id for c in children]
+    return rows
+
+
+def chain_view(db, job_id: uuid.UUID) -> tuple[ModelJob, list[ModelJob]]:
+    """(final row, chain rows attempt-ordered) for one logical request
+    (round-2 finding 6): every status API resolves ANY chain id to the
+    chain's final outcome plus the attempt history, so an async caller
+    polling the id it submitted never reports "failed" while a retry
+    actually succeeded."""
+    rows = _chain_rows(db, job_id)
+    rows.sort(key=lambda j: j.attempt)
+    final = max(rows, key=lambda j: (j.attempt, j.requested_at))
+    return final, rows
+
+
+#: states after which the chain will not change by itself any more
+#: (an open cessation obligation still counts: it only changes via an
+#: operator, and the member-visible outcome must not hang until then)
+_QUIESCENT_STATES = TERMINAL_STATES + ("cessation_unknown",)
+
+
+def error_kind(job: ModelJob) -> str | None:
+    """NEUTRAL, content-free error classification for non-privileged
+    surfaces (round-2 finding 4): the fact that something failed is
+    never a secret, but WHY is provider-supplied and may echo the
+    conversation (sealed competition material). Members and streams
+    get this classification; the redacted diagnostic itself is
+    operator-only."""
+    if job.state == "cancelled":
+        return "cancelled"
+    if job.state == "cessation_unknown":
+        return "cessation_unresolved"
+    if job.state == "failed" or job.error:
+        return "model_call_failed"
+    return None
+
+
+def _persist_logical_outcome(db, rows: list[ModelJob]) -> bool:
+    """Run the job kind's result handler EXACTLY ONCE per logical
+    request (round-2 finding 7): not per attempt. The handler belongs
+    to the chain's FINAL row and fires only when every row of the chain
+    is quiescent (no retry may still dispatch), claimed atomically with
+    a guarded UPDATE so a terminal write racing a cancellation can
+    never persist two hint/AAR events. Attempt diagnostics stay visible
+    as their own rows; the OUTCOME (member evidence) is one event."""
+    if not rows:
+        return False
+    handler = _result_handlers.get(rows[0].kind)
+    if handler is None:
+        return False
+    if any(j.state not in _QUIESCENT_STATES for j in rows):
+        return False
+    final = max(rows, key=lambda j: (j.attempt, j.requested_at))
+    claim = db.execute(text(
+        "UPDATE model_jobs SET outcome_persisted = true "
+        "WHERE job_id = :j AND outcome_persisted = false"),
+        {"j": str(final.job_id)})
+    if claim.rowcount != 1:
+        return False                      # another writer owns the outcome
+    try:
+        handler(db, final, final.state == "succeeded")
+    except Exception as exc:  # noqa: BLE001 — visible, and re-claimable
+        db.execute(text(
+            "UPDATE model_jobs SET outcome_persisted = false "
+            "WHERE job_id = :j"), {"j": str(final.job_id)})
+        final.error = ((final.error or "") +
+                       f"; outcome handler failed: {type(exc).__name__}: "
+                       f"{str(exc)[:200]}")[:2000]
+        db.flush()
+        return False
+    return True
 
 
 def wait(db, job_id: uuid.UUID, timeout: float,
@@ -191,28 +302,35 @@ def wait(db, job_id: uuid.UUID, timeout: float,
 
 
 def cancel(db, job_id: uuid.UUID, *, actor: str = "operator") -> ModelJob:
-    """Visible cancellation, CASCADING over retry descendants (finding
-    2/5: cancel must kill queued/backoff children, and a running call's
-    close is reported as UNCERTAIN cessation, never as proof of stop).
-    Queued: terminal now. Running: request cessation — the execution
-    watcher closes the live SDK task; the slot releases only when the
-    call returns definitively, or the obligation stands."""
+    """Cancellation of the LOGICAL REQUEST (round-2 finding 5): the
+    operation cascades across the whole retry chain regardless of which
+    row the caller named and regardless of that row's own state. A
+    "failed parent + backoff-queued retry child" chain is NOT finished
+    just because the parent is terminal — cancelling it must kill the
+    queued child too, or the original request silently resurrects.
+    Queued rows die un-executed; running rows get the cessation request
+    (the watcher closes the live SDK task; the slot releases only on a
+    definitive return, otherwise the obligation stands)."""
     job = db.get(ModelJob, job_id)
     if job is None:
         raise JobProblem("job not found")
-    if job.state in TERMINAL_STATES:
-        return job
-    if job.state == "queued":
-        job.state = "cancelled"
-        job.error = f"cancelled by {actor} before execution"
-        job.finished_at = _now()
-        _cascade_cancel_queued(db, job, actor=actor)
-    elif job.state == "running":
-        job.cancel_requested = True
-        job.error = (f"cancellation requested by {actor}: the live request "
-                     "is being closed; if its return cannot confirm "
-                     "cessation the slot stays held")
+    rows = _chain_rows(db, job_id)
+    for j in rows:
+        if j.state == "queued":
+            j.state = "cancelled"
+            j.error = (f"cancelled by {actor} before execution "
+                       "(logical request cancellation)")
+            j.finished_at = _now()
+        elif j.state == "running":
+            if not j.cancel_requested:
+                j.cancel_requested = True
+                j.error = (
+                    f"cancellation requested by {actor}: the live request "
+                    "is being closed; if its return cannot confirm "
+                    "cessation the slot stays held")
     db.flush()
+    _persist_logical_outcome(db, rows)
+    db.refresh(job)
     return job
 
 
@@ -412,6 +530,7 @@ def _execute(job_id: uuid.UUID) -> None:
                         "; never dispatched"
             job.finished_at = _now()
             _cascade_cancel_queued(s, job, actor="cancellation")
+            _persist_logical_outcome(s, _chain_rows(s, job_id))
             s.commit()
             return
         if job.depends_on is not None:
@@ -426,6 +545,7 @@ def _execute(job_id: uuid.UUID) -> None:
                     "run the gated work")
                 job.finished_at = _now()
                 _cascade_cancel_queued(s, job, actor="prerequisite failure")
+                _persist_logical_outcome(s, _chain_rows(s, job_id))
                 s.commit()
                 return
         if job.deadline_at is not None and job.deadline_at <= _now():
@@ -434,6 +554,7 @@ def _execute(job_id: uuid.UUID) -> None:
                          "sent to the provider")
             job.finished_at = _now()
             _cascade_cancel_queued(s, job, actor="deadline")
+            _persist_logical_outcome(s, _chain_rows(s, job_id))
             s.commit()
             return
         profile = s.get(ModelProfile, uuid.UUID(job_profile_id)) \
@@ -579,16 +700,11 @@ def _execute(job_id: uuid.UUID) -> None:
                 job.state = "failed"
                 job.error = error_text
                 job.finished_at = _now()
-        handler = _result_handlers.get(job.kind)
-        if handler is not None:
-            try:
-                handler(s, job, job.state == "succeeded")
-            except Exception as exc:  # noqa: BLE001 — visible, not lost
-                job.state = "failed"
-                job.error = (redact_error(
-                    f"result handler failed: {type(exc).__name__}: {exc}")
-                    [:800])
-                job.finished_at = _now()
+        # the member-visible OUTCOME persists exactly once for the
+        # whole logical request (round-2 finding 7), never per attempt:
+        # an attempt that failed WITH a queued retry child leaves the
+        # chain non-quiescent, so nothing fires until the final row
+        _persist_logical_outcome(s, _chain_rows(s, job_id))
         s.commit()
         if child is not None:
             start_model_jobs()
