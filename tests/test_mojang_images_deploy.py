@@ -157,8 +157,10 @@ def test_images_ubuntu_verify_web_local(web_local_overlay, tmp_path):
     assert injected["baseline_file_sha256"] == pin["files"]
 
     # same-digest in-place edit of the pin document: frozen truth stands
-    edited = {role: dict(pin_) for role, pin_ in pins.items()}
+    edited = {role: dict(pin_, files=dict(pin_["files"]))
+              for role, pin_ in pins.items()}
     edited["mojang-web-local"]["files"]["e2scrub_all"] = "0" * 64
+    assert edited["mojang-web-local"]["files"] != pins["mojang-web-local"]["files"]
     injected2 = vs.with_cron_baseline(
         dict(base), verifier_id="cron_persistence_present", host="web01",
         artifacts={"web01": deployed}, pins=edited)
