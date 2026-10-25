@@ -42,12 +42,63 @@ def tool_response(calls: list[dict], *, finish: str = "tool_calls",
             "finish_reason": finish, "usage": usage}
 
 
+def check_wire(body: dict) -> str | None:
+    """STRICT OpenAI-protocol validation of one chat.completions request
+    (review round 2, finding 1): every tool message must answer a tool
+    call the assistant actually made, call ids may never duplicate or
+    go unanswered-then-orphaned, and the message list must be a legal
+    sequence. Returns None when the request is protocol-complete, else
+    the violation description. The real provider (and the reviewer's
+    strict local provider) REJECT orphan tool results with HTTP 400 —
+    the scripted fake must too, or compaction defects stay invisible."""
+    messages = body.get("messages") or []
+    issued: list[str] = []
+    answered: set[str] = set()
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant":
+            for tc in m.get("tool_calls") or []:
+                cid = tc.get("id")
+                if not cid:
+                    return "assistant tool call without an id"
+                if cid in issued:
+                    return f"duplicate tool call id {cid!r}"
+                issued.append(cid)
+        elif role == "tool":
+            cid = m.get("tool_call_id")
+            if not cid:
+                return "tool message without tool_call_id"
+            if cid not in issued:
+                return f"orphan tool result {cid!r}: no assistant call " \
+                       f"asked for it"
+            if cid in answered:
+                return f"tool result {cid!r} answered twice"
+            answered.add(cid)
+    unresolved = [c for c in issued if c not in answered]
+    if unresolved:
+        # an unanswered call is legal only as the LAST assistant turn
+        # (the answer arrives next request); older gaps mean the middle
+        # of the conversation was compacted away — protocol-broken
+        last_assistant = next((m for m in reversed(messages)
+                               if m.get("role") == "assistant"), None)
+        last_ids = [tc.get("id") for tc in
+                    (last_assistant or {}).get("tool_calls") or []]
+        if any(c not in last_ids for c in unresolved):
+            return f"tool call(s) {unresolved} lost their results " \
+                   "(compaction split a call from its return)"
+    return None
+
+
 @dataclass
 class _State:
     script: list = field(default_factory=list)
     auth: str | None = None          # required Authorization value
     hang_s: float = 0.0              # sleep BEFORE responding (client timeout)
+    strict: bool = False             # reject protocol-broken requests 400
+    echo_auth_errors: bool = False   # error bodies echo the Authorization
+    #                                  header (leaky-provider realism)
     requests: list = field(default_factory=list)
+    violations: list = field(default_factory=list)
     live: int = 0
     max_live: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -131,6 +182,22 @@ class FakeModelServer:
                     self.end_headers()
                     self.wfile.write(payload)
                     return
+                if state.strict and self.path.rstrip("/").endswith(
+                        "/chat/completions"):
+                    problem = check_wire(body)
+                    if problem is not None:
+                        with state.lock:
+                            state.violations.append(problem)
+                        payload = json.dumps({"error": {
+                            "message": f"invalid messages: {problem}",
+                            "type": "invalid_request_error"}}).encode()
+                        self.send_response(400)
+                        self.send_header("Content-Type",
+                                         "application/json")
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload)
+                        return
                 if state.script:
                     item = state.script[0]
                     if len(state.script) > 1:
@@ -151,6 +218,22 @@ class FakeModelServer:
                 if item.get("_delay"):
                     time.sleep(float(item["_delay"]))
                 status = item.get("_status", 200)
+                if item.get("_error_echo"):
+                    # leaky provider on ANY status: the diagnostic body
+                    # echoes the Authorization header and (optionally) a
+                    # caller-chosen slice of the request — the redaction
+                    # and status-only-diagnostic layers must survive it
+                    leaked = {"auth": self.headers.get("Authorization")}
+                    if state.echo_auth_errors:
+                        leaked["messages"] = str(body.get("messages"))[:400]
+                    payload = json.dumps({"error": {
+                        "message": "provider diagnostic", **leaked}}).encode()
+                    self.send_response(item.get("_status", 500))
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 if item.get("_stream"):
                     self._sse(item["_stream"], body)
                     return
@@ -217,6 +300,21 @@ class FakeModelServer:
         self.state.script = list(items)
         self.state.auth = auth
         self.state.hang_s = hang_s
+
+    def set_strict(self, enabled: bool = True, *,
+                   echo_error_bodies: bool = False) -> None:
+        """STRICT provider mode: every chat request is protocol-checked
+        (see check_wire) and violations answer HTTP 400 — the way a real
+        strict provider behaves. echo_error_bodies additionally makes
+        error diagnostics echo request message content (hostile-provider
+        realism for the spoiler-leak regressions)."""
+        self.state.strict = enabled
+        self.state.echo_auth_errors = echo_error_bodies
+
+    @property
+    def violations(self) -> list:
+        with self.state.lock:
+            return list(self.state.violations)
 
     @property
     def requests(self) -> list:

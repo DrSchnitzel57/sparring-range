@@ -34,6 +34,15 @@ def test_rejected_completion_is_not_retried(monkeypatch):
     assert len(calls) == 1
 
 
+class _StubSession:
+    """The complete route reads the server-authoritative match deadline
+    (round-2 finding 8); this stub answers 'no match row' — no cap."""
+
+    def execute(self, *a, **k):
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(
+            first=lambda: None))
+
+
 def test_internal_model_rejection_is_explicit_bad_gateway(monkeypatch):
     """A failed DURABLE JOB (here: a rejected completion) is an explicit
     502 with the truthful error — never a fake success and never a silent
@@ -56,7 +65,7 @@ def test_internal_model_rejection_is_explicit_bad_gateway(monkeypatch):
 
     @contextmanager
     def _fake_db():
-        yield object()
+        yield _StubSession()
 
     monkeypatch.setattr(app_module, "db", _fake_db)
     monkeypatch.setattr(ma, "bind_for", lambda db, sid, role: (None, None))
@@ -89,7 +98,7 @@ def test_internal_model_timeout_requests_cessation_never_silent_replay(monkeypat
 
     @contextmanager
     def _fake_db():
-        yield object()
+        yield _StubSession()
 
     def _bound_exceeded(db, id_, bound):
         raise TimeoutError("bound")

@@ -245,13 +245,18 @@ def test_thinking_levels_reach_the_wire_not_a_settings_dict(server,
     server.script([text_response("ok")] * 6)
     conv.run_turn(_profile(server, thinking_level="none"), _msgs())
     body = server.request_bodies()[-1]
-    assert body.get("chat_template_kwargs") == {"thinking": False}
+    # round-2 finding 9: the llama.cpp preset DISABLES explicitly through
+    # the chat-template toggle (omission leaves the template ON)
+    assert body.get("chat_template_kwargs") == {"enable_thinking": False}
     assert "reasoning_effort" not in body
 
-    for level, expect in (("low", True), ("medium", True), ("high", True)):
+    # and the graded levels are DISTINCT on the wire — each carries its
+    # own reasoning_effort (the boolean collapse is structurally gone)
+    for level in ("low", "medium", "high"):
         conv.run_turn(_profile(server, thinking_level=level), _msgs())
         body = server.request_bodies()[-1]
-        assert body.get("chat_template_kwargs") == {"thinking": expect}, level
+        assert body.get("reasoning_effort") == level, level
+        assert not body.get("chat_template_kwargs"), level
 
     conv.run_turn(_profile(server, thinking_level="deep-think",
                            thinking_map={"deep-think":
@@ -289,7 +294,9 @@ def test_none_mapping_can_disable_via_reasoning_effort(server, no_key_leak):
                   _msgs())
     body = server.request_bodies()[-1]
     assert body.get("reasoning_effort") == "none"
-    assert body.get("chat_template_kwargs", {}).get("thinking") is False
+    # round-2 finding 9: a custom level travels EXACTLY its declared
+    # fields — no preset toggle is smuggled alongside it
+    assert not body.get("chat_template_kwargs")
 
 
 def test_no_sdk_retries_on_auth_failure(server, no_key_leak):

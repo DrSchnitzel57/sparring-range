@@ -136,13 +136,18 @@ def test_browser_model_administration(browser, web_app, ports, migrated_db,
         assert "superseded" in rows and "active" in rows
         assert "revoked" not in rows
 
-        # ---- credential rotation: the old version is REVOKED -----------------
+        # ---- credential rotation: EVERY version carrying the replaced
+        # credential is REVOKED (round-2 finding 2 — the superseded v1
+        # copied K1 forward, so rotation invalidates it too) -----------
         pw("click", '[data-testid="rotate-ui-profile"]')
         pw("fill", '[data-testid="field-key"]', "sk-ui-rotated-2")
         pw("click", '[data-testid="rotate-confirm"]')
         _body_has(pw, "credential REPLACED")
         rows = _body_has(pw, "ui-profile")
-        assert "revoked" in rows and "superseded" in rows and "active" in rows
+        assert "revoked" in rows and "active" in rows
+        assert "superseded" not in rows, \
+            "a superseded version still carrying the replaced credential " \
+            "survived rotation (the lineage sweep regressed)"
 
         # ---- discovery is a catalog read, not a completion -------------------
         pw("click", '[data-testid="discover-ui-profile-3"]')

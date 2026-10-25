@@ -339,7 +339,9 @@ def test_match_deadline_caps_admission_and_kills_stale_queue_items(
     model_jobs.start_model_jobs()
     done = _wait_job(stid, timeout_s=10.0)
     assert done.state == "cancelled"
-    assert "before dispatch" in (done.error or "")
+    # terminal BEFORE admission now (round-2 finding 8: expiry at
+    # enqueue is caught at the ONE admission gate, not only at dispatch)
+    assert "nothing was sent to the provider" in (done.error or "")
     assert not any("nowhere" in str(b) for b in srv.request_bodies())
 
 
@@ -399,7 +401,11 @@ def test_async_hint_completes_after_the_request_and_persists_once(
     r = client.get(f"/sessions/{sid}/model-jobs", headers=users["member"])
     mine = [j for j in r.json()["jobs"] if j["job_id"] == str(jid)]
     assert mine and mine[0]["state"] in ("queued", "running")
-    assert "result" not in mine[0] and "error" in mine[0]
+    # round-2 finding 4: the member async surface carries NO raw error
+    # (provider diagnostics can echo sealed conversation content even
+    # after secret redaction) — only the neutral classification.
+    assert "result" not in mine[0] and "error" not in mine[0]
+    assert mine[0]["error_kind"] is None
     done = _wait_job(jid, timeout_s=30.0)
     assert done.state == "succeeded", done.error
     with db_ctx() as s:

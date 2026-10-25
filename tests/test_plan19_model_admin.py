@@ -70,7 +70,7 @@ def _make_profile(client, users, name, base_url, *, key="sk-canary-9"):
 def test_bootstrap_profiles_exist_and_no_read_path_leaks_a_key(client, users, srv):
     body = client.get("/admin/model/profiles", headers=users["op"])
     assert body.status_code == 200, body.text
-    assert client.get("/readyz").json()["migration_version"] == "0021"
+    assert client.get("/readyz").json()["migration_version"] == "0022"
     data = body.json()
     names = {p["name"] for p in data["profiles"]}
     assert {"environment-red", "environment-coach"} <= names
