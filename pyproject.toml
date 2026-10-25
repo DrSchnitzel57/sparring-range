@@ -80,5 +80,6 @@ markers = [
     "hypervisor: real libvirt/KVM lifecycle and QGA readiness (appliance foundation)",
     "access: real guest SSH and recorded bastion replay (appliance access)",
     "journey: installed-appliance full practice journey (real guests, browser, labeled model fixture)",
+    "agent: conversational-agent + model-administration layer (scripted local protocol server; DB when pinned)",
 ]
-addopts = "-m 'not db and not containment and not packet and not authority and not browser and not live and not images and not capture and not hypervisor and not access and not journey'"
+addopts = "-m 'not db and not containment and not packet and not authority and not browser and not live and not images and not capture and not hypervisor and not access and not journey and not agent'"

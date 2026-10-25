@@ -68,6 +68,7 @@ REQUIRED_LAYER_ENV = {
     "hypervisor": "SR_REQUIRE_HYPERVISOR",
     "access": "SR_REQUIRE_ACCESS",
     "journey": "SR_REQUIRE_JOURNEY",
+    "agent": "SR_REQUIRE_AGENT",
 }
 
 

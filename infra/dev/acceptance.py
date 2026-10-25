@@ -36,7 +36,7 @@ import uuid
 REPO = pathlib.Path(__file__).resolve().parents[2]
 PY = sys.executable
 LAYERS = ("db", "containment", "packet", "authority", "browser", "live",
-          "images", "capture", "hypervisor", "access", "journey")
+          "images", "capture", "hypervisor", "access", "journey", "agent")
 COUNT_RE = re.compile(r"(\d+) (passed|failed|errors?|skipped|deselected)")
 
 
@@ -106,7 +106,8 @@ def env_summary(extra: dict | None = None) -> str:
     keys = ("SR_PG_ADMIN_URL", "SR_REQUIRE_DB", "SR_REQUIRE_CONTAINMENT",
             "SR_REQUIRE_PACKET", "SR_REQUIRE_AUTHORITY", "SR_REQUIRE_BROWSER",
             "SR_REQUIRE_IMAGES", "SR_REQUIRE_CAPTURE", "SR_REQUIRE_HYPERVISOR",
-            "SR_REQUIRE_ACCESS", "SR_REQUIRE_JOURNEY", "SR_APPLIANCE_BASE_IMAGE",
+            "SR_REQUIRE_ACCESS", "SR_REQUIRE_JOURNEY", "SR_REQUIRE_AGENT",
+            "SR_APPLIANCE_BASE_IMAGE",
             "RUNNER_CGROUP_ROOT",
             "SR_E2E_API_PORT", "SR_E2E_WEB_PORT", "SR_COMPOSE_PROJECT")
     env = {k: os.environ.get(k, "") for k in keys if os.environ.get(k)}
@@ -209,7 +210,8 @@ def check_selection() -> None:
              f"{len(leaked)} integration tests in default selection, e.g. "
              f"{sorted(leaked)[:5]}")
     for layer in ("db", "containment", "packet", "authority", "browser",
-                  "images", "capture", "hypervisor", "access", "journey"):
+                  "images", "capture", "hypervisor", "access", "journey",
+                  "agent"):
         if not layer_ids[layer]:
             fail(f"layer {layer} non-empty", "layer selection is empty")
     ok("all tests classified",
@@ -480,6 +482,29 @@ def _fixture_failure_probe() -> None:
 
 def _docker_probe(args: list[str]) -> int:
     return subprocess.run(["docker", *args], capture_output=True).returncode
+
+
+def check_agent() -> None:
+    """Conversational agent + model administration (plan 19): the pinned
+    Pydantic AI layer, the durable one-slot queue, pins/rotation/rebind and
+    cancellation obligations, exercised against the REAL wire (a local
+    scripted OpenAI-compatible server) and a disposable PostgreSQL. A skip
+    is never acceptance: SR_REQUIRE_AGENT converts skips to failures."""
+    fx = _pg_fixture()
+    try:
+        env = {"SR_PG_ADMIN_URL": fx.admin_url(), "SR_REQUIRE_DB": "1",
+               "SR_REQUIRE_AGENT": "1"}
+        r, counts = pytest_run(["-m", "agent"], env=env, timeout=1800)
+        require_selection(counts, "agent")
+        if r.returncode != 0:
+            fail("conversational agent + model administration layer",
+                 f"exit {r.returncode}, counts {counts}:\n{r.stdout[-6000:]}")
+        ok("agent layer passes in required mode",
+           f"{counts.get('passed', 0)} passed, {counts.get('failed', 0)} "
+           f"failed, {counts.get('skipped', 0)} skipped, "
+           f"{counts.get('deselected', 0)} deselected")
+    finally:
+        fx.cleanup()
 
 
 def check_db() -> None:
@@ -2099,6 +2124,7 @@ CHECKS = {
     "selection": check_selection,
     "python": check_python,
     "db": check_db,
+    "agent": check_agent,
     "containment": check_containment,
     "authority": check_authority,
     "pve-contract": check_pve_contract,

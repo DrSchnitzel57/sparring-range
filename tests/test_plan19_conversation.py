@@ -23,6 +23,8 @@ from tests.fake_model import FakeModelServer, text_response, tool_call, \
     tool_response
 from srplatform.red_agent import conversation as conv
 
+pytestmark = pytest.mark.agent
+
 
 @pytest.fixture()
 def server():

@@ -23,6 +23,8 @@ from srplatform.db.session import db as db_ctx
 from tests.fake_model import (FakeModelServer, text_response, tool_call,
                               tool_response)
 
+pytestmark = pytest.mark.agent
+
 @pytest.fixture()
 def srv():
     s = FakeModelServer().start()
@@ -509,3 +511,102 @@ def test_probe_is_a_queue_member_not_an_out_of_queue_ping(client, users, srv):
     job = _wait_job(jid)
     assert job.state == "succeeded", job.error
     assert job.kind == "probe"
+
+
+# --------------------------------------------------------------------------- #
+# compaction and accounting at the turn route (agent layer)                    #
+# --------------------------------------------------------------------------- #
+
+def test_compaction_covers_a_range_and_history_survives_it(client, users, srv):
+    """Crossing the profile's compaction point runs a SEPARATE visible
+    summarizer job, records a checkpoint that COVERS the compacted range,
+    and the next turn continues from the checkpoint — the append-only rows
+    still replay everything the model ever saw."""
+    prof = _make_profile(client, users, "compact", srv.base_url)
+    # tiny window forces compaction quickly (budget = 8192 - 1024)
+    r = client.post("/admin/model/profiles/compact/revise", headers=users["op"],
+                    json={"name": "compact", "context_window": 9216,
+                          "max_completion_tokens": 1024})
+    assert r.status_code == 200, r.text
+    client.put("/admin/model/roles", headers=users["op"],
+               json={"role": "attacker", "profile_name": "compact"})
+    client.put("/admin/model/roles", headers=users["op"],
+               json={"role": "summarizer", "profile_name": "compact"})
+    sid, token = _session_and_token(client, users)
+    H = {"Authorization": f"Bearer {token}"}
+
+    # first turn small
+    srv.script([text_response("turn one")])
+    assert client.post("/internal/model/turn", headers=H,
+                       json={"system": "s", "user": "one"}).status_code == 200
+
+    # a turn big enough to cross 80% of the completion-adjusted budget,
+    # and its answer must trigger compaction
+    filler = "recon " + ("x" * 24_000)
+    # the provider reports authoritative usage covering the WHOLE prompt;
+    # 9000 tokens over the 8192-token budget crosses the 80% point
+    srv.script([text_response("turn two " + "y" * 6000,
+                              usage={"prompt_tokens": 8400,
+                                     "completion_tokens": 600,
+                                     "total_tokens": 9000}),
+                text_response("COMPACTED: recon over web01; pivot pending.")])
+    r = client.post("/internal/model/turn", headers=H,
+                    json={"system": "s", "user": filler})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["needs_compaction"] is False, body.get("compaction_error")
+
+    with db_ctx() as s:
+        revs = s.execute(select(ConversationRevision).where(
+            ConversationRevision.session_id == sid)
+            .order_by(ConversationRevision.revision_id)).scalars().all()
+        cps = [v for v in revs if v.kind == "checkpoint"]
+        msgs = [v for v in revs if v.kind == "messages"]
+        assert len(cps) == 1
+        assert cps[-1].revision_id > msgs[-1].revision_id or \
+            cps[-1].payload["covers_through"] >= msgs[-1].revision_id
+        # the checkpoint COVERs a range — the compacted rows are still there
+        assert len(msgs) >= 2
+        assert cps[-1].payload["summary"].startswith("COMPACTED")
+
+    # the NEXT request resumes from the checkpoint: the summarizer text is
+    # in the wire history and the raw pre-checkpoint turns are not resent
+    srv.script([text_response("after compaction")])
+    r = client.post("/internal/model/turn", headers=H,
+                    json={"system": "s", "user": "continue"})
+    assert r.status_code == 200, r.text
+    wire = str(srv.request_bodies()[-1])
+    assert "COMPACTED: recon over web01" in wire
+    assert "x" * 500 not in wire, "pre-checkpoint bulk must not be resent"
+    # compaction itself was a durable job (the summarizer's, visible)
+    jobs = client.get("/admin/model/jobs", headers=users["op"]).json()["jobs"]
+    assert any(j["kind"] == "summarize" and j["state"] == "succeeded"
+               for j in jobs)
+
+
+def test_tool_output_is_bounded_on_the_wire(client, users, srv):
+    """A teletype flood cannot inflate the conversation without limit: the
+    tool return carries a bounded, honestly-labeled window (the full bytes
+    remain in the evidence events, which the model is pointed at)."""
+    prof = _make_profile(client, users, "flood", srv.base_url)
+    client.put("/admin/model/roles", headers=users["op"],
+               json={"role": "attacker", "profile_name": "flood"})
+    sid, token = _session_and_token(client, users)
+    H = {"Authorization": f"Bearer {token}"}
+    srv.script([tool_response([tool_call("c1", "range_command",
+                                         {"command": "cat /flood"})])])
+    assert client.post("/internal/model/turn", headers=H,
+                       json={"system": "s", "user": "go"}).status_code == 200
+    huge = "z" * 200_000
+    srv.script([text_response("noted")])
+    r = client.post("/internal/model/turn", headers=H, json={
+        "system": "s", "user": "next",
+        "tool_result": {"call_id": "c1", "exit_code": 0, "output": huge,
+                        "timed_out": False, "error": None}})
+    assert r.status_code == 200, r.text
+    wire = srv.request_bodies()[-1]
+    tool_msgs = [m for m in wire["messages"] if m["role"] == "tool"]
+    assert tool_msgs
+    content = str(tool_msgs[0]["content"])
+    assert "z" * 500 in content
+    assert "z" * 60_001 not in content, "output must be bounded on the wire"
