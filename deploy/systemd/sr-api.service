@@ -11,6 +11,10 @@ EnvironmentFile=/etc/sparring-range/control-plane.derived.env
 # Operator secrets and overrides load second (optional so pre-derivation
 # installs keep working); manifest-derived facts above, secrets below.
 EnvironmentFile=-/etc/sparring-range/control-plane.env
+# The provider-credential DB identity (migration 0021 onward) is loaded
+# HERE AND ONLY HERE: the ingest, bastion and web units never receive it,
+# and the operator's control-plane.env is not its home either.
+EnvironmentFile=-/etc/sparring-range/secrets/db-secret.env
 WorkingDirectory=/opt/sparring-range
 ExecStart=/opt/sparring-range/.venv/bin/uvicorn srplatform.api.app:app --host 127.0.0.1 --port 8000
 Restart=always

@@ -15,7 +15,7 @@ import os
 import pathlib
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -45,7 +45,14 @@ class Settings(BaseSettings):
     # (plan 19 review finding 8). Empty means credentials are
     # unreachable BY DESIGN — model calls fail visibly; there is no
     # fallback to the application role, which must never read keys.
-    postgres_url_secret: str = ""
+    # Round-2 finding 10: the DOCUMENTED deployment name is
+    # ``SR_PG_SECRET_URL``; the generator's mechanical form and the bare
+    # field name keep resolving (populate_by_name) so existing fixtures
+    # and examples never silently stop working.
+    postgres_url_secret: str = Field(
+        default="",
+        validation_alias=AliasChoices("SR_PG_SECRET_URL",
+                                      "SR_POSTGRES_URL_SECRET"))
     db_app_role: str = "sr_app"
 
     # --- API (single front door) ---

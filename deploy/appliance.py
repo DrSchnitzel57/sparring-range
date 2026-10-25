@@ -1127,7 +1127,8 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
             run, pathlib.Path(services["venv"]),
             node_binary=services["node"]["binary"])
         services["database"] = svc.ensure_database(
-            run, prefix=lay.prefix, env_file=lay.etc / "control-plane.env")
+            run, prefix=lay.prefix, env_file=lay.etc / "control-plane.env",
+            sandboxed=lay.sandboxed)
         services["tls"] = svc.ensure_tls(
             run, etc=lay.etc, public_ip=m.network.lan_address or "127.0.0.1",
             ingest_sans=_ingest_sans(m))

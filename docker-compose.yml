@@ -41,7 +41,8 @@ services:
       PGPASSWORD: ${SR_DEV_OWNER_PASSWORD:-devowner}
     command: >
       psql -h postgres -U sr_owner -d sparring_range -v ON_ERROR_STOP=1
-      -v app_pw=${SR_DEV_APP_PASSWORD:-devapp} -f /bootstrap.sql
+      -v app_pw=${SR_DEV_APP_PASSWORD:-devapp}
+      -v secret_pw=${SR_DEV_SECRET_PASSWORD:-devsecret} -f /bootstrap.sql
     volumes:
       - ./infra/db/bootstrap.sql:/bootstrap.sql:ro
     restart: "no"
@@ -82,6 +83,9 @@ services:
       SR_ENV: ${SR_ENV:-dev}
       # app-role ONLY — the owner URL must not exist in the runtime environment
       POSTGRES_URL: postgresql+psycopg2://sr_app:${SR_DEV_APP_PASSWORD:-devapp}@postgres:5432/sparring_range
+      # credential-store identity (migration 0021 table) — the API is its
+      # ONLY consumer; the ingest/bastion services never receive this URL
+      SR_PG_SECRET_URL: postgresql+psycopg2://sr_secret:${SR_DEV_SECRET_PASSWORD:-devsecret}@postgres:5432/sparring_range
       DB_APP_ROLE: sr_app
       API_BASE_URL: http://localhost:8000
       API_ALLOWED_ORIGINS: ${API_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}

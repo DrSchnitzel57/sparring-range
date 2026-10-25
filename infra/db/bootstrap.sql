@@ -12,3 +12,10 @@
 SELECT format('CREATE ROLE sr_app LOGIN PASSWORD %L', :'app_pw')
 WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'sr_app')\gexec
 ALTER ROLE sr_app LOGIN PASSWORD :'app_pw';
+-- The credential-store identity (migration 0021 grants model_profile_secrets
+-- to exactly this role): the migration FAILS without it, so the dev stack
+-- provisions it here just like the appliance installer does. It receives no
+-- other grant — the migrations decide what it can touch.
+SELECT format('CREATE ROLE sr_secret LOGIN PASSWORD %L', :'secret_pw')
+WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'sr_secret')\gexec
+ALTER ROLE sr_secret LOGIN PASSWORD :'secret_pw';

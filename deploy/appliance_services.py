@@ -422,7 +422,9 @@ def _read_env_file(path: pathlib.Path) -> dict[str, str]:
 
 def ensure_database(run, *, prefix: pathlib.Path, env_file: pathlib.Path,
                     owner_env_file: pathlib.Path | None = None,
-                    app_role: str = "sr_app") -> dict:
+                    app_role: str = "sr_app",
+                    secret_role: str = "sr_secret",
+                    sandboxed: bool = False) -> dict:
     """Create the database roles and run the forward migrations as the owner.
 
     The SCHEMA OWNER credential is deliberately separate from the runtime
@@ -435,6 +437,15 @@ def ensure_database(run, *, prefix: pathlib.Path, env_file: pathlib.Path,
     The URL is parsed, never split on "/" (that would put the credentials
     into the "database name"), and it never appears in a command line or a
     log: it is passed to Alembic through the ENVIRONMENT.
+
+    Round-2 finding 10: the credential-store identity (migration 0021
+    GRANTs to it — the migration FAILS if the role does not exist) is
+    provisioned HERE, not left as manual SQL the operator must have run
+    before the migration. A fresh install gets a generated password in
+    the API-only file ``secrets/db-secret.env`` (0640 root:srrange,
+    loaded ONLY by sr-api.service — never by the ingest, bastion or web
+    environments); an existing file or an explicit ``SR_PG_SECRET_URL``
+    in the environment is honored, and the role is created from it.
     """
     owner_env_file = owner_env_file or (env_file.parent / "secrets" /
                                         "db-owner.env")
@@ -471,6 +482,55 @@ def ensure_database(run, *, prefix: pathlib.Path, env_file: pathlib.Path,
         f"WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname="
         f"'{database}')\n\\gexec"])
 
+    # --- the credential-store identity (plan 19 secret contract) ------
+    secret_env_file = env_file.parent / "secrets" / "db-secret.env"
+    secret_url = os.environ.get("SR_PG_SECRET_URL") or \
+        _read_env_file(secret_env_file).get("SR_PG_SECRET_URL")
+    secret_generated = secret_url is None
+    if secret_generated:
+        if getattr(run, "dry_run", False):
+            secret_url = (f"postgresql+psycopg2://{secret_role}:"
+                          f"<generated>@{owner['host']}:{owner['port']}/"
+                          f"{database}")  # placeholder: never used, never
+                                          # written on a dry run
+        else:
+            import secrets as _secrets
+            secret_url = (f"postgresql+psycopg2://{secret_role}:"
+                          f"{_secrets.token_urlsafe(24)}@"
+                          f"{owner['host']}:{owner['port']}/{database}")
+    secret = _parse_url(secret_url)
+    _psql_as_postgres(run, [
+        f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname="
+        f"'{secret['user']}') THEN CREATE ROLE {secret['user']} LOGIN "
+        f"PASSWORD '{secret['password']}';"
+        f"ELSIF '{str(secret_generated).lower()}' = 'true' THEN "
+        f"ALTER ROLE {secret['user']} WITH LOGIN "
+        f"PASSWORD '{secret['password']}'; END IF; END $$;"])
+    # An operator-PROVIDED URL never overwrites the file's content, and a
+    # dry run never writes anything; a GENERATED password must reach the
+    # API through its 0640 root:srrange file (and if the role already
+    # existed, the ALTER above realigned it — the file and the role are
+    # then consistent, which is what a rerun after a lost file needs).
+    if not getattr(run, "dry_run", False) and \
+            not secret_env_file.exists():
+        secret_env_file.parent.mkdir(parents=True, exist_ok=True)
+        secret_env_file.write_text(
+            "# API-only identity for the provider-credential table ONLY\n"
+            "# (migration 0021 onward). Loaded ONLY by sr-api.service —\n"
+            "# never by ingest, bastion or web. 0640 root:srrange.\n"
+            f"SR_PG_SECRET_URL={secret_url}\n")
+    run("chmod", "0640", str(secret_env_file), check=False)
+    if not sandboxed:
+        try:
+            import grp as _grp
+            import pwd as _pwd
+            run("chown",
+                f"{_pwd.getpwnam('root').pw_uid}:"
+                f"{_grp.getgrnam('srrange').gr_gid}",
+                str(secret_env_file), check=False)
+        except KeyError:
+            pass
+
     # Forward migrations, always as the owner, always through the environment.
     alembic = prefix / ".venv/bin/alembic"
     if not alembic.exists():
@@ -479,10 +539,15 @@ def ensure_database(run, *, prefix: pathlib.Path, env_file: pathlib.Path,
     run(str(alembic), "upgrade", "head",
         env={"POSTGRES_URL_OWNER": owner_url,
              "DB_APP_ROLE": app_role,
+             "DB_SECRET_ROLE": secret["user"],
              "PATH": os.environ.get("PATH", "/usr/bin:/bin")})
     return {"database": database, "owner_role": owner["user"],
             "app_role": app_role, "migrated_with_owner_url": True,
-            "owner_url_file": str(owner_env_file)}
+            "owner_url_file": str(owner_env_file),
+            "secret_role": secret["user"],
+            "secret_url_file": str(secret_env_file),
+            "secret_role_generated": bool(secret_generated),
+            "secret_url_in_returned_data": False}
 
 
 def _parse_url(url: str) -> dict:
