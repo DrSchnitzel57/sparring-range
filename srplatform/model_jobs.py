@@ -111,6 +111,10 @@ def wait(db, job_id: uuid.UUID, timeout: float, poll_s: float = 0.05) -> ModelJo
             return job
         if time.monotonic() >= deadline:
             raise TimeoutError(f"model job exceeded its {timeout:.0f} s bound")
+        # end the transaction between polls: a waiter must never occupy a
+        # pool connection (or hold a snapshot) across its own wait bound —
+        # the same rule that keeps provider calls transaction-free
+        db.commit()
         db.expunge_all()
         time.sleep(poll_s)
 

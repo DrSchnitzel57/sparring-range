@@ -24,7 +24,9 @@ export default function AdminModels() {
   const [note, setNote] = useState(null);
   const [busy, setBusy] = useState(false);
   const [draft, setDraft] = useState({ name: "", base_url: "", model_name: "",
-                                       api_key: "", max_completion_tokens: "" });
+                                       api_key: "", max_completion_tokens: "",
+                                       thinking_level: "none",
+                                       context_window: "", timeout_s: "" });
   const [rotateFor, setRotateFor] = useState(null);
   const [rotateKey, setRotateKey] = useState("");
   const [rebind, setRebind] = useState({ session_id: "", role: "attacker" });
@@ -47,19 +49,29 @@ export default function AdminModels() {
     setBusy(false);
   };
 
+  const num = v => (v === "" ? undefined : Number(v));
   const create = () => run("profile created (v1, active)", () =>
     api("/admin/model/profiles", { method: "POST", body: {
       name: draft.name, base_url: draft.base_url, model_name: draft.model_name,
       api_key: draft.api_key,
-      max_completion_tokens: draft.max_completion_tokens
-        ? Number(draft.max_completion_tokens) : undefined } })
+      thinking_level: draft.thinking_level,
+      max_completion_tokens: num(draft.max_completion_tokens),
+      context_window: num(draft.context_window),
+      timeout_s: num(draft.timeout_s) } })
       .then(() => setDraft({ name: "", base_url: "", model_name: "",
-                             api_key: "", max_completion_tokens: "" })));
+                             api_key: "", max_completion_tokens: "",
+                             thinking_level: "none", context_window: "",
+                             timeout_s: "" })));
 
   const rotate = (name) => run("rotated: new version active, old demoted, "
     + "its queued jobs cancelled — pinned sessions need an explicit rebind",
     () => api(`/admin/model/profiles/${name}/revise`, { method: "POST", body: {
       name, model_name: draft.model_name || undefined,
+      thinking_level: draft.thinking_level !== "none"
+        ? draft.thinking_level : undefined,
+      max_completion_tokens: num(draft.max_completion_tokens),
+      context_window: num(draft.context_window),
+      timeout_s: num(draft.timeout_s),
       api_key: rotateKey || undefined } })
       .then(() => { setRotateFor(null); setRotateKey(""); }));
 
@@ -156,6 +168,28 @@ export default function AdminModels() {
                 value={rotateFor ? rotateKey : draft.api_key}
                 onChange={e => rotateFor ? setRotateKey(e.target.value)
                   : setDraft({ ...draft, api_key: e.target.value })} /></label>
+            <details>
+              <summary>advanced (pinned per version)</summary>
+              <label>thinking level
+                <select value={draft.thinking_level}
+                        onChange={e => setDraft({ ...draft, thinking_level: e.target.value })}>
+                  {["none", "low", "medium", "high"].map(l =>
+                    <option key={l}>{l}</option>)}
+                </select></label>
+              <label>context window <input data-testid="field-context"
+                placeholder="262144" value={draft.context_window}
+                onChange={e => setDraft({ ...draft, context_window: e.target.value })} /></label>
+              <label>max completion tokens <input
+                placeholder="32768 (incl. thinking)"
+                value={draft.max_completion_tokens}
+                onChange={e => setDraft({ ...draft, max_completion_tokens: e.target.value })} /></label>
+              <label>timeout (s, ≤ 900) <input placeholder="900"
+                value={draft.timeout_s}
+                onChange={e => setDraft({ ...draft, timeout_s: e.target.value })} /></label>
+              <p className="dim">generation kwargs are allowlisted server-side
+                (temperature/top_p/penalties only); messages, tools, auth and
+                destinations can never be overridden by a profile.</p>
+            </details>
             {rotateFor
               ? <button disabled={busy} data-testid="rotate-confirm"
                         onClick={() => rotate(rotateFor)}>rotate (new version)</button>
