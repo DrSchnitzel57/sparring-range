@@ -13,6 +13,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -454,11 +455,18 @@ class ModelProfile(Base):
     """Versioned named model profile (plan 19). An edit creates a NEW
     version and demotes the old one (partial unique index: one ACTIVE
     per name); sessions pin a specific version and keep it for their
-    whole life. ``api_key`` is the provider credential and lives ONLY
-    here — no API response, event payload, log line or export ever
-    carries it; every read path must use ``masked()``. Lifecycle only
-    mutates (active → retired/revoked): rotation/revocation is a
-    visible transition, never an in-place model or key swap."""
+    whole life.
+
+    THE PROVIDER CREDENTIAL DOES NOT LIVE HERE. Since migration 0021
+    the key lives only in ``model_profile_secrets``, readable solely
+    through the dedicated secret-role identity (review finding 8): the
+    application/ingestion DB role never receives it, so a compromised
+    ingest plane cannot read provider credentials. Lifecycle statuses:
+    ``active`` (serves new work), ``superseded`` (a NON-secret edit
+    replaced it — sessions already pinned to it keep working, which is
+    what makes thinking/timeout edits safe), ``revoked`` (credential
+    compromise/replacement — pinned work FAILS visibly until an
+    operator rebinds), ``retired`` (taken out of service)."""
 
     __tablename__ = "model_profiles"
 
@@ -469,7 +477,6 @@ class ModelProfile(Base):
     status: Mapped[str] = mapped_column(Text, nullable=False, default="active")
     base_url: Mapped[str] = mapped_column(Text, nullable=False)
     model_name: Mapped[str] = mapped_column(Text, nullable=False)
-    api_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
     thinking_level: Mapped[str] = mapped_column(Text, nullable=False, default="none")
     thinking_map: Mapped[dict] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb"))
@@ -479,6 +486,8 @@ class ModelProfile(Base):
         Integer, nullable=False, server_default="262144")
     max_completion_tokens: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default="32768")
+    compaction_ratio: Mapped[float] = mapped_column(
+        Float, nullable=False, server_default="0.8")
     timeout_s: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default="900")
     capabilities: Mapped[dict] = mapped_column(
@@ -494,18 +503,21 @@ class ModelProfile(Base):
               postgresql_where=text("status = 'active'")),
     )
 
-    def masked(self) -> dict:
-        """The ONLY serialization shape: presence, never value."""
+    def masked(self, *, key_present: bool | None = None) -> dict:
+        """The ONLY serialization shape: presence, never value.
+        ``key_present`` is supplied by the caller from the secret store;
+        ``None`` honestly reports "unknown" rather than a guess."""
         return {
             "profile_id": str(self.profile_id), "name": self.name,
             "version": self.version, "status": self.status,
             "base_url": self.base_url, "model_name": self.model_name,
-            "api_key_set": bool(self.api_key),
+            "api_key_set": key_present,
             "thinking_level": self.thinking_level,
             "thinking_map": self.thinking_map,
             "generation_kwargs": self.generation_kwargs,
             "context_window": self.context_window,
             "max_completion_tokens": self.max_completion_tokens,
+            "compaction_ratio": self.compaction_ratio,
             "timeout_s": self.timeout_s, "capabilities": self.capabilities,
             "note": self.note,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -522,8 +534,27 @@ class ModelProfile(Base):
             "generation_kwargs": self.generation_kwargs,
             "context_window": self.context_window,
             "max_completion_tokens": self.max_completion_tokens,
+            "compaction_ratio": self.compaction_ratio,
             "timeout_s": self.timeout_s,
+            "capabilities": self.capabilities,
         }
+
+
+class ModelProfileSecret(Base):
+    """Provider credential storage behind a SEPARATE minimal DB identity
+    (review finding 8). The app role has no grant here — not a revoked
+    one, none — so ingestion/worker/bastion DB access cannot read a
+    provider key even though the API plane shares the app role. Only
+    the API-side secret store (its own engine and role) touches this
+    table; values never travel over HTTP, into logs, or into events."""
+
+    __tablename__ = "model_profile_secrets"
+
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True)
+    api_key: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class ModelRoleOverride(Base):
@@ -586,18 +617,26 @@ class ModelJob(Base):
         UUID(as_uuid=True), ForeignKey("sessions.session_id"))
     kind: Mapped[str] = mapped_column(Text, nullable=False)
     priority: Mapped[int] = mapped_column(Integer, nullable=False)
-    # queued | running | succeeded | failed | cancelled | cessation_unknown
+    # queued | running | succeeded | failed | cancelled |
+    # cessation_unknown | cessation_resolved
     state: Mapped[str] = mapped_column(Text, nullable=False, default="queued")
     profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     profile_name: Mapped[str | None] = mapped_column(Text)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     parent_job: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    depends_on: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    deadline_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True))
     payload: Mapped[dict] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb"))
     result: Mapped[dict | None] = mapped_column(JSONB)
     error: Mapped[str | None] = mapped_column(Text)
     cancel_requested: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false"))
+    resolved_by: Mapped[str | None] = mapped_column(Text)
+    resolution: Mapped[str | None] = mapped_column(Text)
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True))
     actor: Mapped[str | None] = mapped_column(Text)
     requested_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -605,10 +644,16 @@ class ModelJob(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
-        Index("uq_model_jobs_single_running", "state", unique=True,
-              postgresql_where=text("state = 'running'")),
+        # ONE admission slot, and an UNCERTAIN cessation holds it too
+        # (review finding 2): a call whose provider-side stop cannot be
+        # confirmed keeps the slot occupied until an operator resolves
+        # the obligation — never quietly admitted past.
+        Index("uq_model_jobs_slot", "state", unique=True,
+              postgresql_where=text(
+                  "state IN ('running', 'cessation_unknown')")),
         Index("ix_model_jobs_queue", "state", "priority", "requested_at"),
         Index("ix_model_jobs_session", "session_id"),
+        Index("ix_model_jobs_parent", "parent_job"),
     )
 
 

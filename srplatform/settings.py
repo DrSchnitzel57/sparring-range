@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     # --- Database ---
     postgres_url: str = "postgresql+psycopg2://sr_app:sr_app_dev@localhost:5432/sparring_range"
     postgres_url_owner: str = "postgresql+psycopg2://sr_owner:sr_owner_dev@localhost:5432/sparring_range"
+    # Dedicated minimal role for the provider-credential table ONLY
+    # (plan 19 review finding 8). Empty means credentials are
+    # unreachable BY DESIGN — model calls fail visibly; there is no
+    # fallback to the application role, which must never read keys.
+    postgres_url_secret: str = ""
     db_app_role: str = "sr_app"
 
     # --- API (single front door) ---
