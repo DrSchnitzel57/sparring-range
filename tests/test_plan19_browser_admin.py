@@ -123,17 +123,38 @@ def test_browser_model_administration(browser, web_app, ports, migrated_db,
         body = _body_has(pw, "ui-profile")
         assert "sk-ui-secret-99" not in body
 
-        # ---- rotation: new version, old one visibly retired ------------------
+        # ---- NON-secret rotation: SUPERSEDE (pinned sessions keep running) --
+        pw("eval", "document.querySelector('details').open = true")
         pw("fill", '[data-testid="field-model"]', "gpt-4o-b")
+        pw("fill", '[data-testid="field-compaction"]', "0.7")
         pw("click", '[data-testid="rotate-ui-profile"]')
         _body_has(pw, "rotate ui-profile")          # form switched to rotate mode
         pw("click", '[data-testid="rotate-confirm"]')
-        _body_has(pw, "rotated")
+        _body_has(pw, "SUPERSEDED")
         _body_has(pw, "gpt-4o-b")
         rows = _body_has(pw, "ui-profile")
-        assert "retired" in rows and "active" in rows
+        assert "superseded" in rows and "active" in rows
+        assert "revoked" not in rows
 
-        # ---- probe = queue member; survives reload ---------------------------
+        # ---- credential rotation: the old version is REVOKED -----------------
+        pw("click", '[data-testid="rotate-ui-profile"]')
+        pw("fill", '[data-testid="field-key"]', "sk-ui-rotated-2")
+        pw("click", '[data-testid="rotate-confirm"]')
+        _body_has(pw, "credential REPLACED")
+        rows = _body_has(pw, "ui-profile")
+        assert "revoked" in rows and "superseded" in rows and "active" in rows
+
+        # ---- discovery is a catalog read, not a completion -------------------
+        pw("click", '[data-testid="discover-ui-profile-3"]')
+        _body_has(pw, "coach-mini")      # catalog-only model id proves GET
+
+        # ---- a custom thinking level MUST declare its mapping ---------------
+        pw("select", '[data-testid="field-thinking"]', "custom…")
+        _body_has(pw, "custom level name")
+        pw("click", '[data-testid="create-profile"]')
+        _body_has(pw, "needs a name AND a mapping")
+
+        # ---- probe = queue member; the live job survives reload --------------
         # a LONG hang: the cancel must arrive while the call is genuinely
         # live (a fast answer would race the GUI past the obligation)
         srv.script([text_response("pong")], hang_s=15.0)
@@ -154,16 +175,28 @@ def test_browser_model_administration(browser, web_app, ports, migrated_db,
         body = _body_has(pw, "model jobs")
         assert "probe" in body, "probe job vanished after reload — queue is " \
                                "not durable from the operator's view"
-        # wait for the cancellation/cessation to resolve, then confirm it is
-        # still visible after ANOTHER reload
+        # The watcher CLOSED the live request: that is an UNCERTAIN cessation
+        # — an obligation the GUI surfaces and only an operator releases.
         deadline = time.time() + 45
         while time.time() < deadline:
             pw("reload")
             body = pw("--raw", "eval", "document.body.innerText").stdout
-            if "cancelled" in body:
+            if "cessation_unknown" in body:
                 break
             time.sleep(2)
-        assert "cancelled" in body
+        assert "cessation_unknown" in body, \
+            "a watcher-closed call must present as an unresolved obligation"
+        _body_has(pw, "hold the slot")
+        # resolve it through the GUI: bounded, explained, audited
+        pw("click", '[data-testid="resolve-job"]')
+        pw("fill", '[data-testid="resolve-text"]',
+           "checked the endpoint: request finished; output discarded")
+        pw("click", '[data-testid="resolve-confirm"]')
+        _body_has(pw, "resolved and audited")
+        pw("reload")
+        body = _body_has(pw, "model jobs")
+        assert "cessation_resolved" in body, \
+            "resolution must survive reload — it is durable state"
     finally:
         server.should_exit = True
         srv.stop()
