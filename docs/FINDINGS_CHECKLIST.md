@@ -1,5 +1,125 @@
 # Current findings and validation evidence
 
+## Plan-19 review ROUND 2 — 2026-10-25, branch `practice-upgrades-18-21`
+
+The SECOND independent review returned **VERDICT: FIX** at `1d19c16` with
+thirteen findings against the round-1 repairs. Every one was reproduced,
+then re-fixed at the behavior level; commits `e38c1b5` (wire/compaction/
+thinking/classifier), `21f9f55` (migration 0022 + digests + guard),
+`fb433ac` (chain-unit jobs), `add5223` (surfaces/streams/rollbacks),
+`bdad5c8` (secret-URL provisioning), `4764127` (tests), `bb0fec6` (GUI).
+Applied migrations 0020 AND 0021 are byte-unchanged (the round-1 lesson
+held): all schema work is forward 0022.
+
+### Reproduced defects (pre-fix, exact behavior)
+
+- **F1 compaction split a tool pair:** with a strict-checking provider,
+  compaction covered the assistant tool CALL while the RESULT arrived
+  later; the next replay opened with an orphan tool result and the
+  provider 400'd (the fake provider's strict mode now records exactly
+  that violation class).
+- **F2 rotation left the credential alive:** session pinned v1/K1; three
+  non-secret edits copied K1 to v2–v4; replacing the key revoked only
+  v4 — the pinned session kept calling with the "replaced" credential
+  (the pre-fix run failed asserting `v1.status == 'revoked'`).
+- **F3 short-key leak + post-delete redaction:** the reviewer saved
+  synthetic `uvxyz`; a leaky 500 echo put it in the worker 502 AND the
+  admin job row; re-fetching the key after mid-failure revocation lost
+  the value entirely (round-1 `redact_secrets` had a 6-char floor).
+- **F4 member leak:** a provider 400 echoing the sealed conversation
+  surfaced verbatim through `GET /sessions/{id}/model-jobs` to the
+  owning member — sealed match included.
+- **F5 root cancel:** cancelling the submitted id returned 200 while the
+  backoff-queued retry child stayed queued and then dispatched (the
+  provider received the "cancelled" call).
+- **F6 stale finality:** polling the submitted id reported attempt 1's
+  `failed` after the retry had already succeeded; the admin detail
+  showed the same.
+- **F7 double outcome:** a hint whose attempt 1 failed and attempt 2
+  succeeded persisted TWO hint events (fallback + real).
+- **F8 deadline bypass:** `/internal/model/complete` for an already
+  EXPIRED match contacted the provider (queue-expiry checked only at
+  dispatch; the text route never carried the match deadline).
+- **F9 thinking collapse:** running the round-1 function, `none/low/
+  medium/high` produced FOUR IDENTICAL llama.cpp request bodies.
+- **F10 env-name:** `SR_PG_SECRET_URL` alone resolved
+  `postgres_url_secret` to `''`; on compose, migrate died at 0021's
+  GRANT — `role "sr_secret" does not exist` (reproduced this round).
+- **F11 rotation destroyed a working key:** an invalid rotation
+  (422) left the old secret DELETED and the status rolled back —
+  pinned sessions then failed with no credential. Root cause found
+  empirically: SQLAlchemy 2.1 dispatches `after_rollback` with ONE
+  argument, so the two-argument guard made `Session.rollback()` itself
+  raise before compensating.
+- **F12 false slot index:** raw SQL inserted one `running` PLUS one
+  `cessation_unknown` — `UNIQUE(state) WHERE state IN (...)` does not
+  make DIFFERENT values conflict.
+- **F13 no streams:** status was poll-only; no bounded stream, no
+  reconnect semantics, and no member-safe variant existed.
+
+### Corrected proofs (personally run at the committed HEAD)
+
+All in `tests/test_plan19_review_round2.py` (25 tests, agent layer) +
+`tests/test_plan19_review_round2_deploy.py` (6 fast) — disposable
+PostgreSQL + the strict fake provider; browser-level lineage behavior in
+`tests/test_plan19_browser_admin.py` (real browser). Highlights exactly
+as run: strict-provider violation list stays `[]` across compaction and
+three post-checkpoint turns; lineage revoke asserts v1–v4 revoked with
+secrets deleted and a queued v2 child cancelled, while explicit
+per-version revoke keeps its sibling `superseded`; `uvxyz`/`SEALED-PLAN`
+absent from the 502, every job row, the admin list and the member
+surfaces; root cancel of a queued child leaves it `cancelled` past its
+backoff instant with provider request count frozen at 1; a watcher-closed
+live child lands `cessation_unknown` and holds the slot until operator
+resolution; the hint event count is exactly 1 under retry-success,
+exhaustion, cancel, and a direct double-claim of the outcome claim;
+the expired-match text route returns without any provider request; the
+four thinking levels produce four distinct wire bodies (and an unknown
+preset is refused before the request); invalid rotations leave the key
+byte-identical and the version list unchanged, at mid-effect AND at
+route level; raw SQL running+unknown now raises `IntegrityError` while
+five non-occupying states coexist; worker stream progress + durable
+reconnect result, member stream state-only (`text` never present) and
+sealed-job 404; `SR_PG_SECRET_URL` drives the real secret store.
+
+### Gate receipts for round 2 — all personally run at this revision, serialized, heavy gates one at a time
+
+| Gate | Result | Detail |
+|---|---|---|
+| fast default | PASS | 653 passed, 0 failed, 0 skipped, 381 deselected (83 s) |
+| selection | PASS | every test classified; required-mode negatives proven (132 s) |
+| python | PASS | fresh locked install + 4 entrypoint imports, Python 3.13.5 (4 s) |
+| db | PASS | 242 passed, 0 skipped in required mode (599 s; disposable PG 16) |
+| agent | PASS | 91 passed, 0 failed, 0 skipped — includes all 25 round-2 wire/DB regressions (116 s) |
+| authority | PASS | 35 passed, 0 skipped (24 s) |
+| containment | PASS | 26 passed, 0 skipped (19 s) |
+| pve-contract | PASS | 22 passed, 0 skipped (25 s) |
+| frontend | PASS | npm ci + build + audit: zero high/critical (7 s) |
+| browser | PASS | 2 passed, 0 skipped (105 s). FIRST ATTEMPT FAILED and was kept honest: the model-admin GUI test still asserted round-1 rotation semantics ("a superseded row survives"); the agreed lineage fix legitimately revokes it — the test now asserts `superseded NOT in rows` as the lineage guard, then passed |
+| compose | PASS | full bootstrap/migrate/API/browser flows (179 s). Required the round-2 provisioning fix: migrate died at 0021's GRANT (`role "sr_secret" does not exist`) — fixed in `bdad5c8`, then green |
+| install | PASS | real sandboxed install sequences incl. rerun/TLS-rotation/partial-recovery; managed-service half explicitly stays operator (7 s) |
+| hypervisor | PASS | 2 passed — real libvirt clone/start/QGA/host-key/ownership/destroy, accelerator labeled **explicit-TCG** (no /dev/kvm here; NOT nested-KVM acceptance) (262 s) |
+| access | PASS | 1 passed — real Ubuntu guest SSH, pinned key, recorded bastion replay (138 s) |
+| images | PASS | 19 passed, 0 skipped — mojang builds/boots/services/seeds/flaws/fixes/readiness under isolated QEMU (1740 s) |
+| capture | PASS | 11 passed, 0 skipped — installed auditd/srshipper negatives/recovery/replay (205 s) |
+| bundle | PASS | 345 files, 4 images; bound to THIS checkout (228 runtime files compared); shipped image boots from a throwaway overlay; tampered bundle refused (245 s) |
+| packet | FAILED (environment) — as designed | `PENDING: missing ['root','nft']` — fails closed naming the exact prerequisite; nothing simulated |
+| journey | FAILED (prerequisite) — as designed | `PENDING: missing SR_JOURNEY_*` — needs the installed appliance + member tokens; first promotion gate remains open |
+| release | FAILED (prerequisite) — as designed | `requires SR_LIVE_BASE_URL (deployed lab)` |
+
+After every gate: owned fixtures removed (no `sr-*` containers/volumes, no
+`/tmp/sr-bundle-gate-*` or QEMU run-dirs left; a mid-round SIGKILLed bundle
+attempt left one owned temp dir which was deleted — receipt above is the
+completed retry). Manual checks (milestone plans' operator sections —
+Strata wire, nested KVM, installed-appliance journey) are the operator's.
+
+### Manual / operator-only limits (unchanged by this round)
+
+Strata thinking-wire compatibility, nested-KVM accelerator acceptance,
+packet (root+nft), the installed-appliance journey, and the live release
+journey remain operator/CI-jobs — each fails closed naming its exact
+prerequisite; none was simulated or waived.
+
 ## Plan-19 independent review round — 2026-10-25, branch `practice-upgrades-18-21`
 
 The independent review of plan 19 returned **VERDICT: FIX** at `2bb5305`
