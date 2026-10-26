@@ -1,5 +1,168 @@
 # Current findings and validation evidence
 
+## Plan-19 review ROUND 3 — 2026-10-26, branch `practice-upgrades-18-21`
+
+The THIRD independent review returned **VERDICT: FIX** at `e311ff9` with
+six findings (two HIGH races against the one-slot contract, two MEDIUM
+lifecycle gaps, one MEDIUM admin self-sabotage, one HIGH deployment
+identity boundary). Every one was reproduced at root and fixed with
+DETERMINISTIC concurrency regressions — uncommitted production claims
+held open, event-gated provider responses, hand-driven
+claim/execute/terminal — never sleeps hoping a window opens
+(`tests/test_plan19_review_round3.py`, 18 agent tests;
+`tests/test_plan19_review_round3_deploy.py`, 8 fast tests). Commits
+`b7885c1` (jobs fence + migration 0023), `09ed2b2` (admin outcome
+unification + guard audit), `f6f9014` (OS identity/secret boundary),
+`dfa9f39` (tests). Applied migrations 0020/0021/0022 verified
+BYTE-UNCHANGED (`git diff e311ff9..HEAD` over those files empty); all
+schema work is forward migration **0023** (`cancel_intent` +
+`chain_root` indexed/backfilled, NULL chain = unknown = conservatively
+blocks gating).
+
+### Reproduced defects and fix→proof map (pre-fix behavior, exact)
+
+- **F1 HIGH cancel/claim race released a live slot.** Production claim
+  (`_CLAIM_SQL`, row lock) left uncommitted while a real `cancel()` ran:
+  cancellation did NOT wait, wrote its stale queued snapshot over the
+  committed `running` row — `cancelled_row_state=cancelled`,
+  `second_claimed=True`, provider still generating
+  (`provider_max_concurrent=2`). Fix: `cancel()` locks the WHOLE chain
+  FOR UPDATE root-first (deterministic order, re-enumerating) then acts
+  on the committed truth; live rows get only `cancel_requested`; the
+  claim carries the outer `state/intent` CAS. Proof:
+  `test_cancel_blocked_by_open_claim_acts_on_the_committed_truth`
+  thread-proves the cancellation BLOCKS at the claim fence, then honors
+  `running`+requested; `test_live_call_cancel_requests_cessation_and_
+  holds_the_slot` (event-gated real HTTP) shows the slot is never
+  released while live and at most one provider request exists;
+  `test_cancel_before_claim_never_claims_or_dispatches`.
+- **F2 HIGH retry creation escaped root cancellation.** Attempt 1 live
+  (event-gated), provider answered 500 (definite, retryable) WHILE
+  `cancel()` committed against the old chain snapshot: the executor
+  birthed a fresh queued backoff child — the "cancelled" request
+  re-spawned. Fix: durable `cancel_intent` stamped on EVERY chain row
+  under the lock (migration 0023); the terminal write takes the row
+  lock FIRST and treats `cancel_requested OR cancel_intent` as cessation,
+  ending the chain with no child; claim skips intent rows; children born
+  before the cancel are found by the locked re-enumeration and killed.
+  Proof: `test_retry_cannot_be_born_after_the_root_was_cancelled`
+  (no child, no second request, exactly one outcome — with F4),
+  `test_cancel_after_child_born_kills_it_during_the_race_window`.
+- **F3 MEDIUM dependency gating was attempt-bound.** A gated turn was
+  admitted after the summary's FIRST failed attempt despite the queued
+  retry: executor failed the caller `prerequisite job did not succeed
+  (failed)` (502) while the summary retry later succeeded — three
+  provider requests, wrong verdict. Fix: the claim gate is chain-aware
+  via `chain_root` (wait while ANY attempt may dispatch, admit once
+  quiescent), and the EXECUTOR under its lock decides: requeue if the
+  prereq is in-flight again (race won after admission), truthful
+  `prerequisite logical request did not succeed (final attempt N:
+  state)` on genuine exhaustion. Proof:
+  `test_gated_turn_waits_for_summary_recovery_then_dispatches_once`
+  (request bodies `[_SUM, _SUM, _GATE_MSG]` — dispatched once, only
+  after the chain's final attempt succeeded),
+  `test_gated_turn_fails_only_after_the_summary_chain_is_truly_done`,
+  `test_gated_turn_reports_the_summary_cancellation_truthfully`.
+- **F4 MEDIUM revocation skipped durable outcomes.** Async hint AND AAR
+  revoked before dispatch: `cancelled`, `outcome_persisted=false`,
+  ZERO events — the member's honest fallback vanished; the same bypass
+  existed for restart/recovery and the profile-unavailable branch. Fix:
+  ALL terminal paths route through the ONE protocol —
+  `model_admin._cancel_jobs_for`/`revoke()` call `model_jobs.cancel()`
+  (intent + locked cascade + one guarded outcome claim);
+  `reconcile_startup` and `resolve_cessation` persist the logical
+  outcome; profile-unavailable cascades and persists. Proof:
+  `test_revocation_of_a_queued_hint_persists_the_outcome_once`,
+  `test_lineage_replacement_of_backoff_chain_persists_once`,
+  `test_live_call_revocation_ceases_and_persists_exactly_once` —
+  queued, chain-with-queued-child, and live revocation each yield
+  exactly ONE event, never two.
+- **F5 MEDIUM resaving the SAME key revoked the NEW profile.** The
+  parent's own credential value resubmitted via revise: the sibling
+  sweep (finding the replaced digest AFTER create) matched the
+  brand-NEW version — revoked it and deleted its secret seconds after
+  writing; a 200 for an unusable profile. Fix: same-VALUE detection
+  (digest or plaintext match against the current secret) BEFORE any
+  effect demotes the rotation to a non-secret edit (lineage stays,
+  nothing revoked); the sweep additionally skips `new.profile_id`
+  structurally. Proof (real API): `test_same_key_resave_never_revokes_
+  the_version_it_created` (+ with-other-fields/multiple-superseded,
+  genuine-replacement-still-invalidates-lineage, and failed-revision-
+  changes-nothing variants).
+- **F6 HIGH the API-only secret file was readable by ingest's
+  identity.** `sr-api-ingest.service` ran `User=srrange` — the same uid
+  as the API — and `db-secret.env` was 0640 root:srrange: the ingest
+  process could open the credential-store URL directly (same uid also
+  implies `/proc/PID/environ` and ptrace). EnvironmentFile scoping is
+  not OS access control. Fix (all three halves): ingest runs as its own
+  `sringest` identity (shipped unit + `install.sh` provisions it, gives
+  it `ingest-server.key` and `ingest-listener.env`; the appliance
+  renderer was already `sringest`); `ensure_database` creates the file
+  ATOMICALLY at 0600 (`_write_secret_file_securely`:
+  O_CREAT|O_EXCL, fsync, link-publish — never replaces, no permissive
+  window) and verifies toward 0600 root:root, FAILING CLOSED (the old
+  `write_text` + `chmod check=False` is gone); the service contract now
+  FAILS if two units share a uid or any non-API unit references the
+  file, and `secret_file_boundary_problems()` runs exact POSIX
+  readability math for every appliance identity. Proof:
+  `test_no_two_installed_units_share_an_os_identity`,
+  `test_posix_math_uses_exact_access_semantics_for_service_uids` (the
+  OLD 0640 shape proves readable — the check is not vacuous),
+  `test_secret_file_is_created_restrictive_from_the_first_byte`,
+  `test_verification_fails_closed_when_the_file_cannot_be_secured`.
+  Installed-OS qualification (real uid switch on the appliance) stays
+  an OPERATOR gate — not claimed here.
+- **Audit (parent-directed, now pinned):** the rollback guard lacked
+  after-COMMIT cleanup — session reuse turned compensation into
+  vandalism of a committed profile's live secret; a restore re-checking
+  status on the ROLLING-BACK session hit SQLAlchemy 2.1's inactive-state
+  refusal (proven by debug at the hook) and silently skipped restores;
+  and a FAILED compensation vanished. Fix: `_settled` (after_commit)
+  clears pending entries, restore reads the row's COMMITTED status via
+  a FRESH session (concurrent revocation is never resurrected), and any
+  failing compensation records a durable
+  `model_admin.profile.secret_compensation_failed` admin event. The
+  guard is now documented — honestly — as in-process compensation, NOT
+  crash atomicity. Proof: `test_committed_secret_survives_a_later_
+  rollback_on_the_same_session`,
+  `test_rollback_never_resurrects_a_credential_revoked_concurrently`,
+  `test_failing_compensation_records_a_durable_repair_obligation`;
+  round-2's `test_mid_effect_and_route_level_failures_compensate`
+  (the guard's earlier contract) passes unchanged.
+
+### Round-3 gate receipts
+
+All run at commit `dfa9f39` (tree clean; docs commit follows), serialized,
+each via `.venv/bin/python infra/dev/acceptance.py <gate>` unless noted.
+Environment for the libvirt gates: `. .cache/libvirt-debs/env.sh` +
+`SR_APPLIANCE_BASE_IMAGE=../15/.cache/bundle/sparring-range-appliance/images/appliance-base.qcow2`
++ `SR_APPLIANCE_ROLE_IMAGE_DIR=../15/.cache/bundle/sparring-range-appliance/images`
++ `TMPDIR=/var/tmp/sr-gate` (this runner has no /dev/kvm; guest boots are
+explicitly labeled TCG, never claimed as nested-KVM acceptance).
+
+| Gate | Result | Exact receipt |
+|---|---|---|
+| selection | PASS 133.8 s | fast default **661 passed, 0 skipped, 399 deselected** (83.78 s run) — required mode; empty-selection probe fails loudly |
+| python | PASS 4.4 s | fresh locked install + deps check + 4 entrypoint imports on Python 3.13.5 |
+| pve-contract | PASS 25.5 s | real-proxmoxer legacy contract **22 passed, 0 skipped** (required mode) |
+| authority | PASS 24.3 s | broker boundary/durability/cessation **35 passed, 0 skipped** (required mode) |
+| containment | PASS 20.2 s | namespace/recursive-membership/cancellation **26 passed, 0 skipped**; no run-owned cgroups leaked |
+| db | PASS 628.1 s | disposable PostgreSQL 16 (run-owned container/volume): **260 passed, 0 skipped, 800 deselected** |
+| agent | PASS 140.3 s | real wire + disposable PG (SR_REQUIRE_AGENT=1): **109 passed, 0 failed, 0 skipped, 951 deselected** — includes all 18 round-3 deterministic-race tests |
+| frontend | PASS 27.7 s | production audit: zero high/critical (moderate 0, low 0) |
+| browser | PASS 122.5 s | isolated real-browser workflows **2 passed, 0 skipped** (required mode) — serialized immediately after frontend |
+| install | PASS 10.3 s | REAL sandbox install sequences (dry-run idempotence, key preservation, invalid-manifest refusal, per-service TLS ownership, derived env, ingest plane, dial-key bootstrap); managed-service VM half stays operator-run and is NOT accepted from any flag |
+| compose | PASS 184.6 s | compose project boots, serves, and is **fully removed** (run-owned resources cleaned exactly) |
+| hypervisor | PASS 261.4 s | real libvirt clone/start/QGA-readiness/host-key/ownership/stop/destroy — accelerator **explicit TCG** (labeled, not nested-KVM acceptance); no QEMU owned-run-dir leaks |
+| packet | FAILED (environment) — operator gate, PENDING | missing prerequisites `['root', 'nft']` — fails closed naming the exact missing pieces; rules apply only in disposable netns on an approved CI job; never simulated |
+| journey | FAILED (prerequisite) — operator gate, PENDING | missing `SR_JOURNEY_BASE_URL`, operator/member tokens, SSH key, bastion known-hosts, browser URL/user/password — needs the INSTALLED appliance; fails closed by design |
+| release | FAILED (live layer) — operator gate, PENDING | requires `SR_LIVE_BASE_URL` (deployed lab); nothing about a release is accepted from a sandbox; never executed here |
+| appliance | *(running at this commit; receipt appended in the following docs commit)* | |
+| bundle | *(queued behind appliance; receipt appended)* | |
+| access | *(queued — serialized heavy lane)* | |
+| images | *(queued — serialized heavy lane)* | |
+| capture | *(queued — serialized heavy lane)* | |
+
 ## Plan-19 review ROUND 2 — 2026-10-25, branch `practice-upgrades-18-21`
 
 The SECOND independent review returned **VERDICT: FIX** at `1d19c16` with
