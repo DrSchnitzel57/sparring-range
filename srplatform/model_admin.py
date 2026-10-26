@@ -49,14 +49,50 @@ def _credential_digest(api_key: str | None) -> str | None:
     return "sha256:" + hashlib.sha256(api_key.encode()).hexdigest()
 
 
+def _record_compensation_failure(op: str, profile_id, exc: Exception) -> None:
+    """A FAILED best-effort compensation is a durable repair obligation,
+    not a swallowed log line: the secret store and the profile database
+    are separate stores, and this guard is honest in-process
+    compensation — NOT crash-atomicity. When even the compensation
+    fails, an operator must be able to SEE the divergence (an admin
+    event written through a fresh session, since the failed transaction
+    is being discarded)."""
+    try:
+        from srplatform.db.session import db as db_ctx
+        with db_ctx() as s:
+            _append_admin_note(s, "profile.secret_compensation_failed", {
+                "op": op, "profile_id": str(profile_id),
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                "action_needed": ("provider credential store and profile "
+                                  "database diverge; inspect and re-align "
+                                  "this profile version's credential")})
+            s.commit()
+    except Exception:  # noqa: BLE001 — nothing left to try
+        pass
+
+
 def _track_secret_writes_against_rollback(db: Session, profile_id) -> None:
-    """Compensation across the protected store (round-2 finding 11): the
-    secret store is a SEPARATE database and commits immediately, so a
-    profile row whose transaction later rolls back would leave an
-    unowned secret. Register a per-request rollback guard ONCE that
-    deletes secrets written for rows the transaction discarded. Keys
-    RESTORED as compensation target pre-existing rows and are
-    deliberately not tracked."""
+    """Compensation across the protected store (round-2 finding 11,
+    round-3 audit): the secret store is a SEPARATE database and commits
+    immediately, so a profile row whose transaction later rolls back
+    would leave an unowned secret. Register a per-request rollback guard
+    ONCE that deletes secrets written for rows the transaction discarded
+    and restores secrets whose delete was discarded with it.
+
+    Round-3 audit fixes to the guard itself:
+    * ``after_commit`` clears the pending lists — a COMMITTED unit of
+      work owns its secrets legitimately, and a later rollback on the
+      SAME session (session reuse, or any exception after a mid-request
+      commit) must never re-fire compensation for it;
+    * a restore re-checks the profile's COMMITTED status first: a
+      concurrent revocation that already deleted the credential is
+      never undone by our rollback (no resurrection of a compromised
+      lineage through the wrong window);
+    * a failing compensation records the durable repair obligation
+      (see :func:`_record_compensation_failure`) instead of vanishing.
+
+    Keys RESTORED as compensation target pre-existing rows and are
+    deliberately not tracked as cleanups."""
     if profile_id is not None:
         db.info.setdefault("sr_secret_rollback_cleanups", []).append(
             profile_id)
@@ -70,20 +106,48 @@ def _track_secret_writes_against_rollback(db: Session, profile_id) -> None:
         # Session.rollback() itself raise TypeError before the handler
         # runs, silently killing this exact compensation)
         from srplatform import secret_store
-        for pid in session.info.get("sr_secret_rollback_cleanups", []):
+        cleanups = session.info.get("sr_secret_rollback_cleanups", [])
+        session.info["sr_secret_rollback_cleanups"] = []
+        restores = session.info.get("sr_secret_rollback_restores", [])
+        session.info["sr_secret_rollback_restores"] = []
+        for pid in cleanups:
             try:
                 secret_store.delete_key(pid)
-            except Exception:  # noqa: BLE001 — best effort, already failing
-                pass
-        session.info["sr_secret_rollback_cleanups"] = []
-        for pid, value in session.info.get("sr_secret_rollback_restores", []):
+            except Exception as exc:  # noqa: BLE001 — already failing
+                _record_compensation_failure("delete-rolled-back-write",
+                                             pid, exc)
+        for pid, value in restores:
             try:
+                # the row's COMMITTED status decides: restoring under a
+                # concurrent revocation would resurrect a deleted
+                # credential for a version an operator just killed.
+                # The check reads through a FRESH session — a session
+                # inside its own after_rollback is 'inactive' and
+                # refuses SQL (proven by this guard's own regression).
+                from sqlalchemy import text as _text
+                from srplatform.db.session import app_engine
+                with Session(app_engine()) as chk:
+                    status = chk.execute(_text(
+                        "SELECT status FROM model_profiles "
+                        "WHERE profile_id = CAST(:p AS uuid)"),
+                        {"p": str(pid)}).first()
+                if status is None or status[0] == "revoked":
+                    continue
                 secret_store.set_key(pid, value)
-            except Exception:  # noqa: BLE001 — best effort, already failing
-                pass
+            except Exception as exc:  # noqa: BLE001 — already failing
+                _record_compensation_failure("restore-deleted", pid, exc)
+
+    def _settled(session: Session) -> None:
+        # committed work is legitimate ownership: compensation entries
+        # only ever concern THIS transaction's discarded effects, and a
+        # commit ends that transaction. Without this, a later rollback
+        # on a reused session would delete the committed profile's live
+        # secret (round-3 audit: the guard lacked after-commit cleanup).
+        session.info["sr_secret_rollback_cleanups"] = []
         session.info["sr_secret_rollback_restores"] = []
 
     sa_event.listen(db, "after_rollback", _cleanup)
+    sa_event.listen(db, "after_commit", _settled)
     db.info["sr_secret_guard_installed"] = True
 
 
@@ -541,6 +605,24 @@ def revise(db: Session, name: str, *, api_key: str | None = None,
     from srplatform import secret_store
     old_secret = secret_store.get_key(current.profile_id)  # read only
     replaced_digest = current.credential_digest
+    if rotating_key:
+        # Round-3 finding 5: a resubmitted credential whose VALUE is
+        # unchanged is not a replacement. The GUI (and curl habit) can
+        # resave the whole form, key included; treating that as a
+        # rotation once revoked the brand-new version its own sweep was
+        # performing and deleted the secret seconds after writing it —
+        # a 200 response for an unusable profile. Same value means the
+        # secret axis DID NOT change: it is a non-secret edit, the
+        # lineage stays traceable, and no revocation duty arises. (A
+        # GENUINE replacement still invalidates the whole replaced
+        # lineage immediately, and a revoked version is never revived
+        # — sibling sweeps skip revoked rows and will skip this new
+        # version structurally too, below.)
+        new_digest_now = _credential_digest(api_key)
+        if ((replaced_digest is not None
+             and new_digest_now == replaced_digest)
+                or (old_secret is not None and api_key == old_secret)):
+            rotating_key = False
     new_digest = _credential_digest(api_key) if rotating_key \
         else current.credential_digest
     demote(db, current,
@@ -567,6 +649,12 @@ def revise(db: Session, name: str, *, api_key: str | None = None,
             for sib in siblings:
                 if sib.profile_id == current.profile_id:
                     continue
+                if sib.profile_id == new.profile_id:
+                    # structural guard (round-3 finding 5): THIS
+                    # request's own new version is never a "sibling
+                    # carrying the replaced credential" — sweeping it
+                    # would revoke the replacement it just created
+                    continue
                 sib.status = "revoked"
                 sib.retired_at = datetime.now(timezone.utc)
                 _delete_secret_tracked(db, sib.profile_id)
@@ -574,7 +662,8 @@ def revise(db: Session, name: str, *, api_key: str | None = None,
             _append_admin_note(db, "profile.lineage_revoke", {
                 "name": name, "new_version": new.version,
                 "revoked_versions": [s.version for s in siblings
-                                     if s.profile_id != current.profile_id],
+                                     if s.profile_id not in
+                                     (current.profile_id, new.profile_id)],
                 "effect": "every version carrying the replaced credential "
                           "is revoked; pinned sessions fail visibly until "
                           "an operator rebinds", "by": actor})
@@ -585,7 +674,14 @@ def revise(db: Session, name: str, *, api_key: str | None = None,
         # SAME rollback guard deletes the new version's written secret
         # and restores every secret this request deleted with its
         # recorded value. One consistent story for every failure point
-        # (round-2 finding 11).
+        # (round-2 finding 11). HONEST SCOPE (round-3 audit): this is
+        # in-process compensation across two stores, NOT crash
+        # atomicity — a power loss between the secret-store commit and
+        # this transaction's end can leave a bounded divergence, and a
+        # FAILED compensation records a durable admin obligation rather
+        # than vanishing. Genuine XA over both stores is not on this
+        # release's dependency list; the divergence is documented and
+        # auditable, not hidden.
         raise
     if not rotating_key:
         _append_admin_note(db, "profile.supersede", {
@@ -627,35 +723,24 @@ def _delete_secret_tracked(db: Session, profile_id) -> None:
 
 
 def _cancel_jobs_for(db: Session, prof: ModelProfile, *, reason: str) -> None:
+    """Revocation carries the FULL cancellation duty (round-3 finding 4):
+    every affected logical request goes through the ONE durable protocol
+    — lock, stamp intent, transition conditionally, cascade, and persist
+    the member-visible outcome exactly once — instead of hand-writing
+    row states here and bypassing the outcome claim (the reviewer's
+    repro: cancelled rows, outcome_persisted false, ZERO events)."""
+    from srplatform import model_jobs
     from srplatform.db.models import ModelJob
-    queued = db.execute(select(ModelJob).where(
+    jobs = db.execute(select(ModelJob).where(
         ModelJob.profile_id == prof.profile_id,
-        ModelJob.state == "queued")).scalars().all()
-    for job in queued:
-        job.state = "cancelled"
-        job.error = f"profile {prof.name} v{prof.version} replaced: {reason}"
-        job.finished_at = datetime.now(timezone.utc)
-    running = db.execute(select(ModelJob).where(
-        ModelJob.profile_id == prof.profile_id,
-        ModelJob.state == "running")).scalars().all()
-    for job in running:
-        job.cancel_requested = True
-        job.error = (f"profile {prof.name} v{prof.version} replaced: {reason} "
-                     "— slot held until the live call returns")
-    # queued descendants (retry children, gated turns) must not survive
-    # their parent's cancellation — cascade one visible level at a time
-    cancelled_ids = {j.job_id for j in queued}
-    while cancelled_ids:
-        children = db.execute(select(ModelJob).where(
-            ModelJob.parent_job.in_(cancelled_ids),
-            ModelJob.state == "queued")).scalars().all()
-        cancelled_ids = set()
-        for child in children:
-            child.state = "cancelled"
-            child.error = (f"cancelled with its parent job: {reason}")
-            child.finished_at = datetime.now(timezone.utc)
-            cancelled_ids.add(child.job_id)
-        db.flush()
+        ModelJob.state.in_(("queued", "running")))).scalars().all()
+    for job in jobs:
+        try:
+            model_jobs.cancel(
+                db, job.job_id,
+                actor=f"profile {prof.name} v{prof.version} ({reason})")
+        except model_jobs.JobProblem:
+            continue                       # row vanished under us
 
 
 def revoke(db: Session, profile_id: uuid.UUID, *, actor: str = "operator",
@@ -675,20 +760,20 @@ def revoke(db: Session, profile_id: uuid.UUID, *, actor: str = "operator",
         # revocation of an already-superseded/retired version invalidates
         # its credential too — that is the whole point of revoking it
         _delete_secret_tracked(db, prof.profile_id)
-    # References are cancelled too: every not-yet-terminal job bound to
-    # this version (any state except the terminal ones) fails visibly.
+    # References are cancelled too: every still-live job bound to this
+    # version dies through the logical-request protocol (intent, cascade
+    # and ONE durable outcome per chain — round-3 finding 4), never by
+    # a hand-written state that skips the member's evidence.
     jobs = db.execute(select(ModelJob).where(
         ModelJob.profile_id == prof.profile_id,
         ModelJob.state.in_(("queued", "running")))).scalars().all()
     for job in jobs:
-        if job.state == "queued":
-            job.state = "cancelled"
-            job.error = f"profile {prof.name} v{prof.version} revoked: {reason}"
-            job.finished_at = datetime.now(timezone.utc)
-        else:
-            job.cancel_requested = True
-            job.error = (f"profile {prof.name} v{prof.version} revoked: "
-                         f"{reason} — slot held until the live call returns")
+        try:
+            from srplatform import model_jobs
+            model_jobs.cancel(db, job.job_id,
+                              actor=f"revocation: {reason}")
+        except model_jobs.JobProblem:
+            continue
     _append_admin_note(db, "profile.revoke",
                        {"name": prof.name, "version": prof.version,
                         "by": actor, "reason": reason})
