@@ -158,9 +158,22 @@ def enqueue(db, *, kind: str, priority: int, payload: dict,
         job.finished_at = _now()
         db.add(job)
         db.flush()
+        job.chain_root = job.job_id
+        db.flush()
         _persist_logical_outcome(db, [job])
         return job
     db.add(job)
+    db.flush()
+    # round-3: the logical request's identity is fixed at birth — a root
+    # is its own chain, a child inherits its parent's root. SQL-side
+    # admission/dependency gates need the whole chain in one lookup.
+    if parent_job is not None:
+        parent = db.get(ModelJob, parent_job)
+        job.chain_root = (parent.chain_root if parent is not None
+                          and parent.chain_root is not None
+                          else parent_job)
+    else:
+        job.chain_root = job.job_id
     db.flush()
     start_model_jobs()      # backstop: whoever queues work ensures a runner
     return job
@@ -217,6 +230,70 @@ def chain_view(db, job_id: uuid.UUID) -> tuple[ModelJob, list[ModelJob]]:
 #: (an open cessation obligation still counts: it only changes via an
 #: operator, and the member-visible outcome must not hang until then)
 _QUIESCENT_STATES = TERMINAL_STATES + ("cessation_unknown",)
+
+
+def _lock_chain(db, job_id: uuid.UUID,
+                _passes: int = 24) -> list[ModelJob]:
+    """Round-3 findings 1/2: return the WHOLE logical chain with an
+    open row lock on every row, in a deterministic order (walk-up to
+    the root first, then children attempt-ascending).
+
+    This is the serialization point shared by cancellation, retry-child
+    creation and the terminal write: every one of them takes the lock on
+    the row it is about to change FIRST, so a stale snapshot can never
+    overwrite a fresher one — the loser of the race blocks, re-reads the
+    committed truth, and acts on that. The re-enumeration loop closes
+    the one remaining window (a child committed by the terminal write
+    between our lock pass and the enumeration): chains are bounded and
+    a fenced chain grows no more, so the loop terminates.
+    """
+    row = db.execute(select(ModelJob)
+                     .where(ModelJob.job_id == job_id)
+                     ).scalars().first()
+    if row is None:
+        raise JobProblem("job not found")
+    # walk up WITHOUT locking, so every cancellation acquires its row
+    # locks in the SAME order: root first, then descendants
+    # attempt-ascending. Consistent order = no lock-order deadlock.
+    root = row
+    depth = 0
+    while root.parent_job is not None and depth < 16:
+        parent = db.execute(select(ModelJob)
+                            .where(ModelJob.job_id == root.parent_job)
+                            ).scalars().first()
+        if parent is None:
+            break
+        root = parent
+        depth += 1
+
+    def _lock(jid):
+        return db.execute(select(ModelJob)
+                          .where(ModelJob.job_id == jid)
+                          .with_for_update()
+                          .execution_options(populate_existing=True)
+                          ).scalars().one()
+
+    locked: dict[uuid.UUID, ModelJob] = {root.job_id: _lock(root.job_id)}
+    for _ in range(_passes):
+        frontier = list(locked)
+        found: dict[uuid.UUID, None] = {}
+        while frontier:
+            children = db.execute(select(ModelJob)
+                                  .where(ModelJob.parent_job.in_(frontier))
+                                  .order_by(ModelJob.attempt.asc())
+                                  ).scalars().all()
+            frontier = []
+            for c in children:
+                if c.job_id not in locked and c.job_id not in found:
+                    found[c.job_id] = None
+                    frontier.append(c.job_id)
+        if not found:
+            break
+        for jid in sorted(found, key=str):
+            locked[jid] = _lock(jid)
+    return [locked[jid] for jid in sorted(locked,
+                                          key=lambda j: (locked[j].attempt,
+                                                         str(j)))]
 
 
 def error_kind(job: ModelJob) -> str | None:
@@ -302,20 +379,37 @@ def wait(db, job_id: uuid.UUID, timeout: float,
 
 
 def cancel(db, job_id: uuid.UUID, *, actor: str = "operator") -> ModelJob:
-    """Cancellation of the LOGICAL REQUEST (round-2 finding 5): the
-    operation cascades across the whole retry chain regardless of which
-    row the caller named and regardless of that row's own state. A
-    "failed parent + backoff-queued retry child" chain is NOT finished
-    just because the parent is terminal — cancelling it must kill the
-    queued child too, or the original request silently resurrects.
+    """Cancellation of the LOGICAL REQUEST (round-2 finding 5, round-3
+    findings 1/2): the operation cascades across the whole retry chain
+    regardless of which row the caller named and regardless of any
+    row's previously READ state. The protocol is lock-then-act, never
+    read-then-overwrite:
+
+    * every chain row is loaded UNDER ``FOR UPDATE`` in a deterministic
+      order, so a scheduler that claimed the row between our read and
+      our write makes us wait — and we then act on the committed truth
+      (a LIVE row never receives a stale ``cancelled`` stamp; it
+      receives the cessation request, keeping the slot obligation);
+    * the cancellation INTENT is stamped durably on every chain row:
+      retry-child creation and admission must both consult it under
+      the row lock, so a "cancelled" request can never respawn,
+      whichever direction the race goes;
+    * after the locks are held, the chain is RE-ENUMERATED (a child
+      committed by the terminal write mid-flight is found and killed
+      too — nothing born of a cancelled chain survives it).
+
     Queued rows die un-executed; running rows get the cessation request
     (the watcher closes the live SDK task; the slot releases only on a
     definitive return, otherwise the obligation stands)."""
     job = db.get(ModelJob, job_id)
     if job is None:
         raise JobProblem("job not found")
-    rows = _chain_rows(db, job_id)
+    rows = _lock_chain(db, job_id)
     for j in rows:
+        # durable intent FIRST (under our lock): no child may be born
+        # or dispatch past this point, whichever transaction grows the
+        # chain next
+        j.cancel_intent = True
         if j.state == "queued":
             j.state = "cancelled"
             j.error = (f"cancelled by {actor} before execution "
@@ -328,6 +422,9 @@ def cancel(db, job_id: uuid.UUID, *, actor: str = "operator") -> ModelJob:
                     f"cancellation requested by {actor}: the live request "
                     "is being closed; if its return cannot confirm "
                     "cessation the slot stays held")
+        # every OTHER state is terminal — the row stays what it is; the
+        # INTENT still applies (it forbids any further growth of the
+        # chain, e.g. a retry child racing this very cancellation)
     db.flush()
     _persist_logical_outcome(db, rows)
     db.refresh(job)
@@ -335,19 +432,20 @@ def cancel(db, job_id: uuid.UUID, *, actor: str = "operator") -> ModelJob:
 
 
 def _cascade_cancel_queued(db, parent: ModelJob, *, actor: str) -> None:
-    """Retry/backoff children of a cancelled job must not survive it."""
+    """Retry/backoff children of a cancelled job must not survive it.
+    Round-3: single conditional UPDATE per level — a row is cancelled
+    ONLY if it is still queued at write time, so this can never stomp a
+    row the scheduler claimed in the same instant."""
     frontier = [parent.job_id]
     while frontier:
-        children = db.execute(select(ModelJob).where(
-            ModelJob.parent_job.in_(frontier),
-            ModelJob.state == "queued")).scalars().all()
-        frontier = []
-        for child in children:
-            child.state = "cancelled"
-            child.error = f"cancelled with its parent job (by {actor})"
-            child.finished_at = _now()
-            frontier.append(child.job_id)
-    db.flush()
+        res = db.execute(text(
+            "UPDATE model_jobs SET state = 'cancelled', cancel_intent = "
+            "true, error = :e, finished_at = now() "
+            "WHERE parent_job = ANY(:f) AND state = 'queued' "
+            "RETURNING job_id"),
+            {"e": f"cancelled with its parent job (by {actor})",
+             "f": frontier})
+        frontier = [r[0] for r in res]
 
 
 def resolve_cessation(db, job_id: uuid.UUID, *, actor: str,
@@ -374,6 +472,11 @@ def resolve_cessation(db, job_id: uuid.UUID, *, actor: str,
     job.resolution = resolution
     job.resolved_at = _now()
     db.flush()
+    # the operator's resolution made this chain quiescent-final — the
+    # member-visible outcome persists through the same once-protocol
+    # (round-3 finding 4: NO terminal path bypasses it)
+    _persist_logical_outcome(db, _chain_rows(db, job_id))
+    db.flush()
     return job
 
 
@@ -382,7 +485,9 @@ def reconcile_startup(db) -> int:
     completed provider-side — cessation cannot be confirmed, it is
     NEVER assumed, replayed, or released. These rows HOLD THE SLOT:
     no new admission is granted until an operator resolves each
-    obligation (finding 2's restart case)."""
+    obligation (finding 2's restart case). Chains that end quiescent at
+    reconciliation still owe the member ONE durable outcome (round-3
+    finding 4: restart/recovery is a terminal path like every other)."""
     rows = db.execute(select(ModelJob).where(ModelJob.state == "running")
                       ).scalars().all()
     for job in rows:
@@ -392,6 +497,8 @@ def reconcile_startup(db) -> int:
                      "held until an operator resolves this obligation")
         job.finished_at = _now()
     db.flush()
+    for job in rows:
+        _persist_logical_outcome(db, _chain_rows(db, job.job_id))
     return len(rows)
 
 
@@ -400,20 +507,36 @@ def cancel_session_jobs(db, session_id, *, actor: str = "run finalization") -> d
     nothing used to call cancel from run finalization — generation kept
     burning a 900 s profile timeout after the match ended). Queued jobs
     for this session die; running ones get the cessation request, which
-    closes the live SDK call within the watcher interval."""
-    queued = db.execute(select(ModelJob).where(
+    closes the live SDK call within the watcher interval. Round-3: every
+    logical chain is cancelled ONCE, root first, so finalization takes
+    exactly the cancellation protocol (durable intent, locked rows,
+    one outcome per chain) and cannot deadlock a concurrent cancel."""
+    rows = db.execute(select(ModelJob).where(
         ModelJob.session_id == session_id,
-        ModelJob.state == "queued")).scalars().all()
-    running = db.execute(select(ModelJob).where(
-        ModelJob.session_id == session_id,
-        ModelJob.state == "running")).scalars().all()
-    for job in queued:
-        cancel(db, job.job_id, actor=actor)
-    for job in running:
-        cancel(db, job.job_id, actor=actor)
+        ModelJob.state.in_(("queued", "running")))).scalars().all()
+    # distinct logical chains, locked in a global order (root id)
+    roots: dict = {}
+    for job in rows:
+        root = job
+        depth = 0
+        while root.parent_job is not None and depth < 16:
+            parent = db.get(ModelJob, root.parent_job)
+            if parent is None:
+                break
+            root = parent
+            depth += 1
+        roots.setdefault(root.job_id, None)
+    cancelled = requested = 0
+    for root_id in sorted(roots, key=str):
+        chain = _lock_chain(db, root_id)
+        was = {j.job_id: j.state for j in chain}
+        cancel(db, root_id, actor=actor)
+        cancelled += sum(1 for j in chain
+                         if was[j.job_id] == "queued")
+        requested += sum(1 for j in chain if was[j.job_id] == "running")
     db.flush()
-    return {"queued_cancelled": len(queued), "running_cancellation_requested":
-            len(running)}
+    return {"queued_cancelled": cancelled,
+            "running_cancellation_requested": requested}
 
 
 # --------------------------------------------------------------------------- #
@@ -421,28 +544,71 @@ def cancel_session_jobs(db, session_id, *, actor: str = "run finalization") -> d
 # --------------------------------------------------------------------------- #
 
 #: claim honors priority+FIFO, skips backoff-future rows, waits for a
-#: free slot (running OR unresolved cessation obligation), and refuses
-#: to admit a gated job before its prerequisite job reached a terminal
-#: state (the executor then fails it visibly if the prerequisite did not
-#: succeed).
+#: free slot (running OR unresolved cessation obligation), and admits a
+#: gated job ONLY once its prerequisite's LOGICAL CHAIN is quiescent —
+#: while any attempt of the chain may still dispatch or recover the
+#: dependent WAITS at admission (round-3 finding 3: a failed attempt
+#: with a queued retry child has NOT finished). Quiescence is what the
+#: slot decision needs; whether the final attempt then SUCCEEDED is the
+#: executor's decision under the row lock — admitting a truly-failed
+#: dependency is what lets the dependent fail truthfully ONCE instead
+#: of being stranded in the queue forever. Rows carrying a cancellation
+#: INTENT are never admitted: a cancelled logical request does not
+#: dispatch, wherever its rows are in the queue. The outer
+#: ``state``/intent re-check is the CAS against a cancellation
+#: committing between this statement's read and its write.
 _CLAIM_SQL = text("""
     UPDATE model_jobs
        SET state = 'running', started_at = now()
      WHERE job_id = (SELECT j.job_id FROM model_jobs j
                       WHERE j.state = 'queued' AND j.requested_at <= now()
-                        AND (j.depends_on IS NULL OR EXISTS (
-                              SELECT 1 FROM model_jobs d
-                               WHERE d.job_id = j.depends_on
-                                 AND d.state IN ('succeeded',
-                                         'cessation_resolved',
-                                         'cessation_unknown',
-                                         'failed', 'cancelled')))
+                        AND NOT j.cancel_intent AND NOT j.cancel_requested
+                        AND (j.depends_on IS NULL OR (
+                              (SELECT dr.chain_root FROM model_jobs dr
+                                  WHERE dr.job_id = j.depends_on)
+                                  IS NOT NULL
+                          AND NOT EXISTS (
+                                SELECT 1 FROM model_jobs q
+                                 WHERE q.chain_root =
+                                       (SELECT dr2.chain_root
+                                          FROM model_jobs dr2
+                                         WHERE dr2.job_id = j.depends_on)
+                                   AND q.state IN ('queued', 'running'))))
                       ORDER BY j.priority ASC, j.requested_at ASC
                       LIMIT 1)
+       AND state = 'queued'
+       AND NOT cancel_intent AND NOT cancel_requested
        AND NOT EXISTS (SELECT 1 FROM model_jobs
                         WHERE state IN ('running', 'cessation_unknown'))
     RETURNING job_id
 """)
+
+
+def claim_next(s) -> uuid.UUID | None:
+    """Run one production claim on the given session (the scheduler
+    commits immediately; a test may hold the transaction open to
+    exercise the exact cancellation/claim interleaving — SAME
+    statement, SAME locks, no test-only path)."""
+    row = s.execute(_CLAIM_SQL).first()
+    return row[0] if row else None
+
+
+def _dep_chain_state(db, dep_id: uuid.UUID) -> tuple[str, ModelJob]:
+    """(state, final row) of the prerequisite's LOGICAL chain — the
+    single authority for admission, execution and gated failure
+    (round-3 finding 3). ``in-flight``: an attempt may still dispatch
+    or is live (the dependent must WAIT, not fail). ``succeeded``: the
+    final attempt genuinely succeeded (or an operator resolved it).
+    ``failed-final``: the chain is quiescent and did not succeed. An
+    unresolved cessation is NEVER success."""
+    rows = _chain_rows(db, dep_id)
+    rows.sort(key=lambda j: (j.attempt, j.requested_at))
+    final = rows[-1]
+    if any(j.state in ("queued", "running") for j in rows):
+        return "in-flight", final
+    if final.state in ("succeeded", "cessation_resolved"):
+        return "succeeded", final
+    return "failed-final", final
 
 
 def _job_result_from_turn(res) -> dict:
@@ -524,7 +690,10 @@ def _execute(job_id: uuid.UUID) -> None:
             return
         payload = dict(job.payload or {})
         job_profile_id = str(job.profile_id) if job.profile_id else None
-        if job.cancel_requested:
+        if job.cancel_requested or job.cancel_intent:
+            # round-3 finding 2: a durable cancellation INTENT is
+            # absolute — the request never dispatches, whichever row
+            # carries it, and nothing may be born from it
             job.state = "cancelled"
             job.error = (job.error or "cancellation requested") + \
                         "; never dispatched"
@@ -534,15 +703,33 @@ def _execute(job_id: uuid.UUID) -> None:
             s.commit()
             return
         if job.depends_on is not None:
-            dep = s.get(ModelJob, job.depends_on)
-            ok = dep is not None and dep.state in ("succeeded",
-                                                    "cessation_resolved")
-            if not ok:
+            dep_row = s.get(ModelJob, job.depends_on)
+            if dep_row is None:
+                dep_state, dep_final = "failed-final", None
+            else:
+                dep_state, dep_final = _dep_chain_state(s, job.depends_on)
+            if dep_state == "in-flight":
+                # round-3 finding 3: the prerequisite logical request
+                # may STILL recover (a retry is queued or live). The
+                # dependent goes back to the queue untouched — waiting
+                # for owned recovery is not a failure, and admitting
+                # now would fail the caller before its own summary's
+                # retry can succeed. The claim gate blocks re-admission
+                # until the chain is quiescent, so this cannot spin.
+                s.execute(text(
+                    "UPDATE model_jobs SET state = 'queued' "
+                    "WHERE job_id = :j AND state = 'running'"),
+                    {"j": str(job_id)})
+                s.commit()
+                return
+            if dep_state == "failed-final":
                 job.state = "failed"
                 job.error = (
-                    "prerequisite job did not succeed "
-                    f"({dep.state if dep else 'missing'}) — refusing to "
-                    "run the gated work")
+                    "prerequisite logical request did not succeed "
+                    + (f"(final attempt {dep_final.attempt}: "
+                       f"{dep_final.state})" if dep_final is not None
+                       else "(prerequisite row missing)")
+                    + " — refusing to run the gated work")
                 job.finished_at = _now()
                 _cascade_cancel_queued(s, job, actor="prerequisite failure")
                 _persist_logical_outcome(s, _chain_rows(s, job_id))
@@ -562,11 +749,16 @@ def _execute(job_id: uuid.UUID) -> None:
         if profile is None or profile.status not in ("active", "superseded"):
             # A superseded version still RUNS already-queued work (its
             # session was frozen on it); revoked/retired never does.
+            # Terminal for the logical request — so it goes through the
+            # same outcome protocol (round-3 finding 4), never a silent
+            # row write.
             job.state = "failed"
             job.error = ("profile version cannot serve this job "
                          f"({profile.status if profile else 'missing'}) — "
                          "refusing to run on a substitute")
             job.finished_at = _now()
+            _cascade_cancel_queued(s, job, actor="profile unavailable")
+            _persist_logical_outcome(s, _chain_rows(s, job_id))
             s.commit()
             return
         profile_snapshot = profile
@@ -643,10 +835,19 @@ def _execute(job_id: uuid.UUID) -> None:
         job = s.get(ModelJob, job_id)
         if job is None:
             return
+        # round-3 finding 1: take the row lock FIRST, then act. A
+        # cancellation committing concurrently either lands before our
+        # read (its intent/requested flag is committed and we honor it)
+        # or waits behind this transaction (and then acts on the state
+        # we leave). There is no window in which a stale read becomes a
+        # stale WRITE — every writer here locks before writing.
+        s.execute(select(ModelJob).where(ModelJob.job_id == job_id)
+                  .with_for_update())
         s.refresh(job)
+        cease = bool(job.cancel_requested or job.cancel_intent)
         child = None
         if error_text is None:
-            if job.cancel_requested:
+            if cease:
                 # the call RETURNED: that is definitive cessation —
                 # result discarded, slot releases
                 job.state = "cancelled"
@@ -659,7 +860,7 @@ def _execute(job_id: uuid.UUID) -> None:
                 job.finished_at = _now()
                 _persist_turn(s, job, result)
         else:
-            if job.cancel_requested:
+            if cease:
                 job.state = ("cessation_unknown" if uncertain
                              else "cancelled")
                 job.error = (error_text + " — provider-side cessation "
@@ -676,26 +877,41 @@ def _execute(job_id: uuid.UUID) -> None:
                              "operator resolves this obligation")
                 job.finished_at = _now()
             elif retryable and job.attempt < MODEL_ATTEMPTS:
-                # ATOMIC chain: the retry child exists exactly when the
-                # parent is terminal-failed — no window where the caller
-                # sees "final" while a retry starts (finding 5)
-                run_at = _now() + timedelta(
-                    seconds=RETRY_DELAYS[min(job.attempt - 1,
-                                             len(RETRY_DELAYS) - 1)])
-                child = ModelJob(
-                    kind=job.kind, priority=job.priority,
-                    payload=job.payload, session_id=job.session_id,
-                    actor=job.actor, parent_job=job.job_id,
-                    depends_on=job.depends_on, deadline_at=job.deadline_at,
-                    attempt=job.attempt + 1,
-                    profile_id=job.profile_id,
-                    profile_name=job.profile_name,
-                    state="queued", requested_at=run_at)
-                s.add(child)
-                job.state = "failed"
-                job.error = (error_text + f" — retry attempt "
-                             f"{job.attempt + 1}/{MODEL_ATTEMPTS} queued")
-                job.finished_at = _now()
+                if job.cancel_intent:
+                    # round-3 finding 2: a cancelled logical request
+                    # spawns NOTHING. The failure is recorded honestly,
+                    # but the retry chain ENDS here — the cancellation
+                    # intent was stamped under this chain's row lock,
+                    # so it is committed truth, not a racing opinion.
+                    job.state = "cancelled"
+                    job.error = (error_text + " — no retry is admitted "
+                                 "for a cancelled logical request")
+                    job.finished_at = _now()
+                else:
+                    # ATOMIC chain: the retry child exists exactly when
+                    # the parent is terminal-failed — no window where
+                    # the caller sees "final" while a retry starts
+                    # (finding 5)
+                    run_at = _now() + timedelta(
+                        seconds=RETRY_DELAYS[min(job.attempt - 1,
+                                                 len(RETRY_DELAYS) - 1)])
+                    child = ModelJob(
+                        kind=job.kind, priority=job.priority,
+                        payload=job.payload, session_id=job.session_id,
+                        actor=job.actor, parent_job=job.job_id,
+                        depends_on=job.depends_on,
+                        deadline_at=job.deadline_at,
+                        attempt=job.attempt + 1,
+                        chain_root=job.chain_root or job.job_id,
+                        profile_id=job.profile_id,
+                        profile_name=job.profile_name,
+                        state="queued", requested_at=run_at)
+                    s.add(child)
+                    job.state = "failed"
+                    job.error = (error_text + f" — retry attempt "
+                                 f"{job.attempt + 1}/{MODEL_ATTEMPTS} "
+                                 "queued")
+                    job.finished_at = _now()
             else:
                 job.state = "failed"
                 job.error = error_text
@@ -742,14 +958,14 @@ class ModelJobScheduler(threading.Thread):
     def _claim(self) -> uuid.UUID | None:
         with db_ctx() as s:
             try:
-                row = s.execute(_CLAIM_SQL).first()
+                claimed = claim_next(s)
                 s.commit()
             except IntegrityError:
                 # another process won the single-slot claim for this
                 # instant; nothing was lost, the row stays queued
                 s.rollback()
                 return None
-            return row[0] if row else None
+            return claimed
 
 
 _scheduler: ModelJobScheduler | None = None

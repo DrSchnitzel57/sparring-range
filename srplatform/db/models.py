@@ -639,6 +639,18 @@ class ModelJob(Base):
     error: Mapped[str | None] = mapped_column(Text)
     cancel_requested: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false"))
+    # round-3 finding 2: DURABLE cancellation intent stamped on EVERY
+    # row of a logical request when it is cancelled. Retry-child
+    # creation and admission must consult it under the row lock —
+    # "cancelled" means no future attempt may ever be born or
+    # dispatched, whichever row grows the chain next.
+    cancel_intent: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false"))
+    # attempt-1 job id of the logical request this row belongs to
+    # (round-3): the chain is one index lookup for SQL-side admission
+    # and dependency gates. NULL (raw-SQL writers) is UNKNOWN — gated
+    # jobs on an unknown dependency are conservatively refused.
+    chain_root: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     resolved_by: Mapped[str | None] = mapped_column(Text)
     resolution: Mapped[str | None] = mapped_column(Text)
     resolved_at: Mapped[datetime | None] = mapped_column(
@@ -667,6 +679,7 @@ class ModelJob(Base):
               case((text("state IN ('running', 'cessation_unknown')"), 0)),
               unique=True),
         Index("ix_model_jobs_queue", "state", "priority", "requested_at"),
+        Index("ix_model_jobs_chain_root", "chain_root"),
         Index("ix_model_jobs_session", "session_id"),
         Index("ix_model_jobs_parent", "parent_job"),
     )
