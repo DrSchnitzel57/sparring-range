@@ -102,6 +102,7 @@ class _State:
     live: int = 0
     max_live: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
+    gates: dict = field(default_factory=dict)
 
 
 class FakeModelServer:
@@ -217,6 +218,15 @@ class FakeModelServer:
                     time.sleep(state.hang_s)
                 if item.get("_delay"):
                     time.sleep(float(item["_delay"]))
+                if item.get("_gate"):
+                    # deterministic hold: the response stays unsent until
+                    # the TEST opens the gate (a mid-flight window with no
+                    # probabilistic sleeps — races are forced by events
+                    # and locks, never by hoping a sleep was long enough)
+                    ev = state.gates.setdefault(item["_gate"],
+                                                threading.Event())
+                    if not ev.wait(120):
+                        raise RuntimeError("fake gate timeout")
                 status = item.get("_status", 200)
                 if item.get("_error_echo"):
                     # leaky provider on ANY status: the diagnostic body
@@ -295,6 +305,27 @@ class FakeModelServer:
         return f"http://127.0.0.1:{self._server.server_address[1]}/v1"
 
     # -- scripting -----------------------------------------------------------
+    def gate(self, name: str) -> "threading.Event":
+        """A deterministic hold point: a scripted item with
+        ``{"_gate": name}`` will not respond until ``release`` sets it."""
+        return self.state.gates.setdefault(name, threading.Event())
+
+    def release(self, name: str) -> None:
+        self.gate(name).set()
+
+    def wait_requests(self, n: int, timeout: float = 30.0) -> None:
+        """Wait until at least n POSTed model requests have ARRIVED
+        (waiting on an observed fact, not on a guessed duration)."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            with self.state.lock:
+                got = sum(1 for r in self.state.requests
+                          if r["path"].endswith("/chat/completions"))
+            if got >= n:
+                return
+            time.sleep(0.02)
+        raise AssertionError(f"only {got}/{n} requests arrived")
+
     def script(self, items: list, *, auth: str | None = None,
                hang_s: float = 0.0) -> None:
         self.state.script = list(items)
