@@ -5,8 +5,13 @@ Wants=network-online.target
 
 [Service]
 Type=exec
-User=srrange
-Group=srrange
+# Round-3 finding 6: the ingest listener gets its OWN identity. The API
+# is the sole member of srrange, so the credential-store material that
+# systemd delivers to sr-api.service (as root, before privileges drop)
+# is unreachable HERE: different uid cannot read its /proc/PID/environ,
+# cannot ptrace it, and cannot open its files.
+User=sringest
+Group=sringest
 # Manifest-derived facts first, then the ingest-plane reduction, then
 # operator overrides (optional so older installs keep working).
 EnvironmentFile=/etc/sparring-range/control-plane.derived.env

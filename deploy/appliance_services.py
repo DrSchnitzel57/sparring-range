@@ -420,6 +420,78 @@ def _read_env_file(path: pathlib.Path) -> dict[str, str]:
     return values
 
 
+def _write_secret_file_securely(path: pathlib.Path, content: str) -> None:
+    """Round-3 finding 6: a secret file must never EXIST with loose
+    permissions, not even for the microseconds between write and chmod
+    (the previous ``write_text`` + ``chmod/chown check=False`` had
+    exactly that window and failed SILENTLY when securing failed).
+    Contract: create with ``O_CREAT|O_EXCL`` mode 0600 from the first
+    byte, fsync, then rename atomically into place. There is no window
+    where a permissive file holds the secret, and a failed securing or
+    rename raises — fail closed, never a half-protected credential.
+    """
+    import os
+    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+    fd = None
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(fd, content.encode())
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        # atomic publish that NEVER replaces an existing destination:
+        # a credential file is either created here or nothing happens
+        try:
+            os.link(tmp, path)
+        except FileExistsError as exc:
+            raise RuntimeError(
+                f"{path} already exists — refusing to overwrite an "
+                "existing credential file") from exc
+        os.unlink(tmp)
+        # directory entry durability: after a crash the file is either
+        # fully there or not at all
+        dfd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except Exception as exc:  # noqa: BLE001 — fail closed, loudly
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"could not provision {path} with restrictive permissions — "
+            f"refusing to leave a credential unprotected: {exc}") from exc
+
+
+def _verify_secret_file(path: pathlib.Path, *, sandboxed: bool) -> int:
+    """Post-write verification AND drift repair toward the hard floor:
+    0600, and on a real (non-sandboxed, root) install also root:root.
+    A file that cannot be secured raises; nothing downstream may proceed
+    with a readable credential-store URL on disk."""
+    import os
+    st = path.stat()
+    mode = st.st_mode & 0o777
+    if mode & 0o077:
+        os.chmod(path, 0o600)
+        mode = 0o600
+    if mode != 0o600:
+        raise RuntimeError(f"{path} must be exactly 0600, got {oct(mode)}")
+    if not sandboxed and os.geteuid() == 0:
+        if st.st_uid != 0 or st.st_gid != 0:
+            os.chown(path, 0, 0)
+        st = path.stat()
+        if st.st_uid != 0 or st.st_gid != 0:
+            raise RuntimeError(f"{path} must be owned by root:root")
+    return mode
+
+
 def ensure_database(run, *, prefix: pathlib.Path, env_file: pathlib.Path,
                     owner_env_file: pathlib.Path | None = None,
                     app_role: str = "sr_app",
@@ -442,10 +514,13 @@ def ensure_database(run, *, prefix: pathlib.Path, env_file: pathlib.Path,
     GRANTs to it — the migration FAILS if the role does not exist) is
     provisioned HERE, not left as manual SQL the operator must have run
     before the migration. A fresh install gets a generated password in
-    the API-only file ``secrets/db-secret.env`` (0640 root:srrange,
-    loaded ONLY by sr-api.service — never by the ingest, bastion or web
-    environments); an existing file or an explicit ``SR_PG_SECRET_URL``
-    in the environment is honored, and the role is created from it.
+    the API-only file ``secrets/db-secret.env`` — 0600 root:root, created
+    atomically with restrictive permissions and verified (round-3
+    finding 6). systemd loads it as root for sr-api.service ONLY; no
+    service USER — ingest, bastion, worker, web — may read it, and the
+    operator's control-plane.env is not its home either. An existing
+    file or an explicit ``SR_PG_SECRET_URL`` in the environment is
+    honored, and the role is created from it.
     """
     owner_env_file = owner_env_file or (env_file.parent / "secrets" /
                                         "db-owner.env")
@@ -508,28 +583,26 @@ def ensure_database(run, *, prefix: pathlib.Path, env_file: pathlib.Path,
         f"PASSWORD '{secret['password']}'; END IF; END $$;"])
     # An operator-PROVIDED URL never overwrites the file's content, and a
     # dry run never writes anything; a GENERATED password must reach the
-    # API through its 0640 root:srrange file (and if the role already
+    # API through its file — and (round-3 finding 6) that file is 0600
+    # root:root: systemd reads EnvironmentFile as ROOT before dropping
+    # privileges, so NO service user must be able to read it. Group
+    # access is exactly what leaked the URL toward the ingest identity
+    # before; ownership/mode are verified (and repaired toward the floor)
+    # after every install, and a file that cannot be secured aborts the
+    # install — fail closed, no check=False wishes. (If the role already
     # existed, the ALTER above realigned it — the file and the role are
-    # then consistent, which is what a rerun after a lost file needs).
-    if not getattr(run, "dry_run", False) and \
-            not secret_env_file.exists():
+    # then consistent, which is what a rerun after a lost file needs.)
+    if not getattr(run, "dry_run", False):
         secret_env_file.parent.mkdir(parents=True, exist_ok=True)
-        secret_env_file.write_text(
-            "# API-only identity for the provider-credential table ONLY\n"
-            "# (migration 0021 onward). Loaded ONLY by sr-api.service —\n"
-            "# never by ingest, bastion or web. 0640 root:srrange.\n"
-            f"SR_PG_SECRET_URL={secret_url}\n")
-    run("chmod", "0640", str(secret_env_file), check=False)
-    if not sandboxed:
-        try:
-            import grp as _grp
-            import pwd as _pwd
-            run("chown",
-                f"{_pwd.getpwnam('root').pw_uid}:"
-                f"{_grp.getgrnam('srrange').gr_gid}",
-                str(secret_env_file), check=False)
-        except KeyError:
-            pass
+        if not secret_env_file.exists():
+            _write_secret_file_securely(secret_env_file, (
+                "# API-only identity for the provider-credential table "
+                "ONLY\n# (migration 0021 onward). systemd loads it as "
+                "root for\n# sr-api.service ONLY — no service USER may "
+                "read this file:\n# 0600 root:root, delivered through "
+                "the unit environment.\n"
+                f"SR_PG_SECRET_URL={secret_url}\n"))
+        _verify_secret_file(secret_env_file, sandboxed=sandboxed)
 
     # Forward migrations, always as the owner, always through the environment.
     alembic = prefix / ".venv/bin/alembic"

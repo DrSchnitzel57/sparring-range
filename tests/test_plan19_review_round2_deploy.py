@@ -112,9 +112,14 @@ def test_fresh_install_provisions_the_secret_role_and_api_only_file(tmp_path,
     assert out["secret_role"] == "sr_secret"
     assert out["secret_role_generated"] is True
     assert out["secret_url_in_returned_data"] is False
-    # and the mode is asserted through the recorded commands (0640)
-    assert any("chmod" in call and "0640" in call and
-               call[-1].endswith("db-secret.env") for call in rec.calls)
+    # round-3 finding 6: the file is created ATOMICALLY at 0600 — there
+    # is no "write then hope the chmod lands" command sequence any more;
+    # the mode is verified on the file itself
+    mode = secret_file.stat().st_mode & 0o777
+    assert mode == 0o600, f"secret file mode {oct(mode)}, expected 0600"
+    assert not any("chmod" in call and call[-1].endswith("db-secret.env")
+                   for call in rec.calls), \
+        "secret securing must not depend on a check=False chmod afterthought"
 
 
 def test_rerun_preserves_the_existing_secret_file(tmp_path, monkeypatch):
