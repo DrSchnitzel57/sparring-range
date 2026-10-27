@@ -2040,18 +2040,29 @@ def check_upgrade() -> None:
 
     Fresh install -> populated database at the PREVIOUS migration head ->
     the actual `appliance.py upgrade` against a real built bundle and a
-    real disposable PostgreSQL: journal, private config backup, real
-    pg_dump (restore-listable), digest-verified staging, per-file atomic
-    activation (drifted bytes replaced, never foreign files), proven
-    forward-only migrations, version stamp. Then: rerun answers no-op;
-    SIGKILL interruption leaves an in-progress attempt that REFUSES new
-    work and RESUMES to completion; the config-only restore repairs a
-    corrupted config from the attempt's backup without any service
-    action; a tampered payload and a pre-21 bundle are refused.
+    real disposable PostgreSQL: payload verification, journal, admission
+    fence, durable-work quiescence (a queued or cessation_unknown model
+    job BLOCKS even --dry-run), private config backup (journal tree
+    excluded; original modes/ownership recorded), database dump through
+    the PGPASSFILE channel (the wrapper FAILS the gate if the synthetic
+    secret ever appears in argv — exit 47), digest-verified staging,
+    per-file atomic activation, real provisioning of the activated
+    payload (locked venv deps + entrypoint import + frontend build),
+    proven forward-only migrations, and a CHECKED restart against a
+    `systemctl` service double — the version stamp only after it
+    succeeded. Negatives: rerun no-op; a second attempt refused while one
+    is in progress; SIGKILL interruption keeps fence+journal until resume
+    completes; provision failure and restart failure never complete and
+    never stamp; restore is two-pass (corrupt late file = ZERO changes)
+    and restores modes exactly; tampered bytes, contract mismatch,
+    duplicate manifest keys and pre-21 bundles are refused BEFORE any
+    side effect and the no-op answer cannot bypass them.
 
     Prerequisite: docker (the fixture owns its postgres:16 container
-    `sr-upg-pg-*` and the pg_dump wrapper runs INSIDE that fixture; the
-    dumped artifact is the real database, never synthetic).
+    `sr-upg-pg-*`; the pg_dump wrapper runs the real pg_dump INSIDE that
+    fixture — the dumped artifact is the real database, never synthetic).
+    The `systemctl` double and fake systemctl logs are owned by the run
+    directory; nothing external is touched.
     """
     import subprocess as sp
     import hashlib as _hl
@@ -2071,16 +2082,35 @@ def check_upgrade() -> None:
     run_id = _hl.sha256(str(time.time()).encode()).hexdigest()[:8]
     cname = f"sr-upg-pg-{run_id}"
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="sr-upgrade-gate-"))
+    fake_secret = "SrGateFake$9e2f1c"  # SYNTHETIC; proves the argv channel
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith("SR_PG_ADMIN")}
+           if not k.startswith(("SR_PG_ADMIN", "SR_PG_UPGRADE",
+                                "POSTGRES_URL"))}
     env.update(DB_APP_ROLE="sr_uapp", DB_SECRET_ROLE="sr_usecret")
+    env["NPM_CONFIG_FUND"] = "false"
     port = None
+    # a `systemctl` service DOUBLE on PATH: the engine's restart path is
+    # the REAL checked one; only the service manager itself is a double.
+    fake_bin = tmp / "bin"
+    fake_bin.mkdir()
+    ctl = fake_bin / "systemctl"
+    ctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'echo "$@" >> "${SR_FAKE_SYSTEMCTL_LOG:-/dev/null}"\n'
+        'case "$1" in\n'
+        '  restart)   if [[ -n "${SR_FAKE_RESTART_FAIL:-}" ]]; then '
+        'echo "double: refusing restart" >&2; exit 5; fi;;\n'
+        "  is-active) exit 0;;\n"
+        "esac\n"
+        "exit 0\n")
+    ctl.chmod(0o755)
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
 
     def docker(*args: str, timeout: int = 120) -> sp.CompletedProcess:
         return sp.run(["docker", *args], capture_output=True, text=True,
                       timeout=timeout)
 
-    def cli(*args: str, timeout: int = 1200, extra_env: dict | None = None,
+    def cli(*args: str, timeout: int = 2400, extra_env: dict | None = None,
             proc: bool = False):
         cmd = [sys.executable, str(REPO / "deploy/appliance.py"), *args]
         e = {**env, **(extra_env or {})}
@@ -2094,7 +2124,7 @@ def check_upgrade() -> None:
 
     try:
         d = docker("run", "-d", "--name", cname,
-                   "-e", "POSTGRES_PASSWORD=ci",
+                   "-e", f"POSTGRES_PASSWORD={fake_secret}",
                    "-p", "127.0.0.1::5432", "postgres:16")
         if d.returncode != 0:
             prereq_fail("preserving upgrade sequences",
@@ -2118,31 +2148,45 @@ def check_upgrade() -> None:
                 'CREATE DATABASE srupg OWNER postgres ENCODING \'UTF8\' '
                 "TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'",
                 'CREATE DATABASE srupg2 OWNER postgres ENCODING \'UTF8\' '
+                "TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'",
+                'CREATE DATABASE srupg3 OWNER postgres ENCODING \'UTF8\' '
                 "TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'"):
             r = docker("exec", cname, "psql", "-U", "postgres", "-v",
                        "ON_ERROR_STOP=1", "-c", stmt, timeout=60)
             if r.returncode != 0:
                 fail("postgres fixture bootstrap",
                      f"{stmt[:40]}: {r.stderr[-200:]}")
-        url = f"postgresql://postgres:ci@127.0.0.1:{host_port}/srupg"
+        url = (f"postgresql://postgres:{fake_secret}@127.0.0.1:{host_port}"
+               "/srupg")
         url2 = url.replace("/srupg", "/srupg2")
+        url3 = url.replace("/srupg", "/srupg3")
 
-        # pg_dump WRAPPER around the real pg_dump INSIDE the fixture: the
-        # engine's argv contract is kept, the artifact is a real dump.
+        # pg_dump WRAPPER around the real pg_dump INSIDE the fixture. NEW
+        # credential contract: endpoint FLAGS in argv, password via
+        # PGPASSFILE in the environment; if the secret ever appears in the
+        # wrapper's argv the gate dies with 47 (argv-leak tripwire).
         wrapper = tmp / "pg_dump-wrapper.sh"
         wrapper.write_text(
             "#!/usr/bin/env bash\n"
-            "out=''; url=''\n"
+            "for a in \"$@\"; do\n"
+            f"  if [[ \"$a\" == *'{fake_secret}'* ]]; then\n"
+            "    echo 'ARGV SECRET LEAK' >&2; exit 47; fi\n"
+            "done\n"
+            '[[ -z "${PGPASSFILE:-}" || ! -r "${PGPASSFILE}" ]] && '
+            '{ echo "PGPASSFILE channel missing" >&2; exit 46; }\n'
+            "db=''; out=''\n"
             "while [[ $# -gt 0 ]]; do\n"
             "  case \"$1\" in\n"
+            "    -d) db=\"$2\"; shift 2;;\n"
             "    --file) out=\"$2\"; shift 2;;\n"
-            "    --format=custom) shift;;\n"
-            "    *) url=\"$1\"; shift;;\n"
+            "    --format=custom|-h|-p|-U) shift 2;;\n"
+            "    *) shift;;\n"
             "  esac\n"
             "done\n"
-            f"url_in=\"${{url//127.0.0.1:{host_port}/localhost:5432}}\"\n"
-            f"docker exec {cname} pg_dump --format=custom "
-            "--file=/tmp/srupg.dump \"$url_in\" || exit 1\n"
+            "pw=$(cut -d: -f5- \"${PGPASSFILE}\" | tail -1)\n"
+            f"docker exec -e PGPASSWORD=\"$pw\" {cname} pg_dump "
+            "-h localhost -U postgres "
+            f"-d \"$db\" --format=custom --file=/tmp/srupg.dump || exit 1\n"
             f"docker cp {cname}:/tmp/srupg.dump \"$out\" || exit 1\n")
         wrapper.chmod(0o755)
 
@@ -2201,16 +2245,25 @@ def check_upgrade() -> None:
                     {"sid": sid})
             eng.dispose()
 
-        def upgrade_cli(root, manifest, db_url, *, resume=None, extra=()):
+        def upgrade_cli(root, manifest, db_url, *, resume=None, extra=(),
+                        extra_env=None, fresh=True, allow_fail=False):
             args = ["upgrade", "--manifest", str(manifest),
                     "--system-root", str(root), "--payload", str(payload),
-                    "--db-url", db_url, "--pg-dump-bin", str(wrapper),
-                    "--python-exe", sys.executable, *extra]
+                    "--pg-dump-bin", str(wrapper), *extra]
+            if fresh:
+                args += ["--allow-fresh-install"]
             if resume:
                 args += ["--resume", resume]
-            return cli(*args, extra_env=env, timeout=1800)
+            e = {"SR_PG_UPGRADE_URL": db_url}
+            if extra_env:
+                e.update(extra_env)
+            r = cli(*args, extra_env=e, timeout=2400)
+            if r.returncode != 0 and not allow_fail:
+                fail("upgrade CLI unexpectedly failed",
+                     (r.stdout + r.stderr)[-1200:])
+            return r
 
-        # ---- sandbox fresh install + witnesses -------------------------- #
+        # ---- scenario A: real preserving upgrade, provisioned + restarted #
         manifest_path = iseq.build_manifest(tmp / "appliance-input")
         rootA = tmp / "rootA"
         apply_sandbox(rootA, manifest_path)
@@ -2221,18 +2274,25 @@ def check_upgrade() -> None:
         sentinel = paths["state"] / "sentinel.db"
         sentinel.parent.mkdir(parents=True, exist_ok=True)
         sentinel.write_text("history-and-data\n")
-
-        r = upgrade_cli(rootA, manifest_path, url)
-        if r.returncode != 0:
-            fail("preserving upgrade (scenario A)",
-                 (r.stdout + r.stderr)[-1200:])
+        # mode witnesses: a service-readable 0640 and a plain 0644 file
+        # must survive backup+restore with their ORIGINAL bits (F4)
+        svc_read = paths["etc"] / "svc-read.txt"
+        svc_read.write_text("service-readable\n")
+        svc_read.chmod(0o640)
+        plain = paths["etc"] / "plain.txt"
+        plain.write_text("plain\n")
+        plain.chmod(0o644)
+        ctl_log_a = tmp / "ctlA.log"
+        r = upgrade_cli(rootA, manifest_path, url,
+                        extra_env={"SR_FAKE_SYSTEMCTL_LOG": str(ctl_log_a)})
         outA = json.loads(r.stdout)
         stages = outA.get("stages", {})
-        missing = [s for s in ("backup", "stage", "activate", "migrate",
-                               "finalize")
+        missing = [s for s in ("backup", "stage", "activate", "provision",
+                               "migrate", "finalize", "restart")
                    if stages.get(s, {}).get("status") != "done"]
         if outA.get("status") != "done" or missing:
-            fail("preserving upgrade journal completeness",
+            fail("preserving upgrade journal completeness "
+                 "(backup..provision..restart)",
                  f"status={outA.get('status')} missing={missing}")
         heads = {row[0] for row in
                  db_q(url, "SELECT version_num FROM alembic_version")}
@@ -2265,9 +2325,48 @@ def check_upgrade() -> None:
         if lst.returncode != 0 or "TABLE DATA public users" not in lst.stdout:
             fail("database backup is a restore-listable artifact",
                  (lst.stdout + lst.stderr)[-300:])
-        ok("preserving upgrade (journal, backups, migrations, users, keys, "
-           "restore-listable dump)",
-           f"attempt {outA['attempt']}, heads {sorted(heads)}")
+        # F3: the mutable journal tree is NOT config and must be excluded
+        backup_files = json.loads(
+            (att_dir / "config-backup-manifest.json").read_text())["files"]
+        if any(str(k).startswith("upgrade") for k in backup_files):
+            fail("config backup excludes the journal tree",
+                 str([k for k in backup_files if str(k).startswith("upgrade")
+                      ][:3]))
+        # F1: provisioning produced a real receipt and the installed venv
+        # imports the entrypoints (the provision stage executed them)
+        receipt = json.loads((att_dir / "provision-receipt.json").read_text())
+        venv_py = pathlib.Path(receipt["venv"]) / "bin" / "python"
+        chk = sp.run([str(venv_py), "-c",
+                      "import srplatform.api.app, infra.appliance.brokerd"],
+                     cwd=str(rootA / "opt/sparring-range"),
+                     capture_output=True, text=True, timeout=120)
+        if chk.returncode != 0:
+            fail("installed venv runs the release entrypoints",
+                 (chk.stdout + chk.stderr)[-300:])
+        # F5: the CHECKED restart ran against the service double — every
+        # unit restarted and then verified active; stamp only after that
+        ctl_lines = ctl_log_a.read_text().splitlines() if \
+            ctl_log_a.is_file() else []
+        restarted = [l.split()[1] for l in ctl_lines
+                     if l.startswith("restart ")]
+        verified = [l.split()[2] for l in ctl_lines
+                    if l.startswith("is-active --quiet ")]
+        if not restarted or set(restarted) - set(verified):
+            fail("restart verified every unit active",
+                 f"restarted={restarted} verified={verified}")
+        stamp = json.loads((paths["etc"] / "release-version.json")
+                           .read_text())
+        if stamp.get("attempt") != outA["attempt"] or \
+                stamp.get("revision") != payload_manifest["revision"]:
+            fail("version stamp names the completed attempt and revision",
+                 str(stamp)[:200])
+        # fence dropped only on completion
+        if (paths["state"] / "maintenance").exists():
+            fail("admission fence released on completion",
+                 "fence file remains after a completed attempt")
+        ok("preserving upgrade (journal, fence, backups, provisioning, "
+           "migrations, verified restart, users, keys, restore-listable "
+           "dump)", f"attempt {outA['attempt']}, heads {sorted(heads)}")
 
         r2 = upgrade_cli(rootA, manifest_path, url)
         if r2.returncode != 0 or '"no_op"' not in r2.stdout:
@@ -2275,14 +2374,145 @@ def check_upgrade() -> None:
                  (r2.stdout + r2.stderr)[-300:])
         ok("rerun at the same revision is a truthful no-op")
 
-        # ============ scenario B: interrupt, refuse, resume, restore ====== #
+        # F4: corrupt config + flip modes, restore, ORIGINAL bits return
+        svc_read.write_text("CORRUPT\n")
+        svc_read.chmod(0o600)
+        envf = paths["env"]
+        envf.write_text("CORRUPTED BY THE UPGATE\n")
+        rr = cli("upgrade", "--manifest", str(manifest_path),
+                 "--system-root", str(rootA),
+                 "--restore-config", outA["attempt"])
+        rr_out = json.loads(rr.stdout) if rr.returncode == 0 else {}
+        if rr.returncode != 0 or rr_out.get("service_actions") != [] \
+                or "CORRUPTED" in envf.read_text():
+            fail("config-only restore from the attempt backup",
+                 (rr.stdout + rr.stderr)[-400:])
+        if (svc_read.stat().st_mode & 0o777 != 0o640
+                or svc_read.read_text() != "service-readable\n"):
+            fail("restore preserves the original 0640 service mode",
+                 f"mode {svc_read.stat().st_mode & 0o777:04o}")
+        if plain.stat().st_mode & 0o777 != 0o644:
+            fail("restore preserves 0644", f"{plain.stat().st_mode & 0o777:04o}")
+        ok("config-only restore repairs bytes AND original modes, "
+           "no service action")
+
+        # F7: at head (a would-be no-op), tampered bytes must REFUSE, not
+        # no-op; contract mismatch and duplicate keys likewise, before
+        # any side effect.
+        victim = payload / "srplatform/settings.py"
+        keep = victim.read_bytes()
+        victim.write_bytes(b"# tampered by the upgrade gate\n")
+        neg = upgrade_cli(rootA, manifest_path, url, allow_fail=True)
+        victim.write_bytes(keep)
+        if neg.returncode == 0 or "digest" not in (neg.stdout + neg.stderr) \
+                or '"no_op"' in neg.stdout:
+            fail("tampered payload refused before the no-op answer",
+                 (neg.stdout + neg.stderr)[-300:])
+        ok("payload tampering is refused even where a no-op would answer")
+
+        lie = tmp / "contract-lie-bundle"
+        lie.mkdir()
+        man = json.loads((payload / "MANIFEST.json").read_text())
+        shutil.copytree(payload / "srplatform", lie / "srplatform")
+        man["upgrade"]["revision"] = "deadbeefdeadbeefdeadbeefdeadbeefdead"
+        (lie / "MANIFEST.json").write_text(json.dumps(man))
+        neg3 = upgrade_cli(rootA, manifest_path, url, allow_fail=True,
+                           extra=("--payload", str(lie)))
+        if neg3.returncode == 0 or "contract" not in (
+                (neg3.stdout + neg3.stderr).lower()):
+            fail("contract revision mismatch refused",
+                 (neg3.stdout + neg3.stderr)[-300:])
+        ok("upgrade contract disagreeing with the manifest is refused")
+
+        dup = tmp / "dup-manifest-bundle"
+        dup.mkdir()
+        shutil.copytree(payload / "srplatform", dup / "srplatform")
+        (dup / "pyproject.toml").write_bytes(b"a\n")
+        # hand-written raw JSON with the SAME key twice: last-wins parsing
+        # must not smuggle an unchecked runtime path past verification
+        digest_a = _hl.sha256(b"a\n").hexdigest()
+        (dup / "MANIFEST.json").write_text(
+            '{"bundle_version": 2, "revision": "cafe", "upgrade": '
+            '{"engine": "deploy/upgrade.py", "migrations": "srplatform", '
+            '"bundle_version": 2, "revision": "cafe"}, "files": {'
+            f'"pyproject.toml": {{"sha256": "{digest_a}", "bytes": 2}}, '
+            f'"pyproject.toml": {{"sha256": "{"0" * 64}", "bytes": 2}}}}')
+        neg4 = upgrade_cli(rootA, manifest_path, url, allow_fail=True,
+                           extra=("--payload", str(dup)))
+        if neg4.returncode == 0 or "duplicate" not in (
+                neg4.stdout + neg4.stderr):
+            fail("duplicate manifest keys refused",
+                 (neg4.stdout + neg4.stderr)[-300:])
+        ok("a MANIFEST with duplicate keys is refused before parsing wins")
+
+        # F2: --dry-run must NOT claim quiesced while durable work exists.
+        # Scenario B's database gets real jobs; unknown cessation is the
+        # loudest case. No mutation, no journal, no fence on dry-run.
         rootB = tmp / "rootB"
         apply_sandbox(rootB, manifest_path)
         assert alembic(url2, "upgrade", "0025").returncode == 0
         seed(url2, "b")
+        pathsB = iseq._manifest_paths(rootB)
+
+        def insert_job(state: str) -> None:
+            eng = sa_create(url2)
+            with eng.begin() as c:
+                jid = c.execute(sa_text(
+                    "INSERT INTO model_jobs (job_id, kind, priority, state, "
+                    "payload, requested_at) VALUES (gen_random_uuid(), "
+                    "'probe', 5, :st, '{}'::jsonb, now()) "
+                    "RETURNING job_id"), {"st": state}).scalar()
+            eng.dispose()
+            return str(jid)
+
+        jid = insert_job("queued")
+        dneg = upgrade_cli(rootB, manifest_path, url2, extra=("--dry-run",),
+                           allow_fail=True)
+        if dneg.returncode == 0 or "model job" not in (
+                dneg.stdout + dneg.stderr):
+            fail("dry-run REFUSES while a model job is queued",
+                 (dneg.stdout + dneg.stderr)[-400:])
+        eng = sa_create(url2)
+        with eng.begin() as c:
+            c.execute(sa_text("DELETE FROM model_jobs WHERE job_id = :j"),
+                      {"j": jid})
+        eng.dispose()
+        jid = insert_job("cessation_unknown")
+        dneg2 = upgrade_cli(rootB, manifest_path, url2, extra=("--dry-run",),
+                            allow_fail=True)
+        if dneg2.returncode == 0 or "cessation" not in (
+                dneg2.stdout + dneg2.stderr):
+            fail("dry-run REFUSES cessation_unknown obligations",
+                 (dneg2.stdout + dneg2.stderr)[-400:])
+        eng = sa_create(url2)
+        with eng.begin() as c:
+            c.execute(sa_text("DELETE FROM model_jobs WHERE job_id = :j"),
+                      {"j": jid})
+        eng.dispose()
+        if list((pathsB["etc"] / "upgrade").glob("*/journal.json")) \
+                or (pathsB["state"] / "maintenance").exists():
+            fail("dry-run performs no side effects",
+                 "journal or fence appeared during --dry-run")
+        ok("--dry-run refuses queued AND cessation_unknown durable work "
+           "with zero side effects")
+
+        # F2: without --allow-fresh-install a MISSING ledger is missing
+        # evidence, not quiescence.
+        dneg3 = upgrade_cli(rootB, manifest_path, url2,
+                            extra=("--dry-run",), fresh=False,
+                            allow_fail=True)
+        if dneg3.returncode == 0 or "MISSING" not in (
+                dneg3.stdout + dneg3.stderr):
+            fail("missing broker ledger is not silent success",
+                 (dneg3.stdout + dneg3.stderr)[-400:])
+        ok("a missing ledger must be answered by --allow-fresh-install, "
+           "never by silence")
+
+        # ============ scenario B: interrupt, refuse, resume, restore ====== #
         drifted = rootB / "opt/sparring-range/srplatform/__init__.py"
         drifted.parent.mkdir(parents=True, exist_ok=True)
         drifted.write_text("# foreign drift injected by the upgrade gate\n")
+        ctl_log_b = tmp / "ctlB.log"
         # deterministic interruption window: a 10-second ACCESS EXCLUSIVE
         # table lock makes the migration stage BLOCK (real lock wait), so
         # the SIGKILL lands mid-work, never after a lucky fast completion.
@@ -2293,11 +2523,13 @@ def check_upgrade() -> None:
                  stdout=sp.DEVNULL, stderr=sp.DEVNULL)
         pB = cli("upgrade", "--manifest", str(manifest_path),
                  "--system-root", str(rootB), "--payload", str(payload),
-                 "--db-url", url2, "--pg-dump-bin", str(wrapper),
-                 "--python-exe", sys.executable, proc=True)
+                 "--pg-dump-bin", str(wrapper), "--allow-fresh-install",
+                 extra_env={"SR_PG_UPGRADE_URL": url2,
+                            "SR_FAKE_SYSTEMCTL_LOG": str(ctl_log_b)},
+                 proc=True)
         journalB = None
-        attempts_dir = iseq._manifest_paths(rootB)["etc"] / "upgrade"
-        deadline = time.time() + 120
+        attempts_dir = pathsB["etc"] / "upgrade"
+        deadline = time.time() + 240
         while time.time() < deadline:
             for j in attempts_dir.glob("*/journal.json"):
                 data = json.loads(j.read_text())
@@ -2312,20 +2544,24 @@ def check_upgrade() -> None:
         os.killpg(os.getpgid(pB.pid), signal.SIGKILL)
         pB.wait(timeout=30)
         attempt_b = journalB["attempt"]
-        refused = upgrade_cli(rootB, manifest_path, url2)
+        if not (pathsB["state"] / "maintenance").is_file():
+            fail("admission fence stays up while an attempt is unfinished",
+                 "fence file absent after SIGKILL")
+        ok("SIGKILL interruption is retained; new attempts REFUSED and the "
+           "fence holds", f"attempt {attempt_b} in progress")
+        refused = upgrade_cli(rootB, manifest_path, url2, allow_fail=True)
         if refused.returncode == 0 or "unknown" not in (
                 refused.stdout + refused.stderr):
             fail("interrupted attempt blocks new upgrade work",
                  (refused.stdout + refused.stderr)[-400:])
-        ok("SIGKILL interruption is retained and REFUSES new attempts",
-           f"attempt {attempt_b} in progress")
-        r3 = upgrade_cli(rootB, manifest_path, url2, resume=attempt_b)
-        if r3.returncode != 0:
-            fail("resume of the interrupted attempt",
-                 (r3.stdout + r3.stderr)[-1200:])
+        # F5: resuming an UNFINISHED attempt may never answer no-op even
+        # though installed revision + schema could look up to date
+        r3 = upgrade_cli(rootB, manifest_path, url2, resume=attempt_b,
+                         extra_env={"SR_FAKE_SYSTEMCTL_LOG": str(ctl_log_b)})
         outB = json.loads(r3.stdout)
-        if outB.get("status") != "done":
-            fail("resumed upgrade completed", json.dumps(outB)[:400])
+        if outB.get("no_op") or outB.get("status") != "done":
+            fail("resume of the unfinished attempt COMPLETES it (never "
+                 "no-ops away)", json.dumps(outB)[:400])
         heads_b = {row[0] for row in
                    db_q(url2, "SELECT version_num FROM alembic_version")}
         if heads_b != {"0027"}:
@@ -2335,34 +2571,163 @@ def check_upgrade() -> None:
         if db_q(url2, "SELECT count(*) FROM users WHERE username="
                       "'p21-witness-b'") != [(1,)]:
             fail("interrupted+resumed upgrade preserved users")
+        if (pathsB["state"] / "maintenance").exists():
+            fail("resume completion releases the fence", "fence remains")
         ok("interruption -> refusal -> resume completes to head, drift "
-           "repaired, users preserved")
+           "repaired, fence released, users preserved")
 
-        # config-only restore: corrupt, restore, NO service actions
-        envf = iseq._manifest_paths(rootB)["env"]
-        envf.write_text("CORRUPTED BY THE UPGATE\n")
-        rr = cli("upgrade", "--manifest", str(manifest_path),
-                 "--system-root", str(rootB),
-                 "--restore-config", attempt_b)
-        rr_out = json.loads(rr.stdout) if rr.returncode == 0 else {}
-        if rr.returncode != 0 or rr_out.get("service_actions") != [] \
-                or "CORRUPTED" in envf.read_text():
-            fail("config-only restore from the attempt backup",
-                 (rr.stdout + rr.stderr)[-400:])
-        ok("config-only restore repairs config and issues NO service action")
+        # F3 (two-pass restore): corrupt a LATE backup file -> the restore
+        # refuses and changes EXACTLY ZERO live files.
+        envfB = pathsB["env"]
+        envfB.write_text("CORRUPTED BY THE UPGATE\n")
+        before = {p: _hl.sha256(p.read_bytes()).hexdigest()
+                  for p in sorted(pathsB["etc"].rglob("*"))
+                  if p.is_file() and "/upgrade/" not in str(p)}
+        late = sorted((pathsB["etc"] / "upgrade" / attempt_b /
+                       "config-backup").rglob("*"))[-1]
+        late.write_bytes(b"# corrupted late backup file\n")
+        rr2 = cli("upgrade", "--manifest", str(manifest_path),
+                  "--system-root", str(rootB),
+                  "--restore-config", attempt_b)
+        after = {p: _hl.sha256(p.read_bytes()).hexdigest()
+                 for p in sorted(pathsB["etc"].rglob("*"))
+                 if p.is_file() and "/upgrade/" not in str(p)}
+        if rr2.returncode == 0 or "BEFORE any write" not in (
+                rr2.stdout + rr2.stderr) or before != after:
+            fail("corrupt late backup file -> ZERO changed files",
+                 f"exit={rr2.returncode} changed="
+                 f"{[str(p) for p in before if before[p] != after.get(p)][:3]}"
+                 f" {(rr2.stdout + rr2.stderr)[-200:]}")
+        if envfB.read_text().find("CORRUPTED") < 0:
+            fail("refused restore left the tree untouched",
+                 "env file changed despite refusal")
+        ok("restore validates the COMPLETE backup before writing "
+           "(late corruption = zero changes)")
 
-        # ================= negatives ====================================== #
-        # a sandbox with NO version stamp: preflight cannot answer no-op,
-        # so the refusal below is genuinely caused by the payload defect.
-        rootC = tmp / "rootC"
-        apply_sandbox(rootC, manifest_path)
-        victim = payload / "srplatform/settings.py"
-        victim.write_bytes(b"# tampered by the upgrade gate\n")
-        neg = upgrade_cli(rootC, manifest_path, url)
-        if neg.returncode == 0 or "digest" not in (neg.stdout + neg.stderr):
-            fail("tampered payload refused", (neg.stdout + neg.stderr)[-300:])
-        ok("payload digest tampering is refused before activation")
+        # journal survives its own restore (it is not config)
+        jnow = json.loads((attempts_dir / attempt_b / "journal.json")
+                          .read_text())
+        if jnow.get("attempt") != attempt_b or jnow.get("status") not in (
+                "done", "in-progress"):
+            fail("attempt journal is never rolled back by a restore",
+                 json.dumps(jnow)[:200])
+        ok("the journal that records the restore is never restored over")
 
+        # ============ scenario D: restart failure is never success ====== #
+        rootD = tmp / "rootD"
+        apply_sandbox(rootD, manifest_path)
+        assert alembic(url3, "upgrade", "0025").returncode == 0
+        seed(url3, "d")
+        pathsD = iseq._manifest_paths(rootD)
+        dfail = upgrade_cli(rootD, manifest_path, url3,
+                            extra_env={"SR_FAKE_RESTART_FAIL": "1"},
+                            allow_fail=True)
+        if dfail.returncode == 0 or "restart" not in (
+                dfail.stdout + dfail.stderr):
+            fail("failed service restart fails the upgrade truthfully",
+                 (dfail.stdout + dfail.stderr)[-600:])
+        stampD = pathsD["etc"] / "release-version.json"
+        if stampD.exists():
+            fail("failed restart writes NO version stamp",
+                 stampD.read_text()[:200])
+        jD = next((json.loads(j.read_text())
+                   for j in (pathsD["etc"] / "upgrade").glob(
+                       "*/journal.json")), {})
+        if jD.get("stages", {}).get("restart", {}).get("status") != "failed":
+            fail("journal records the failed restart stage",
+                 json.dumps(jD.get("stages", {}).get("restart")))
+        if not (pathsD["state"] / "maintenance").is_file():
+            fail("restart failure keeps the admission fence up",
+                 "fence absent with services unverified")
+        ok("restart failure: attempt in progress, fence up, NO stamp")
+        dres = upgrade_cli(rootD, manifest_path, url3,
+                           resume=jD["attempt"])
+        outD = json.loads(dres.stdout)
+        if outD.get("status") != "done":
+            fail("resume after a fixed restart completes",
+                 json.dumps(outD)[:300])
+        if not stampD.is_file():
+            fail("version stamp written only after the verified restart",
+                 "stamp missing after completed resume")
+        ok("verified restart then (and only then) the version stamp")
+
+        # ============ provisioning failure never claims success ========= #
+        bad_tree = tmp / "badlock-src"
+        sp.run(["cp", "-al", str(REPO), str(bad_tree)], check=True,
+               timeout=300)
+        shutil.rmtree(bad_tree / ".git", ignore_errors=True)
+        (bad_tree / "requirements.lock").unlink()
+        (bad_tree / "requirements.lock").write_text(
+            "nonexistent-pkg-srgate-9f3c==9.9.9\n")
+        bad_payload = tmp / "badlock-bundle"
+        bb = sp.run([sys.executable, str(bad_tree / "deploy/bundle.py"),
+                     "build", "--output", str(bad_payload),
+                     "--base-image", str(fake_base)],
+                    cwd=str(bad_tree), capture_output=True, text=True,
+                    timeout=1800, env=env)
+        if bb.returncode != 0:
+            fail("bad-lock payload build", (bb.stdout + bb.stderr)[-400:])
+        rootP = tmp / "rootP"
+        apply_sandbox(rootP, manifest_path)
+        pf = cli("upgrade", "--manifest", str(manifest_path),
+                 "--system-root", str(rootP), "--payload", str(bad_payload),
+                 "--pg-dump-bin", str(wrapper), "--allow-fresh-install",
+                 extra_env={"SR_PG_UPGRADE_URL": url},
+                 timeout=2400)
+        if pf.returncode == 0 or "provision" not in (
+                pf.stdout + pf.stderr):
+            fail("provisioning failure fails the upgrade",
+                 (pf.stdout + pf.stderr)[-600:])
+        pathsP = iseq._manifest_paths(rootP)
+        if (pathsP["etc"] / "release-version.json").exists():
+            fail("provision failure writes no version stamp")
+        jP = next((json.loads(j.read_text())
+                   for j in (pathsP["etc"] / "upgrade").glob(
+                       "*/journal.json")), {})
+        if jP.get("stages", {}).get("provision", {}).get("status") != "failed":
+            fail("journal records the failed provision stage",
+                 json.dumps(jP.get("stages", {}).get("provision")))
+        if not (pathsP["state"] / "maintenance").is_file():
+            fail("provision failure keeps the fence up (old runtime must "
+                 "not silently resume under new bytes)", "fence absent")
+        ok("provisioning failure: services NOT restarted, fence up, no "
+           "stamp, attempt resumable")
+
+        # F2 (API side): while the fence file exists the API refuses NEW
+        # work with 503 but still serves health, login and the existing-
+        # work internal callbacks — admission, not outage.
+        flag = tmp / "fence-flag"
+        flag.write_text('{"reason": "gate"}\n')
+        os.environ["SR_MAINTENANCE_FLAG"] = str(flag)
+        try:
+            import srplatform.settings as _s
+            _s.get_settings.cache_clear()
+            from fastapi.testclient import TestClient
+            from srplatform.api.app import app as _app
+            client = TestClient(_app, raise_server_exceptions=False)
+            r_new = client.post("/sessions", json={})
+            r_login = client.post("/auth/login", json={})
+            r_internal = client.post("/internal/runs/x/heartbeat", json={})
+            r_health = client.get("/healthz")
+            if r_new.status_code != 503:
+                fail("fenced API refuses NEW work with 503",
+                     f"POST /sessions -> {r_new.status_code}")
+            if r_login.status_code == 503 or r_internal.status_code == 503 \
+                    or r_health.status_code == 503:
+                fail("fence exempts login, internal callbacks and health",
+                     f"login={r_login.status_code} "
+                     f"internal={r_internal.status_code} "
+                     f"health={r_health.status_code}")
+            flag.unlink()
+            if client.post("/sessions", json={}).status_code == 503:
+                fail("fence removal re-admits work", "still 503")
+            ok("admission fence: 503 for new work, callbacks/login/health "
+               "unblocked, removal re-admits")
+        finally:
+            _s.get_settings.cache_clear()
+            os.environ.pop("SR_MAINTENANCE_FLAG", None)
+
+        # ================= negatives (unchanged contract) ================ #
         old = tmp / "old-bundle"
         old.mkdir()
         (old / "pyproject.toml").write_bytes(b"x\n")
@@ -2372,11 +2737,21 @@ def check_upgrade() -> None:
                     _hl.sha256(b"x\n").hexdigest(), "bytes": 2}}}))
         neg2 = cli("upgrade", "--manifest", str(manifest_path),
                    "--system-root", str(rootA), "--payload", str(old),
-                   "--db-url", url)
+                   extra_env={"SR_PG_UPGRADE_URL": url})
         if neg2.returncode == 0 or "predates" not in (neg2.stdout + neg2.stderr):
             fail("pre-21 bundle refused as an upgrade payload",
                  (neg2.stdout + neg2.stderr)[-300:])
         ok("pre-21 bundle without the upgrade contract is refused")
+
+        # F6: the CLI itself refuses a credential-bearing argv contract
+        leak = cli("upgrade", "--manifest", str(manifest_path),
+                   "--system-root", str(rootA), "--payload", str(payload),
+                   "--db-url", url)
+        if leak.returncode == 0:
+            fail("--db-url (credential in argv) is no longer accepted",
+                 "CLI accepted a URL argument")
+        ok("the CLI refuses --db-url: owner credentials travel by "
+           "environment only")
     finally:
         sp.run(["docker", "rm", "-f", cname], capture_output=True,
                timeout=120)

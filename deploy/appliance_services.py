@@ -367,6 +367,28 @@ def verify_service_runtime(run, venv: pathlib.Path, *,
     return {"uid_checks": results, "node_binary": node}
 
 
+def _create_venv(run, venv: pathlib.Path) -> None:
+    """Create the venv with a REAL interpreter backend, in priority order:
+    the distro ``python3 -m venv`` (the appliance contract — the native
+    package list carries ``python3-venv``), else ``uv venv --seed`` for
+    hosts whose only Python came with uv (development/CI machines built
+    this way); both produce a pip-bearing venv. No silent third option:
+    a host with neither gets the exact missing package named."""
+    probe = subprocess.run(["python3", "-c", "import ensurepip"],
+                           capture_output=True, text=True, timeout=60)
+    if probe.returncode == 0:
+        run("python3", "-m", "venv", str(venv))
+        return
+    uv = shutil.which("uv")
+    if uv:
+        run(uv, "venv", "--seed", str(venv))
+        return
+    raise RuntimeError(
+        "cannot create a Python venv: python3 lacks ensurepip "
+        "(install the python3-venv package) and uv is not present — the "
+        "appliance will not fabricate an environment it cannot build")
+
+
 def ensure_venv(run, *, prefix: pathlib.Path, source: pathlib.Path) -> pathlib.Path:
     """Create the appliance's Python environment from the LOCKED requirements.
 
@@ -392,7 +414,7 @@ def ensure_venv(run, *, prefix: pathlib.Path, source: pathlib.Path) -> pathlib.P
     if not (venv / "bin/python").exists():
         old = os.umask(0o022)
         try:
-            run("python3", "-m", "venv", str(venv))
+            _create_venv(run, venv)
         finally:
             os.umask(old)
     run(str(venv / "bin/pip"), "install", "--upgrade", "pip")
