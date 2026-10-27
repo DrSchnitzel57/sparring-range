@@ -1182,11 +1182,23 @@ new work is forward, data-only migration 0024.
 | Dependency success = the chain-final attempt GENUINELY `succeeded` AND, for a summarize prerequisite, its durable checkpoint with the exact covered range EXISTS; `cessation_resolved` is honest `failed-final` (new `no-checkpoint` verdict when a summary "succeeded" without one) | Accepting `cessation_resolved` as prerequisite success (the reviewer's repro: after an audited resolve the gated turn dispatched the uncompacted over-budget context — resolution created NO summary and NO checkpoint); trusting the `succeeded` state label alone (an attempt can end succeeded with no checkpoint artifact) | `resolve_cessation` proves a SLOT was released, not that a RESULT exists. The dependent consumes the compaction ARTIFACT, so the artifact is consulted — its absence refuses with the truthful reason and zero provider calls; the 500→retry→checkpoint→dispatch-once positive keeps legitimate recovery flowing. |
 | Concurrency proofs are DATABASE-OBSERVED: tests wait until `pg_stat_activity` shows the victim backend parked on a lock wait (and event-gated fake-model servers for provider interleavings) — replacing the round-3 `t.join(timeout); is_alive()` guess; pin proofs freeze the pin at FIRST role use, then edit (dead URL + same-key resave) and serve a real subsequent turn | Sleeping then asserting a thread is alive (proves scheduling, not the lock); creating the session AFTER the revisions and calling that a pin proof (proved serviceability, not that v1 stayed usable — the pre-fix test failed exactly when made honest) | A race test must demonstrate the interleaving from the database's own view. The corrected pin proof fails loudly against unfixed behavior — that is what makes it a proof. |
 
+### Plan 19 review round-5 decision (2026-10-27, branch `practice-upgrades-18-21`)
+
+The FIFTH review (VERDICT FIX at `e07c52a`, one blocker) showed the
+audit of a failed compensation was itself leaking: `str(exc)` from a
+secret-store failure carries PostgreSQL's `DETAIL: Failing row
+contains (...)` — the credential — into app-role-readable append-only
+evidence. Fixed in `db36809`; no migration touched.
+
+| Chosen | Rejected | Why |
+|---|---|---|
+| Compensation/audit records carry STRUCTURE ONLY: exception class names + 5-char SQLSTATE codes along the bounded cause/`orig` chain (`safe_error_shape`); the obligation-write failure logs safe shapes and says the durable record is missing; the outcome-handler failure note (API-visible) follows the same convention | Persisting `str(exc)` (the reproduced leak: a deliberate fixture CHECK made the restore's INSERT fail, and PG's own diagnostic quoted the credential into the app-readable event); pattern-based redaction of the text (short opaque keys and provider keys of unknown shape defeat every pattern — redaction that must catch everything secret is catch-anything logic, which is exactly what this codebase bans elsewhere); silent `except: pass` on the obligation write (a divergence with NO evidence is worse than a loud structural record) | A diagnostic's text is attacker/DB-controlled content; class names and codes are library structure that cannot carry a value. The failure stays fully actionable (op, profile, code, action_needed) while the value can never ride along because nothing value-bearing is ever read. Regression pinned by real-PG fault injection asserting absence across event rows read as the app role, payloads and every log record |
+
 ### Review-round evidence
 
 `docs/FINDINGS_CHECKLIST.md` — "Plan-19 independent review round" sections
 record the reproduced original failures, the corrected proofs, and every
-gate receipt for all four rounds.
+gate receipt for all five rounds.
 
 ## Risks and explicitly unverified inputs (historical baseline; see reevaluation above)
 

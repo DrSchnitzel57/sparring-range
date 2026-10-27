@@ -173,6 +173,19 @@ historical 14–17. Implementation waits for the user's new worktree:
   [Plan](../.openchamber/plans/21-upgrade-and-integrated-release.md). Supported preserving
   in-place upgrade, corrected fresh-install bundle, changed-artifact rebuilds,
   installed/aggregate proofs and explicit real-Strata/manual acceptance.
+  *Carry-forward scoped limitation (2026-10-27, recorded at plan-19 round-5
+  review):* the pinned guest package set `infra/images/packages-24.04.txt`
+  has drifted out of the Ubuntu mirrors (build-guest apt: `E: Version
+  '1.24.0-2ubuntu7.18' for 'nginx' was not found`), so role-image builds —
+  the `images` gate and everything downstream (capture overlay, bundle role
+  artifacts) — are NOT reproducible as pinned. This is a software
+  supply-chain reproducibility blocker to REPAIR before the 21 release
+  (documented pin refresh with re-recorded versions and rebuild evidence,
+  on a KVM runner or with warm cache); it is not an environmental waiver
+  and no PASS is recorded for those gates. Also unproven and carried:
+  installed UID/proc/systemd boundaries, Strata/KVM nested virtualization
+  and all operator gates (packet/journey/release) — sandbox fixtures are
+  not installed-system proof.
 
 Architecture section K records choices/defaults. Do not restart cancelled
 DB/selection runs as though they failed; future acceptance may run them when needed.

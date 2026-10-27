@@ -1,5 +1,81 @@
 # Current findings and validation evidence
 
+## Plan-19 review ROUND 5 — 2026-10-27, branch `practice-upgrades-18-21`
+
+The FIFTH independent review (complete controls at `e07c52a`: every
+prior concurrency/upgrade/compaction/outcome/pin blocker PASSED the
+reviewer's own barriers; 0020–0022 byte-unchanged against `e311ff9`,
+0023 against `b7ea7cd`, 0024 untouched) returned **VERDICT: FIX** with
+ONE remaining reproduced blocker — a MEDIUM secret leak inside the
+repair-obligation audit itself. Fixed at root in `db36809`; no
+migration touched (0020–0024 unchanged).
+
+### Reproduced defect and fix→proof map
+
+- **R5-F1 MEDIUM — the compensation-failure audit leaked the
+  credential.** `_record_compensation_failure` persisted
+  `str(exc)[:200]` into the append-only
+  `model_admin.profile.secret_compensation_failed` event. The reviewer
+  injected the fault on a real disposable PostgreSQL (deliberate fixture
+  CHECK constraint refusing the credential value — not a production
+  constraint): the rolled-back tracked delete re-inserted the secret,
+  the constraint raised `IntegrityError`, and PostgreSQL's own
+  diagnostic — `DETAIL: Failing row contains (..., <secret>, ...)` —
+  landed in an **app-role-readable** event verbatim.
+  Fix (honest obligation, zero secret):
+  `model_admin.safe_error_shape()` records only library class names
+  plus 5-character SQLSTATE codes along the bounded, cycle-safe
+  cause/`orig` chain — raw text, `args`, `params`, statements, row
+  details, provider bodies and tracebacks are never READ, and no
+  pattern-based "redaction" is trusted (short opaque keys defeat every
+  pattern). The obligation keeps everything an operator needs: op,
+  profile id, structure (`IntegrityError[23514]`), action_needed. The
+  obligation WRITE's own failure is no longer `except: pass` — the
+  last-resort log line carries safe shapes only and states in words
+  that the durable record is missing. The sibling audit fallback
+  (`_persist_logical_outcome`'s handler-failure note, job evidence an
+  API caller reads) moved to the same structural convention.
+  Provider-call normalization (`redact_error` on job errors) stays as
+  previously accepted — it is not a compensation/audit path.
+
+  Proof (`tests/test_plan19_review_round5.py`, 3 agent tests, real PG
+  fault injection, no mocks of the leaking mechanism): obligation
+  present exactly once with `IntegrityError[23514]`; store stays
+  honestly divergent (no silent success); the credential appears in NO
+  app-role surface — raw `to_jsonb(events)` read through the app
+  identity, obligation payloads, every log record; when even the
+  obligation write is refused (second fixture constraint), the bounded
+  last-resort log names structure only and says `NOT recorded`.
+  Positive controls unchanged and still green inside the gates:
+  legitimate rollback restores; the locked restore cannot undo a
+  committed revocation.
+
+### Round-5 gate receipts — all personally run at `db36809` (tree clean), serialized, logs `.cache/gate_r5_*.log`
+
+Fast default at the final code commit: **661 passed, 0 failed, 0
+skipped, 412 deselected** (85.01 s).
+
+| Gate | Result | Exact receipt |
+|---|---|---|
+| selection | PASS 168.0 s | every test classified; fast default **661 passed, 0 skipped, 412 deselected** |
+| python | PASS 5.5 s | locked install + deps + imports |
+| authority | PASS 26.6 s | **35 passed, 0 skipped** |
+| containment | PASS 20.8 s | **26 passed, 0 skipped**; no leaked run-owned cgroups |
+| db | PASS 634.3 s | **272 passed, 0 skipped, 801 deselected**; fixture container removed; no `srtest_*`/`sr_*` databases or roles remain |
+| agent | PASS 150.2 s | **120 passed, 0 failed, 0 skipped** — incl. the 3 round-5 fault-injection tests plus all round-3/4 deterministic barriers |
+| frontend | PASS 7.3 s | production audit: zero high/critical |
+| browser | PASS 112.6 s | **2 passed, 0 skipped** — serialized immediately after frontend |
+
+Not re-run for this small correction per operator instruction:
+pve-contract, install, compose, hypervisor, access (unchanged domains,
+receipts at `12ecbcb`); images/capture/bundle stay blocked by the
+recorded pin-drift supply-chain item — **now carried forward in the
+ROADMAP under milestone 21 as a release-blocking reproducibility
+defect, not an environmental waiver**; operator gates
+(packet/journey/release) and installed UID/proc/systemd/Strata/KVM
+qualifications remain NOT PROVEN — sandbox fixtures are not
+installed-system proof.
+
 ## Plan-19 review ROUND 4 — 2026-10-27, branch `practice-upgrades-18-21`
 
 The FOURTH independent review (SOURCE-ONLY — no reviewer tests ran)
