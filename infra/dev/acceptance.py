@@ -2070,6 +2070,7 @@ def check_upgrade() -> None:
     import tempfile
     import shutil as _sh
     sys.path.insert(0, str(REPO / "infra" / "dev"))
+    sys.path.insert(0, str(REPO))  # deploy/srplatform imports below
     import install_sequences as iseq  # noqa: E402
     from sqlalchemy import create_engine as sa_create
     from sqlalchemy import text as sa_text
@@ -2179,7 +2180,8 @@ def check_upgrade() -> None:
             "  case \"$1\" in\n"
             "    -d) db=\"$2\"; shift 2;;\n"
             "    --file) out=\"$2\"; shift 2;;\n"
-            "    --format=custom|-h|-p|-U) shift 2;;\n"
+            "    --format=custom) shift;;\n"
+            "    -h|-p|-U) shift 2;;\n"
             "    *) shift;;\n"
             "  esac\n"
             "done\n"
@@ -2653,10 +2655,19 @@ def check_upgrade() -> None:
 
         # ============ provisioning failure never claims success ========= #
         bad_tree = tmp / "badlock-src"
-        sp.run(["cp", "-al", str(REPO), str(bad_tree)], check=True,
-               timeout=300)
-        shutil.rmtree(bad_tree / ".git", ignore_errors=True)
-        (bad_tree / "requirements.lock").unlink()
+        bad_tree.mkdir()
+        # hardlinks cannot cross the tmpfs boundary; stream ONLY the
+        # packaged source (node_modules and caches are not bundle inputs)
+        from deploy import bundle as _bundle
+        tar = sp.run(
+            ["tar", "-C", str(REPO), "-cf", "-", "--exclude=node_modules",
+             "--exclude=__pycache__", "--exclude=.next",
+             *_bundle.APP_DIRS, *_bundle.APP_FILES],
+            capture_output=True, timeout=300)
+        if tar.returncode != 0:
+            fail("bad-lock payload tree", tar.stderr[-300:])
+        sp.run(["tar", "-C", str(bad_tree), "-xf", "-"], input=tar.stdout,
+               check=True, timeout=300)
         (bad_tree / "requirements.lock").write_text(
             "nonexistent-pkg-srgate-9f3c==9.9.9\n")
         bad_payload = tmp / "badlock-bundle"
@@ -2724,7 +2735,8 @@ def check_upgrade() -> None:
             ok("admission fence: 503 for new work, callbacks/login/health "
                "unblocked, removal re-admits")
         finally:
-            _s.get_settings.cache_clear()
+            if "_s" in dir():
+                _s.get_settings.cache_clear()
             os.environ.pop("SR_MAINTENANCE_FLAG", None)
 
         # ================= negatives (unchanged contract) ================ #

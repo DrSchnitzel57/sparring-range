@@ -693,7 +693,7 @@ def durable_work_problems(db_url: str | None) -> list[str]:
                 else:
                     problems.append(f"{count} model job(s) {state}")
             n = conn.execute(text(
-                "SELECT count(*) FROM run_operations WHERE status IN "
+                "SELECT count(*) FROM run_operations WHERE state IN "
                 "('active', 'cancel-unknown')")).scalar()
             if n:
                 problems.append(f"{n} dispatched command operation(s) whose "
@@ -891,7 +891,8 @@ def provision_release(layout, payload: ReleasePayload, *, run,
     else:
         receipt["native_packages"] = svc.ensure_native_dependencies(run)
         receipt["node"] = svc.ensure_node_runtime(run)
-    venv = svc.ensure_venv(run, prefix=source, source=source)
+    venv = svc.ensure_venv(run, prefix=source, source=source,
+                           broker_bindings=not layout.sandboxed)
     receipt["venv"] = str(venv)
     # the units exec THIS interpreter on THESE sources — it must import
     # the entrypoints, or activation only moved files

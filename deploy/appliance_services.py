@@ -389,7 +389,8 @@ def _create_venv(run, venv: pathlib.Path) -> None:
         "appliance will not fabricate an environment it cannot build")
 
 
-def ensure_venv(run, *, prefix: pathlib.Path, source: pathlib.Path) -> pathlib.Path:
+def ensure_venv(run, *, prefix: pathlib.Path, source: pathlib.Path,
+                broker_bindings: bool = True) -> pathlib.Path:
     """Create the appliance's Python environment from the LOCKED requirements.
 
     The lock file is the only source of dependency versions: the installer
@@ -425,7 +426,11 @@ def ensure_venv(run, *, prefix: pathlib.Path, source: pathlib.Path) -> pathlib.P
     # ownership. This is the exact, narrow repair for the umask-027 203/EXEC
     # failure; it is deliberately NOT applied to anything else.
     run("chmod", "-R", "a+rX", str(venv))
-    _expose_native_bindings(run, venv)
+    if broker_bindings:
+        # the broker unit imports libvirt from this venv; a sandbox has no
+        # broker and no host libvirt, and faking the binding there would
+        # prove nothing (the appliance install keeps this REQUIRED)
+        _expose_native_bindings(run, venv)
     return venv
 
 
