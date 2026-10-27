@@ -187,22 +187,27 @@ historical 14–17. Implementation waits for the user's new worktree:
   [Plan](../.openchamber/plans/20-coach-dashboard-and-replay.md). Grounded coach/AAR,
   modern home/history/session navigation, filtered audit and synchronized new-run
   timed attacker/defender replay with honest historical fallback.
-  *Status 2026-10-27 (branch `practice-upgrades-18-21`, implementation):*
-  commits `76b6cd7`…`7b03388` deliver migration 0025 (append-only
-  `coach_messages` + `operation_outputs`; 0020–0024 byte-unchanged),
-  durable-job coach chat with enqueue-frozen evidence window, bounded
-  timed output capture behind a worker-authenticated idempotent
-  endpoint, paginated/filtered replay v2 with an attacker-by-
-  construction operations track, the honest sessions envelope, and
-  the tabbed dark dashboard/coach/review UI (no new npm deps). 32 new
-  tests across db/containment/agent/browser. Personal re-runs at
-  `7b03388`: fast 661/0, selection, python (offline cache — sandbox
-  DNS down), authority, containment 33/0, agent 122/0, db 295/0,
-  browser 4/0 — all zero failed/skipped; the frontend production
-  audit sub-step is PENDING on registry egress (the full receipts,
-  limitations and carried operator gates are in
-  [findings](FINDINGS_CHECKLIST.md)). Ticked when the audit re-run
-  passes and the parent re-review accepts.
+  *Status 2026-10-27 (branch `practice-upgrades-18-21`, independent
+  review fix round):* the review at `28b1f8b` (VERDICT FIX) reproduced
+  eleven defects; all eleven are root-fixed in `f8d3e3c` (audience-
+  separated coach threads, migration 0026), `e2cb098` (non-blocking
+  sequenced timed capture, atomic all-payload quotas, read-time
+  stamping), `5eb442d` (provenance-bound paged replay,
+  orphan-honest operations, durable-only lifecycle flags) and
+  `bd6167e` (validated-citation UI: only server-approved ids link;
+  epoch-true defender player; read-time chunk placement; fully lazy
+  server-cursor replay paging). Every fix carries a real HTTP /
+  subprocess / disposable-PG / browser counterexample. This round's
+  receipts at `bd6167e`: fast 661/0/0, selection, python, authority
+  35/0, containment, agent 123/0, pve-contract 22/0, db 314/0/0,
+  frontend with the ONLINE audit zero high/critical (the DNS-blocked
+  PENDING cleared), browser 5/0 serialized after frontend, compose,
+  install, hypervisor (labeled TCG) and access — all recorded in
+  [findings](FINDINGS_CHECKLIST.md). capture/images/bundle are blocked
+  solely by the carried pinned-nginx mirror-drift 21 blocker (exact
+  serial evidence there), and packet/journey/release fail closed by
+  design. Ticked when the parent's independent re-review accepts 20;
+  milestone 21 is NOT started.
 - [ ] **21 — Upgrade and qualified integrated release.**
   [Plan](../.openchamber/plans/21-upgrade-and-integrated-release.md). Supported preserving
   in-place upgrade, corrected fresh-install bundle, changed-artifact rebuilds,

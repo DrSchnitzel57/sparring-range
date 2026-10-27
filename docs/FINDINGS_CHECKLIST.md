@@ -1,5 +1,60 @@
 # Current findings and validation evidence
 
+## Plan-20 independent review fix round — 2026-10-27, branch `practice-upgrades-18-21`
+
+Independent review (VERDICT: FIX) at `28b1f8b` reproduced eleven
+defects. All eleven received root fixes with counterexample regressions;
+no applied migration was edited (0020–0025 byte-unchanged; 0026 is the
+only addition). Fix commits on the branch:
+
+| Finding (severity, reproduced) | Root fix | Counterexample proof |
+|---|---|---|
+| 1 (HIGH) operator sealed-coach answer leaked the member follow-up prompt / shared thread | Migration 0026 `coach_messages.audience` + thread partitioning: history, send and pending list are audience-filtered server-side (pending via payload `chat_meta`) | db: two-thread isolation matrix incl. `SEALED_ATTACK_PLAN_BACKDOOR` string asserted absent from the OTHER audience's list, GET and POST paths (updated `test_plan20_coach` + agent wire test) |
+| 2 (HIGH) a hung capture endpoint stalled the pipe reader and the command deadline | `srplatform/red_agent/capture.py` rewritten: bounded queue + one lazily-started daemon consumer; reader only enqueues; `finish()` bounded join with `budget_exceeded` accounting | containment: subprocess test against a REAL socket that never answers — deadline path keeps ticking, chunks land as counted gaps (`test_plan20_capture`, 27 capture+api tests) |
+| 3 (HIGH) quota race: concurrent writers each passed the byte/row check | session-row `SELECT … FOR UPDATE` admission; ALL payload bytes (output/gap/marker) charged vs per-op and per-session caps; row cap 1000 + reserved marker; `dropped_bytes` clamped | db: real concurrent HTTP POSTers against the endpoint — total stored bytes never exceed the budget; the one-time `truncated` marker is unique-index-backed (uq_operation_outputs_truncated_once) |
+| 4 (MEDIUM) defender player assumed cast epoch == session start | `ReplayPanel` tracks `castRel = epoch − t0`: seeks/drift-corrects only inside the cast; exposes `data-player-at` from `getCurrentTime()` | browser: attacker evidence 100 s BEFORE a 40 s cast; seek 105 → player's own reported time ≈5 (and ≈30 at 130); conflating the epochs cannot pass (`test_browser_replay_cast_epoch_and_read_time`) |
+| 5 (MEDIUM) any event mentioning an `op_uuid` entered the attacker track | operations track query filters `actor='red'` (server-set provenance) at the QUERY level; `registered` reported from `run_operations` | db: same-op_uuid system/verifier pairs and NESTED spoof payloads stay out; red positive control still pairs |
+| 6 (MEDIUM) a lone historical `action_result` 500'd | results without intent render INCOMPLETE (`orphan_result`, no invented command/start); chunk requests answer | db: orphan/intent-only/duplicate evidence fixtures over real rows; HTTP 200 + honest shape |
+| 7 (MEDIUM) dashboard hid warnings (prose LIKE-probe) | flags derive ONLY from durable facts: session status/outcome, `matches.state`, `runs.status='cancel-unknown'`, unresolved ops; the LIKE probe is deleted | db+api: the reviewer's interrupted-match repro shows `interrupted`+`cleanup_pending`; finalizing→retry and resolved transitions flip honestly; prose alone never flags |
+| 8 (MEDIUM) citations validated against compressed-away ids; UI linked every `#id` | server validates against ids parsed from the RENDERED compressed timeline; AAR emits `approved_citation_ids`; `md.js` renders non-approved ids as `span.md-cite-unverified` — never an anchor; user-authored rows get an empty allow-list | browser: approved id links and deep-links; `#999999` stays visible, unverified, unlinked; report links all match `?tab=activity&event=<approved>` |
+| 9 (MEDIUM) lost-ack retries renumbered chunks | producer-side monotonic `seq`; retries reuse seq+content; endpoint idempotence protocol `stored/duplicate/conflict/quota` | db: replayed ack-loss sequence yields exactly one row per chunk; same seq + different text = 409 conflict |
+| 10 (MEDIUM) chunks placed at PERSIST time | reader stamps `read_ts` (`sink.feed(chunk, at=time.time())`); UI renders `read_ts ?? ts`; honesty fields `read_timed`/`timing_precision_s` | browser: chunk persisted +620 s read +660 s is ABSENT at clock 630 and PRESENT at 670 — persist-based placement fails this |
+| 11 (MEDIUM) replay pages read ALL casts+operations; client cursor re-consumed collapsed runs | `/replay` returns counts only; new paged `/casts` (recording-id cursor) and `/operations` (raw event cursor); `next_after_event_id` is the RAW last consumed row; chunk rows carry `read_ts` | db: mid-noise-run raw-cursor proof; browser: 450 folded noise events — page cursor is the raw 200th id and the next page ADVANCES; lazy per-command output (0 op outputs fetched at load, 1 at approach) |
+
+### Gate receipts at HEAD `bd6167e` (this fix round; disposable PG fixture owned and removed; libvirt session + labeled TCG where noted)
+
+| gate | result |
+| --- | --- |
+| fast | exit 0 — **661 passed, 0 failed, 0 skipped, 472 deselected**, 6 warnings, 85.3 s |
+| selection | **PASS** 169.1 s |
+| python | **PASS** 4.6 s (registry reachable again after the DNS outage; lock verified) |
+| authority | **PASS** — 35 passed, 0 skipped |
+| containment | **PASS** (incl. the rewritten capture subprocess suite) |
+| agent | **PASS** — 123 passed, 0 failed, 0 skipped |
+| pve-contract | **PASS** — 22 passed, 0 skipped |
+| db | **PASS** — 314 passed, 0 failed, 0 skipped, 819 deselected, 654.3 s; owned resources cleaned |
+| frontend | **PASS** — build + ONLINE `npm audit --omit=dev` **zero high/critical (moderate=0 low=0)**; the previous round's DNS-blocked PENDING is cleared |
+| browser (after frontend) | **PASS** — 5 passed, 0 skipped, 248.8 s (stage5 member loop, plan19 admin, 3× plan20 incl. the new epoch/read-time counterexample) |
+| compose | **PASS** 179.1 s |
+| install | **PASS** — real clean/rerun/upgrade/drift sequences; managed-service half stays the operator's (not accepted from any flag) |
+| hypervisor | **PASS** — 2 passed, 0 skipped, accelerator=explicit-TCG (LABELED software emulation; NOT nested-KVM acceptance) |
+| access | **PASS** — 1 passed: real guest SSH, pinned key, qga marker, recorded `.cast` replay |
+| capture | **FAILED (environment — 21 blocker)**: `test_capture_installed_negatives_on_real_guest` errors at guest build: serial shows `E: Version '1.24.0-2ubuntu7.18' for 'nginx' was not found` → `SR-GUEST-BUILD-APT-FAIL`. Identical root cause to the pinned-nginx mirror drift already carried as milestone 21's supply-chain repair; `git diff 28b1f8b..HEAD -- infra/images/ infra/dev/ srplatform/guest/` touches only the journey client (no image/manifest change) |
+| images | **FAILED (environment — same 21 blocker)** this fix round at 06:58 (revision within `28b1f8b..HEAD`, image build code identical to `bd6167e`): 15 passed, 4 ERRORS, all `SR-GUEST-BUILD-APT-FAIL` on the same missing pinned nginx version |
+| bundle | **FAILED (prerequisite)** — role images come from the images gate (blocked above); with `SR_APPLIANCE_BASE_IMAGE` set the bundle verifies the base but refuses placeholder role bytes |
+| packet | **FAILED (environment, fail-closed)** — needs root + `nft` (approved CI job only; never host namespaces) |
+| journey | **FAILED (prerequisite, fail-closed)** — needs the INSTALLED appliance + operator/member tokens; refused by design |
+| appliance (aggregate) | re-runs the individual gates in order and stops at the images blocker above (receipt `.cache/gate_r6_appliance.log`); nothing the individual gates refuse can pass here |
+| release | **FAILED (prerequisite, fail-closed)** — `SR_LIVE_BASE_URL` live job; "nothing about a release is accepted from a sandbox" |
+
+Carried, unchanged by this round and NOT reopened by it: the nginx/package
+mirror pin reproducibility repair is milestone 21's explicit software
+blocker; installed Strata/UID/proc/systemd/nested-KVM/operator
+qualifications remain NOT PROVEN from this sandbox; hypervisor/access
+receipts are labeled-TCG software emulation. `git status` clean at this
+commit; the round's own PG fixture (`sr-r6pg`) and libvirt session were
+created and removed by this operator.
+
 ## Plan-20 implementation — 2026-10-27, branch `practice-upgrades-18-21`
 
 Conversational coach, bounded timed output capture, replay v2 and the
