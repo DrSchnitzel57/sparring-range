@@ -390,8 +390,11 @@ def _bounded_reader(proc: subprocess.Popen, max_bytes: int,
             break  # EOF
         if sink is not None:
             # plan 20 timed replay: the SEPARATE capture consumer sees every
-            # byte (its own bounded quota), independent of the result buffer
-            sink.feed(chunk)
+            # byte (its own bounded quota), independent of the result
+            # buffer. The READ INSTANT travels with the bytes (finding 10)
+            # and hand-off never blocks on the network (finding 2): a slow
+            # capture endpoint cannot stretch this loop or the deadline.
+            sink.feed(chunk, at=time.time())
         if len(buf) < max_bytes:
             buf.extend(chunk[: max_bytes - len(buf)])
         # past the bound: keep draining (prevents pipe deadlock) without keeping

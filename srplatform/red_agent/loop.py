@@ -164,9 +164,10 @@ class RedAgentLoop:
         s = get_settings()
         transport = self.transport
 
-        def _emit(seq, kind, text, dropped):
+        def _emit(seq, kind, text, dropped, read_ts=None):
             return transport.append_output(op_uuid, seq, kind, text=text,
-                                           dropped_bytes=dropped)
+                                           dropped_bytes=dropped,
+                                           read_ts=read_ts)
         return OutputCapture(_emit, chunk_bytes=s.runner_output_chunk_bytes,
                              quota_bytes=s.runner_op_capture_bytes)
 

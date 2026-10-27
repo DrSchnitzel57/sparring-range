@@ -1833,81 +1833,177 @@ def complete_run_operation(run_id: uuid.UUID, op_id: str, body: OperationDoneIn,
     return {"ok": True, "updated": res.rowcount}
 
 
+# Independent review findings 3/9 (FIX round): the server is the quota
+# authority for EVERY payload it stores — output text, gap text, the
+# truncation marker itself and claimed drop counts. A single chunk may
+# never exceed this text bound (workers chunk far below it), and a
+# worker-claimed dropped-byte total is clamped, never trusted.
+_CAPTURE_MAX_TEXT_BYTES = 64 * 1024
+_CAPTURE_MAX_CLAIMED_DROPPED = 1_000_000_000
+
+
 class OperationOutputIn(BaseModel):
-    seq: int = Field(ge=0)
+    seq: int = Field(ge=0, le=10_000_000)
     kind: str = "output"            # output | gap | truncated
     text: str | None = None
     dropped_bytes: int | None = Field(default=None, ge=0)
+    read_ts: float | None = Field(default=None, ge=0, lt=1e12)
+
+
+def _capture_quota_response(db, run_id, session_id, op_id, dropped):
+    """Honest refusal once any authoritative budget is closed. Exactly
+    ONE truncated marker per operation exists — the partial unique index
+    (run_id, op_id) WHERE kind='truncated' makes even the racing second
+    marker a database impossibility (finding 3)."""
+    from sqlalchemy import func as sa_func
+    from srplatform.db.models import OperationOutput
+    exists = db.execute(
+        select(OperationOutput.id)
+        .where(OperationOutput.run_id == run_id,
+               OperationOutput.op_id == op_id,
+               OperationOutput.kind == "truncated")
+        .limit(1)).first()
+    if exists is None:
+        next_seq = db.execute(
+            select(sa_func.coalesce(sa_func.max(OperationOutput.seq), -1))
+            .where(OperationOutput.run_id == run_id,
+                   OperationOutput.op_id == op_id)).scalar()
+        db.execute(OperationOutput.__table__.insert().values(
+            run_id=run_id, session_id=session_id, op_id=op_id,
+            seq=int(next_seq) + 1, kind="truncated",
+            text="server capture quota reached — further chunks were "
+                 "not stored",
+            dropped_bytes=dropped))
+    db.commit()
+    return JSONResponse({"ok": True, "status": "quota"}, status_code=200)
 
 
 @app.post("/internal/runs/{run_id}/operations/{op_id}/output", status_code=201)
-def append_operation_output(run_id: uuid.UUID, op_id: str, body: OperationOutputIn,
+def append_operation_output(run_id: uuid.UUID, op_id: str,
+                            body: OperationOutputIn,
                             x_worker_token: str | None = Header(default=None),
                             db: DbSession = None):
-    """Append one bounded output chunk for a REGISTERED operation (plan 20
-    timed replay). Worker-token authenticated, and:
+    """Append one bounded output chunk for a REGISTERED operation (plan
+    20 timed replay; hardened per the independent review).
 
-    * identity is unique ``(run_id, op_id, seq)`` — worker re-delivery after
-      a hiccup lands on ON CONFLICT DO NOTHING, never duplicate rows;
-    * the SERVER enforces the per-operation capture quota independently of
-      the worker (client honesty is never the only fence). Past the quota
-      nothing more is stored and exactly ONE ``truncated`` marker row
-      exists per operation;
+    Worker-token authenticated, and:
+
+    * EVERY stored byte counts — output text, gap text and the marker
+      are all bound by per-operation and per-session byte budgets plus
+      a per-operation ROW cap (finding 3: the old code charged only
+      non-empty output text, so markers/gaps were unbounded);
+    * admission is ATOMIC: all budget/row reads and the insert happen
+      under the session row lock (SELECT … FOR UPDATE), never a racy
+      count-then-insert (finding 3);
+    * re-delivery of identical content at a known ``(run_id, op_id,
+      seq)`` answers ``duplicate`` (idempotent success); different
+      content at the same seq answers ``conflict`` — never silently,
+      never overwriting (finding 9);
+    * exactly ONE ``truncated`` marker exists per operation, enforced
+      by a partial unique index, and worker-claimed drop totals are
+      clamped, not trusted;
+    * ``read_ts`` (the worker's observed pipe-read instant) is stored
+      separately from the row's persist time (finding 10) — replay
+      timing never silently degrades to persist time unlabelled;
     * chunks attach only to an operation the worker registered BEFORE
       dispatch — orphans (forged op ids) are refused.
     """
-    from sqlalchemy import func as sa_func
     from sqlalchemy.dialects.postgresql import insert as pg_insert
-    from srplatform.db.models import OperationOutput, RunOperation
+    from srplatform.db.models import (OperationOutput, RunOperation,
+                                       Session as SessionModel)
     run = _require_worker(db, run_id, x_worker_token)
     if body.kind not in ("output", "gap", "truncated"):
         raise HTTPException(422, "kind must be output, gap or truncated")
+    if body.text is not None and body.text == "" and body.kind == "output":
+        raise HTTPException(422, "output chunks must carry text")
+    if body.text is not None and \
+            len(body.text.encode("utf-8", "replace")) > _CAPTURE_MAX_TEXT_BYTES:
+        raise HTTPException(422, "chunk text exceeds the server bound")
     registered = db.execute(
         select(RunOperation.id).where(RunOperation.run_id == run_id,
                                       RunOperation.op_id == op_id)
         .limit(1)).first()
     if registered is None:
         raise HTTPException(404, "operation not registered for this run")
-    stored = True
-    reason = None
-    if body.kind == "output" and body.text:
-        total = db.execute(
-            select(sa_func.coalesce(sa_func.sum(
-                sa_func.octet_length(OperationOutput.text)), 0))
-            .where(OperationOutput.run_id == run_id,
-                   OperationOutput.op_id == op_id,
-                   OperationOutput.kind == "output")).scalar() or 0
+
+    dropped = body.dropped_bytes
+    if dropped is not None and dropped > _CAPTURE_MAX_CLAIMED_DROPPED:
+        dropped = _CAPTURE_MAX_CLAIMED_DROPPED
+
+    # ---- atomic admission: serialize every store for this session ----
+    db.execute(select(SessionModel.session_id)
+               .where(SessionModel.session_id == run.session_id)
+               .with_for_update())
+
+    existing = db.execute(
+        select(OperationOutput.kind, OperationOutput.text)
+        .where(OperationOutput.run_id == run_id,
+               OperationOutput.op_id == op_id,
+               OperationOutput.seq == body.seq)
+        .limit(1)).first()
+    if existing is not None:
+        db.commit()
+        if existing[0] == body.kind and existing[1] == body.text:
+            return JSONResponse({"ok": True, "status": "duplicate"},
+                                status_code=200)
+        return JSONResponse({"ok": True, "status": "conflict"},
+                            status_code=200)
+
+    s = get_settings()
+    if body.text:
+        from sqlalchemy import func as sa_func
         incoming = len(body.text.encode("utf-8", "replace"))
-        if total + incoming > get_settings().runner_op_capture_bytes:
-            stored = False
-            reason = "quota"
-    if stored:
-        res = db.execute(
-            pg_insert(OperationOutput)
-            .values(run_id=run_id, session_id=run.session_id, op_id=op_id,
-                    seq=body.seq, kind=body.kind, text=body.text,
-                    dropped_bytes=body.dropped_bytes)
-            .on_conflict_do_nothing(
-                index_elements=["run_id", "op_id", "seq"]))
-        if res.rowcount == 0:
-            stored, reason = False, "duplicate"
-    if not stored and reason == "quota":
-        # exactly one honest marker; later quota rejections are no-ops
-        exists = db.execute(
-            select(OperationOutput.id)
+
+        def _op_bytes():
+            # EVERY stored text counts against the operation budget —
+            # output, gap and marker alike (finding 3: charging only
+            # non-empty output text made gap/marker rows unbounded)
+            return db.execute(
+                select(sa_func.coalesce(
+                    sa_func.sum(sa_func.octet_length(OperationOutput.text)), 0))
+                .where(OperationOutput.run_id == run_id,
+                       OperationOutput.op_id == op_id)).scalar() or 0
+
+        def _sess_bytes():
+            return db.execute(
+                select(sa_func.coalesce(
+                    sa_func.sum(sa_func.octet_length(OperationOutput.text)), 0))
+                .where(OperationOutput.session_id == run.session_id)).scalar() \
+                or 0
+
+        def _op_rows():
+            return db.execute(
+                select(sa_func.count())
+                .where(OperationOutput.run_id == run_id,
+                       OperationOutput.op_id == op_id)).scalar() or 0
+
+        if (incoming > s.runner_op_capture_bytes
+                or _op_bytes() + incoming > s.runner_op_capture_bytes
+                or _sess_bytes() + incoming > s.runner_session_capture_bytes
+                or _op_rows() >= s.runner_op_capture_rows):
+            return _capture_quota_response(db, run_id, run.session_id, op_id,
+                                           dropped)
+
+    res = db.execute(
+        pg_insert(OperationOutput)
+        .values(run_id=run_id, session_id=run.session_id, op_id=op_id,
+                seq=body.seq, kind=body.kind, text=body.text,
+                dropped_bytes=dropped, read_ts=body.read_ts)
+        .on_conflict_do_nothing(index_elements=["run_id", "op_id", "seq"]))
+    if res.rowcount == 0:
+        # cannot happen under the session lock with the pre-check, but a
+        # conflict is NEVER silently folded into success
+        row = db.execute(
+            select(OperationOutput.kind, OperationOutput.text)
             .where(OperationOutput.run_id == run_id,
                    OperationOutput.op_id == op_id,
-                   OperationOutput.kind == "truncated")
-            .limit(1)).first()
-        if exists is None:
-            db.execute(OperationOutput.__table__.insert().values(
-                run_id=run_id, session_id=run.session_id, op_id=op_id,
-                seq=body.seq, kind="truncated",
-                text="server capture quota reached — further chunks were "
-                     "not stored",
-                dropped_bytes=body.dropped_bytes))
+                   OperationOutput.seq == body.seq)).first()
+        db.commit()
+        status = "duplicate" if row and row[0] == body.kind and row[1] == body.text \
+            else "conflict"
+        return JSONResponse({"ok": True, "status": status}, status_code=200)
     db.commit()
-    return {"ok": True, "stored": stored, "reason": reason}
+    return {"ok": True, "status": "stored"}
 
 
 # --- trusted verification (backend executes; request is not a result) ----------

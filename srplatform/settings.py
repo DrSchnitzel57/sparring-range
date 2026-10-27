@@ -200,6 +200,11 @@ class Settings(BaseSettings):
     # quota independently (client honesty is never the only fence).
     runner_output_chunk_bytes: int = 4096
     runner_op_capture_bytes: int = 200_000
+    # Review finding 3: rows and the whole session are bounded too — a
+    # flood of gap/marker rows or many concurrent operations cannot
+    # out-grow the per-operation byte quota.
+    runner_op_capture_rows: int = 1000
+    runner_session_capture_bytes: int = 5_000_000
     # --- telemetry enrollment evidence bounds (audit T-05) --------------
     # How long provisioning waits for the HOST-ORIGINATED authenticated
     # callback (delivery) and for the capture probe's audit event (capture).
