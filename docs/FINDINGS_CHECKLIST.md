@@ -1,5 +1,142 @@
 # Current findings and validation evidence
 
+## Plan-19 review ROUND 4 — 2026-10-27, branch `practice-upgrades-18-21`
+
+The FOURTH independent review (SOURCE-ONLY — no reviewer tests ran)
+returned **VERDICT: FIX** at `b7ea7cd` with three source findings (one
+HIGH TOCTOU in the round-3 rollback compensation itself, two MEDIUM:
+the 0023 fence could not reach pre-0023 escaped chains, and a
+cessation RESOLUTION was being accepted as compaction SUCCESS) plus two
+test-quality gaps (the claim-race `is_alive()` guess; a pin "proof" that
+created its session after the edits). Every one was reproduced at root
+and fixed; commits `069491f` (fixes) and `12ecbcb` (tests). Applied
+migrations 0020–0023 verified BYTE-UNCHANGED (`git diff` over those
+files empty in both round-3 and round-4 ranges); the new schema work is
+forward, data-only migration **0024** (head → 0024; `downgrade` is a
+deliberate no-op — erasing the fence would re-arm the dispatch it
+closes).
+
+### Reproduced defects and fix→proof map (pre-fix behavior, exact)
+
+- **R4-F1 HIGH — rollback compensation could resurrect a revoked key.**
+  The round-3 restore read the profile's COMMITTED status through a
+  fresh session, **closed it**, and only then called `set_key`: a revoke
+  committing in that check→write window deleted the credential, and the
+  compensation recreated it for a profile an operator had just killed
+  (a status check alone is not serialization). Fix: the restore now
+  takes **FOR UPDATE on the same profile row a revocation locks to
+  change status** and holds it across check + secret write + commit
+  (bounded `SET LOCAL lock_timeout='10s'`; a timeout is a recorded
+  durable repair obligation, never a silent success). Proof: the TOCTOU
+  test forces the revocation to arrive while the restore is INSIDE the
+  write, and `pg_stat_activity` **shows** the revoke backend parked on
+  a lock wait before the write is released — ordering becomes total;
+  final state: credential stays deleted, profile stays revoked. A
+  positive control proves a legitimate rolled-back delete still
+  restores (the fence is not a silent refusal).
+- **R4-F2 MEDIUM — migration 0023 left pre-0023 escaped chains
+  dispatchable.** 0023 could only stamp `cancel_intent = false` on rows
+  that already existed and backfill chain identity; a `cancelled` root
+  with `queued` retry children — the exact state the old defect
+  produced — survived the upgrade with clean flags, and admission and
+  execution consulted only the candidate's own flags. Fix (forward,
+  never editing applied migrations): **0024** reconciles populated
+  pre-0023 databases — every row of a chain CONTAINING a cancelled row
+  gets the durable intent, `queued` members become `cancelled` with an
+  honest reconciliation note, while `running`/`cessation_unknown` rows
+  KEEP their state (an uncertain cessation is an obligation; the slot
+  stays held). The claim statement and the executor gained the same
+  chain-level fence (`COALESCE(chain_root, job_id)` containing a
+  cancelled row) — fail-closed reconciliation BEFORE any dispatch. An
+  ordinary FAILED parent with a queued retry child is explicitly NOT
+  fenced (a failed attempt is not a cancelled logical request). Proof:
+  a second disposable database migrated to **0022 by the real Alembic
+  CLI**, populated using ONLY old-schema columns, upgraded to head; the
+  **production `_CLAIM_SQL` itself** then verifies escaped chains are
+  unfetchable, the ordinary retry is admitted once the slot is free,
+  and running rows survive via `reconcile_startup` as
+  `cessation_unknown` obligations. Runtime half: an escaped child never
+  claims; a forced legacy claim reconciles to `cancelled` (fence note)
+  with **zero provider requests**, and the grandchild settles too.
+- **R4-F3 MEDIUM — cessation resolution is not compaction success.**
+  `_dep_chain_state` accepted `cessation_resolved` as prerequisite
+  success, but `resolve_cessation` is an operator slot-release
+  ATTESTATION — it creates no summary and no checkpoint — so after an
+  uncertain summary was audited away the gated turn could dispatch the
+  uncompacted, over-budget context. Fix: dependency success requires
+  the chain-final attempt to be genuinely `succeeded`, AND (for a
+  summarize prerequisite) its coverage-bounded checkpoint row with the
+  exact `covers_through` must exist (`_checkpoint_persisted`; a new
+  `no-checkpoint` verdict otherwise). `cessation_resolved` is now an
+  honest `failed-final`. Proof: client-timeout summary → audited
+  `resolve_cessation` → gated turn **refuses** (error names
+  `cessation_resolved`, nothing was sent to the provider);
+  succeeded-without-checkpoint refuses likewise naming the missing
+  checkpoint; the positive control 500 → bounded retry → checkpoint →
+  dispatch runs the native turn **exactly once**, and the FIFO shape
+  proves admission correctly skipped the gated turn while the chain
+  could recover.
+- **Test quality (reviewer items):** the round-3 claim-race
+  `t.join(timeout); is_alive()` guess is replaced by the same explicit
+  `_await_lock_wait` barrier (PostgreSQL itself reports the victim
+  backend on a lock wait) — no test anywhere now assumes thread
+  scheduling. The pin proof now FREEZES the pin at the session's first
+  served turn while v1 is live, then points v2 at a dead URL and
+  same-key-resaves v3 — the pinned session's next call is still served
+  by v1 over the real wire (the pre-fix form failed exactly this way,
+  which is what made it a real proof). Round-3's positive dependency
+  test was updated to carry the real `persist`/`covers_through` range
+  so its summarize lands a genuine checkpoint under the reworked logic.
+
+### Round-4 gate receipts — all personally run at `12ecbcb` (tree clean), serialized, logs under `.cache/gate_r4_*.log`
+
+Fast default: `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -ra -p
+no:cacheprovider` → exit 0: **661 passed, 0 failed, 0 skipped, 409
+deselected**, 6 warnings, 84.32 s. Combined disposable-PG sweep
+`-m "agent or db"` (tree identical to `12ecbcb`, run-owned container):
+**311 passed, 0 failed**, 759 deselected, 747.84 s (`.cache/r4_sweep.log`).
+
+Environment for the libvirt/QEMU gates (this runner has **no
+`/dev/kvm`**; boots are explicitly labeled TCG, never claimed as
+nested-KVM acceptance): `. .cache/libvirt-debs/env.sh` + `PATH` incl.
+`.cache/libvirt-debs/root/usr/sbin` + `SR_APPLIANCE_BASE_IMAGE` = the
+base **rebuilt at this checkpoint** by the documented no-root path
+(`infra/images/appliance_base.py`, pinned checksum-verified Ubuntu
+cloud image, sha256 `6b1fbc…d2b2f`) + `TMPDIR=/var/tmp/sr-gate`.
+
+| Gate | Result | Exact receipt |
+|---|---|---|
+| selection | PASS 162.3 s | every test classified; fast default **661 passed, 0 skipped, 409 deselected** (required mode) |
+| python | PASS 5.1 s | locked install + deps + entrypoint imports, Python 3.13 |
+| pve-contract | PASS 27.1 s | legacy contract **22 passed, 0 skipped** (required mode) |
+| authority | PASS 26.6 s | broker boundary/durability/cessation **35 passed, 0 skipped** |
+| containment | PASS 20.5 s | execution/cessation boundaries **26 passed, 0 skipped**; no leaked run-owned cgroups |
+| install | PASS 6.6 s | REAL sandbox install sequences; managed-service VM half stays operator-run |
+| db | PASS 633.2 s | disposable PostgreSQL 16: **270 passed, 0 skipped, 800 deselected** — incl. both real-Alembic 0022→head populated-upgrade tests; fixture container removed, `no srtest_*/sr_* databases or roles remain` |
+| agent | PASS 146.9 s | real wire + disposable PG: **117 passed, 0 failed, 0 skipped, 953 deselected** — includes all 8 round-4 deterministic-barrier/wire tests |
+| frontend | PASS 9.5 s | production audit: zero high/critical |
+| browser | PASS 107.0 s | isolated real-browser workflows **2 passed, 0 skipped** — serialized immediately after frontend |
+| compose | PASS 71.6 s | compose project boots, serves, fully removed |
+| hypervisor | PASS 268.6 s | real libvirt clone/start/QGA/host-key/ownership/stop/destroy, accelerator **explicit TCG** (labeled) |
+| access | PASS 142.5 s | real Ubuntu guest SSH + recording bastion flows on the freshly rebuilt base |
+| images | **FAILED (environment) — NOT accepted** | 1770.6 s: 15 passed, 4 setup ERRORS. Root cause chain, exactly: the warm role-image cache was destroyed by a host disk cleanup, and the pinned guest package versions in `infra/images/packages-24.04.txt` have since **drifted out of the Ubuntu mirrors** — the build guest's own apt reported `E: Version '1.24.0-2ubuntu7.18' for 'nginx' was not found` → `SR-GUEST-BUILD-APT-FAIL` (serial preserved at `/tmp/opencode/sr-gate-debug/guest.serial.serial.log`). Deterministic mirror version removal (successful index fetch, package found, pinned version gone), ~6 days after milestone 15 built the identical list. Repair requires a documented package-pin refresh — a release-engineering/supply-chain decision that does NOT belong inside a model-jobs review round and changes artifact identity under the reviewer's feet. Milestone 15 also recorded that a COLD role-image build under TCG (no `/dev/kvm`) exceeds the built-in 1500 s serial-marker timeout even when apt works, so a pin refresh on THIS host is not a guaranteed pass either. |
+| capture | **PENDING (environment)** | the capture overlay's own `guest_build.build_overlay` step installs the SAME `packages-24.04.txt` pins through the SAME guest-apt path (see `infra/images/guest_userdata.py` install line) — it deterministically reproduces the images failure above before any capture assertion runs; deliberately not re-run to burn a known-failing 30-minute boot. No PASS claimed. |
+| bundle | **FAILED (fail-closed prerequisite) — PENDING on images** | 0.0 s: `release bundle role artifacts — no mojang-web-local image found …build the role images first (the images gate)` — the gate refuses placeholder bytes exactly as designed. No PASS claimed at this checkpoint. |
+| appliance (aggregate) | not re-run by design | it re-runs every individual software gate; each already received a fresh receipt above at `12ecbcb` (its compose-build half is the passed `compose` gate). Re-running the aggregate would duplicate compute, not add evidence. |
+| packet | PENDING (operator) | needs root + `nft`; fails closed naming them (round-3 receipt). Not re-run — recorded pending per operator instruction. |
+| journey | PENDING (operator) | needs the INSTALLED appliance + the eight `SR_JOURNEY_*` operator inputs; fails closed by design. Not re-run. |
+| release | PENDING (operator) | needs `SR_LIVE_BASE_URL` on the deployed lab; nothing is accepted from a sandbox. Not re-run. |
+
+Scope note for the images/capture/bundle situation: the round-4 diff
+(`git diff b7ea7cd..HEAD`) touches ONLY `srplatform/model_jobs.py`,
+`srplatform/model_admin.py`, migration 0024, and plan-19 tests — zero
+`infra/images`, deployment, or appliance paths. Milestone 19's own
+acceptance criteria (plan §Acceptance 1–6) are fully covered by the
+PASS rows above; the heavy image lane belongs to the images/release
+milestones and its blocker is recorded truthfully rather than forced
+green or papered over with silent pin edits.
+
 ## Plan-19 review ROUND 3 — 2026-10-26, branch `practice-upgrades-18-21`
 
 The THIRD independent review returned **VERDICT: FIX** at `e311ff9` with
@@ -157,11 +294,14 @@ explicitly labeled TCG, never claimed as nested-KVM acceptance).
 | packet | FAILED (environment) — operator gate, PENDING | missing prerequisites `['root', 'nft']` — fails closed naming the exact missing pieces; rules apply only in disposable netns on an approved CI job; never simulated |
 | journey | FAILED (prerequisite) — operator gate, PENDING | missing `SR_JOURNEY_BASE_URL`, operator/member tokens, SSH key, bastion known-hosts, browser URL/user/password — needs the INSTALLED appliance; fails closed by design |
 | release | FAILED (live layer) — operator gate, PENDING | requires `SR_LIVE_BASE_URL` (deployed lab); nothing about a release is accepted from a sandbox; never executed here |
-| appliance | *(running at this commit; receipt appended in the following docs commit)* | |
-| bundle | *(queued behind appliance; receipt appended)* | |
-| access | *(queued — serialized heavy lane)* | |
-| images | *(queued — serialized heavy lane)* | |
-| capture | *(queued — serialized heavy lane)* | |
+
+*(The five heavy-lane rows this section left as "running/queued" —
+appliance, bundle, access, images, capture — became moot at this
+revision before settling: the host disk cleanup destroyed the warm
+role-image/base cache mid-lane and the `/tmp` rotation lost those early
+run logs. Fresh receipts for every heavy gate at the current checkpoint
+`12ecbcb` are in the ROUND 4 section above; nothing here claims a result
+the round-4 table does not repeat.)*
 
 ## Plan-19 review ROUND 2 — 2026-10-25, branch `practice-upgrades-18-21`
 
