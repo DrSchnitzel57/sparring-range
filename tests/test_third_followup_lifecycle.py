@@ -231,7 +231,7 @@ def _run_client_255(runner, op, state, script):
         return real_popen(*a, **k)
 
     R.subprocess.Popen = fake_popen
-    R._bounded_reader = lambda proc, max_bytes, deadline=None: (b"", False)
+    R._bounded_reader = lambda proc, max_bytes, deadline=None, sink=None: (b"", False)
     try:
         return runner.run("true", timeout=8, op_id=op)
     finally:

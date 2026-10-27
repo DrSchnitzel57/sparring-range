@@ -24,6 +24,11 @@ class Transport(Protocol):
     def register_operation(self, op_uuid: str, kind: str = "remote") -> None: ...
     def complete_operation(self, op_uuid: str, state: str = "completed",
                            detail: str | None = None) -> None: ...
+    # plan 20 timed output capture (implemented by the real transports; the
+    # loop only builds a capture sink when append_output is present)
+    def append_output(self, op_uuid: str, seq: int, kind: str,
+                      text: str | None = None,
+                      dropped_bytes: int | None = None) -> bool: ...
 
 
 PAGE = 1000
@@ -78,6 +83,25 @@ class HttpTransport:
         self.client.post(f"/internal/runs/{self.run_id}/operations/{op_uuid}/done",
                          json={"state": state, "detail": detail},
                          headers={"X-Worker-Token": self.token or ""}).raise_for_status()
+
+    def append_output(self, op_uuid: str, seq: int, kind: str,
+                      text: str | None = None,
+                      dropped_bytes: int | None = None) -> bool:
+        """Deliver one timed output chunk. NEVER raises: capture is
+        additive evidence — a failed POST is counted as a gap by the
+        capture and must never break the command or the stop path."""
+        if not self.run_id:
+            return False
+        try:
+            r = self.client.post(
+                f"/internal/runs/{self.run_id}/operations/{op_uuid}/output",
+                json={"seq": seq, "kind": kind, "text": text,
+                      "dropped_bytes": dropped_bytes},
+                headers={"X-Worker-Token": self.token or ""},
+                timeout=10)
+            return r.status_code in (200, 201) and bool(r.json().get("stored", True))
+        except Exception:  # noqa: BLE001 — honest gap, never an abort
+            return False
 
     def log_event(self, event: dict) -> None:
         self.client.post("/events", json=event).raise_for_status()
@@ -134,6 +158,21 @@ class TestClientTransport:
                         json={"state": state, "detail": detail},
                         headers={"X-Worker-Token": self.token or ""})
         r.raise_for_status()
+
+    def append_output(self, op_uuid: str, seq: int, kind: str,
+                      text: str | None = None,
+                      dropped_bytes: int | None = None) -> bool:
+        if not self.run_id:
+            return False
+        try:
+            r = self.c.post(
+                f"/internal/runs/{self.run_id}/operations/{op_uuid}/output",
+                json={"seq": seq, "kind": kind, "text": text,
+                      "dropped_bytes": dropped_bytes},
+                headers={"X-Worker-Token": self.token or ""})
+            return r.status_code in (200, 201) and bool(r.json().get("stored", True))
+        except Exception:  # noqa: BLE001 — capture never breaks the run
+            return False
 
     def log_event(self, event: dict) -> None:
         self.c.post("/events", json=event, headers=self.headers).raise_for_status()

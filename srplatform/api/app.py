@@ -1773,6 +1773,83 @@ def complete_run_operation(run_id: uuid.UUID, op_id: str, body: OperationDoneIn,
     return {"ok": True, "updated": res.rowcount}
 
 
+class OperationOutputIn(BaseModel):
+    seq: int = Field(ge=0)
+    kind: str = "output"            # output | gap | truncated
+    text: str | None = None
+    dropped_bytes: int | None = Field(default=None, ge=0)
+
+
+@app.post("/internal/runs/{run_id}/operations/{op_id}/output", status_code=201)
+def append_operation_output(run_id: uuid.UUID, op_id: str, body: OperationOutputIn,
+                            x_worker_token: str | None = Header(default=None),
+                            db: DbSession = None):
+    """Append one bounded output chunk for a REGISTERED operation (plan 20
+    timed replay). Worker-token authenticated, and:
+
+    * identity is unique ``(run_id, op_id, seq)`` — worker re-delivery after
+      a hiccup lands on ON CONFLICT DO NOTHING, never duplicate rows;
+    * the SERVER enforces the per-operation capture quota independently of
+      the worker (client honesty is never the only fence). Past the quota
+      nothing more is stored and exactly ONE ``truncated`` marker row
+      exists per operation;
+    * chunks attach only to an operation the worker registered BEFORE
+      dispatch — orphans (forged op ids) are refused.
+    """
+    from sqlalchemy import func as sa_func
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from srplatform.db.models import OperationOutput, RunOperation
+    run = _require_worker(db, run_id, x_worker_token)
+    if body.kind not in ("output", "gap", "truncated"):
+        raise HTTPException(422, "kind must be output, gap or truncated")
+    registered = db.execute(
+        select(RunOperation.id).where(RunOperation.run_id == run_id,
+                                      RunOperation.op_id == op_id)
+        .limit(1)).first()
+    if registered is None:
+        raise HTTPException(404, "operation not registered for this run")
+    stored = True
+    reason = None
+    if body.kind == "output" and body.text:
+        total = db.execute(
+            select(sa_func.coalesce(sa_func.sum(
+                sa_func.octet_length(OperationOutput.text)), 0))
+            .where(OperationOutput.run_id == run_id,
+                   OperationOutput.op_id == op_id,
+                   OperationOutput.kind == "output")).scalar() or 0
+        incoming = len(body.text.encode("utf-8", "replace"))
+        if total + incoming > get_settings().runner_op_capture_bytes:
+            stored = False
+            reason = "quota"
+    if stored:
+        res = db.execute(
+            pg_insert(OperationOutput)
+            .values(run_id=run_id, session_id=run.session_id, op_id=op_id,
+                    seq=body.seq, kind=body.kind, text=body.text,
+                    dropped_bytes=body.dropped_bytes)
+            .on_conflict_do_nothing(
+                index_elements=["run_id", "op_id", "seq"]))
+        if res.rowcount == 0:
+            stored, reason = False, "duplicate"
+    if not stored and reason == "quota":
+        # exactly one honest marker; later quota rejections are no-ops
+        exists = db.execute(
+            select(OperationOutput.id)
+            .where(OperationOutput.run_id == run_id,
+                   OperationOutput.op_id == op_id,
+                   OperationOutput.kind == "truncated")
+            .limit(1)).first()
+        if exists is None:
+            db.execute(OperationOutput.__table__.insert().values(
+                run_id=run_id, session_id=run.session_id, op_id=op_id,
+                seq=body.seq, kind="truncated",
+                text="server capture quota reached — further chunks were "
+                     "not stored",
+                dropped_bytes=body.dropped_bytes))
+    db.commit()
+    return {"ok": True, "stored": stored, "reason": reason}
+
+
 # --- trusted verification (backend executes; request is not a result) ----------
 class VerifierCheckIn(BaseModel):
     objective_id: str

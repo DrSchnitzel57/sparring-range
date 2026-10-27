@@ -193,6 +193,13 @@ class Settings(BaseSettings):
     runner_supervisor_bin: str = "runner-supervisor"
     runner_command_timeout_s: int = 120
     runner_max_output_bytes: int = 8000
+    # plan 20 timed replay: per-operation bounded output capture, a SEPARATE
+    # and larger quota than the model-context bound above (what the replay
+    # stores must not shrink what the model sees, or vice versa). Chunks are
+    # POSTed through the API as they are read; the server enforces the same
+    # quota independently (client honesty is never the only fence).
+    runner_output_chunk_bytes: int = 4096
+    runner_op_capture_bytes: int = 200_000
     # --- telemetry enrollment evidence bounds (audit T-05) --------------
     # How long provisioning waits for the HOST-ORIGINATED authenticated
     # callback (delivery) and for the capture probe's audit event (capture).
