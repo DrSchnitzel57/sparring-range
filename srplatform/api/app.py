@@ -119,6 +119,44 @@ async def _ingest_only_guard(request, call_next):
     return await call_next(request)
 
 
+#: Paths that may still CHANGE state while the admission fence is up:
+#: they complete or authenticate EXISTING work, they never admit new
+#: engagements. Blocking them would strand in-flight runs un-terminalized.
+_FENCE_EXEMPT_PATHS = frozenset({
+    "/auth/login", "/auth/logout", "/healthz", "/readyz",
+    "/enroll/confirm", "/ingest/auditd",
+})
+_FENCE_EXEMPT_PREFIXES = ("/internal/",)  # worker/supervisor callbacks
+_FENCE_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+@app.middleware("http")
+async def _maintenance_fence(request, call_next):
+    """Plan 21 preserving upgrade: while the fence FILE exists the API is
+    the business-logic front door for NEW work — and new work is refused.
+    The upgrade creates the file before its quiescence is consumed and
+    removes it only after the restarted services are verified, so no
+    request can race the check/mutation boundary. Fail-open would defeat
+    the fence: a stat() error is treated as fenced."""
+    import pathlib
+    from srplatform.settings import get_settings as _gs
+    s = _gs()
+    try:
+        if not pathlib.Path(s.maintenance_flag).exists():
+            return await call_next(request)
+    except OSError:
+        pass  # unreadable flag location: treat as fenced (fail closed)
+    if (request.method in _FENCE_WRITE_METHODS
+            and request.url.path not in _FENCE_EXEMPT_PATHS
+            and not request.url.path.startswith(_FENCE_EXEMPT_PREFIXES)):
+        return JSONResponse(
+            {"detail": "maintenance: the appliance is completing a "
+                       "preserving upgrade; new work is refused",
+             "retry_after_s": 30},
+            status_code=503, headers={"Retry-After": "30"})
+    return await call_next(request)
+
+
 # The ONE shared request DB session (function scope — commit completes before
 # the response is sent; see srplatform/api/deps.py for why) and the auth
 # dependencies built on it.

@@ -274,15 +274,19 @@ def build(output: pathlib.Path, *, base_image: pathlib.Path,
             "migrations": "srplatform/db/migrations/versions",
             "bundle_version": BUNDLE_VERSION,
             "revision": manifest_revision,
-            "command": "python deploy/appliance.py upgrade --manifest "
-                       "manifest.json --payload <this bundle> --db-url "
-                       "$POSTGRES_URL_OWNER",
-            "notes": "preserving in-place upgrade: journal first, private "
-                     "config + database backups, digest-verified staging, "
-                     "per-file atomic activation, forward-only migrations, "
-                     "ordered service reload; data, keys and the ledger "
-                     "are never deleted, and unknown in-flight work is "
-                     "refused until resolved",
+            "command": "SR_PG_UPGRADE_URL=... python deploy/appliance.py "
+                       "upgrade --manifest manifest.json --payload <this "
+                       "bundle>  # owner URL via environment ONLY: a URL "
+                       "with a credential must never be a process argument",
+            "notes": "preserving in-place upgrade: journal first, admission "
+                     "fence, private config + database backups (password "
+                     "via private PGPASSFILE, never argv), digest-verified "
+                     "staging, per-file atomic activation, provisioning of "
+                     "the locked runtime + frontend BEFORE migration, "
+                     "forward-only migrations, checked service restart with "
+                     "readiness, version stamp last; data, keys and the "
+                     "ledger are never deleted, and unknown in-flight work "
+                     "is refused until resolved",
         },
     }
     (output / MANIFEST_NAME).write_text(

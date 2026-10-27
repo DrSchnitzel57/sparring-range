@@ -26,7 +26,9 @@ Usage::
     python deploy/appliance.py apply    --manifest M [--prefix PREFIX] [--dry-run]
     python deploy/appliance.py status   --manifest M [--json]
     python deploy/appliance.py doctor   --manifest M [--json]
-    python deploy/appliance.py upgrade  --manifest M --payload BUNDLE [--db-url URL]
+    python deploy/appliance.py upgrade  --manifest M --payload BUNDLE
+        # owner URL via the environment ONLY (default $SR_PG_UPGRADE_URL):
+        # SR_PG_UPGRADE_URL=... appliance.py upgrade --manifest M --payload B
     python deploy/appliance.py upgrade  --manifest M --restore-config ATTEMPT
     python deploy/appliance.py recovery status --manifest M
     python deploy/appliance.py recovery reconcile --manifest M
@@ -1668,8 +1670,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="the release bundle to upgrade to (built by "
                          "deploy/bundle.py; carries the MANIFEST upgrade "
                          "contract and forward migrations)")
-    pu.add_argument("--db-url", help="database owner URL (default: "
-                                     "$POSTGRES_URL_OWNER)")
+    pu.add_argument("--db-url-env", metavar="NAME", default=None,
+                    help="NAME of an environment variable holding the "
+                         "database owner URL (default: $SR_PG_UPGRADE_URL, "
+                         "then $POSTGRES_URL_OWNER). The URL is deliberately "
+                         "NOT a command-line argument: argv is world-readable "
+                         "in the process table for the whole upgrade, and a "
+                         "URL there leaks the owner credential. Run it as "
+                         "`SR_PG_UPGRADE_URL=... appliance.py upgrade ...` "
+                         "(inline environment, never shown by ps auxww)")
     pu.add_argument("--resume", metavar="ATTEMPT",
                     help="resume one specific journaled attempt instead of "
                          "starting new work")
@@ -1678,9 +1687,29 @@ def main(argv: list[str] | None = None) -> int:
                          "backup; issues NO service action — nothing is "
                          "started or resumed")
     pu.add_argument("--pg-dump-bin", help="pg_dump binary or wrapper for the "
-                                          "preserving database backup")
+                                          "preserving database backup "
+                                          "(reads PGPASSFILE from its "
+                                          "environment; no URL in argv)")
     pu.add_argument("--python-exe", help="interpreter used for alembic "
-                                         "(default: this interpreter)")
+                                         "(default: the INSTALLED venv at "
+                                         "<prefix>/.venv/bin/python)")
+    pu.add_argument("--skip-provision", action="store_true",
+                    help="explicit exception only: skip installing the "
+                         "locked dependencies / frontend build for the "
+                         "activated payload (an externally maintained "
+                         "runtime is then the operator's claim)")
+    pu.add_argument("--skip-frontend", action="store_true",
+                    help="provision everything except the frontend build "
+                         "(a pre-built web release is then the operator's "
+                         "claim)")
+    pu.add_argument("--allow-fresh-install", action="store_true",
+                    help="attest that this installation provably never "
+                         "claimed work (a missing broker ledger then "
+                         "qualifies; NEVER set this to work around a "
+                         "refusal)")
+    pu.add_argument("--maintenance-flag", help="path of the admission-fence "
+                                               "file (default: "
+                                               "<state-dir>/maintenance)")
     pu.add_argument("--dry-run", action="store_true")
 
     pr = sub.add_parser("recovery")
@@ -1746,18 +1775,29 @@ def main(argv: list[str] | None = None) -> int:
                     "against that artifact; config re-rendering alone is "
                     "`apply`, and calling that an upgrade would be a lie")
             payload = engine.ReleasePayload(pathlib.Path(args.payload))
-            db_url = args.db_url or os.environ.get("POSTGRES_URL_OWNER")
-            restart_hook = None
-            if not lay.sandboxed:
-                runner = Runner(dry_run=args.dry_run)
-
-                def restart_hook(units, _r=runner):  # engine contract
-                    for unit in units:
-                        _r("systemctl", "restart", unit, check=False)
+            # The owner URL arrives via the ENVIRONMENT only: the name of
+            # the variable is a safe argument, its value never touches any
+            # argv (the process table would show the credential for the
+            # whole upgrade).  The engine additionally keeps it out of the
+            # pg_dump child's argv via a private PGPASSFILE.
+            url_name = args.db_url_env or "SR_PG_UPGRADE_URL"
+            db_url = os.environ.get(url_name) or os.environ.get(
+                "POSTGRES_URL_OWNER")
+            if not db_url:
+                ap.error(
+                    "no database owner URL: export it as $SR_PG_UPGRADE_URL "
+                    "(or the named --db-url-env variable) — passing a "
+                    "credential as a command-line argument is refused, it "
+                    "would be visible in the process table")
             out = engine.run_upgrade(
                 m, lay, payload, db_url=db_url, resume=args.resume,
                 dry_run=args.dry_run, python_exe=args.python_exe,
-                pg_dump_bin=args.pg_dump_bin, restart_hook=restart_hook)
+                pg_dump_bin=args.pg_dump_bin,
+                skip_provision=args.skip_provision,
+                skip_frontend=args.skip_frontend,
+                allow_fresh_install=args.allow_fresh_install,
+                maintenance_flag=(pathlib.Path(args.maintenance_flag)
+                                  if args.maintenance_flag else None))
             print(json.dumps(out, indent=2, sort_keys=True))
         elif args.cmd == "firstboot":
             lay = _layout(args)
