@@ -116,6 +116,10 @@ textarea { font-family: var(--mono); font-size: .9em; }
   border-radius: 8px; padding: 10px 12px; overflow-x: auto;
   white-space: pre-wrap; font-size: .86rem; }
 .md-cite { font-family: var(--mono); font-size: .84em; }
+/* Finding 8: a citation outside the approved evidence list stays visible
+   but is clearly NOT an evidence link — honest, unverified text. */
+.md-cite-unverified { font-family: var(--mono); font-size: .84em;
+  color: var(--muted-foreground); border-bottom: 1px dotted var(--muted-foreground); }
 
 /* terminals & replay */
 .term { background: #05070a; border: 1px solid var(--line); border-radius: 8px;

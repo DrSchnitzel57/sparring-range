@@ -128,8 +128,12 @@ def build_aar(events: list[dict], scenario: dict, scorecard: dict | None,
     end_note = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
     narrative_block = ""
+    # Review finding 8: citations are valid only against the evidence the
+    # report ACTUALLY shows (the rendered, compressed timeline) — never
+    # against every id that existed in the window but was compressed away.
+    visible_ids = {int(m) for m in CITE_RE.findall(timeline)}
     if narrative:
-        narrative = validate_narrative(narrative, {e.get("event_id") for e in events})
+        narrative = validate_narrative(narrative, visible_ids)
         if narrative.strip():
             narrative_block = "## Coach narrative (citations validated)\n" + narrative.strip() + "\n"
 
@@ -170,12 +174,18 @@ def build_aar(events: list[dict], scenario: dict, scorecard: dict | None,
 
     cited = [m["event"].get("event_id") for m in idx["misses"] + idx["telemetry_gaps"]
              if isinstance(m, dict)] + [e.get("event_id") for e in idx["wins"]]
+    # The UI may turn #id tokens into ACTIVE links only for this list:
+    # events the report shows, key evidence it names, and the cutoff.
+    # Anything else renders as an honest unverified label.
+    approved_citations = sorted(
+        visible_ids | {c for c in cited if c} | ({cutoff} if cutoff else set()))
     return {"markdown": md, "grade": grade, "score_status": status,
             "earned": earned, "total": total, "pct": pct,
             "misses": [f"{format_citation(m['event'])} — {m['reason']}" for m in idx["misses"]],
             "telemetry_gaps": [f"{format_citation(g['event'])} — {g['reason']}"
                                for g in idx["telemetry_gaps"]],
             "cited_events": sorted(set(filter(None, cited))),
+            "approved_citation_ids": approved_citations,
             "evidence_cutoff_event_id": cutoff,
             "rubric_version": card.get("rubric_version", scenario.get("rubric_version", 1))}
 

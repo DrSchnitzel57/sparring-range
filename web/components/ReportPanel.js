@@ -49,7 +49,7 @@ export default function ReportPanel({ sid }) {
       {aar.telemetry_gaps?.length > 0 && (
         <p className="bad">telemetry gaps: {aar.telemetry_gaps.length} (detailed below)</p>
       )}
-      <Md text={aar.markdown} />
+      <Md text={aar.markdown} citations={aar.approved_citation_ids || []} />
       <p className="row" style={{ marginTop: 14 }}>
         <button onClick={() => generate(true)} disabled={busy}>{busy ? "regenerating…" : "regenerate (new version)"}</button>
         <span className="dim"> prior versions stay in the append-only log (evidence cutoff{" "}

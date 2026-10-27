@@ -597,11 +597,16 @@ def _run_preset(c: httpx.Client, preset: str, *, duration: int, pace: int,
     out["inject_releases"] = len((inj.json() or {}).get("releases") or [])
 
     # Replay is read after the member's SSH transcript exists. A missing cast
-    # is a real failure for this gate, not an empty-success.
+    # is a real failure for this gate, not an empty-success. The replay page
+    # itself only counts; cast summaries and frames come from the bounded
+    # casts endpoint (plan 20 review finding 11).
     replay = _json(c.get(f"/sessions/{sid}/replay"), "replay")
-    out["casts"] = len(replay.get("casts") or [])
+    casts_page = _json(c.get(f"/sessions/{sid}/casts?limit=20"
+                             f"&include_frames=true"), "casts")
+    out["casts"] = len(casts_page.get("casts") or [])
     out["cast_frames"] = sum(len(x.get("frames") or [])
-                             for x in replay.get("casts") or [])
+                             for x in casts_page.get("casts") or [])
+    out["timeline_page"] = len(replay.get("timeline") or [])
     if ssh_key and known_hosts:
         if out["casts"] < 1 or out["cast_frames"] < 1:
             raise JourneyError(f"{preset}: no replay cast frames after member SSH")

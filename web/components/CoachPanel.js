@@ -103,7 +103,9 @@ export default function CoachPanel({ sid }) {
           <div key={m.message_id} className={`msg ${m.role}`} data-role={m.role}
                data-model-ok={m.model_ok === null ? "" : String(m.model_ok)}>
             <div className="who">{m.role === "user" ? "you" : m.model_ok === false ? "coach (no model answer — honest fallback)" : "coach"}</div>
-            <Md text={m.body} />
+            {/* Finding 8: only server-approved citations render as active
+                links; the member's own text never self-links evidence. */}
+            <Md text={m.body} citations={m.role === "user" ? [] : (m.citations || [])} />
             {m.citations?.length > 0 && (
               <div className="citations">evidence:{" "}
                 {m.citations.map(id => <a key={id} href={`?tab=activity&event=${id}`} className="md-cite">#{id}</a>)}
