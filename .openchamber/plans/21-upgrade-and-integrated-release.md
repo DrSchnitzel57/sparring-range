@@ -1,7 +1,7 @@
 # 21 — Preserving upgrade and qualified integrated release
 
 ## Steps
-- [ ] Inventory installed overrides and define versioned upgrade/preflight contract.
+- [x] Inventory installed overrides and define versioned upgrade/preflight contract.
 - [ ] Deliver preserving in-place upgrade and corrected fresh-install bundle.
 - [ ] Prove real install/upgrade/failure/recovery sequences and integrated journeys.
 - [ ] Reconcile full backlog, evidence, manuals and handoff.
