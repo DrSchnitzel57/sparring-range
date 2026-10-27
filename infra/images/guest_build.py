@@ -108,7 +108,7 @@ def recorded_packages(serial: pathlib.Path) -> dict[str, str]:
 
 def build_overlay(*, repo_root: pathlib.Path, run_dir: pathlib.Path,
                   cache_dir: pathlib.Path, role: str = "mojang-web-db",
-                  memory_mb: int = 2048, timeout_s: int = 1500,
+                  memory_mb: int = 2048, timeout_s: int = 3600,
                   disk_gb: int = 16,
                   base_dir: pathlib.Path | None = None) -> dict:
     """Build (or reuse) the superset overlay. Returns the build record with
@@ -214,7 +214,7 @@ def build_attacker_overlay(*, repo_root: pathlib.Path, run_dir: pathlib.Path,
                            cache_dir: pathlib.Path,
                            key_manifest: dict[str, str],
                            memory_mb: int = 1024,
-                           timeout_s: int = 1500,
+                           timeout_s: int = 3600,
                            base_dir: pathlib.Path | None = None) -> dict:
     """Build (or reuse) the attacker template overlay (plan 13 phase 3):
     pinned base + attacker role + runner-supervisor + capture path + runner

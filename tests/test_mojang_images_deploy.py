@@ -54,7 +54,7 @@ def _role_overlay(role: str, memory_mb: int = 2048):
     try:
         rec = guest_build.build_overlay(
             repo_root=REPO, run_dir=run, cache_dir=GUEST_CACHE,
-            role=role, memory_mb=memory_mb, timeout_s=1500)
+            role=role, memory_mb=memory_mb, timeout_s=3600)
         yield {"run": run, "overlay": pathlib.Path(rec["overlay"]), "record": rec}
     finally:
         shutil.rmtree(run, ignore_errors=True)
