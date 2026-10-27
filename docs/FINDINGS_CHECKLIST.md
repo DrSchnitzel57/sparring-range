@@ -31,8 +31,17 @@ Gate receipts (exact commands, this environment, revision `3a4d927`):
 
 Honest PENDING (not simulated, not waived): `images`/`capture`/`bundle`
 need the role artifacts — the pin repair removed the mirror blocker, but
-cold TCG role builds exceed this round's budget; `packet` needs root +
-`nft`; `journey`/`release` need the installed appliance. Per plan 21,
+cold TCG role builds exceed this round's budget; the `bundle` lane was
+ATTEMPTED and failed closed truthfully (8.6s, receipt
+`.cache/gate_r8_bundle.log`): the only role images on disk
+(`/tmp/sr-guest-cache`, 3.4 GB, left by the checkpoint aggregate's images
+lane) are qcow2 chains whose transient backing bases
+(`/tmp/sr-qemu-c4fcda2e`) no longer exist, and the gate correctly refuses
+non-self-contained artifacts. The `images` gate rebuild produces the
+flattened artifacts the bundle requires; those stale chains belong to the
+shared guest cache (possibly reused by other checkouts) and were left in
+place rather than guessed-into cleanup. `packet` needs root + `nft`;
+`journey`/`release` need the installed appliance. Per plan 21,
 missing mandatory evidence prevents PASS: **21 stays unticked**; the
 operator's supervised-practice deployment is the next owner.
 

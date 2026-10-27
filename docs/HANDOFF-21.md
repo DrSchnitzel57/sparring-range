@@ -1,9 +1,9 @@
 # Handoff — milestone 21 (preserving upgrade), round 1
 
 Entry point for the parent's release-focused review and for the operator's
-supervised-practice testing. Branch `practice-upgrades-18-21`; round-1 HEAD
-`3a4d927`. Milestone 20 is NOT accepted and nothing here re-runs or claims
-its gates; the pulled blockers F1–F4 are fixed here, F5–F9 are the recorded
+supervised-practice testing. Branch `practice-upgrades-18-21`; round-1 code
+HEAD `3a4d927` (documentation commits follow). Milestone 20 is NOT accepted
+and nothing here re-runs or claims its gates; the pulled blockers F1–F4 are fixed here, F5–F9 are the recorded
 repository backlog (`docs/FINDINGS_CHECKLIST.md`).
 
 ## Commit map
@@ -59,7 +59,10 @@ env SR_PG_ADMIN_URL=... SR_REQUIRE_DB=1 PYTHONDONTWRITEBYTECODE=1 \
 * Milestone 20 acceptance (parent owns it); F5–F9 remain open backlog.
 * `images`/`capture`/`bundle` gates: the pin repair removed the mirror
   blocker, but role artifacts need cold TCG builds that exceeded this
-  round's budget — recorded PENDING, never simulated.
+  round's budget — recorded PENDING, never simulated. The `bundle` lane
+  was attempted and refused the only on-disk role images (stale qcow2
+  chains whose transient backing bases no longer exist) — correct
+  fail-closed behavior, exact receipt in FINDINGS.
 * `packet` (root+nft), `journey`/`release` (installed appliance):
   operator-machine gates, fail closed by design.
 * Any live deployment, provider, or appliance operation was performed by
