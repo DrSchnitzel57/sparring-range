@@ -26,7 +26,8 @@ Usage::
     python deploy/appliance.py apply    --manifest M [--prefix PREFIX] [--dry-run]
     python deploy/appliance.py status   --manifest M [--json]
     python deploy/appliance.py doctor   --manifest M [--json]
-    python deploy/appliance.py upgrade  --manifest M [--prefix PREFIX]
+    python deploy/appliance.py upgrade  --manifest M --payload BUNDLE [--db-url URL]
+    python deploy/appliance.py upgrade  --manifest M --restore-config ATTEMPT
     python deploy/appliance.py recovery status --manifest M
     python deploy/appliance.py recovery reconcile --manifest M
 """
@@ -1663,6 +1664,23 @@ def main(argv: list[str] | None = None) -> int:
     common(pu)
     pu.add_argument("--prefix", default=str(DEFAULT_PREFIX))
     pu.add_argument("--etc", default=str(DEFAULT_ETC))
+    pu.add_argument("--payload",
+                    help="the release bundle to upgrade to (built by "
+                         "deploy/bundle.py; carries the MANIFEST upgrade "
+                         "contract and forward migrations)")
+    pu.add_argument("--db-url", help="database owner URL (default: "
+                                     "$POSTGRES_URL_OWNER)")
+    pu.add_argument("--resume", metavar="ATTEMPT",
+                    help="resume one specific journaled attempt instead of "
+                         "starting new work")
+    pu.add_argument("--restore-config", metavar="ATTEMPT",
+                    help="config-only restore from an attempt's verified "
+                         "backup; issues NO service action — nothing is "
+                         "started or resumed")
+    pu.add_argument("--pg-dump-bin", help="pg_dump binary or wrapper for the "
+                                          "preserving database backup")
+    pu.add_argument("--python-exe", help="interpreter used for alembic "
+                                         "(default: this interpreter)")
     pu.add_argument("--dry-run", action="store_true")
 
     pr = sub.add_parser("recovery")
@@ -1707,19 +1725,39 @@ def main(argv: list[str] | None = None) -> int:
             out = apply_plan(sm, plan, layout=lay, dry_run=args.dry_run)
             print(json.dumps(out, indent=2, sort_keys=True))
         elif args.cmd == "upgrade":
-            # Re-render config/units and run forward migrations; data, keys and
-            # the ledger are never deleted or recreated.
+            # The preserving in-place upgrade runs through the release
+            # engine: journal first, private config + database backups,
+            # verified staged payload, per-file atomic activation, proven
+            # forward-only migrations, config re-render, version stamp,
+            # ordered service reload. Data, keys and the ledger are never
+            # deleted or recreated, and unknown in-flight work is refused
+            # until it is resolved — never silently.
+            from deploy import upgrade as engine
             lay = _layout(args)
-            sm = sandbox_manifest(m, lay.root)
-            plan = render_files(sm, layout=lay)
-            out = apply_plan(sm, plan, layout=lay, dry_run=args.dry_run)
+            if args.restore_config:
+                out = engine.restore_config(m, lay, args.restore_config,
+                                            dry_run=args.dry_run)
+                print(json.dumps(out, indent=2, sort_keys=True))
+                return 0
+            if not args.payload:
+                ap.error(
+                    "upgrade requires --payload (a built release bundle): "
+                    "the preserving upgrade backs up, verifies and migrates "
+                    "against that artifact; config re-rendering alone is "
+                    "`apply`, and calling that an upgrade would be a lie")
+            payload = engine.ReleasePayload(pathlib.Path(args.payload))
+            db_url = args.db_url or os.environ.get("POSTGRES_URL_OWNER")
+            restart_hook = None
             if not lay.sandboxed:
-                run = Runner(dry_run=args.dry_run)
-                run("systemctl", "restart", "sr-appliance-broker.service",
-                    "sr-api.service", "sr-appliance-ingest.service",
-                    "sr-worker-supervisor.service", "sr-bastion.service",
-                    check=False)
-            out["upgrade"] = "config/units re-rendered; data and keys preserved"
+                runner = Runner(dry_run=args.dry_run)
+
+                def restart_hook(units, _r=runner):  # engine contract
+                    for unit in units:
+                        _r("systemctl", "restart", unit, check=False)
+            out = engine.run_upgrade(
+                m, lay, payload, db_url=db_url, resume=args.resume,
+                dry_run=args.dry_run, python_exe=args.python_exe,
+                pg_dump_bin=args.pg_dump_bin, restart_hook=restart_hook)
             print(json.dumps(out, indent=2, sort_keys=True))
         elif args.cmd == "firstboot":
             lay = _layout(args)
