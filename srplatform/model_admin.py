@@ -23,6 +23,8 @@ Trust model:
 from __future__ import annotations
 
 import hashlib
+import logging
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -35,6 +37,47 @@ from srplatform.db.models import (Event, ModelProfile, ModelRoleOverride,
 
 BOOTSTRAP_NAME = "environment"
 ROLES = ("attacker", "coach", "summarizer")
+
+_SAFE_CODE_RE = re.compile(r"\A[0-9A-Za-z]{5}\Z")
+
+
+def safe_error_shape(exc: BaseException | None) -> str:
+    """The SECRET-SAFE structural identity of an exception (round-5
+    review): class names plus SQLSTATE-style codes, nothing else.
+
+    Raw exception text must never be persisted into evidence. Real
+    PostgreSQL diagnostics quote the failing row's VALUES in the message
+    (``DETAIL: Failing row contains (...)``), so a failed operation
+    against the secret store can copy a provider credential VERBATIM
+    into app-role-readable events, logs or exports. Class names and
+    5-character codes are library-defined structure and cannot carry a
+    value; text, ``args``, ``params``, statements, row details,
+    tracebacks and provider bodies are never read, and NO pattern-based
+    redaction is trusted — short opaque keys defeat every pattern.
+    The failure itself stays fully recorded (this is not a silencer).
+    """
+    segments: list[str] = []
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while isinstance(cur, BaseException) and len(segments) < 4:
+        if id(cur) in seen:
+            break
+        seen.add(id(cur))
+        codes: list[str] = []
+        hops = [cur]
+        orig = getattr(cur, "orig", None)
+        if isinstance(orig, BaseException):
+            hops.append(orig)
+        for hop in hops:
+            for attr in ("pgcode", "sqlstate"):
+                code = getattr(hop, attr, None)
+                if (isinstance(code, str) and _SAFE_CODE_RE.fullmatch(code)
+                        and code not in codes):
+                    codes.append(code)
+        segments.append(type(cur).__name__
+                        + (f"[{','.join(sorted(codes))}]" if codes else ""))
+        cur = cur.__cause__ if cur.__cause__ is not None else cur.__context__
+    return " <- ".join(segments) or "unknown"
 
 
 def _credential_digest(api_key: str | None) -> str | None:
@@ -56,19 +99,39 @@ def _record_compensation_failure(op: str, profile_id, exc: Exception) -> None:
     compensation — NOT crash-atomicity. When even the compensation
     fails, an operator must be able to SEE the divergence (an admin
     event written through a fresh session, since the failed transaction
-    is being discarded)."""
+    is being discarded).
+
+    Round-5 review: the record names the failure STRUCTURALLY ONLY
+    (``safe_error_shape``). A real PostgreSQL diagnostic can quote the
+    failing row's values — for a secret-store operation that is the
+    provider credential itself — and these events are app-role
+    evidence. Honest obligation, zero secret: never raw diagnostics,
+    text, params, row details, causes-as-text or tracebacks, and no
+    pattern "redaction" that could miss a short opaque key.
+    """
     try:
         from srplatform.db.session import db as db_ctx
         with db_ctx() as s:
             _append_admin_note(s, "profile.secret_compensation_failed", {
                 "op": op, "profile_id": str(profile_id),
-                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                "error": safe_error_shape(exc),
                 "action_needed": ("provider credential store and profile "
                                   "database diverge; inspect and re-align "
                                   "this profile version's credential")})
             s.commit()
-    except Exception:  # noqa: BLE001 — nothing left to try
-        pass
+    except Exception as note_exc:  # noqa: BLE001 — last resort, see below
+        # The durable obligation itself could not be written (the DB may
+        # be wedged or rejecting rows). Nothing remains that is both
+        # available and secret-safe EXCEPT this process's own log — so
+        # record the safe shapes loudly there. The divergence then has
+        # no durable record by force of the environment, which is
+        # exactly why the line says so in words; we never fake success.
+        logging.getLogger("srplatform.model_admin").error(
+            "secret compensation FAILED op=%s profile=%s error=%s; "
+            "durable obligation NOT recorded (note write failed: %s) — "
+            "manual credential re-alignment required",
+            op, profile_id, safe_error_shape(exc),
+            safe_error_shape(note_exc))
 
 
 def _track_secret_writes_against_rollback(db: Session, profile_id) -> None:

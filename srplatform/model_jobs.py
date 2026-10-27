@@ -337,12 +337,18 @@ def _persist_logical_outcome(db, rows: list[ModelJob]) -> bool:
     try:
         handler(db, final, final.state == "succeeded")
     except Exception as exc:  # noqa: BLE001 — visible, and re-claimable
+        # Round-5 review: this note is job evidence an API caller reads,
+        # and real DB diagnostics can quote row VALUES — so the failure
+        # is named STRUCTURALLY (class + SQLSTATE only, via
+        # `safe_error_shape`), never with raw text. Re-claimability and
+        # the honest "handler failed" marker are unchanged.
+        from srplatform.model_admin import safe_error_shape
         db.execute(text(
             "UPDATE model_jobs SET outcome_persisted = false "
             "WHERE job_id = :j"), {"j": str(final.job_id)})
         final.error = ((final.error or "") +
-                       f"; outcome handler failed: {type(exc).__name__}: "
-                       f"{str(exc)[:200]}")[:2000]
+                       f"; outcome handler failed: "
+                       f"{safe_error_shape(exc)}")[:2000]
         db.flush()
         return False
     return True
