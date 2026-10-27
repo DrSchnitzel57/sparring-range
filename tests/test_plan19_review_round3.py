@@ -77,6 +77,25 @@ def _drive(jid: uuid.UUID) -> None:
     model_jobs._execute(jid)
 
 
+def _await_lock_wait(app_name: str, timeout: float = 20.0) -> None:
+    """Round-4 test-quality fix: an EXPLICIT database-observed barrier
+    — returns only when PostgreSQL itself reports the named backend
+    parked on a lock wait. No thread-scheduling guesses anywhere."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        with db_ctx() as s:
+            row = s.execute(text(
+                "SELECT wait_event_type FROM pg_stat_activity "
+                "WHERE application_name = :n "
+                "  AND pid <> pg_backend_pid()"),
+                {"n": app_name}).first()
+        if row is not None and row[0] == "Lock":
+            return
+        time.sleep(0.02)
+    raise AssertionError(
+        f"backend {app_name!r} never reached an observed lock wait")
+
+
 def _run_one() -> bool:
     jid = _claim_once()
     if jid is None:
@@ -126,16 +145,22 @@ def _enqueue_hint(client, users, sid, name, *, text="help"):
         return job.job_id
 
 
-def _enqueue_text(name, kind="hint", **kw):
+def _enqueue_text(name, kind="hint", *, persist=None,
+                  covers_through=None, **kw):
     from srplatform import model_jobs
     pid = _profile_id(name)
+    payload = {"mode": "text",
+               "system": kw.pop("system", "s"),
+               "user": kw.pop("user", "go")}
+    if persist is not None:
+        payload["persist"] = persist
+    if covers_through is not None:
+        payload["covers_through"] = int(covers_through)
     with db_ctx() as s:
         prof = s.get(ModelProfile, pid)
         job = model_jobs.enqueue(
             s, kind=kind, priority=kw.pop("priority", 5), profile=prof,
-            payload={"mode": "text",
-                     "system": kw.pop("system", "s"),
-                     "user": kw.pop("user", "go")}, **kw)
+            payload=payload, **kw)
         return job.job_id
 
 
@@ -223,13 +248,17 @@ def test_cancel_blocked_by_open_claim_acts_on_the_committed_truth(
         def _cancel():
             try:
                 with db_ctx() as s:
+                    s.execute(text(
+                        "SET LOCAL application_name = 'sr-r3-cancel'"))
                     model_jobs.cancel(s, jid, actor="member")
             except Exception as exc:       # noqa: BLE001
                 errors.append(exc)
 
         t = threading.Thread(target=_cancel, daemon=True)
         t.start()
-        t.join(timeout=0.4)
+        # explicit barrier: the database SHOWS the cancellation parked
+        # on the claim's row lock (not a scheduling guess)
+        _await_lock_wait("sr-r3-cancel")
         assert t.is_alive(), \
             "cancellation did not wait at the claim fence — stale write"
         claims.commit()                    # the claim lands: running now
@@ -350,11 +379,16 @@ def test_gated_turn_waits_for_summary_recovery_then_dispatches_once(
     — three provider requests total, in order."""
     _manual(monkeypatch)
     _profile(client, users, "r3dep", srv.base_url)
+    sid = _session(client, users)
     srv.script([_ERR500,
                 text_response("summary v2"),
                 text_response("native turn after recovery")])
+    # round-4 finding 3: a summarize that must authorize a dependent
+    # carries its persist range and lands a real checkpoint on success
     sum_id = _enqueue_text("r3dep", kind="summarize", system=_SUM,
-                           user=_SUM)
+                           user=_SUM,
+                           persist={"session_id": str(sid)},
+                           covers_through=1)
     gate_id = _enqueue_text("r3dep", kind="red-turn", system=_GATE_MSG,
                             user=_GATE_MSG, depends_on=sum_id)
     # attempt 1 fails -> backoff child queued
@@ -582,8 +616,13 @@ def test_same_key_resave_with_other_fields_keeps_pinned_sessions(client,
     assert st[4] == "active"
     assert all(v == "superseded" for v in st.values()
                if v != "active"), st          # nothing revoked
-    # and the credential still WORKS on a pinned-style call (superseded
-    # versions may serve queued work): direct text turn on v1 via role
+    # and the credential still WORKS on a served call (the role points
+    # at the current version; the genuine PIN-PROOF — session created
+    # BEFORE the revisions and still served by the pinned v1 after a
+    # dead-URL edit — is the dedicated round-4 test
+    # test_pinned_session_keeps_serving_from_the_pinned_profile; the
+    # round-3 form of this block created the session only afterwards
+    # and therefore proved serviceability, not the pin).
     client.put("/admin/model/roles", headers=users["op"],
                json={"role": "attacker", "profile_name": "samekb"})
     srv.script([text_response("served")])
