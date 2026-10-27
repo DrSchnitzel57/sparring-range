@@ -339,7 +339,7 @@ def _jobs_root_ids(db, session_id, *, sealed: bool) -> list:
         # the existence of turns/summaries and any diagnostic that
         # could echo the conversation — is not member-visible at all.
         stmt = stmt.where(ModelJob.kind.in_(
-            ("hint", "aar-narrative")))
+            ("hint", "aar-narrative", "coach-chat")))
     return list(db.execute(stmt.order_by(
         ModelJob.requested_at.desc())).scalars().all())
 
@@ -388,7 +388,7 @@ def model_job_detail(session_id: uuid.UUID, job_id: uuid.UUID,
     job = db.get(ModelJob, job_id)
     if job is None or str(job.session_id) != str(session_id):
         raise HTTPException(404, "job not found")
-    if sealed and job.kind not in ("hint", "aar-narrative"):
+    if sealed and job.kind not in ("hint", "aar-narrative", "coach-chat"):
         raise HTTPException(404, "job not found")
     body = chain_status_body(db, job_id, errors=False, result_kind=False)
     return strip_sealed(body) if sealed else strip_results(body)
@@ -414,7 +414,8 @@ def model_job_stream(session_id: uuid.UUID, job_id: uuid.UUID,
         job = s.get(ModelJob, job_id)
         if job is None or str(job.session_id) != str(session_id):
             raise HTTPException(404, "job not found")
-        if sealed and job.kind not in ("hint", "aar-narrative"):
+        if sealed and job.kind not in ("hint", "aar-narrative",
+                                       "coach-chat"):
             raise HTTPException(404, "job not found")
     from srplatform.settings import get_settings
     s0 = get_settings()
@@ -495,6 +496,153 @@ def _register_result_handlers() -> None:
     from srplatform import model_jobs
     model_jobs.register_result_handler("hint", _hint_result_handler)
     model_jobs.register_result_handler("aar-narrative", _aar_result_handler)
+    model_jobs.register_result_handler("coach-chat", _coach_chat_result_handler)
+
+
+# --------------------------------------------------------------------------- #
+# conversational coach (plan 20)                                               #
+# --------------------------------------------------------------------------- #
+
+from pydantic import Field  # noqa: E402  (kept adjacent to the chat routes)
+
+
+class ChatIn(BaseModel):
+    text: str = Field(min_length=1, max_length=4000)
+
+
+@router.post("/sessions/{session_id}/coach/messages", status_code=201)
+def coach_chat_post(session_id: uuid.UUID, body: ChatIn,
+                    p: Principal = Depends(any_member)):
+    """One turn of the persistent coach conversation.
+
+    The member's message is stored durably FIRST (their own data
+    survives model absence); the answer is a durable ``coach-chat`` job
+    through the ONE slot at interactive priority, generated strictly
+    from the member-visible evidence window captured at enqueue (a
+    cutoff, never a moving target). NO database transaction is held
+    across the model wait, and reload always answers "is my coach
+    answer still pending?" — ``pending`` in the GET lists it from the
+    job row. When no profile is bound or the queue is saturated, the
+    honest UNAVAILABLE notice is persisted instead of silence: chat is
+    never a silently-dropped surface, and it never awards anything."""
+    from srplatform.coach import chat as chat
+    with _db_ctx() as db:
+        sess = db.get(SessionModel, session_id)
+        if sess is None:
+            raise HTTPException(404, "session not found")
+        if not p.is_operator and str(sess.user_id) != str(p.user_id):
+            raise HTTPException(403, "not your session")
+        from srplatform.api.visibility import filter_event
+        events = [filter_event(db, sess, p, e)
+                  for e in _events_of(db, session_id)]
+        history = chat.recent_messages(db, session_id)
+    system, user, cutoff, allowed = chat.build_chat_prompt(
+        events, history, body.text)
+
+    from srplatform import model_admin as ma
+    from srplatform import model_jobs
+    from srplatform.db.models import CoachMessage
+    try:
+        with _db_ctx() as db:
+            db.add(CoachMessage(session_id=session_id, role="user",
+                                body=body.text))
+            _pin, prof = ma.bind_for(db, session_id, "coach")
+            job = model_jobs.enqueue(
+                db, kind="coach-chat", priority=PRIORITY_HINT,
+                payload={"mode": "text", "system": system, "user": user,
+                         "chat_meta": {"question": body.text,
+                                       "cutoff": cutoff,
+                                       "allowed_ids": allowed,
+                                       "fallback": chat.CHAT_FALLBACK}},
+                session_id=session_id, profile=prof, actor="member",
+                deadline_at=model_jobs.match_deadline(db, session_id))
+            jid = job.job_id
+        return {"status": "queued", "job_id": str(jid), "pending": True}
+    except ma.ProfileProblem:
+        pass  # fall through to the honest unavailable record
+    except model_jobs.QueueFull:
+        pass
+    with _db_ctx() as db:
+        db.add(CoachMessage(session_id=session_id, role="user",
+                            body=body.text))
+        db.add(CoachMessage(session_id=session_id, role="coach",
+                            body=chat.CHAT_UNAVAILABLE, citations=[],
+                            model_ok=False))
+    return {"status": "coach-unavailable", "pending": False}
+
+
+@router.get("/sessions/{session_id}/coach/messages")
+def coach_chat_list(session_id: uuid.UUID,
+                    after_id: int | None = None,
+                    before_id: int | None = None,
+                    limit: int = 100,
+                    p: Principal = Depends(any_member), db: DbSession = None):
+    """The conversation, oldest-first, with the durable PENDING answers
+    (queued/running coach-chat jobs) alongside — a reload always shows
+    what is still cooking. Pagination: ``after_id`` polls forward for
+    new turns; ``before_id`` walks history backwards; neither returns
+    the most recent window. This conversation is the session's own
+    coach exchange (generated from visibility-filtered evidence); it
+    carries no scores and no sealed red payload by construction."""
+    from srplatform.db.models import CoachMessage, ModelJob
+    sess = _check_access(db, p, session_id)
+    limit = max(1, min(limit, 200))
+    stmt = select(CoachMessage).where(CoachMessage.session_id == session_id)
+    if after_id is not None:
+        rows = db.execute(stmt.where(CoachMessage.message_id > after_id)
+                          .order_by(CoachMessage.message_id)
+                          .limit(limit)).scalars().all()
+    else:
+        if before_id is not None:
+            stmt = stmt.where(CoachMessage.message_id < before_id)
+        rows = list(reversed(db.execute(
+            stmt.order_by(CoachMessage.message_id.desc())
+            .limit(limit)).scalars().all()))
+    from srplatform import model_jobs as _mj
+    pending_rows = db.execute(
+        select(ModelJob).where(
+            ModelJob.session_id == session_id,
+            ModelJob.kind == "coach-chat",
+            ModelJob.state.not_in(_mj.TERMINAL_STATES))
+        .order_by(ModelJob.requested_at)).scalars().all()
+    from srplatform.api.visibility import competition_sealed
+    return {"messages": [{
+        "message_id": m.message_id, "role": m.role, "body": m.body,
+        "citations": m.citations or [], "model_ok": m.model_ok,
+        "model_job": str(m.model_job) if m.model_job else None,
+        "context_cutoff_event_id": m.context_cutoff_event_id,
+        "created_at": m.created_at.isoformat(),
+    } for m in rows],
+        "pending": [{
+            "job_id": str(j.job_id), "state": j.state,
+            "requested_at": j.requested_at.isoformat()
+            if j.requested_at else None,
+        } for j in pending_rows],
+        "sealed": competition_sealed(db, sess, p)}
+
+
+def _coach_chat_result_handler(db, job, success: bool) -> None:
+    """Persist the coach answer EXACTLY ONCE with the job's final state:
+    real answers keep their model_ok mark and only the citations their
+    own evidence window allowed; failures record the honest fallback —
+    never an invented hint, never a silent drop."""
+    from srplatform.coach import chat as chat
+    from srplatform.db.models import CoachMessage
+    meta = (job.payload or {}).get("chat_meta") or {}
+    text = None
+    if success:
+        t = (job.result or {}).get("text")
+        if isinstance(t, str) and t.strip():
+            text = t.strip()
+    ok = text is not None
+    if not text:
+        text = meta.get("fallback") or chat.CHAT_FALLBACK
+    db.add(CoachMessage(session_id=job.session_id, role="coach",
+                        body=text,
+                        citations=chat.validated_citations(
+                            text, meta.get("allowed_ids")),
+                        model_job=job.job_id, model_ok=ok,
+                        context_cutoff_event_id=meta.get("cutoff")))
 
 
 _register_result_handlers()

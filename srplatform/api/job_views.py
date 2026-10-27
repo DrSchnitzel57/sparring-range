@@ -23,7 +23,10 @@ import uuid
 
 from fastapi.responses import StreamingResponse
 
-MEMBER_VISIBLE_WHEN_SEALED = ("hint", "aar-narrative")
+# Member coach work stays label-visible when sealed: hint, AAR
+# narrative and (plan 20) the conversational coach are all the member's
+# OWN session surface; attacker kinds never enter this tuple.
+MEMBER_VISIBLE_WHEN_SEALED = ("hint", "aar-narrative", "coach-chat")
 
 
 def chain_status_body(s, job_id: uuid.UUID, *, errors: bool,
