@@ -13,8 +13,20 @@ export default function CoachPanel({ sid }) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
+  const [hint, setHint] = useState("");
   const endRef = useRef(null);
   const lastIdRef = useRef(0);
+
+  async function askHint() {
+    setBusy(true); setErr(null);
+    try {
+      const r = await api(`/sessions/${sid}/hint`, { method: "POST", body: { question: "" } });
+      const payload = r || {};
+      const shown = (payload.hint || "").trim() || payload.redacted;
+      setHint(shown || "The last model hint was empty. No usable hint was generated.");
+    } catch (e) { setErr(String(e.message || e)); }
+    setBusy(false);
+  }
 
   const load = useCallback(async (initial) => {
     try {
@@ -38,6 +50,20 @@ export default function CoachPanel({ sid }) {
   }, [sid]);
 
   useEffect(() => { lastIdRef.current = 0; setMsgs([]); load(true); }, [load]);
+  useEffect(() => {
+    // the LATEST hint event stays visible across reloads: an empty stored
+    // hint must surface as an honest failure, not as silent absence (18/19
+    // regression kept from the old coach panel)
+    if (!sid) return;
+    let stop = false;
+    api(`/events?session_id=${sid}&action_type=hint&tail=1`).then((events) => {
+      if (stop || !events.length) return;
+      const payload = events[0].payload || {};
+      setHint(payload.redacted || (payload.hint || "").trim() ||
+        "The last model hint was empty. No usable hint was generated.");
+    }).catch(() => {});
+    return () => { stop = true; };
+  }, [sid]);
   useEffect(() => {
     const t = setInterval(() => load(false), 4000);
     return () => clearInterval(t);
@@ -64,6 +90,11 @@ export default function CoachPanel({ sid }) {
         Hints and guidance only — the coach never runs commands and never
         awards points. {sealed && "This match is sealed: answers use only the evidence you are allowed to see."}
       </p>
+      <div className="row" style={{ marginBottom: 10 }}>
+        <button className="ghost" onClick={askHint} disabled={busy || !!pending.length}>
+          request a hint</button>
+        {hint && <span className="dim" style={{ flex: 1 }}>{hint}</span>}
+      </div>
       {err && <p className="bad" role="alert">{err}</p>}
       <div className="chat" aria-live="polite">
         {msgs.length === 0 && !pending.length &&

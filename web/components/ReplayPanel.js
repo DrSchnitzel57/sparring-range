@@ -328,6 +328,7 @@ export default function ReplayPanel({ sid }) {
                  className={`tl-row${past && !pre ? " current" : ""}`}
                  style={{ opacity: past ? 1 : 0.45 }}
                  role="button" tabIndex={0}
+                 data-off={off === null ? "" : String(Math.round(off * 10) / 10)}
                  onKeyDown={(ev) => { if (ev.key === "Enter" && off >= 0) seek(off); }}
                  title={`#${e.event_id}${e.collapsed ? ` (${e.collapsed} events folded)` : ""}`}
                  onClick={() => { if (off !== null && off >= 0) seek(off); }}>

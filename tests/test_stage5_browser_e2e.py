@@ -301,7 +301,10 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
         pw("fill", 'input[placeholder="username"]', "blue")
         pw("fill", 'input[placeholder="password"]', MEM_PW)
         pw("click", 'button[type="submit"]')
-        _body_has(pw, "scenario library")  # login worked and the library loaded
+        _body_has(pw, "dashboard")  # login worked and the dashboard home loaded
+        # launch lives behind the dashboard's library link (plan 20)
+        pw("click", 'a:has-text("launch new scenario")')
+        _body_has(pw, "scenario library")
 
         # ---- create/launch through the UI ------------------------------------
         pw("click", 'tr:has-text("quick-win-01") button')
@@ -325,14 +328,16 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
              "comm": "bash", "exe": "/usr/bin/bash", "source_id": "71", "boot_id": "b1"}]},
             headers={"Authorization": f"Bearer {tok}"})
         assert r.status_code == 201 and r.json()["accepted"] == 1
-        # the live dashboard (2s poll) shows the captured command event.
-        # Wait for the INGESTED EVENT ITSELF (M01-R1/R3): "web01" is already
-        # on the page from the connection instructions, so waiting on it
-        # proved nothing and the immediate assert raced the first poll.
+        # The ingested event must be VISIBLE in the UI (M01-R1/R3): the
+        # Activity tab is the event projection surface (plan 20) — "web01"
+        # on the overview is just the connection instructions and proved
+        # nothing, so wait for the event row itself.
+        pw("goto", f"{WEB_URL}/session/{sid}?tab=activity")
         _body_has(pw, "command", timeout=20)
 
         # Regression fixture: old deployments persisted empty model hints.
         # Reload must expose that failure, not silently render no coach text.
+        # (plan 20: the hint surface lives on the Coach tab now)
         eng = create_engine(test_db_url_owner)
         with eng.begin() as conn:
             conn.execute(text(
@@ -340,15 +345,17 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
                 "VALUES (:s, now(), 'system', 'hint', CAST(:p AS jsonb))"),
                 {"s": sid, "p": json.dumps({"hint": "", "question": ""})})
         eng.dispose()
-        pw("reload")
+        pw("goto", f"{WEB_URL}/session/{sid}?tab=coach")
         _body_has(pw, "The last model hint was empty")
-        pw("select", 'select[aria-label="Event filter"]', "hint")
+        pw("goto", f"{WEB_URL}/session/{sid}?tab=activity")
+        pw("select", 'select[aria-label="Event kind filter"]', "hint")
         _body_has(pw, "details #")
         pw("click", "details summary")
         _body_has(pw, '\"hint\": \"\"')
-        pw("select", 'select[aria-label="Event filter"]', "action_result")
-        _body_has(pw, "No matching events yet")
-        pw("select", 'select[aria-label="Event filter"]', "")
+        pw("select", 'select[aria-label="Event kind filter"]', "action_result")
+        _body_has(pw, "no matching events yet")
+        pw("select", 'select[aria-label="Event kind filter"]', "")
+        pw("goto", f"{WEB_URL}/session/{sid}")
 
         # ---- begin match: SERVER clock + REAL worker subprocess via the UI ----
         pw("click", 'button:has-text("begin match")')
@@ -420,53 +427,50 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
                  "b": cast.stat().st_size})
         eng.dispose()
         pw("goto", f"{WEB_URL}/session/{sid}/replay")
-        _body_has(pw, "event timeline")
-        # asciinema-player 3.17 (Solid rewrite) mounts as .ap-player with the
-        # text mirror in <pre class="ap-term-text"> — the legacy
-        # .asciinema-player class no longer exists in the DOM.
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            if pw("--raw", "eval",
-                  "!!document.querySelector('.ap-player')").stdout.strip() == "true":
-                break
-            time.sleep(0.5)
-        else:
-            pytest.fail("asciinema-player (.ap-player) never mounted on the replay page")
+        _body_has(pw, "session timeline")
 
         def _eval(expr: str) -> str:
             return pw("--raw", "eval", expr).stdout.strip().strip('"')
 
-        # the driver DROPS a seek issued while still loading (silent no-op),
-        # so first wait until the recording is actually loaded (duration
-        # known) — and fail loudly on a surfaced player error instead of
-        # mistaking a dead player for a seek problem
+        # wait for the player to REALLY mount (plan 20: duration is known
+        # from the clock even before the cast loads, so mount + rendered
+        # terminal + duration are the readiness contract), and fail loudly
+        # on a surfaced player error instead of mistaking a dead player
+        # for a seek problem
         deadline = time.time() + 30
-        ev_trace = ""
         while time.time() < deadline:
-            dur = _eval("document.querySelector('[data-duration]').getAttribute('data-duration')")
             perr = _eval("document.querySelector('[data-player-error]').getAttribute('data-player-error')")
-            ev_trace = _eval("document.querySelector('[data-player-events]').getAttribute('data-player-events')")
             if perr:
                 pytest.fail(f"asciinema-player failed to load the recording: {perr}")
+            mounted = _eval("String(!!document.querySelector('.ap-player'))")
+            dur = _eval("document.querySelector('[data-duration]').getAttribute('data-duration')")
             try:
-                if float(dur) > 0:
-                    break
+                ready = mounted == "true" and float(dur) > 0
             except ValueError:
-                pass
+                ready = False
+            if ready and _eval("String(!!document.querySelector('.ap-term-text'))") == "true":
+                break
             time.sleep(0.5)
         else:
-            pytest.fail("asciinema-player never loaded the recording "
-                        f"(duration stayed empty; lifecycle events seen: {ev_trace or 'NONE — startup stalled'})")
+            pytest.fail("asciinema-player never mounted and rendered the "
+                        "recording (player stayed unmounted/empty)")
 
         # paused at t=0: the 1s frame is NOT rendered yet
         assert "hardening done" not in _eval(
             "document.querySelector('.ap-term-text').textContent")
 
-        # the first timeline row shows its offset; it must sit strictly
-        # between the two frames for the content assertion to prove position
-        row = 'div[title^="#"] >> nth=0'
+        # the first timeline row whose offset sits strictly between the two
+        # frames is the seek target (rows before the cast epoch say
+        # "pre-rec" and must not be clicked); it is marked from the DOM
+        # under test, then clicked like any user row
+        _eval("""(() => { document.querySelectorAll('.tl-row').forEach(r => {
+            const o = parseFloat(r.getAttribute('data-off'));
+            if (!r.dataset.testseek && o > 1.5 && o < 3590)
+                r.dataset.testseek = '1';
+        }); return 'ok'; })()""")
+        row = '.tl-row[data-testseek="1"] >> nth=0'
         off = float(_eval(
-            "document.querySelector('div[title^=\"#\"]').innerText").split("s")[0])
+            "document.querySelector('.tl-row[data-testseek]').getAttribute('data-off')"))
         assert 1.5 < off < 3590, f"event offset {off}s outside the frame bracket"
 
         # the player's OWN reported position (polled into data-now) must move

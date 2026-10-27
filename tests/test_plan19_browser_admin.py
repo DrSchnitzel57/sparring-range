@@ -88,7 +88,7 @@ def test_browser_model_administration(browser, web_app, ports, migrated_db,
         pw("fill", 'input[placeholder="username"]', "blue")
         pw("fill", 'input[placeholder="password"]', MEM_PW)
         pw("click", 'button[type="submit"]')
-        _body_has(pw, "scenario library")
+        _body_has(pw, "dashboard")
         pw("goto", f"{WEB_URL}/admin/models")
         _body_has(pw, "operator only")
 
@@ -97,7 +97,7 @@ def test_browser_model_administration(browser, web_app, ports, migrated_db,
         pw("fill", 'input[placeholder="username"]', "drew")
         pw("fill", 'input[placeholder="password"]', OP_PW)
         pw("click", 'button[type="submit"]')
-        _body_has(pw, "scenario library")
+        _body_has(pw, "dashboard")
         pw("click", 'nav a:has-text("models")')
         _body_has(pw, "model administration")
         # bootstrap profiles came up from the environment configuration
