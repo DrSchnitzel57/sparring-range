@@ -1,5 +1,50 @@
 # Current findings and validation evidence
 
+## Plan-20 SECOND independent review + user reprioritization — 2026-10-27
+
+The parent review completed at `adc10d4` (**VERDICT: FIX**, nine findings
+with reproductions) and the user explicitly reprioritized: **milestone 21
+proceeds now** (same branch) so a deployable release can be operated and
+tested; milestone 20 stays **unchecked and unaccepted**; the fixes below
+are split into (a) MINIMUM release blockers folded into 21 and (b) the
+repository backlog. The reviewer separately observed the five-file pin
+commit `3000361` and did not review or accept it. The prior round's gate
+receipts remain valid **checkpoint-scoped receipts, not acceptance**.
+Independently PASSED positives of that round (recorded truthfully): new
+audience threads separate, child deadline unblocked, correct cast positive
+offsets, attacker actor-query excludes non-red, legacy orphan HTTP 200,
+durable lifecycle flags, compressed-away citation refused, real ack-loss
+persists exact bytes, short-write timing measured, 450-noise raw-cursor
+pagination with lazy output, foreign/sealed authorization surfaces pass;
+applied 0020–0025 byte-unchanged vs `28b1f8b`.
+
+### (a) Release blockers — pulled into milestone 21 (fix here, prove here)
+
+| # | Sev | Defect (reproduced) | Status / impact |
+|---|---|---|---|
+| F1 | HIGH | 0026 `audience` backfill (0026:32–36 `server_default="member"`) silently labels ALL pre-0026 coach history member-visible although operator history may carry sealed context; legacy pending jobs without `chat_meta` audience also default member (`coach_routes.py:619,664`). Repro: populated PRE-0026 schema → forward upgrade discloses `PRE0026_SEALED_OPERATOR_BACKDOOR` in member GET and the next provider wire | **IN FIX (21)**: forward migration re-labels every migrated row to fail-closed `legacy` audience (raw rows preserved, visible only at privileged/unknown scope, never in member threads or provider prompts); runtime fence refuses coach history while schema head == 0026 (API can never serve mid-upgrade); metadata-less jobs resolve `legacy`, never member; real populated-upgrade + provider-wire tests |
+| F2 | HIGH | Capture quota admission (`app.py:1880–1905,1979–2012`): all checks sit inside `if body.text:` → 5-row cap but 20 null-text gap rows persist (cap 201); server truncation marker is 63 bytes against a 10-byte reserved budget (op AND session); second explicit marker raises 500 | **IN FIX (21, minimal release-safety guard)**: bounds always enforced atomically for ALL payload kinds (output/gap/marker) including null text; marker fits a reserved budget inside the total (or honest compact/zero form); duplicate marker answers the idempotent protocol, never 500. Not the full 20 replay polish |
+| F3 | HIGH | Valid 0025 history BREAKS migration 0026 (0026:51–55 `uq_operation_outputs_truncated_once`): 0025 permitted two truncation markers per operation (pre-fix race), so `CREATE UNIQUE INDEX` raises UniqueViolation — a populated 0025 database cannot upgrade at all. This is 21's core preserving-upgrade scope, not backlog-able | **IN FIX (21)**: applied 0026 stays byte-identical, no row is ever deleted or modified. Upgrade design = explicit SUPPORTED prerequisite + forward catch-up (see ARCHITECTURE "Plan-21 upgrade-compatibility decisions"): engine detects the duplicate-marker condition before migrating; the documented path skips only 0026's data-dependent INDEX statement (columns are re-applied idempotently by forward 0027 with `IF NOT EXISTS`, legacy rows untouched) and forward 0027 installs the future-proof uniqueness guard that legacy rows still satisfy; real 0025-populated → head proven through the actual installer, plus schema comparison against the clean path. No manual SQL, no evidence deletion |
+| F4 | MEDIUM | Capture consumer resource leak (`capture.py:193–201,295–355`, `transport.py:108–113`): six completed operations leave six consumer threads alive 11.58 s against an endpoint dribbling bytes; inactivity timeout does not bound absolute request age; `finish()` join cannot cancel; idle exit unreachable inside `_deliver` | **IN FIX (21, bounded functional guard)**: process-wide consumer concurrency bound; absolute per-delivery budget; `finish()` drains with bounded deadline and counts honest dropped gaps; command deadline/drain paths stay independent. Full 20 replay polish not attempted |
+
+### (b) Repository backlog (milestone 20 remains unaccepted; these stay open, none silently dropped)
+
+| # | Sev | Defect (reproduced) | Priority / deployment impact |
+|---|---|---|---|
+| B1=F5 | MEDIUM | Citation payload forgery: a command payload containing `echo reference #99999999` adds the non-existent id to the APPROVED set (`coach/chat.py:110–113`, `coach/aar.py:131–136`); browser shows 2 active links. Approval must match canonical AUTHORIZED EVENT RECORD ids, not regex over payload text | Before any "citations verified" claim; no data leak, UI trust issue. Backlog unless naturally fixed while touching that code |
+| B2=F6 | MEDIUM | Replay seek-back before cast start leaves the player at the last in-cast frame (30) instead of following the session clock; changing the actor filter shifts cast offset (100→50). Canonical session clock, filter-independent | UX correctness; operator testing can proceed with the labeled limitation |
+| B3=F7 | MEDIUM | Generic model-job audience (`coach_routes.py:332–433`): a member enumerates operator coach jobs and fetches job detail/SSE (HTTP 200). Reproduced STATE/TIMING only — answer text was not observed to leak; fresh coach pending path is isolated | Fix minimally as part of F1's audience filter where natural; precise impact recorded; do not overclaim a secret-answer leak, do not claim solved until re-verified |
+| B4=F8 | MEDIUM | Idempotence gaps (`app.py:1965–1977,2023–2031`): same seq+same text but different `read_ts`/`dropped_bytes` persists a duplicate; changed text classifies CONFLICT but answers HTTP 200 instead of 409 | Evidence-integrity polish; claim only "duplicate suppression by seq+content" until fixed |
+| B5=F9 | MEDIUM | Worker-claimed `read_ts` trusted for new operations (`app.py:1872–1877,1949–1954,2014–2018`): accepts `read_ts=1`, replay renders without lifetime/provenance labels | Timing-claim honesty; server-side sanity window + explicit "worker-claimed" label; timing display is advisory until then |
+| B6 | — | Everything else the second review judged "polish": not reopened in 21 by design; 20 acceptance stays with the parent | Roadmap 20 stays unchecked |
+
+Claim discipline while these are open: do NOT claim verified citations
+(F5), full idempotence (F8), deterministic-timing provenance (F9),
+filter-independent replay (F6), or complete audience/job isolation (F7)
+until re-verified. F1's fail-closed re-labeling plus runtime fence,
+F2's always-on quota guard and F4's bounded consumer ARE 21's release
+minimum, proven with real DB/subprocess tests in this milestone.
+
 ## Plan-20 independent review fix round — 2026-10-27, branch `practice-upgrades-18-21`
 
 Independent review (VERDICT: FIX) at `28b1f8b` reproduced eleven

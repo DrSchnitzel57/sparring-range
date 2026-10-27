@@ -207,7 +207,13 @@ historical 14–17. Implementation waits for the user's new worktree:
   solely by the carried pinned-nginx mirror-drift 21 blocker (exact
   serial evidence there), and packet/journey/release fail closed by
   design. Ticked when the parent's independent re-review accepts 20;
-  milestone 21 is NOT started.
+  SECOND review at `adc10d4` (2026-10-27, VERDICT FIX, nine findings)
+  KEPT 20 UNACCEPTED and the user reprioritized milestone 21 to proceed
+  now on this branch; release blockers F1–F4 are being fixed inside 21,
+  polish F5–F9 are backlog entries in
+  [findings](FINDINGS_CHECKLIST.md) — nothing dropped.
+  Milestone 21 implementation started 2026-10-27 (pin repair `3000361`,
+  preserving-upgrade engine and pulled blockers F1–F4 follow).
 - [ ] **21 — Upgrade and qualified integrated release.**
   [Plan](../.openchamber/plans/21-upgrade-and-integrated-release.md). Supported preserving
   in-place upgrade, corrected fresh-install bundle, changed-artifact rebuilds,
