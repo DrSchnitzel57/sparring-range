@@ -1,5 +1,116 @@
 # Current findings and validation evidence
 
+## Milestone 21 review round 2 — reproduced FIX and superseding proofs — 2026-10-27 (`0a169e9`)
+
+The second release-focused review at `2ba575e` returned **VERDICT: FIX**
+with seven blockers; the reviewer's upgrade-gate FAIL (19.4 s, `backup
+digest mismatch upgrade/.../journal.json`) was independently REPRODUCED
+here before fixing (`.cache/gate_r10_upgrade_repro.log` shows the earlier
+engine still passing only because the journal-exclusion parameter existed
+unwired — flaky passes, not proof; they are retracted). Every fix is
+proven at the REAL CLI level by the re-forged `upgrade` gate; claim
+discipline: the gate was run three consecutive times (93.8 s, 94.6 s,
+93.5 s — `.cache/gate_r11_upgrade.log`, `.cache/gate_r12_upgrade_{1,2}.log`),
+all PASS, all fixtures self-removed (`NO_SR_CONTAINERS`, no gate tmp).
+
+Finding → fix → proof (all at `0a169e9`; fix commits `431f2c1`/`0a169e9`,
+gate `a2ee8c9`):
+
+1. **Production CLI did not provision the runtime** → provisioning is a
+   real journaled stage between activation and migration running the
+   SAME service helpers as install (locked `requirements.lock` venv
+   install, selected Node, per-UID runtime verification on the real
+   appliance, locked frontend build) with the installed venv required to
+   import every unit entrypoint; migrations default to the installed
+   venv python, never the invoking interpreter. Proof: positive (receipt
+   + independent import probe of `srplatform.api.app`/`infra.appliance.brokerd`
+   with the created venv), negative (impossible lockfile → provision
+   failed, fence up, no stamp, resumable), both through the real CLI.
+2. **Quiescence false / no admission fence** → durable work now read
+   from every authority (runs, model jobs incl. `cessation_unknown`,
+   dispatched-command inventory, ledger — a MISSING ledger refuses unless
+   `--allow-fresh-install` is truth); an admission fence file is held
+   from preflight through verified restart and the API answers 503 to
+   NEW work while login/internal-callbacks/health flow; quiescence is
+   RE-proved under the fence. Proof: dry-run refusal for queued AND
+   cessation_unknown jobs with zero side effects; missing-ledger
+   refusal; fence survives SIGKILL, released only on completion;
+   TestClient 503/admit matrix against the real app.
+3. **Config backup contained its own mutable journal; restore was not
+   atomic** → the backup excludes the journal tree entirely; restore is
+   TWO-PASS (complete inventory + digests + metadata + path safety
+   validated BEFORE any write). Proof: no `upgrade*` entries in any
+   backup manifest; corrupting a LATE backup file changes ZERO files;
+   the attempt journal is never restored over.
+4. **Restore destroyed original permissions/ownership** → backups record
+   ORIGINAL mode/uid/gid separately from the private copy; restore
+   applies them (root restores fully; a non-root restore may only touch
+   its own files — never privilege guessing). Proof: 0640 service file
+   and 0644 file corrupted+chmodded, restored byte-exact with original
+   modes.
+5. **Restart failure looked like success; resume could be no-op'd away**
+   → version stamp only after a CHECKED restart (restart + `is-active`
+   per unit); an unfinished attempt outranks every no-op answer; failed
+   restart/provision keep the fence up and the attempt in progress.
+   Proof: against a `systemctl` service double — failing restart → exit
+   ≠0, journal restart failed, NO stamp, fence up → resume completes →
+   stamp then; unfinished+resume never answers no-op.
+6. **DB owner secret in argv** → `--db-url` REMOVED (the CLI refuses
+   it); the URL arrives by named environment variable and pg_dump
+   receives endpoint flags + private 0600 `PGPASSFILE` only. Proof: the
+   gate's pg_dump wrapper exits 47 if the synthetic fixture secret ever
+   appears in its argv and 46 without the PGPASSFILE channel — the
+   passing gate IS the inspection.
+7. **Preflight skipped payload verification** → `verify()` (bytes +
+   contract + path/duplicate safety) runs before ANY qualification,
+   dry-run/no-op included; contract must match manifest revision/version/
+   inventory. Proof: tampered bytes REFUSED where a no-op would have
+   answered; contract revision lie refused; duplicate manifest keys
+   refused; pre-21 refused — all before side effects.
+
+Supporting fixes (build-fix class, reported per instruction):
+`run_operations.state` (not `status`) in the durable check; the sandbox's
+venv creation gained `_create_venv` (`python3 -m venv` = appliance
+contract, `uv venv --seed` for uv-served dev hosts — production call
+unchanged) and the broker libvirt-binding exposure became an explicit
+broker-role step (a sandbox has no broker/libvirt; the appliance keeps
+it required). Gate plumbing: wrapper arg parsing, tar-stream bad-lock
+payload (hardlinks cannot cross tmpfs), import path.
+
+Milestone 21 status: local software lanes now cover the corrected
+engine; `images`/`capture` role artifacts were built at `2ba575e`
+(role INPUTS unchanged since — see artifact receipt below) and the
+release bundle must be (and will be) rebuilt from the corrected HEAD so
+its `upgrade` contract matches the fixed engine. `packet`/`journey`/
+installed-systemd/Strata/nested-KVM remain operator-machine pending —
+never passed here.
+
+### Role-artifact receipt (supervised-practice candidate) — built 2026-10-27
+
+Self-contained flattened qcow2 artifacts (`qemu-img info` shows NO
+backing file), built through the production builders with the repaired
+pins; the resolved package versions below were RECORDED FROM THE BUILD
+GUEST's own serial output, proving the artifacts match the repaired pin
+file (`pins_sha256 2c284ee217f3…`, git input `2ba575e62…` — role INPUTS
+unchanged through the review fixes; input hashes `b468a1840bf5c669` /
+`b3eb3947c5bb8fb2` / `f5330fa551f3604c` are what the `images` gate
+cache-keys on, so its rebuild reuses them honestly as BUILD-CACHED):
+
+| Artifact (`.cache/images/`) | sha256 (prefix) | disk |
+|---|---|---|
+| `mojang-web-local.qcow2` | `97d694851c20…` | 2728 MiB |
+| `mojang-web-db.qcow2` | `7c6072615646…` | 2724 MiB |
+| `attacker.qcow2` | `015aeafe5a5f…` | 2249 MiB |
+
+Guest-resolved versions: nginx `1.24.0-2ubuntu7.19`, openssh
+`1:9.6p1-3ubuntu13.20`, curl `8.5.0-2ubuntu10.16`, qemu-guest-agent
+`1:8.2.2+ds-0ubuntu1.18`, auditd `1:3.1.2-2.1ubuntu0.1`, mysql
+`8.0.46-0ubuntu0.24.04.4`. Full machine-readable receipt:
+`.cache/images/role-artifacts.json`. **Identity limit, stated plainly:**
+the attacker artifact carries the gate's SYNTHETIC keys (TEST_KEYS), so
+this set is the supervised-practice candidate; the production contract
+remains the operator's key-bearing template rebuild per the runbook.
+
 ## Milestone 21 implementation round 1 — 2026-10-27 (branch `practice-upgrades-18-21`)
 
 Scope executed: preserving in-place upgrade (engine + real CLI + required

@@ -370,49 +370,105 @@ the remediation hint — that is "not your window yet", not a failure; exit
   paths (unknown session → 404, unknown incident → 404, an operator-only
   view as a member → 403) are checked in every session.
 
-### 7. Preserving in-place upgrade (milestone 21)
+### 7. Preserving in-place upgrade (milestone 21, review-corrected)
 
 The upgrade is driven by a built release bundle — the same artifact you
-installed from, at a newer revision. Quiesce first (no armed lease, no
-open obligations, no latched range; the CLI refuses otherwise), then:
+installed from, at a newer revision.
+
+**Before anything else: a whole-VM snapshot.** The engine keeps config +
+database backups, but the honest rollback of a hypervisor-VM appliance is
+a powered-off snapshot (or full copy) taken while no engagement runs.
+That snapshot, not the engine, is your last resort; keep it until you
+have completed the post-upgrade checks below.
+
+Quiesce first: finish or stop engagements, drain model work, and confirm
+nothing is in `cessation_unknown` (the CLI now BLOCKS on it — that state
+means provider-side cessation is unconfirmed and needs your bounded
+resolution, never a restart-over). The credential for the owner dump
+travels by ENVIRONMENT ONLY — never a CLI argument, because argv is
+world-readable in the process table for the whole upgrade:
 
 ```bash
 python3 deploy/bundle.py verify /srv/sr-release                 # must pass
-python3 deploy/appliance.py upgrade --manifest /etc/sparring-range/manifest.json \
-    --payload /srv/sr-release --db-url "$POSTGRES_URL_OWNER" --dry-run
-python3 deploy/appliance.py upgrade --manifest /etc/sparring-range/manifest.json \
-    --payload /srv/sr-release --db-url "$POSTGRES_URL_OWNER"
+# inline environment assignment: invisible to ps, never in journal or logs
+SR_PG_UPGRADE_URL='postgresql://sr_owner:…@127.0.0.1:5432/spranging' \
+  python3 deploy/appliance.py upgrade --manifest \
+  /etc/sparring-range/manifest.json --payload /srv/sr-release --dry-run
 ```
 
-What it does, in order, under a journal in `/etc/sparring-range/upgrade/`:
-private config backup + `pg_dump` of the database (restore-listable, the
-digest is recorded), digest-verified staging, per-file atomic activation
-(only files the payload owns; foreign files are never touched), FORWARD
-migrations only, config re-render, version stamp, ordered service
-restart. Users, password hashes, keys/pins, closed sessions, audit rows,
-casts and historical reports are never deleted or rewritten. A rerun at
-the same revision answers `no_op`.
+The dry-run verifies the COMPLETE payload (bytes, upgrade contract,
+inventory, migration graph) and every durable-work authority BEFORE it
+answers anything, with zero side effects; a refusal naming a queued or
+cessation-unknown job is the quiescence telling you the truth. Only then
+remove `--dry-run`. On a provably never-claimed appliance you may add
+`--allow-fresh-install`; a missing broker ledger otherwise refuses, on
+purpose. Never add it to work around a refusal.
+
+What the real run does, journaled under `/etc/sparring-range/upgrade/`
+(the journal tree is never part of the config backup and a restore never
+rewrites any journal): it raises the **admission fence**
+(`/var/lib/sparring-range/maintenance` — the API then answers 503 to NEW
+work while existing callbacks, login and health keep flowing, so nothing
+can race the upgrade and in-flight runs still terminalize), takes the
+private config backup (original modes/ownership recorded; the journal
+tree excluded) and a `pg_dump` whose password arrives ONLY through a
+private 0600 `PGPASSFILE` — no credential is in any argv, log or
+manifest; then digest-verified staging, per-file atomic activation (only
+payload-owned files), **provisioning of the activated release** (locked
+`requirements.lock` install into the service venv, an entrypoint import
+check with that venv's own interpreter, the locked frontend build — the
+services must RUN the new release, not just store it), proven FORWARD-only
+migrations with the installed venv, config re-render, and a **checked
+restart** (every unit restarted AND verified active). Only after that
+does the version stamp get written and the fence drop. Users, password
+hashes, keys/pins, closed sessions, audit rows, casts and historical
+reports are never deleted or rewritten; a rerun at the same revision
+answers `no_op` — but an UNFINISHED attempt always outranks that answer.
 
 Failure and interruption discipline:
 
-* A failed stage leaves the attempt **in progress**; a new upgrade is
-  then REFUSED. Look at the attempt journal, then resume exactly that
-  attempt: `... upgrade ... --resume <ATTEMPT>`. Never delete a journal
-  to "unstick" it — unknown work is resolved, not discarded.
+* A failed stage (provisioning, migration, restart) leaves the attempt
+  **in progress**, keeps the fence UP (new work stays refused; nothing
+  silently resumes on half-verified bytes) and writes NO version stamp —
+  the appliance never claims a release that never ran. Fix the cause,
+  then resume exactly that attempt: `... upgrade ... --resume
+  <ATTEMPT>`; only unfinished stages re-run. A new upgrade is refused
+  while any attempt is in progress; never delete a journal to unstick it.
 * Migration state after an interruption is PROVEN from the database
   before continuing; an unrecognizable position stops with the attempt
   retained rather than guessing a schema.
 * Config-only rollback: `... upgrade --manifest ... --restore-config
-  <ATTEMPT>` restores the attempt's verified config backup and issues NO
-  service action — you start services yourself, so a restore can never
-  resume an engagement. Database rollback is deliberately not offered:
-  schema is forward-only; the attempt journal holds your `pg_dump` for
-  an explicit, quiesced `pg_restore` if you ever truly need it.
+  <ATTEMPT>` validates the COMPLETE backup BEFORE writing (a corrupt
+  late file changes ZERO files), restores original modes/ownership,
+  clears the fence and issues NO service action — you start services
+  yourself, so a restore can never resume an engagement. Database
+  rollback is deliberately not offered: schema is forward-only; the
+  attempt journal holds your `pg_dump` for an explicit, quiesced
+  `pg_restore` if you ever truly need it.
 * Supported 0025-era databases with duplicate truncation markers take a
   RECORDED prerequisite (0026's index is un-creatable over legacy rows;
   forward 0027 installs the legacy-safe guard). This is automatic,
   journalled, and deletes nothing. Pre-21 bundles are refused as
   payloads by construction (no `upgrade` contract).
+
+Post-upgrade checks before admitting members again (all operator-side,
+on the installed appliance — none of this runs from the upgrade):
+
+```bash
+python3 deploy/appliance.py doctor --manifest /etc/sparring-range/manifest.json
+python3 deploy/appliance.py verify --manifest /etc/sparring-range/manifest.json
+ls /var/lib/sparring-range/maintenance            # must NOT exist
+cat /etc/sparring-range/release-version.json      # the new revision
+curl -fsS https://<appliance>/readyz
+journalctl -u sparring-api -u sparring-web -u sparring-brokerd -b --since \
+  "-15 min" | grep -iE "error|refus" || echo "clean boot"
+```
+
+Then log in with a real member account (existing password, not a reset),
+open the coach thread of an old session (sealed history renders), start
+one supervised practice engagement, end it, and replay a pre-upgrade
+recording byte-for-byte. Only after all of that remove the pre-upgrade
+VM snapshot.
 
 ## Historical direct-PVE runbook
 

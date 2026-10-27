@@ -213,25 +213,28 @@ historical 14–17. Implementation waits for the user's new worktree:
   polish F5–F9 are backlog entries in
   [findings](FINDINGS_CHECKLIST.md) — nothing dropped.
   Milestone 21 implementation round 1 landed 2026-10-27 (`3a4d927`):
-  preserving-upgrade engine + real CLI + required `upgrade` gate (PASS ×2),
-  bundle upgrade contract, pulled blockers F1–F4 fixed with real proofs;
-  21 stays UNTICKED — images/capture/bundle await role-artifact builds,
-  packet/journey/release remain operator-machine gates. Exact receipts in
-  [findings](FINDINGS_CHECKLIST.md).
+  preserving-upgrade engine + real CLI + required `upgrade` gate, bundle
+  upgrade contract, pulled blockers F1–F4 fixed with real proofs. The
+  release review at `2ba575e` returned VERDICT: FIX (seven engine/CLI
+  blockers); round 2 (`431f2c1`/`a2ee8c9`/`0a169e9`) fixed all seven with
+  the re-forged `upgrade` gate PASS ×3 deterministically (93.5–94.6 s),
+  and role-image artifacts built from the repaired pins (self-contained,
+  digests in FINDINGS); the release bundle is rebuilt from the corrected
+  HEAD. 21 stays UNTICKED — bundle verification receipt and
+  packet/journey/release (operator-machine) gates remain. Exact receipts
+  in [findings](FINDINGS_CHECKLIST.md).
 - [ ] **21 — Upgrade and qualified integrated release.**
   [Plan](../.openchamber/plans/21-upgrade-and-integrated-release.md). Supported preserving
   in-place upgrade, corrected fresh-install bundle, changed-artifact rebuilds,
   installed/aggregate proofs and explicit real-Strata/manual acceptance.
   *Carry-forward scoped limitation (2026-10-27, recorded at plan-19 round-5
-  review):* the pinned guest package set `infra/images/packages-24.04.txt`
-  has drifted out of the Ubuntu mirrors (build-guest apt: `E: Version
-  '1.24.0-2ubuntu7.18' for 'nginx' was not found`), so role-image builds —
-  the `images` gate and everything downstream (capture overlay, bundle role
-  artifacts) — are NOT reproducible as pinned. This is a software
-  supply-chain reproducibility blocker to REPAIR before the 21 release
-  (documented pin refresh with re-recorded versions and rebuild evidence,
-  on a KVM runner or with warm cache); it is not an environmental waiver
-  and no PASS is recorded for those gates. Also unproven and carried:
+  review):* ~~the pinned guest package set has drifted out of the Ubuntu
+  mirrors~~ — REPAIRED 2026-10-27 (`3000361` + artifact build): pins
+  re-resolved against the live mirrors (`apt-get -s` SIM_OK) and the
+  three role images built and flattened from them with guest-recorded
+  resolved versions (FINDINGS artifact receipt). Reproducible as pinned;
+  final `images`/`capture`/`bundle` gate receipts still land with 21.
+  Also unproven and carried:
   installed UID/proc/systemd boundaries, Strata/KVM nested virtualization
   and all operator gates (packet/journey/release) — sandbox fixtures are
   not installed-system proof.
