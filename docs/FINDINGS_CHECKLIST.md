@@ -27,6 +27,14 @@ Gate receipts (exact commands, this environment, revision `3a4d927`):
   completes, drift repaired; config-only restore with ZERO service
   actions; tampered payload refused; pre-21 bundle refused. Fixture:
   run-owned `sr-upg-pg-<run>` postgres:16, removed in `finally`.
+- Sweep at HEAD (serialized, receipts `.cache/gate_r8_*.log`):
+  `selection` **PASS** (173.0s — 1141 tests all classified = 661 fast +
+  480 integration, including the 8 new plan-21 proofs; empty-selection
+  negative passes); `db` **PASS** (671.3s — **322 passed, 0 failed, 0
+  skipped**, 819 deselected, disposable PostgreSQL 16, owned-resource
+  cleanup proven); `agent` **PASS** (154.9s — 123/0/0); `containment`
+  **PASS** (25.0s — 41/0, no leaked cgroups). All sweep fixtures removed;
+  zero `sr-*` containers remain.
 - Aggregate now ATTEMPTS `agent` and `upgrade` (criterion 3 list change).
 
 Honest PENDING (not simulated, not waived): `images`/`capture`/`bundle`
