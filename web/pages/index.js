@@ -14,20 +14,24 @@ export default function Home() {
     try {
       const r = await api("/auth/login", { method: "POST", body: { username, password } });
       saveSession(r);
-      router.push("/library");
+      router.push("/home");
     } catch (e2) { setErr(String(e2.message || e2)); setBusy(false); }
   }
   return (
-    <div className="panel" style={{ maxWidth: 420, margin: "60px auto" }}>
-      <h2>sparring-range — login</h2>
-      <p className="dim">Real credential login (operator-provisioned accounts). Tokens expire;
-        no internet, no SSO — home-LAN gym.</p>
-      <form onSubmit={login} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        <input placeholder="username" value={username} onChange={(e) => setU(e.target.value)} autoFocus />
-        <input placeholder="password" type="password" value={password} onChange={(e) => setP(e.target.value)} />
+    <div className="panel" style={{ maxWidth: 430, margin: "70px auto" }}>
+      <h2>sparring-range</h2>
+      <p className="dim">Sign in with your operator-provisioned account. Real
+        credentials, expiring tokens, no internet, no SSO.</p>
+      <form onSubmit={login} style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        <label className="dim">username
+          <input placeholder="username" value={username} autoComplete="username"
+            onChange={(e) => setU(e.target.value)} autoFocus /></label>
+        <label className="dim">password
+          <input placeholder="password" type="password" autoComplete="current-password"
+            value={password} onChange={(e) => setP(e.target.value)} /></label>
         <button type="submit" disabled={busy || !username || !password}>{busy ? "…" : "enter the gym"}</button>
       </form>
-      {err && <p className="bad">{err}</p>}
+      {err && <p className="bad" role="alert">{err}</p>}
     </div>
   );
 }
