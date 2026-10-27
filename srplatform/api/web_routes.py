@@ -120,37 +120,206 @@ def get_recording(recording_id: uuid.UUID, p: Principal = Depends(any_member),
 
 
 @router.get("/sessions/{session_id}/replay")
-def replay(session_id: uuid.UUID, p: Principal = Depends(any_member),
-           db: DbSession = None):
-    """Multiple recordings; each header's epoch is the sync anchor (F17)."""
+def replay(session_id: uuid.UUID,
+           after_event_id: int | None = None,
+           limit: int | None = None,
+           actor: str | None = None,
+           action_type: str | None = None,
+           collapsed: bool = True,
+           include_frames: bool = False,
+           p: Principal = Depends(any_member), db: DbSession = None):
+    """Session-clock replay, PAGINATED and FILTERED (plan 20).
+
+    * the timeline is a cursor-paged projection (``after_event_id`` +
+      ``limit``, default 400, max 2000) — a session view never downloads
+      the whole audit; ``actor``/``action_type`` filter server-side;
+    * ``collapsed`` (default) folds consecutive connection/bastion noise
+      into one honest summary entry (counted, expandable via its id
+      range) so the meaningful events are readable;
+    * casts are returned as SUMMARIES (frame count, duration, epoch);
+      full frames come from ``GET /recordings/{id}`` or explicitly via
+      ``include_frames=1`` — rendering a list never fetches casts;
+    * ``operations`` is the attacker command track (intent paired with
+      result, plus per-operation capture facts and ``has_output``); a
+      SEALED competition member gets NO commands — visibility is
+      enforced here, not by hiding a button;
+    * missing/corrupt casts are per-entry honest errors, never dropped.
+    """
     sess = _session_or_403(db, p, session_id)
     from srplatform.api.visibility import competition_sealed
     sealed = competition_sealed(db, sess, p)
-    events = db.execute(sa_text(
-        "SELECT event_id, ts, actor, action_type, phase FROM events "
-        "WHERE session_id = :sid ORDER BY event_id"), {"sid": str(session_id)}).fetchall()
-    # Red kill-chain phases are sealed content (a timeline showing live
-    # `priv-esc` is the spoiler, not the timestamps around it). Casts
-    # stay unfiltered: they are the defender's own shell transcripts
-    # (first-party observation of their own environment, no red
-    # internals — the red worker has no recorded sessions).
-    timeline = [{"event_id": e.event_id, "ts": e.ts.isoformat(), "actor": e.actor,
-                 "action_type": e.action_type,
-                 "phase": (None if sealed and e.actor == "red" else e.phase)}
-                for e in events]
+    limit = 400 if limit is None else max(1, min(limit, 2000))
+    conds = ["session_id = :sid"]
+    params = {"sid": str(session_id), "lim": limit + 1}
+    if after_event_id is not None:
+        conds.append("event_id > :after")
+        params["after"] = after_event_id
+    if actor:
+        conds.append("actor = :actor")
+        params["actor"] = actor
+    if action_type:
+        conds.append("action_type = :atype")
+        params["atype"] = action_type
+    where = " AND ".join(conds)
+    rows = db.execute(sa_text(
+        f"SELECT event_id, ts, actor, action_type, phase FROM events "
+        f"WHERE {where} ORDER BY event_id LIMIT :lim"), params).fetchall()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    total = db.execute(sa_text(
+        f"SELECT count(*) FROM events WHERE {where}"),
+        {k: v for k, v in params.items() if k != "lim"}).scalar() or 0
+
+    noise = {"bastion_session_start", "bastion_session_end"}
+    timeline: list[dict] = []
+    run_noise: list = []
+
+    def _flush_noise():
+        if not run_noise:
+            return
+        first, last = run_noise[0], run_noise[-1]
+        kinds = sorted({e.action_type for e in run_noise})
+        timeline.append({
+            "event_id": first.event_id, "collapsed": len(run_noise),
+            "first_event_id": first.event_id, "last_event_id": last.event_id,
+            "ts": first.ts.isoformat(), "actor": first.actor,
+            "action_type": "connection_noise", "kinds": kinds, "phase": None})
+        run_noise.clear()
+
+    for e in rows:
+        # Red kill-chain phases are sealed content (a live `priv-esc`
+        # timeline is the spoiler). Casts stay unfiltered: defender
+        # first-party transcripts, no red internals.
+        phase = None if (sealed and e.actor == "red") else e.phase
+        if collapsed and e.action_type in noise:
+            run_noise.append(e)
+            continue
+        _flush_noise()
+        timeline.append({"event_id": e.event_id, "ts": e.ts.isoformat(),
+                         "actor": e.actor, "action_type": e.action_type,
+                         "phase": phase})
+    _flush_noise()
+
     recs = db.execute(select(Recording).where(Recording.session_id == session_id)
                       .order_by(Recording.created_at)).scalars().all()
     casts = []
     for r in recs:
         try:
             data = _safe_read_cast(r.cast_path)
-            casts.append({"recording_id": str(r.recording_id),
-                          "name": os.path.basename(r.cast_path), **data})
+            frames = data["frames"]
+            entry = {"recording_id": str(r.recording_id),
+                     "name": os.path.basename(r.cast_path),
+                     "header": data["header"],
+                     "frame_count": len(frames),
+                     "duration_s": frames[-1][0] if frames else 0,
+                     "started_at": data["header"].get("timestamp"),
+                     "bytes": data["bytes"]}
+            if include_frames:
+                entry["frames"] = frames
+            casts.append(entry)
         except HTTPException as e:
             casts.append({"recording_id": str(r.recording_id), "error": e.detail,
-                          "header": None, "frames": []})
+                          "header": None, "frame_count": 0})
+
+    # attacker command track — pair intent with result by op_uuid
+    operations = _operation_track(db, session_id, sealed)
     return {"session_id": str(session_id), "scenario_id": sess.scenario_id,
-            "casts": casts, "timeline": timeline}
+            "sealed": sealed,
+            "casts": casts, "timeline": timeline,
+            "operations": operations,
+            "total_events": total, "has_more": has_more,
+            "next_after_event_id": rows[-1].event_id if has_more and rows else None}
+
+
+def _operation_track(db: Session, session_id, sealed: bool) -> list[dict]:
+    """attacker commands paired with their results (plan 20 replay). A
+    SEALED member sees NO red command content — the track is empty, not
+    redacted page by page. Legacy operations without capture rows keep
+    ``has_output`` False: they render as command-only evidence, never
+    as a reconstructed fake cast."""
+    if sealed:
+        return []
+    rows = db.execute(sa_text(
+        "SELECT event_id, ts, actor, action_type, payload FROM events "
+        "WHERE session_id = :sid AND action_type IN "
+        "('action_intent','action_result') ORDER BY event_id"),
+        {"sid": str(session_id)}).fetchall()
+    have_output = {r[0] for r in db.execute(sa_text(
+        "SELECT DISTINCT op_id FROM operation_outputs WHERE session_id = :sid"),
+        {"sid": str(session_id)}).fetchall()}
+    by_uuid: dict[str, dict] = {}
+    order: list[str] = []
+    for e in rows:
+        payload = e.payload or {}
+        ouuid = payload.get("op_uuid")
+        if not ouuid:
+            continue          # pre-UUID legacy lines: not a forged track
+        if e.action_type == "action_intent":
+            by_uuid[ouuid] = {"op_uuid": ouuid,
+                              "op_id": payload.get("op_id"),
+                              "command": payload.get("command"),
+                              "intent_event_id": e.event_id,
+                              "ts": e.ts.isoformat(),
+                              "result_event_id": None, "end_ts": None,
+                              "exit_code": None, "timed_out": None,
+                              "cancel_state": None, "capture": None,
+                              "has_output": ouuid in have_output}
+            order.append(ouuid)
+        else:
+            op = by_uuid.get(ouuid)
+            if op is None:
+                # result without intent (events predating the pairing or
+                # trimmed history): still show it, honestly incomplete
+                op = {"op_uuid": ouuid, "op_id": payload.get("op_id"),
+                      "command": payload.get("command"),
+                      "intent_event_id": None,
+                      "ts": e.ts.isoformat(), "result_event_id": e.event_id,
+                      "end_ts": e.ts.isoformat(),
+                      "has_output": ouuid in have_output}
+                order.append(ouuid)
+            op.update({"result_event_id": e.event_id, "end_ts": e.ts.isoformat(),
+                       "exit_code": payload.get("exit_code"),
+                       "timed_out": payload.get("timed_out"),
+                       "cancel_state": payload.get("cancel_state"),
+                       "capture": payload.get("output_capture")})
+            op["has_output"] = ouuid in have_output
+    return [by_uuid[u] for u in order]
+
+
+@router.get("/sessions/{session_id}/operations/{op_id}/output")
+def operation_output(session_id: uuid.UUID, op_id: str,
+                     after_seq: int | None = None,
+                     limit: int = 200,
+                     p: Principal = Depends(any_member), db: DbSession = None):
+    """One operation's timed output chunks (plan 20). Sealed competition
+    members get NOTHING for red operations — chunks are attacker output
+    and never cross the visibility boundary through this door either.
+    Operations that predate capture honestly report zero rows (the
+    caller renders the command-only fallback)."""
+    sess = _session_or_403(db, p, session_id)
+    from srplatform.api.visibility import competition_sealed
+    sealed = competition_sealed(db, sess, p)
+    if sealed:
+        return {"op_id": op_id, "chunks": [], "hidden": True}
+    limit = max(1, min(limit, 1000))
+    conds = ["session_id = :sid", "op_id = :op"]
+    params: dict = {"sid": str(session_id), "op": op_id,
+                    "lim": limit + 1}
+    if after_seq is not None:
+        conds.append("seq > :after")
+        params["after"] = after_seq
+    rows = db.execute(sa_text(
+        f"SELECT seq, ts, kind, text, dropped_bytes FROM operation_outputs "
+        f"WHERE {' AND '.join(conds)} ORDER BY seq LIMIT :lim"),
+        params).fetchall()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    return {"op_id": op_id,
+            "chunks": [{"seq": r.seq, "ts": r.ts.isoformat(),
+                        "kind": r.kind, "text": r.text,
+                        "dropped_bytes": r.dropped_bytes} for r in rows],
+            "has_more": has_more,
+            "next_after_seq": rows[-1].seq if has_more and rows else None}
 
 
 # --- progress: per-domain scores from scoring ITEMS (F20) -------------------------

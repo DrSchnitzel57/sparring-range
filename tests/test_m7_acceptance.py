@@ -153,8 +153,18 @@ def test_m7_replay_shape_epoch_and_containment(client, users, tmp_path):
     rid = r.json()["recording_id"]
 
     rp = client.get(f"/sessions/{sid}/replay", headers=users["member"]).json()
+    # plan 20: replay returns cast SUMMARIES; frames only on explicit
+    # request (rendering a list never downloads a cast)
     assert rp["casts"][0]["header"]["timestamp"]              # epoch anchor present
-    assert rp["casts"][0]["frames"][1] == [0.4, "i", "id\n"]
+    assert "frames" not in rp["casts"][0]
+    assert rp["casts"][0]["frame_count"] == 2
+    full = client.get(f"/sessions/{sid}/replay",
+                      params={"include_frames": True},
+                      headers=users["member"]).json()
+    assert full["casts"][0]["frames"][1] == [0.4, "i", "id\n"]
+    via_id = client.get(f"/recordings/{rid}", headers=users["member"]).json()
+    assert via_id["frames"][1] == [0.4, "i", "id\n"]
+    assert rp["operations"] == []          # no commands ran in this session
 
     # path containment: a path outside the recordings root is rejected at REGISTRATION
     outside = tmp_path / "evil.cast"

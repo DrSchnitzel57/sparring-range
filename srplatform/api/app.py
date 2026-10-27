@@ -410,17 +410,77 @@ def create_session(body: SessionCreate, p: Principal = Depends(any_member),
 
 
 @app.get("/sessions")
-def list_sessions(mine: bool = Query(True), p: Principal = Depends(any_member),
-                  db: DbSession = None):
-    q = select(SessionModel).order_by(SessionModel.started_at, SessionModel.session_id)
+def list_sessions(mine: bool = Query(True),
+                  view: str = Query("all"),      # all | active | history
+                  limit: int = Query(50, ge=1, le=200),
+                  offset: int = Query(0, ge=0),
+                  p: Principal = Depends(any_member), db: DbSession = None):
+    """Paginated session list with per-session honesty flags (plan 20).
+
+    ``view=active`` is what is (or was just) in flight; ``history`` is
+    everything finished. Flags ride each row so the dashboard can say
+    what needs attention WITHOUT loading each session: ``interrupted``
+    (failed / worker failure / stop unconfirmed), ``unscored`` (finished
+    without any scorecard snapshot), ``cleanup_pending`` (an operation
+    whose cessation is still unresolved). Members only ever see their
+    own sessions; operators may pass ``mine=false`` for the all-session
+    view — authorization, not a filter checkbox, enforces this."""
+    from sqlalchemy import func as sa_func
+    from sqlalchemy import select as sa_select
+    from sqlalchemy import text as sa_text
+    ACTIVE = ("preparing", "ready", "running", "stopping", "canceling")
+    q = select(SessionModel).order_by(SessionModel.started_at.desc(),
+                                      SessionModel.session_id.desc())
+    count_q = sa_select(sa_func.count()).select_from(SessionModel)
     if mine or not p.is_operator:
         q = q.where(SessionModel.user_id == p.user_id)
-    rows = db.execute(q).scalars().all()
-    return [{"session_id": str(r.session_id), "scenario_id": r.scenario_id,
-             "user_id": str(r.user_id) if r.user_id else None,
-             "started_at": r.started_at.isoformat() if r.started_at else None,
-             "ended_at": r.ended_at.isoformat() if r.ended_at else None,
-             "status": r.status, "outcome": r.outcome} for r in rows]
+        count_q = count_q.where(SessionModel.user_id == p.user_id)
+    if view == "active":
+        q = q.where(SessionModel.status.in_(ACTIVE))
+        count_q = count_q.where(SessionModel.status.in_(ACTIVE))
+    elif view == "history":
+        q = q.where(SessionModel.status.notin_(ACTIVE))
+        count_q = count_q.where(SessionModel.status.notin_(ACTIVE))
+    total = db.execute(count_q).scalar() or 0
+    rows = db.execute(q.limit(limit).offset(offset)).scalars().all()
+
+    sids = [r.session_id for r in rows]
+    interrupted_extra, unscored, cleanup = set(), set(), set()
+    if sids:
+        # one batched probe per flag — a list page never runs a per-row
+        # scan, and never claims a flag it cannot prove
+        for row in db.execute(sa_text(
+                "SELECT DISTINCT session_id FROM run_operations "
+                "WHERE session_id = ANY(CAST(:ids AS uuid[])) "
+                "AND state IN ('active','cancel-unknown')"),
+                {"ids": [str(s) for s in sids]}).fetchall():
+            cleanup.add(str(row[0]))
+        for row in db.execute(sa_text(
+                "SELECT DISTINCT session_id FROM events "
+                "WHERE session_id = ANY(CAST(:ids AS uuid[])) AND action_type = "
+                "'score_snapshot'"), {"ids": [str(s) for s in sids]}).fetchall():
+            unscored.add(str(row[0]))
+        for row in db.execute(sa_text(
+                "SELECT DISTINCT session_id FROM events "
+                "WHERE session_id = ANY(CAST(:ids AS uuid[])) AND action_type = 'agent_note' "
+                "AND payload->>'note' LIKE '%worker failure%'"),
+                {"ids": [str(s) for s in sids]}).fetchall():
+            interrupted_extra.add(str(row[0]))
+    return {"sessions": [{
+        "session_id": str(r.session_id), "scenario_id": r.scenario_id,
+        "user_id": str(r.user_id) if r.user_id else None,
+        "started_at": r.started_at.isoformat() if r.started_at else None,
+        "ended_at": r.ended_at.isoformat() if r.ended_at else None,
+        "status": r.status, "outcome": r.outcome,
+        "interrupted": (r.status == "failed"
+                        or r.outcome in ("worker_failure", "cancel_unconfirmed",
+                                         "canceled")
+                        or str(r.session_id) in interrupted_extra),
+        "unscored": (r.status == "complete"
+                     and str(r.session_id) not in unscored),
+        "cleanup_pending": str(r.session_id) in cleanup,
+    } for r in rows], "total": total, "limit": limit, "offset": offset,
+        "has_more": offset + len(rows) < total}
 
 
 def _get_session(db, p, session_id) -> SessionModel:
