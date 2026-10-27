@@ -1,5 +1,70 @@
 # Current findings and validation evidence
 
+## Plan-20 implementation — 2026-10-27, branch `practice-upgrades-18-21`
+
+Conversational coach, bounded timed output capture, replay v2 and the
+modernized web review surface. Implementation commits `76b6cd7`
+(migration 0025 + append-only artifacts), `1b30d96` (coach chat over
+durable jobs), `096691f` (timed capture plane), `569bd81` (replay v2 +
+sessions envelope), `86fd86f` (web redesign), `7b03388` (real-browser
+acceptance; stage5/plan19 updated for the new UI). Applied migrations
+0020–0024 are byte-unchanged against `8e77567`; `0025` is the only
+addition, and `/readyz` reports head 0025.
+
+Plan-20 test surface (32 tests): `test_plan20_artifacts` (2 db),
+`test_plan20_coach` (8 db), `test_plan20_coach_agent` (2 agent),
+`test_plan20_capture` (7 containment), `test_plan20_capture_api`
+(5 db, incl. the real loop → transport → internal endpoint path),
+`test_plan20_replay_api` (6 db), `test_plan20_browser` (2 browser+db).
+
+### Gate receipts at HEAD `7b03388` (same day, disposable PG on
+run-owned port 5446; the gate's own fixture starts/stops its own
+container for the db run)
+
+| gate | command | result |
+| --- | --- | --- |
+| fast | `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -p no:cacheprovider` | exit 0 — **661 passed, 0 failed, 0 skipped, 444 deselected**, 6 warnings, 85.26 s |
+| selection | `acceptance.py selection` | **PASS** (165.7 s) |
+| python | `acceptance.py python` | **PASS** (4.5 s) — with `UV_OFFLINE=1`: this sandbox lost DNS mid-session (`registry.npmjs.org` and `pypi.org` unresolvable), and the offline mode installs the identical exact-pin lock into a fresh venv, verifies `uv pip check` and the four entrypoint imports |
+| authority | `acceptance.py authority` | **PASS** (25.5 s) |
+| containment | `acceptance.py containment` | **PASS** (21.7 s; 33 tests incl. the 7 new capture regressions) |
+| agent | `acceptance.py agent` | **PASS** — 122 passed, 0 failed, 0 skipped, 983 deselected (149.6 s), incl. the 2 plan-20 full-loop coach tests against the pinned fake provider |
+| db | `acceptance.py db` | **PASS** — 295 passed, 0 skipped, 810 deselected (651.5 s); owned DB resources cleaned, fixture container removed |
+| frontend | `acceptance.py frontend` | build **PASS**; `npm audit --omit=dev --json` **PENDING (environment)** — errors with empty JSON while the registry is unreachable (DNS failure above). `npm audit --omit=dev --json --offline` (cached advisory snapshot from the same day) reports **zero vulnerabilities**, and the online command passed **zero high/critical** at `86fd86f` the same day; `git diff 86fd86f..HEAD -- web/package.json web/package-lock.json` is empty. Online re-run required before milestone 21 promotion |
+| browser | `acceptance.py browser` (run AFTER frontend) | **PASS** — 4 passed (stage5 member loop, plan19 admin GUI, 2× plan20), 0 skipped (188.6 s) |
+
+Not attempted here (unchanged operator gates): `packet` (root+`nft`),
+`journey` (installed appliance), installed UID/proc/systemd/Strata/KVM
+rechecks. The pinned-nginx mirror-drift blocker recorded under
+plan-19 round 5 (images/capture/bundle reproducibility) stays carried
+for milestone 21; the DNS/registry outage above is a sandbox egress
+condition, not evidence about package pins.
+
+### Boundaries proven by the new tests (not by this prose)
+
+* Coach answers ride durable `coach-chat` jobs (one inference slot);
+  the member message persists first; reload shows pending from the job
+  row; the evidence cutoff and allowed citation ids freeze at enqueue;
+  citations outside the window are dropped, prose stays verbatim;
+  unavailable/failed model persists the honest fallback, never an
+  invented answer (browser test proves the DOM, agent tests prove the
+  wire). No chat path mints scores or audit events.
+* Timed capture is a second, independently-quota'd consumer of the
+  command stream: bounded chunks, exactly one truncated marker, gaps
+  counted, emit failures never break the run or the stop path, and
+  the SERVER re-enforces the quota with idempotent
+  `(run_id, op_id, seq)`. Pre-capture history renders command-only —
+  historical first-4000-char results are never reconstructed.
+* The replay operations track pairs ONLY the red worker's own
+  intent/result events; verifier, telemetry and bastion/MOTD traffic
+  never becomes attacker attribution (db test). A sealed competition
+  member gets no commands, chunks or phases through replay, the
+  chunk endpoint or the coach (db tests), and the browser gate proves
+  the operator/member dashboard difference.
+* Playback never scores: the UNSCORED honesty notice survives AAR
+  generation with no scorecard (browser test); trusted scores come
+  only from verifier scorecards.
+
 ## Plan-19 review ROUND 5 — 2026-10-27, branch `practice-upgrades-18-21`
 
 **Accepted (SOFTWARE) 2026-10-27:** independent review at `1348b10` →

@@ -187,6 +187,22 @@ historical 14–17. Implementation waits for the user's new worktree:
   [Plan](../.openchamber/plans/20-coach-dashboard-and-replay.md). Grounded coach/AAR,
   modern home/history/session navigation, filtered audit and synchronized new-run
   timed attacker/defender replay with honest historical fallback.
+  *Status 2026-10-27 (branch `practice-upgrades-18-21`, implementation):*
+  commits `76b6cd7`…`7b03388` deliver migration 0025 (append-only
+  `coach_messages` + `operation_outputs`; 0020–0024 byte-unchanged),
+  durable-job coach chat with enqueue-frozen evidence window, bounded
+  timed output capture behind a worker-authenticated idempotent
+  endpoint, paginated/filtered replay v2 with an attacker-by-
+  construction operations track, the honest sessions envelope, and
+  the tabbed dark dashboard/coach/review UI (no new npm deps). 32 new
+  tests across db/containment/agent/browser. Personal re-runs at
+  `7b03388`: fast 661/0, selection, python (offline cache — sandbox
+  DNS down), authority, containment 33/0, agent 122/0, db 295/0,
+  browser 4/0 — all zero failed/skipped; the frontend production
+  audit sub-step is PENDING on registry egress (the full receipts,
+  limitations and carried operator gates are in
+  [findings](FINDINGS_CHECKLIST.md)). Ticked when the audit re-run
+  passes and the parent re-review accepts.
 - [ ] **21 — Upgrade and qualified integrated release.**
   [Plan](../.openchamber/plans/21-upgrade-and-integrated-release.md). Supported preserving
   in-place upgrade, corrected fresh-install bundle, changed-artifact rebuilds,
