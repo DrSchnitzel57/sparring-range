@@ -370,6 +370,50 @@ the remediation hint — that is "not your window yet", not a failure; exit
   paths (unknown session → 404, unknown incident → 404, an operator-only
   view as a member → 403) are checked in every session.
 
+### 7. Preserving in-place upgrade (milestone 21)
+
+The upgrade is driven by a built release bundle — the same artifact you
+installed from, at a newer revision. Quiesce first (no armed lease, no
+open obligations, no latched range; the CLI refuses otherwise), then:
+
+```bash
+python3 deploy/bundle.py verify /srv/sr-release                 # must pass
+python3 deploy/appliance.py upgrade --manifest /etc/sparring-range/manifest.json \
+    --payload /srv/sr-release --db-url "$POSTGRES_URL_OWNER" --dry-run
+python3 deploy/appliance.py upgrade --manifest /etc/sparring-range/manifest.json \
+    --payload /srv/sr-release --db-url "$POSTGRES_URL_OWNER"
+```
+
+What it does, in order, under a journal in `/etc/sparring-range/upgrade/`:
+private config backup + `pg_dump` of the database (restore-listable, the
+digest is recorded), digest-verified staging, per-file atomic activation
+(only files the payload owns; foreign files are never touched), FORWARD
+migrations only, config re-render, version stamp, ordered service
+restart. Users, password hashes, keys/pins, closed sessions, audit rows,
+casts and historical reports are never deleted or rewritten. A rerun at
+the same revision answers `no_op`.
+
+Failure and interruption discipline:
+
+* A failed stage leaves the attempt **in progress**; a new upgrade is
+  then REFUSED. Look at the attempt journal, then resume exactly that
+  attempt: `... upgrade ... --resume <ATTEMPT>`. Never delete a journal
+  to "unstick" it — unknown work is resolved, not discarded.
+* Migration state after an interruption is PROVEN from the database
+  before continuing; an unrecognizable position stops with the attempt
+  retained rather than guessing a schema.
+* Config-only rollback: `... upgrade --manifest ... --restore-config
+  <ATTEMPT>` restores the attempt's verified config backup and issues NO
+  service action — you start services yourself, so a restore can never
+  resume an engagement. Database rollback is deliberately not offered:
+  schema is forward-only; the attempt journal holds your `pg_dump` for
+  an explicit, quiesced `pg_restore` if you ever truly need it.
+* Supported 0025-era databases with duplicate truncation markers take a
+  RECORDED prerequisite (0026's index is un-creatable over legacy rows;
+  forward 0027 installs the legacy-safe guard). This is automatic,
+  journalled, and deletes nothing. Pre-21 bundles are refused as
+  payloads by construction (no `upgrade` contract).
+
 ## Historical direct-PVE runbook
 
 Status: **planning runbook, not an accepted production installation guide**.

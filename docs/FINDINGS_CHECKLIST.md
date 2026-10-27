@@ -1,5 +1,41 @@
 # Current findings and validation evidence
 
+## Milestone 21 implementation round 1 — 2026-10-27 (branch `practice-upgrades-18-21`)
+
+Scope executed: preserving in-place upgrade (engine + real CLI + required
+gate), bundle upgrade contract, and the four pulled release blockers.
+Milestone 20 remains UNACCEPTED; nothing below re-runs or claims its gates.
+
+| Commit | Delivered |
+|---|---|
+| `3000361` | drifted guest package pins repaired (verified by live mirror dry-runs) + labeled-TCG build ceilings |
+| `463e408` | second plan-20 review + user reprioritization + full F5–F9 repository backlog |
+| `b3df934` | F1 forward 0027 + runtime fence; F2 always-on quota, reserved marker budget, no-500 duplicate marker; F3 supported prerequisite in the engine + legacy-safe forward guard; F4 absolute delivery budget + process-wide delivery bound |
+| `b504a76` | real proofs (8/8 on disposable PostgreSQL): naive 0025→head still fails on 0026 (defect shown); engine reaches 0027 with the prerequisite recorded; legacy duplicate markers survive unmodified; sealed row fail-closed `legacy`; fence 503-at-0026; HTTP audience separation; second marker never 500; null-gap row cap; dribbling endpoint bounded; consumer retires with counted drops |
+| `f2d8e3b` | `appliance.py upgrade` drives the real engine (backup→stage→activate→migrate→finalize, journal, resume, restore); bundles carry the MANIFEST `upgrade` contract (BUNDLE_VERSION 2; pre-21 refused) |
+| `3a4d927` | required-mode `acceptance.py upgrade` + backup-snapshot integrity hardening |
+
+Gate receipts (exact commands, this environment, revision `3a4d927`):
+
+- `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD ... pytest -q -p no:cacheprovider`
+  — **661 passed, 0 failed, 0 skipped**, 480 deselected, 87.7s.
+- `... infra/dev/acceptance.py upgrade` — **PASS ×2** (20.6s, 20.7s): real
+  preserving upgrade through the real CLI (journal complete, heads 0027
+  exactly once, users/keys/state byte-preserved, restore-listable
+  pg_dump, fail-closed legacy relabel via the installer); truthful no-op
+  rerun; deterministic SIGKILL interruption → new work REFUSED → `--resume`
+  completes, drift repaired; config-only restore with ZERO service
+  actions; tampered payload refused; pre-21 bundle refused. Fixture:
+  run-owned `sr-upg-pg-<run>` postgres:16, removed in `finally`.
+- Aggregate now ATTEMPTS `agent` and `upgrade` (criterion 3 list change).
+
+Honest PENDING (not simulated, not waived): `images`/`capture`/`bundle`
+need the role artifacts — the pin repair removed the mirror blocker, but
+cold TCG role builds exceed this round's budget; `packet` needs root +
+`nft`; `journey`/`release` need the installed appliance. Per plan 21,
+missing mandatory evidence prevents PASS: **21 stays unticked**; the
+operator's supervised-practice deployment is the next owner.
+
 ## Plan-20 SECOND independent review + user reprioritization — 2026-10-27
 
 The parent review completed at `adc10d4` (**VERDICT: FIX**, nine findings

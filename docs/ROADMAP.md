@@ -212,8 +212,12 @@ historical 14–17. Implementation waits for the user's new worktree:
   now on this branch; release blockers F1–F4 are being fixed inside 21,
   polish F5–F9 are backlog entries in
   [findings](FINDINGS_CHECKLIST.md) — nothing dropped.
-  Milestone 21 implementation started 2026-10-27 (pin repair `3000361`,
-  preserving-upgrade engine and pulled blockers F1–F4 follow).
+  Milestone 21 implementation round 1 landed 2026-10-27 (`3a4d927`):
+  preserving-upgrade engine + real CLI + required `upgrade` gate (PASS ×2),
+  bundle upgrade contract, pulled blockers F1–F4 fixed with real proofs;
+  21 stays UNTICKED — images/capture/bundle await role-artifact builds,
+  packet/journey/release remain operator-machine gates. Exact receipts in
+  [findings](FINDINGS_CHECKLIST.md).
 - [ ] **21 — Upgrade and qualified integrated release.**
   [Plan](../.openchamber/plans/21-upgrade-and-integrated-release.md). Supported preserving
   in-place upgrade, corrected fresh-install bundle, changed-artifact rebuilds,
