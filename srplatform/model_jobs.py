@@ -553,8 +553,11 @@ def cancel_session_jobs(db, session_id, *, actor: str = "run finalization") -> d
 #: executor's decision under the row lock — admitting a truly-failed
 #: dependency is what lets the dependent fail truthfully ONCE instead
 #: of being stranded in the queue forever. Rows carrying a cancellation
-#: INTENT are never admitted: a cancelled logical request does not
-#: dispatch, wherever its rows are in the queue. The outer
+#: INTENT are never admitted, and neither are rows of a chain that
+#: CONTAINS a cancelled row (round-4 finding 2: the candidate's own
+#: flags are not enough — an escaped child of the pre-0023 defect has
+#: clean flags and a cancelled root). A cancelled logical request does
+#: not dispatch, wherever its rows are in the queue. The outer
 #: ``state``/intent re-check is the CAS against a cancellation
 #: committing between this statement's read and its write.
 _CLAIM_SQL = text("""
@@ -563,6 +566,11 @@ _CLAIM_SQL = text("""
      WHERE job_id = (SELECT j.job_id FROM model_jobs j
                       WHERE j.state = 'queued' AND j.requested_at <= now()
                         AND NOT j.cancel_intent AND NOT j.cancel_requested
+                        AND NOT EXISTS (
+                              SELECT 1 FROM model_jobs fc
+                               WHERE fc.chain_root =
+                                     COALESCE(j.chain_root, j.job_id)
+                                 AND fc.state = 'cancelled')
                         AND (j.depends_on IS NULL OR (
                               (SELECT dr.chain_root FROM model_jobs dr
                                   WHERE dr.job_id = j.depends_on)
@@ -593,20 +601,55 @@ def claim_next(s) -> uuid.UUID | None:
     return row[0] if row else None
 
 
+def _checkpoint_persisted(db, job: ModelJob) -> bool:
+    """Did THIS summarize attempt durably persist its coverage-bounded
+    checkpoint? ``_persist_turn`` writes the checkpoint transactionally
+    with success — but only when the summary text and the captured
+    coverage range exist, and round-4 finding 3 demands the DEPENDENT
+    side verify the artifact rather than trust the state label: a
+    "succeeded" summary without a checkpoint still describes an
+    uncompacted context, and dispatching a gated turn on it would send
+    the over-budget blob the gate exists to prevent."""
+    payload = job.payload or {}
+    persist = payload.get("persist") or {}
+    sid = persist.get("session_id")
+    covers = payload.get("covers_through")
+    if not sid or covers is None:
+        return False
+    from srplatform.db.models import ConversationRevision
+    row = db.execute(
+        select(ConversationRevision.revision_id).where(
+            ConversationRevision.session_id == uuid.UUID(str(sid)),
+            ConversationRevision.kind == "checkpoint",
+            ConversationRevision.payload["covers_through"].as_integer()
+            == int(covers)).limit(1)).first()
+    return row is not None
+
+
 def _dep_chain_state(db, dep_id: uuid.UUID) -> tuple[str, ModelJob]:
     """(state, final row) of the prerequisite's LOGICAL chain — the
     single authority for admission, execution and gated failure
-    (round-3 finding 3). ``in-flight``: an attempt may still dispatch
-    or is live (the dependent must WAIT, not fail). ``succeeded``: the
-    final attempt genuinely succeeded (or an operator resolved it).
-    ``failed-final``: the chain is quiescent and did not succeed. An
-    unresolved cessation is NEVER success."""
+    (round-3 finding 3, reworked by round-4 finding 3).
+
+    ``in-flight``: an attempt may still dispatch or is live (the
+    dependent must WAIT, not fail).
+    ``succeeded``: the final attempt genuinely SUCCEEDED — and for a
+    compaction summary, genuinely produced its durable checkpoint with
+    the exact covered range. An operator's ``cessation_resolved`` is a
+    slot-release ATTESTATION, not a result: it created no summary and
+    must never authorize a dependent call, so it is failure, honestly
+    reported as ``failed-final`` (state ``cessation_resolved``).
+    ``no-checkpoint``: the summary attempt ended "succeeded" but no
+    checkpoint row exists — dependent fails, never dispatches.
+    An unresolved cessation is NEVER success."""
     rows = _chain_rows(db, dep_id)
     rows.sort(key=lambda j: (j.attempt, j.requested_at))
     final = rows[-1]
     if any(j.state in ("queued", "running") for j in rows):
         return "in-flight", final
-    if final.state in ("succeeded", "cessation_resolved"):
+    if final.state == "succeeded":
+        if final.kind == "summarize" and not _checkpoint_persisted(db, final):
+            return "no-checkpoint", final
         return "succeeded", final
     return "failed-final", final
 
@@ -702,6 +745,30 @@ def _execute(job_id: uuid.UUID) -> None:
             _persist_logical_outcome(s, _chain_rows(s, job_id))
             s.commit()
             return
+        # round-4 finding 2 (fail-closed reconciliation before
+        # dispatch): a chain that CONTAINS a cancelled row IS a
+        # cancelled logical request, whatever this row's own flags
+        # say — an escaped child of the pre-0023 defect, or of any
+        # writer that grew the chain around the fence. It never
+        # dispatches; it cancels truthfully and settles the chain.
+        fenced = s.execute(text(
+            "SELECT 1 FROM model_jobs WHERE chain_root = "
+            "COALESCE(CAST(:r AS uuid), CAST(:j AS uuid)) "
+            "AND state = 'cancelled' AND job_id <> CAST(:j2 AS uuid) "
+            "LIMIT 1"),
+            {"r": str(job.chain_root) if job.chain_root else None,
+             "j": str(job_id), "j2": str(job_id)}).first()
+        if fenced is not None:
+            job.cancel_intent = True
+            job.state = "cancelled"
+            job.error = ("cancelled with its logical request — a "
+                         "cancellation fence covers this chain; the "
+                         "attempt never dispatched")
+            job.finished_at = _now()
+            _cascade_cancel_queued(s, job, actor="cancellation fence")
+            _persist_logical_outcome(s, _chain_rows(s, job_id))
+            s.commit()
+            return
         if job.depends_on is not None:
             dep_row = s.get(ModelJob, job.depends_on)
             if dep_row is None:
@@ -722,14 +789,21 @@ def _execute(job_id: uuid.UUID) -> None:
                     {"j": str(job_id)})
                 s.commit()
                 return
-            if dep_state == "failed-final":
+            if dep_state in ("failed-final", "no-checkpoint"):
                 job.state = "failed"
-                job.error = (
-                    "prerequisite logical request did not succeed "
-                    + (f"(final attempt {dep_final.attempt}: "
-                       f"{dep_final.state})" if dep_final is not None
-                       else "(prerequisite row missing)")
-                    + " — refusing to run the gated work")
+                if dep_state == "no-checkpoint":
+                    job.error = (
+                        "prerequisite compaction summary did not persist "
+                        "its coverage-bounded checkpoint — refusing to run "
+                        "the gated turn against an uncompacted context "
+                        "(nothing was sent to the provider)")
+                else:
+                    job.error = (
+                        "prerequisite logical request did not succeed "
+                        + (f"(final attempt {dep_final.attempt}: "
+                           f"{dep_final.state})" if dep_final is not None
+                           else "(prerequisite row missing)")
+                        + " — refusing to run the gated work")
                 job.finished_at = _now()
                 _cascade_cancel_queued(s, job, actor="prerequisite failure")
                 _persist_logical_outcome(s, _chain_rows(s, job_id))

@@ -121,19 +121,35 @@ def _track_secret_writes_against_rollback(db: Session, profile_id) -> None:
                 # the row's COMMITTED status decides: restoring under a
                 # concurrent revocation would resurrect a deleted
                 # credential for a version an operator just killed.
-                # The check reads through a FRESH session — a session
-                # inside its own after_rollback is 'inactive' and
-                # refuses SQL (proven by this guard's own regression).
+                # A STATUS CHECK ALONE IS NOT SERIALIZATION (round-4
+                # finding 1): between a check and the write a revoke
+                # could commit (delete the credential) and we would
+                # recreate it for a revoked profile. The restore
+                # therefore takes the SAME row lock a revocation takes
+                # to change status — FOR UPDATE on the profile row —
+                # and holds it ACROSS the secret write, committing
+                # after. Ordering is then total: either our restore
+                # lands first and the later revoke deletes the secret,
+                # or the revoke lands first and our lock waits, sees
+                # 'revoked', and skips. A bounded lock_timeout keeps a
+                # wedged writer from hanging the compensation: a
+                # timeout is a FAILED compensation — recorded as the
+                # durable repair obligation, never a silent success.
+                # Fresh session because a session inside its own
+                # after_rollback is 'inactive' and refuses SQL (proven
+                # by this guard's own regression).
                 from sqlalchemy import text as _text
                 from srplatform.db.session import app_engine
                 with Session(app_engine()) as chk:
-                    status = chk.execute(_text(
-                        "SELECT status FROM model_profiles "
-                        "WHERE profile_id = CAST(:p AS uuid)"),
-                        {"p": str(pid)}).first()
-                if status is None or status[0] == "revoked":
-                    continue
-                secret_store.set_key(pid, value)
+                    chk.execute(_text("SET LOCAL lock_timeout = '10s'"))
+                    status = chk.execute(
+                        select(ModelProfile.status)
+                        .where(ModelProfile.profile_id == pid)
+                        .with_for_update()).first()
+                    if status is None or status[0] == "revoked":
+                        continue
+                    secret_store.set_key(pid, value)
+                    chk.commit()
             except Exception as exc:  # noqa: BLE001 — already failing
                 _record_compensation_failure("restore-deleted", pid, exc)
 
