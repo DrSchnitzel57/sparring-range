@@ -336,18 +336,29 @@ def installed_version(layout) -> dict:
     return {}
 
 
-def _copy_tree_private(src: pathlib.Path, dst: pathlib.Path) -> dict:
+def _copy_tree_private(src: pathlib.Path, dst: pathlib.Path,
+                       *, exclude_rel: str | None = None) -> dict:
     """Copy a config tree into the private backup area.
 
     Symlinks are recorded, never followed (a config tree must not pull
     /root into the backup). Modes are kept but stripped of group/other
     bits: the backup lives mode-0700 under the state directory.
+
+    ``exclude_rel`` skips the attempt's OWN live journal directory: that
+    file changes every stage (and mkstemp-replaces it while the backup
+    runs), it is never config to restore, and a config restore must not
+    roll back the journal that records the restore.
     """
     entries: dict[str, dict] = {}
     dst.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(dst, 0o700)
     for path in sorted(src.rglob("*")):
         rel = str(path.relative_to(src))
+        if exclude_rel and (rel == exclude_rel
+                            or rel.startswith(exclude_rel + "/")):
+            continue
+        if path.name.startswith(".journal."):
+            continue  # transient mkstemp siblings are never files
         if path.is_symlink():
             entries[rel] = {"skipped_symlink": os.readlink(path)}
             continue
@@ -355,10 +366,14 @@ def _copy_tree_private(src: pathlib.Path, dst: pathlib.Path) -> dict:
             continue
         target = dst / rel
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # digest BEFORE the write, from the SOURCE: an external writer
+        # racing this snapshot makes the digest refuse the restore, it
+        # can never bake a mismatch into the backup manifest.
+        src_sha = _sha256(path)
         shutil.copyfile(path, target)
         mode = path.stat().st_mode & 0o777 & ~0o077
         os.chmod(target, mode)
-        entries[rel] = {"sha256": _sha256(target), "mode": f"{mode:04o}",
+        entries[rel] = {"sha256": src_sha, "mode": f"{mode:04o}",
                         "bytes": target.stat().st_size}
     return entries
 
@@ -482,7 +497,9 @@ def preflight(m, layout, payload: ReleasePayload, *, db_url: str | None,
         return {"no_op": True, "reason": "already at payload revision",
                 "revision": payload.revision, "problems": []}
 
-    problems += [f"not quiesced: {p}" for p in quiescence_problems(m)]
+    from deploy.appliance import sandbox_manifest
+    problems += [f"not quiesced: {p}" for p in quiescence_problems(
+        sandbox_manifest(m, pathlib.Path(layout.root)))]
 
     # --- disk headroom: payload staged twice (copy + live) + backup slack -- #
     payload_bytes = sum((payload.dir / rel).stat().st_size
@@ -789,9 +806,10 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
     # ---------------- stage: finalize (config render, version, restart) --- #
     if journal.load(attempt)["stages"].get("finalize", {}).get("status") != "done":
         journal.mark(attempt, "finalize", "started")
-        from deploy.appliance import Runner, render_files, _write_files
+        from deploy.appliance import (Runner, render_files, sandbox_manifest,
+                                      _write_files)
         lay = layout
-        plan = render_files(m, layout=lay)
+        plan = render_files(sandbox_manifest(m, lay.root), layout=lay)
         rewritten = _write_files(plan.files, Runner(dry_run=False), lay)
         version_file(lay).write_text(json.dumps({
             "revision": payload.revision,

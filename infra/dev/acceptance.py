@@ -2032,12 +2032,365 @@ def check_bundle() -> None:
 
 
 # -------------------------------------------------------------------------- #
+# upgrade (21): the preserving in-place upgrade, end to end                   #
+# -------------------------------------------------------------------------- #
+
+def check_upgrade() -> None:
+    """The REAL preserving upgrade through the REAL CLI, in sandboxes.
+
+    Fresh install -> populated database at the PREVIOUS migration head ->
+    the actual `appliance.py upgrade` against a real built bundle and a
+    real disposable PostgreSQL: journal, private config backup, real
+    pg_dump (restore-listable), digest-verified staging, per-file atomic
+    activation (drifted bytes replaced, never foreign files), proven
+    forward-only migrations, version stamp. Then: rerun answers no-op;
+    SIGKILL interruption leaves an in-progress attempt that REFUSES new
+    work and RESUMES to completion; the config-only restore repairs a
+    corrupted config from the attempt's backup without any service
+    action; a tampered payload and a pre-21 bundle are refused.
+
+    Prerequisite: docker (the fixture owns its postgres:16 container
+    `sr-upg-pg-*` and the pg_dump wrapper runs INSIDE that fixture; the
+    dumped artifact is the real database, never synthetic).
+    """
+    import subprocess as sp
+    import hashlib as _hl
+    import signal
+    import tempfile
+    import shutil as _sh
+    sys.path.insert(0, str(REPO / "infra" / "dev"))
+    import install_sequences as iseq  # noqa: E402
+    from sqlalchemy import create_engine as sa_create
+    from sqlalchemy import text as sa_text
+
+    if shutil.which("docker") is None:
+        prereq_fail("preserving upgrade sequences",
+                    "requires docker for the disposable postgres:16 "
+                    "fixture (the gate owns sr-upg-pg-<run>; nothing "
+                    "external is selected)")
+    run_id = _hl.sha256(str(time.time()).encode()).hexdigest()[:8]
+    cname = f"sr-upg-pg-{run_id}"
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="sr-upgrade-gate-"))
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("SR_PG_ADMIN")}
+    env.update(DB_APP_ROLE="sr_uapp", DB_SECRET_ROLE="sr_usecret")
+    port = None
+
+    def docker(*args: str, timeout: int = 120) -> sp.CompletedProcess:
+        return sp.run(["docker", *args], capture_output=True, text=True,
+                      timeout=timeout)
+
+    def cli(*args: str, timeout: int = 1200, extra_env: dict | None = None,
+            proc: bool = False):
+        cmd = [sys.executable, str(REPO / "deploy/appliance.py"), *args]
+        e = {**env, **(extra_env or {})}
+        if proc:
+            return sp.Popen(cmd, cwd=REPO, env=e,
+                            stdout=sp.PIPE, stderr=sp.STDOUT, text=True,
+                            start_new_session=True)
+        r = sp.run(cmd, cwd=REPO, env=e, capture_output=True, text=True,
+                   timeout=timeout)
+        return r
+
+    try:
+        d = docker("run", "-d", "--name", cname,
+                   "-e", "POSTGRES_PASSWORD=ci",
+                   "-p", "127.0.0.1::5432", "postgres:16")
+        if d.returncode != 0:
+            prereq_fail("preserving upgrade sequences",
+                        f"postgres:16 fixture could not start: "
+                        f"{(d.stdout + d.stderr)[-300:]}")
+        # readiness = a real SQL roundtrip, not pg_isready (the image's
+        # initdb phase runs a TEMPORARY server whose socket disappears on
+        # restart; pg_isready alone can succeed against the transient one)
+        for _ in range(120):
+            r = docker("exec", cname, "psql", "-U", "postgres", "-v",
+                       "ON_ERROR_STOP=1", "-tAc", "SELECT 1", timeout=15)
+            if r.returncode == 0 and r.stdout.strip() == "1":
+                break
+            time.sleep(1)
+        else:
+            fail("postgres fixture readiness", "psql SELECT 1 never succeeded")
+        port = docker("port", cname, "5432/tcp").stdout.split()[0]
+        host_port = int(str(port).rsplit(":", 1)[1])
+        for stmt in (
+                'CREATE ROLE sr_uapp', 'CREATE ROLE sr_usecret',
+                'CREATE DATABASE srupg OWNER postgres ENCODING \'UTF8\' '
+                "TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'",
+                'CREATE DATABASE srupg2 OWNER postgres ENCODING \'UTF8\' '
+                "TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'"):
+            r = docker("exec", cname, "psql", "-U", "postgres", "-v",
+                       "ON_ERROR_STOP=1", "-c", stmt, timeout=60)
+            if r.returncode != 0:
+                fail("postgres fixture bootstrap",
+                     f"{stmt[:40]}: {r.stderr[-200:]}")
+        url = f"postgresql://postgres:ci@127.0.0.1:{host_port}/srupg"
+        url2 = url.replace("/srupg", "/srupg2")
+
+        # pg_dump WRAPPER around the real pg_dump INSIDE the fixture: the
+        # engine's argv contract is kept, the artifact is a real dump.
+        wrapper = tmp / "pg_dump-wrapper.sh"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            "out=''; url=''\n"
+            "while [[ $# -gt 0 ]]; do\n"
+            "  case \"$1\" in\n"
+            "    --file) out=\"$2\"; shift 2;;\n"
+            "    --format=custom) shift;;\n"
+            "    *) url=\"$1\"; shift;;\n"
+            "  esac\n"
+            "done\n"
+            f"url_in=\"${{url//127.0.0.1:{host_port}/localhost:5432}}\"\n"
+            f"docker exec {cname} pg_dump --format=custom "
+            "--file=/tmp/srupg.dump \"$url_in\" || exit 1\n"
+            f"docker cp {cname}:/tmp/srupg.dump \"$out\" || exit 1\n")
+        wrapper.chmod(0o755)
+
+        def alembic(url_x: str, *args: str):
+            return sp.run([sys.executable, "-m", "alembic", *args],
+                          cwd=REPO, capture_output=True, text=True,
+                          timeout=900,
+                          env={**env, "POSTGRES_URL_OWNER": url_x})
+
+        # ---- payload: a REAL bundle built from this candidate ---------- #
+        fake_base = tmp / "upg-base.qcow2"
+        sp.run(["qemu-img", "create", "-f", "qcow2", str(fake_base), "64M"],
+               capture_output=True, check=True, timeout=60)
+        payload = tmp / "payload-bundle"
+        b = sp.run([sys.executable, str(REPO / "deploy/bundle.py"), "build",
+                    "--output", str(payload), "--base-image", str(fake_base)],
+                   cwd=REPO, capture_output=True, text=True, timeout=1800,
+                   env=env)
+        if b.returncode != 0:
+            fail("upgrade payload bundle build", (b.stdout + b.stderr)[-500:])
+        payload_manifest = json.loads(
+            (payload / "MANIFEST.json").read_text())
+        ok("payload bundle built from the candidate",
+           f"revision {payload_manifest['revision'][:12]}, upgrade contract "
+           f"for head-driven migration")
+
+        def db_q(url_x: str, sql: str):
+            eng = sa_create(url_x)
+            with eng.connect() as c:
+                r = c.execute(sa_text(sql)).fetchall()
+            eng.dispose()
+            return r
+
+        def apply_sandbox(root: pathlib.Path, manifest: pathlib.Path):
+            r = cli("apply", "--manifest", str(manifest),
+                    "--system-root", str(root))
+            if r.returncode != 0:
+                fail("sandbox fresh install", (r.stdout + r.stderr)[-500:])
+
+        def seed(url_x: str, tag: str) -> None:
+            eng = sa_create(url_x)
+            with eng.begin() as c:
+                c.execute(sa_text(
+                    "INSERT INTO users (user_id, username, password_hash, "
+                    "role) VALUES (gen_random_uuid(), :u, "
+                    "'scrypt$witness$keep', 'operator')"),
+                    {"u": f"p21-witness-{tag}"})
+                sid = c.execute(sa_text(
+                    "INSERT INTO sessions (session_id, scenario_id, status) "
+                    "VALUES (gen_random_uuid(), 'web-foothold-01', "
+                    "'complete') RETURNING session_id"
+                )).scalar()
+                c.execute(sa_text(
+                    "INSERT INTO coach_messages (session_id, role, body) "
+                    "VALUES (:sid, 'coach', 'P21-SEALED-HISTORY-KEEP')"),
+                    {"sid": sid})
+            eng.dispose()
+
+        def upgrade_cli(root, manifest, db_url, *, resume=None, extra=()):
+            args = ["upgrade", "--manifest", str(manifest),
+                    "--system-root", str(root), "--payload", str(payload),
+                    "--db-url", db_url, "--pg-dump-bin", str(wrapper),
+                    "--python-exe", sys.executable, *extra]
+            if resume:
+                args += ["--resume", resume]
+            return cli(*args, extra_env=env, timeout=1800)
+
+        # ---- sandbox fresh install + witnesses -------------------------- #
+        manifest_path = iseq.build_manifest(tmp / "appliance-input")
+        rootA = tmp / "rootA"
+        apply_sandbox(rootA, manifest_path)
+        assert alembic(url, "upgrade", "0025").returncode == 0
+        seed(url, "a")
+        paths = iseq._manifest_paths(rootA)
+        token_bytes = paths["token"].read_bytes()
+        sentinel = paths["state"] / "sentinel.db"
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text("history-and-data\n")
+
+        r = upgrade_cli(rootA, manifest_path, url)
+        if r.returncode != 0:
+            fail("preserving upgrade (scenario A)",
+                 (r.stdout + r.stderr)[-1200:])
+        outA = json.loads(r.stdout)
+        stages = outA.get("stages", {})
+        missing = [s for s in ("backup", "stage", "activate", "migrate",
+                               "finalize")
+                   if stages.get(s, {}).get("status") != "done"]
+        if outA.get("status") != "done" or missing:
+            fail("preserving upgrade journal completeness",
+                 f"status={outA.get('status')} missing={missing}")
+        heads = {row[0] for row in
+                 db_q(url, "SELECT version_num FROM alembic_version")}
+        if heads != {"0027"}:
+            fail("preserving upgrade reached head", f"heads {heads}")
+        aud = db_q(url, "SELECT audience FROM coach_messages "
+                        "WHERE body LIKE 'P21-SEALED%'")
+        if aud != [("legacy",)]:
+            fail("upgrade path fail-closed legacy relabel",
+                 f"audience {aud} (sealed history must never default "
+                 "member)")
+        users = db_q(url, "SELECT password_hash FROM users "
+                          "WHERE username = 'p21-witness-a'")
+        if users != [("scrypt$witness$keep",)]:
+            fail("preserving upgrade preserved the operator user", str(users))
+        if paths["token"].read_bytes() != token_bytes:
+            fail("preserving upgrade preserved the capability key")
+        if sentinel.read_text() != "history-and-data\n":
+            fail("preserving upgrade left data alone")
+        att_dir = (paths["etc"] / "upgrade" / outA["attempt"])
+        dump = att_dir / "database.dump"
+        if not dump.is_file() or dump.stat().st_size == 0:
+            fail("preserving database backup exists", str(dump))
+        if _hl.sha256(dump.read_bytes()).hexdigest() != \
+                stages["backup"].get("db_sha256"):
+            fail("database backup digest matches its journal entry")
+        docker("cp", str(dump), f"{cname}:/tmp/check.dump")
+        lst = docker("exec", cname, "pg_restore", "--list", "/tmp/check.dump",
+                     timeout=120)
+        if lst.returncode != 0 or "TABLE DATA public users" not in lst.stdout:
+            fail("database backup is a restore-listable artifact",
+                 (lst.stdout + lst.stderr)[-300:])
+        ok("preserving upgrade (journal, backups, migrations, users, keys, "
+           "restore-listable dump)",
+           f"attempt {outA['attempt']}, heads {sorted(heads)}")
+
+        r2 = upgrade_cli(rootA, manifest_path, url)
+        if r2.returncode != 0 or '"no_op"' not in r2.stdout:
+            fail("rerun at the payload revision answers no-op",
+                 (r2.stdout + r2.stderr)[-300:])
+        ok("rerun at the same revision is a truthful no-op")
+
+        # ============ scenario B: interrupt, refuse, resume, restore ====== #
+        rootB = tmp / "rootB"
+        apply_sandbox(rootB, manifest_path)
+        assert alembic(url2, "upgrade", "0025").returncode == 0
+        seed(url2, "b")
+        drifted = rootB / "opt/sparring-range/srplatform/__init__.py"
+        drifted.parent.mkdir(parents=True, exist_ok=True)
+        drifted.write_text("# foreign drift injected by the upgrade gate\n")
+        # deterministic interruption window: a 10-second ACCESS EXCLUSIVE
+        # table lock makes the migration stage BLOCK (real lock wait), so
+        # the SIGKILL lands mid-work, never after a lucky fast completion.
+        sp.Popen(["docker", "exec", cname, "psql", "-U", "postgres",
+                  "-d", "srupg2", "-c",
+                  "LOCK TABLE coach_messages IN ACCESS EXCLUSIVE MODE; "
+                  "SELECT pg_sleep(10);"],
+                 stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+        pB = cli("upgrade", "--manifest", str(manifest_path),
+                 "--system-root", str(rootB), "--payload", str(payload),
+                 "--db-url", url2, "--pg-dump-bin", str(wrapper),
+                 "--python-exe", sys.executable, proc=True)
+        journalB = None
+        attempts_dir = iseq._manifest_paths(rootB)["etc"] / "upgrade"
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            for j in attempts_dir.glob("*/journal.json"):
+                data = json.loads(j.read_text())
+                if data.get("stages"):
+                    journalB = data
+                    break
+            if journalB:
+                break
+            time.sleep(0.02)
+        if not journalB:
+            fail("interruption fixture", "journal never appeared")
+        os.killpg(os.getpgid(pB.pid), signal.SIGKILL)
+        pB.wait(timeout=30)
+        attempt_b = journalB["attempt"]
+        refused = upgrade_cli(rootB, manifest_path, url2)
+        if refused.returncode == 0 or "unknown" not in (
+                refused.stdout + refused.stderr):
+            fail("interrupted attempt blocks new upgrade work",
+                 (refused.stdout + refused.stderr)[-400:])
+        ok("SIGKILL interruption is retained and REFUSES new attempts",
+           f"attempt {attempt_b} in progress")
+        r3 = upgrade_cli(rootB, manifest_path, url2, resume=attempt_b)
+        if r3.returncode != 0:
+            fail("resume of the interrupted attempt",
+                 (r3.stdout + r3.stderr)[-1200:])
+        outB = json.loads(r3.stdout)
+        if outB.get("status") != "done":
+            fail("resumed upgrade completed", json.dumps(outB)[:400])
+        heads_b = {row[0] for row in
+                   db_q(url2, "SELECT version_num FROM alembic_version")}
+        if heads_b != {"0027"}:
+            fail("resumed upgrade reached head exactly once", str(heads_b))
+        if drifted.read_text().startswith("# foreign drift"):
+            fail("activation replaced the drifted runtime file")
+        if db_q(url2, "SELECT count(*) FROM users WHERE username="
+                      "'p21-witness-b'") != [(1,)]:
+            fail("interrupted+resumed upgrade preserved users")
+        ok("interruption -> refusal -> resume completes to head, drift "
+           "repaired, users preserved")
+
+        # config-only restore: corrupt, restore, NO service actions
+        envf = iseq._manifest_paths(rootB)["env"]
+        envf.write_text("CORRUPTED BY THE UPGATE\n")
+        rr = cli("upgrade", "--manifest", str(manifest_path),
+                 "--system-root", str(rootB),
+                 "--restore-config", attempt_b)
+        rr_out = json.loads(rr.stdout) if rr.returncode == 0 else {}
+        if rr.returncode != 0 or rr_out.get("service_actions") != [] \
+                or "CORRUPTED" in envf.read_text():
+            fail("config-only restore from the attempt backup",
+                 (rr.stdout + rr.stderr)[-400:])
+        ok("config-only restore repairs config and issues NO service action")
+
+        # ================= negatives ====================================== #
+        # a sandbox with NO version stamp: preflight cannot answer no-op,
+        # so the refusal below is genuinely caused by the payload defect.
+        rootC = tmp / "rootC"
+        apply_sandbox(rootC, manifest_path)
+        victim = payload / "srplatform/settings.py"
+        victim.write_bytes(b"# tampered by the upgrade gate\n")
+        neg = upgrade_cli(rootC, manifest_path, url)
+        if neg.returncode == 0 or "digest" not in (neg.stdout + neg.stderr):
+            fail("tampered payload refused", (neg.stdout + neg.stderr)[-300:])
+        ok("payload digest tampering is refused before activation")
+
+        old = tmp / "old-bundle"
+        old.mkdir()
+        (old / "pyproject.toml").write_bytes(b"x\n")
+        (old / "MANIFEST.json").write_text(json.dumps({
+            "bundle_version": 1, "revision": "deadbeef",
+            "files": {"pyproject.toml": {"sha256":
+                    _hl.sha256(b"x\n").hexdigest(), "bytes": 2}}}))
+        neg2 = cli("upgrade", "--manifest", str(manifest_path),
+                   "--system-root", str(rootA), "--payload", str(old),
+                   "--db-url", url)
+        if neg2.returncode == 0 or "predates" not in (neg2.stdout + neg2.stderr):
+            fail("pre-21 bundle refused as an upgrade payload",
+                 (neg2.stdout + neg2.stderr)[-300:])
+        ok("pre-21 bundle without the upgrade contract is refused")
+    finally:
+        sp.run(["docker", "rm", "-f", cname], capture_output=True,
+               timeout=120)
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
+# -------------------------------------------------------------------------- #
 # appliance (16): the aggregate software gate at a pinned candidate         #
 # -------------------------------------------------------------------------- #
 
-APPLIANCE_GATES = ("selection", "python", "db", "authority", "install",
-                   "hypervisor", "containment", "images", "capture", "access",
-                   "frontend", "browser", "compose", "bundle")
+APPLIANCE_GATES = ("selection", "python", "db", "authority", "agent",
+                   "install", "hypervisor", "containment", "images",
+                   "capture", "access", "frontend", "browser", "compose",
+                   "bundle", "upgrade")
 
 # The gates that need the OPERATOR's machine: root + nft for the packet
 # layer, the INSTALLED appliance with operator/member tokens for the
@@ -2139,6 +2492,7 @@ CHECKS = {
     "journey": check_journey,
     "install": check_install,
     "bundle": check_bundle,
+    "upgrade": check_upgrade,
     "appliance": check_appliance,
     "release": check_release,
 }
