@@ -2,6 +2,13 @@
 
 ## Plan-19 review ROUND 5 — 2026-10-27, branch `practice-upgrades-18-21`
 
+**Accepted (SOFTWARE) 2026-10-27:** independent review at `1348b10` →
+**VERDICT: SHIP**, all six plan criteria PASS on the reviewer's own
+re-runs (matching receipts in `docs/ROADMAP.md`); manual/operator and
+installed-system qualifications stay open, and the pinned-package
+supply-chain blocker stays carried for milestone 21. Historical
+constraint: nothing below is reopened by that acceptance.
+
 The FIFTH independent review (complete controls at `e07c52a`: every
 prior concurrency/upgrade/compaction/outcome/pin blocker PASSED the
 reviewer's own barriers; 0020–0022 byte-unchanged against `e311ff9`,

@@ -161,10 +161,28 @@ historical 14–17. Implementation waits for the user's new worktree:
   installed-system qualifications above remain open and are carried
   into milestone 21's promotion checks. Milestone 19 implementation
   starts from this base.
-- [ ] **19 — Conversational agent and model administration.**
+- [x] **19 — Conversational agent and model administration.**
   [Plan](../.openchamber/plans/19-conversation-and-model-admin.md). Pydantic AI slim,
   protected versioned profiles/role overrides/thinking mappings, context-aware
   history/checkpoints, one-slot async scheduling/cancellation and admin GUI.
+  *Accepted 2026-10-27 (SOFTWARE):* after five reproduced-defect review
+  rounds, the independent review at `1348b10` returned **SHIP**; the
+  reviewer personally re-ran the evidence (fast 661 passed/412 deselected
+  6 warnings 98.81 s; agent 120/953 160.4 s; db 272/801 663.5 s;
+  authority 35/1038 33.4 s; containment 26/1047 29.2 s; frontend build +
+  audit zero high/critical 18.8 s THEN browser 2/1071 113.1 s — all zero
+  failed/skipped) plus an independent real-PG fault-injection
+  confidentiality suite (7 passed/8 deselected, 7.38 s) confirming the
+  compensation audit records only `IntegrityError[23514]`-shaped
+  structure with no credential/row/SQL in app-role events, APIs or
+  logs, honest non-recording when the obligation write itself fails,
+  bounded cause cycles/invalid codes, legitimate rollback restore,
+  DB-observed concurrent-revoke lock and pre-edit same-key pins.
+  Applied migrations 0020–0024 byte-unchanged versus `e07c52a`.
+  **Software acceptance only** — operator gates (packet/journey/release),
+  installed UID/proc/systemd/Strata/nested-KVM qualifications and the
+  pinned-package supply-chain repair above remain open and are carried
+  into milestone 21's promotion checks.
 - [ ] **20 — Conversational coach and session review.**
   [Plan](../.openchamber/plans/20-coach-dashboard-and-replay.md). Grounded coach/AAR,
   modern home/history/session navigation, filtered audit and synchronized new-run
