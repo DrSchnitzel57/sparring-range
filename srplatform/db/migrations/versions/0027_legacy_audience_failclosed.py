@@ -62,9 +62,24 @@ def upgrade() -> None:
     # Every row that exists at migration time predates per-message
     # audience truth; its real audience is unknowable, so it is neither
     # member-visible nor deleted. Fresh installs have no rows here.
+    #
+    # The 0025 append-only trigger protects RUNTIME mutation of coach
+    # history; this one relabel is schema maintenance performed by the
+    # migration itself, so it is bracketed EXPLICITLY (never a silent
+    # bypass): disable the trigger, fail the whole step closed, relabel,
+    # re-enable. The trigger is back in force before this transaction
+    # commits; no UPDATE other than this relabel ever touched the table.
     bind.execute(sa.text(
-        "UPDATE coach_messages SET audience = 'legacy' "
-        "WHERE audience = 'member'"))
+        "ALTER TABLE coach_messages "
+        "DISABLE TRIGGER coach_messages_append_only"))
+    try:
+        bind.execute(sa.text(
+            "UPDATE coach_messages SET audience = 'legacy' "
+            "WHERE audience = 'member'"))
+    finally:
+        bind.execute(sa.text(
+            "ALTER TABLE coach_messages "
+            "ENABLE TRIGGER coach_messages_append_only"))
 
     # ---- F3: the future-proof guard that legacy rows still satisfy. ---- #
     # One truncation marker per (run, op) for every marker persisted at

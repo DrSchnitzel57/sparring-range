@@ -516,6 +516,64 @@ def preflight(m, layout, payload: ReleasePayload, *, db_url: str | None,
 # the resumable upgrade                                                       #
 # --------------------------------------------------------------------------- #
 
+def forward_migrate(python_exe: str, db_url: str, cwd: str,
+                    versions_dir: pathlib.Path, from_heads: set[str],
+                    to_head: str, journal=None,
+                    attempt: str | None = None) -> tuple[set[str], list[str]]:
+    """Walk the chain ONE revision at a time to ``to_head`` (never a blind
+    ``upgrade head`` over unknown state). Returns (heads, skipped).
+
+    The ONLY tolerated per-step failure is the F3 SUPPORTED PREREQUISITE
+    — documented, recorded, automatic, never a silent pass: applied-0026's
+    unique truncation index cannot be created over provable 0025-era
+    duplicate markers, and 0026 is immutable. The failed step rolled back
+    atomically (heads unchanged, re-proven); skip ONLY that index
+    statement by stamping past it and let forward 0027 re-apply 0026's
+    other effects idempotently and install the legacy-safe forward
+    guard. No row is deleted or modified; any other failure propagates.
+    """
+    def _alembic(*args: str) -> subprocess.CompletedProcess:
+        env = {**os.environ, "POSTGRES_URL_OWNER": db_url}
+        return subprocess.run(
+            [python_exe, "-m", "alembic", *args],
+            cwd=cwd, env=env, capture_output=True, text=True, timeout=1800)
+
+    steps = _chain_between(versions_dir, from_heads, to_head)
+    if steps is None:  # non-linear graph: one plain forward step
+        steps = ["head"]
+    skipped: list[str] = []
+    while steps:
+        rev, steps = steps[0], steps[1:]
+        proc = _alembic("upgrade", rev)
+        if proc.returncode == 0:
+            continue
+        if (rev == "0026"
+                and db_heads(db_url) == from_heads
+                and "uq_operation_outputs_truncated_once"
+                in (proc.stdout + proc.stderr)
+                and _legacy_duplicate_markers(db_url)):
+            stamp = _alembic("stamp", "0026")
+            if stamp.returncode != 0:
+                raise UpgradeError(
+                    "supported 0026 prerequisite could not stamp: "
+                    + (stamp.stdout + stamp.stderr)[-400:])
+            skipped.append("0026:uq_operation_outputs_truncated_once")
+            if journal is not None and attempt is not None:
+                journal.mark(attempt, "migrate", "prerequisite",
+                             revision="0026",
+                             note="0026's unique truncation index is "
+                                  "un-creatable over provable 0025-era "
+                                  "duplicate markers; stamped past the "
+                                  "index statement only; forward 0027 "
+                                  "re-applies 0026's other effects and "
+                                  "the legacy-safe guard")
+            continue
+        raise UpgradeError(
+            f"forward migration to {rev} failed (exit "
+            f"{proc.returncode}): {(proc.stdout + proc.stderr)[-400:]}")
+    return db_heads(db_url), skipped
+
+
 def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
                 resume: str | None = None, dry_run: bool = False,
                 python_exe: str | None = None, pg_dump_bin: str | None = None,
@@ -706,63 +764,18 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
         journal.mark(attempt, "migrate", "started",
                      from_heads=report["from_heads"],
                      to_head=report["to_head"])
-        env = {**os.environ, "POSTGRES_URL_OWNER": db_url}
-
-        def _alembic(*args: str) -> subprocess.CompletedProcess:
-            return subprocess.run(
-                [python_exe, "-m", "alembic", *args],
-                cwd=str(layout.prefix), env=env, capture_output=True,
-                text=True, timeout=1800)
-
-        steps = _chain_between(payload.versions_dir(),
-                               set(report["from_heads"]), report["to_head"])
-        if steps is None:  # non-linear graph: one plain forward step
-            steps = ["head"]
-        skipped: list[str] = []
-        while steps:
-            rev, steps = steps[0], steps[1:]
-            proc = _alembic("upgrade", rev)
-            if proc.returncode == 0:
-                continue
-            # F3 SUPPORTED PREREQUISITE (documented, recorded, automatic —
-            # never a silent pass): applied-0026's unique partial index
-            # cannot be created over provable 0025-era duplicate
-            # truncation markers, and 0026 is immutable. The failed step
-            # rolled back atomically; skip ONLY that index statement by
-            # stamping past it and let forward 0027 re-apply every other
-            # 0026 effect idempotently and install the legacy-safe
-            # forward guard. No row is deleted or modified; any other
-            # failure propagates normally.
-            if (rev == "0026"
-                    and db_heads(db_url) == set(report["from_heads"])
-                    and "uq_operation_outputs_truncated_once"
-                    in (proc.stdout + proc.stderr)
-                    and _legacy_duplicate_markers(db_url)):
-                stamp = _alembic("stamp", "0026")
-                if stamp.returncode != 0:
-                    raise UpgradeError(
-                        "supported 0026 prerequisite could not stamp: "
-                        + (stamp.stdout + stamp.stderr)[-400:])
-                skipped.append("0026:uq_operation_outputs_truncated_once")
-                journal.mark(attempt, "migrate", "prerequisite",
-                             revision="0026",
-                             note="0026's unique truncation index is "
-                                  "un-creatable over provable 0025-era "
-                                  "duplicate markers; stamped past the "
-                                  "index statement only; forward 0027 "
-                                  "re-applies 0026's other effects and "
-                                  "the legacy-safe guard")
-                continue
-            after = db_heads(db_url)
-            journal.mark(attempt, "migrate", "failed", revision=rev,
-                         error=f"alembic exit {proc.returncode}: "
-                               f"{(proc.stdout + proc.stderr)[-400:]}",
-                         heads=sorted(after))
+        try:
+            after, skipped = forward_migrate(
+                python_exe, db_url, str(layout.prefix),
+                payload.versions_dir(), set(report["from_heads"]),
+                report["to_head"], journal=journal, attempt=attempt)
+        except UpgradeError as exc:
+            heads_now = db_heads(db_url)
+            journal.mark(attempt, "migrate", "failed",
+                         error=str(exc)[-400:], heads=sorted(heads_now))
             raise UpgradeError(
-                f"forward migration did not reach {rev} (now {sorted(after)});"
-                f" attempt {attempt} preserved — data and config were not "
-                "touched")
-        after = db_heads(db_url)
+                f"{exc} — attempt {attempt} preserved; data and config "
+                "were not touched") from exc
         if after != {report["to_head"]}:
             journal.mark(attempt, "migrate", "failed",
                          heads=sorted(after), error="did not reach head")
@@ -770,7 +783,7 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
                 f"migrations ended at {sorted(after)}, not "
                 f"{report['to_head']!r}")
         journal.mark(attempt, "migrate", "done", heads=sorted(after),
-                     **( {"prerequisite_skips": skipped} if skipped else {}))
+                     **({"prerequisite_skips": skipped} if skipped else {}))
     out["migrated_to"] = report["to_head"]
 
     # ---------------- stage: finalize (config render, version, restart) --- #

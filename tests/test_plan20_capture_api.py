@@ -114,7 +114,7 @@ def test_chunk_redelivery_distinguishes_duplicate_from_conflict(client,
 def test_server_enforces_quota_with_one_marker(client, users, monkeypatch):
     import srplatform.api.app as app_mod
     from srplatform.settings import get_settings
-    small = get_settings().model_copy(update={"runner_op_capture_bytes": 10})
+    small = get_settings().model_copy(update={"runner_op_capture_bytes": 80})
     monkeypatch.setattr(app_mod, "get_settings", lambda: small)
 
     sid = _running_session(client, users)
@@ -136,14 +136,15 @@ def test_server_enforces_quota_with_one_marker(client, users, monkeypatch):
 
 def test_quota_charges_every_payload_not_just_output_text(client, users,
                                                           monkeypatch):
-    """Finding 3's exact repro: with a 10-byte quota, ten authenticated
+    """Finding 3's exact repro: with an 80-byte budget (the 63-byte reserved marker
+    included), ten authenticated
     400-byte gap requests used to store 4000 uncharged bytes (and TWO
     truncation markers). Now gap text counts against the same operation
     and session budgets, and the marker stays exactly one."""
     import srplatform.api.app as app_mod
     from srplatform.settings import get_settings
     small = get_settings().model_copy(update={
-        "runner_op_capture_bytes": 10, "runner_session_capture_bytes": 4096,
+        "runner_op_capture_bytes": 80, "runner_session_capture_bytes": 4096,
         "runner_op_capture_rows": 1000})
     monkeypatch.setattr(app_mod, "get_settings", lambda: small)
 
@@ -172,7 +173,7 @@ def test_session_budget_bounds_gap_rows_across_operations(client, users,
     from srplatform.settings import get_settings
     small = get_settings().model_copy(update={
         "runner_op_capture_bytes": 100_000,
-        "runner_session_capture_bytes": 20,
+        "runner_session_capture_bytes": 83,
         "runner_op_capture_rows": 1000})
     monkeypatch.setattr(app_mod, "get_settings", lambda: small)
 
@@ -221,7 +222,7 @@ def test_session_budget_spans_operations(client, users, monkeypatch):
     import srplatform.api.app as app_mod
     from srplatform.settings import get_settings
     small = get_settings().model_copy(update={
-        "runner_op_capture_bytes": 1000, "runner_session_capture_bytes": 20,
+        "runner_op_capture_bytes": 1000, "runner_session_capture_bytes": 83,
         "runner_op_capture_rows": 1000})
     monkeypatch.setattr(app_mod, "get_settings", lambda: small)
 
@@ -245,13 +246,14 @@ def test_concurrent_admission_cannot_double_marker_or_overshoot(client,
                                                                 users,
                                                                 monkeypatch):
     """Finding 3: admission must be atomic, never read-count-then-insert.
-    Eight real concurrent POSTs against a 10-byte quota land at most one
+    Eight real concurrent POSTs against an 80-byte budget (63 of
+    them permanently reserved for the marker) land at most one
     stored output row and EXACTLY ONE truncated marker."""
     import concurrent.futures
 
     import srplatform.api.app as app_mod
     from srplatform.settings import get_settings
-    small = get_settings().model_copy(update={"runner_op_capture_bytes": 10})
+    small = get_settings().model_copy(update={"runner_op_capture_bytes": 80})
     monkeypatch.setattr(app_mod, "get_settings", lambda: small)
 
     sid = _running_session(client, users)
