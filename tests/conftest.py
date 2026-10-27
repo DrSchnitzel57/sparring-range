@@ -365,7 +365,7 @@ def wipe_data(db_url_owner: str) -> None:
               "deployments", "runs", "safety_records", "safety_state", "recordings",
               "range_lease", "users", "model_jobs", "conversation_revisions",
               "session_model_pins", "model_role_overrides", "model_profiles",
-              "model_profile_secrets")
+              "model_profile_secrets", "coach_messages", "operation_outputs")
     with eng.begin() as c:
         c.execute(text("TRUNCATE " + ", ".join(tables) + " CASCADE"))
     eng.dispose()

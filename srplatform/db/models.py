@@ -711,3 +711,66 @@ class ConversationRevision(Base):
     __table_args__ = (
         Index("ix_conversation_revisions_session", "session_id", "revision_id"),
     )
+
+
+class CoachMessage(Base):
+    """Append-only per-session coach conversation (plan 20). ``role`` is
+    ``user`` (the authenticated member) or ``coach`` (a durable-job
+    answer; ``model_job`` names it, ``model_ok`` distinguishes a genuine
+    model answer from the honest recorded fallback). A coach row keeps
+    the evidence CUTOFF it was generated under and its validated event
+    citations. Conversation, never audit — and never a score."""
+
+    __tablename__ = "coach_messages"
+
+    message_id: Mapped[int] = mapped_column(BigInteger, primary_key=True,
+                                            autoincrement=True)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.session_id"), nullable=False)
+    role: Mapped[str] = mapped_column(Text, nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    citations: Mapped[list | None] = mapped_column(JSONB)
+    model_job: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    model_ok: Mapped[bool | None] = mapped_column(Boolean)
+    context_cutoff_event_id: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_coach_messages_session", "session_id", "message_id"),
+    )
+
+
+class OperationOutput(Base):
+    """Sequence-numbered, timestamped bounded output chunk for a red
+    command operation (plan 20 timed replay). Additive evidence: exit,
+    timeout, truncation and containment facts stay on ``run_operations``
+    and the ``action_result`` event even if capture fails. ``kind``:
+    ``output`` real bytes; ``gap`` capture failure/dropped bytes
+    (``dropped_bytes`` counted); ``truncated`` quota reached. Unique
+    ``(run_id, op_id, seq)`` makes worker re-delivery idempotent.
+    Operations predating this table simply have no rows — command-only
+    fallback, never a reconstructed fake cast."""
+
+    __tablename__ = "operation_outputs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True,
+                                    autoincrement=True)
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("runs.run_id"), nullable=False)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.session_id"), nullable=False)
+    op_id: Mapped[str] = mapped_column(Text, nullable=False)
+    seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False,
+                                      server_default="output")
+    text: Mapped[str | None] = mapped_column(Text)
+    dropped_bytes: Mapped[int | None] = mapped_column(BigInteger)
+
+    __table_args__ = (
+        Index("uq_operation_outputs_op_seq", "run_id", "op_id", "seq",
+              unique=True),
+        Index("ix_operation_outputs_session", "session_id", "op_id", "seq"),
+    )
