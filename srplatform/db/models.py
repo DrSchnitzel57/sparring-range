@@ -24,6 +24,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy import text as sa_text  # alias: class attrs shadow `text`
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -728,6 +729,11 @@ class CoachMessage(Base):
     session_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("sessions.session_id"), nullable=False)
     role: Mapped[str] = mapped_column(Text, nullable=False)
+    audience: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="member", default="member",
+        comment="immutable conversation audience: 'member' | 'operator' "
+                "(review finding 1); operator context never renders or "
+                "prompts into the member thread")
     body: Mapped[str] = mapped_column(Text, nullable=False)
     citations: Mapped[list | None] = mapped_column(JSONB)
     model_job: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
@@ -738,6 +744,8 @@ class CoachMessage(Base):
 
     __table_args__ = (
         Index("ix_coach_messages_session", "session_id", "message_id"),
+        Index("ix_coach_messages_session_audience", "session_id",
+              "audience"),
     )
 
 
@@ -768,9 +776,16 @@ class OperationOutput(Base):
                                       server_default="output")
     text: Mapped[str | None] = mapped_column(Text)
     dropped_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    read_ts: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="wall-clock seconds (time.time) at pipe-read time; NULL = "
+                "not observed — never silently equal to persist time "
+                "(review finding 10)")
 
     __table_args__ = (
         Index("uq_operation_outputs_op_seq", "run_id", "op_id", "seq",
               unique=True),
         Index("ix_operation_outputs_session", "session_id", "op_id", "seq"),
+        Index("uq_operation_outputs_truncated_once", "run_id", "op_id",
+              unique=True, postgresql_where=sa_text("kind = 'truncated'")),
     )

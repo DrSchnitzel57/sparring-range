@@ -138,8 +138,12 @@ def test_chat_prompt_cutoff_and_window(client, users, monkeypatch):
     from srplatform.db.session import db as db_ctx
     now = datetime.now(timezone.utc)
     with db_ctx() as s:
-        s.add(Event(session_id=U.UUID(sid), ts=now, actor="blue",
-                    action_type="note", payload={"text": "baseline"}))
+        # RENDERED evidence (red tool_call): citations may only cover what
+        # the compressed prompt actually displays (finding 8), so the
+        # window test must use evidence the model really sees.
+        s.add(Event(session_id=U.UUID(sid), ts=now, actor="red",
+                    host="web01", action_type="tool_call",
+                    payload={"command": "whoami", "tool": "exec"}))
         s.commit()
 
     captured = {}
@@ -159,11 +163,15 @@ def test_chat_prompt_cutoff_and_window(client, users, monkeypatch):
     meta = payload["chat_meta"]
 
     with db_ctx() as s:
-        all_ids = [e.event_id for e in s.execute(
-            select(Event).where(Event.session_id == U.UUID(sid))
-            .order_by(Event.event_id)).scalars().all()]
+        ids = s.execute(select(Event.event_id, Event.action_type)
+                        .where(Event.session_id == U.UUID(sid))
+                        .order_by(Event.event_id)).all()
+    all_ids = [i for i, _ in ids]
+    seed_ids = [i for i, k in ids if k == "tool_call"]
     assert meta["cutoff"] == max(all_ids)
-    assert set(meta["allowed_ids"]) <= set(all_ids)
+    # citation ids are the RENDERED evidence: exactly the seeded red
+    # command — never every row in the session
+    assert meta["allowed_ids"] == seed_ids
 
     # the frozen citation window is the invariant: a NEW event after
     # enqueue cannot ride an already-queued answer (and the prompt was
@@ -171,14 +179,13 @@ def test_chat_prompt_cutoff_and_window(client, users, monkeypatch):
     # deliberately does not echo raw payloads)
     with db_ctx() as s:
         s.add(Event(session_id=U.UUID(sid), ts=datetime.now(timezone.utc),
-                    actor="blue", action_type="note",
-                    payload={"text": "after cutoff"}))
+                    actor="red", host="web01", action_type="tool_call",
+                    payload={"command": "id", "tool": "exec"}))
         s.commit()
         late_ids = [e.event_id for e in s.execute(
             select(Event).where(Event.session_id == U.UUID(sid))
             .order_by(Event.event_id)).scalars().all()]
-    assert set(meta["allowed_ids"]) == set(all_ids)
-    assert set(late_ids) - set(all_ids)          # proof there IS a later id
+    assert set(meta["allowed_ids"]) == set(seed_ids)
     assert (set(late_ids) - set(all_ids)).isdisjoint(meta["allowed_ids"])
 
 
@@ -291,3 +298,159 @@ def test_validated_citations_only_allow_given_evidence():
     assert chat.validated_citations("no refs", [7]) == []
     assert chat.validated_citations("#7", None) == []
     assert chat.validated_citations("#7 #7 #8", [7, 8]) == [7, 8]
+
+
+# --------------------------------------------------------------------------- #
+# review finding 1 (FIX round): audience-separated threads                     #
+# --------------------------------------------------------------------------- #
+
+def _msgs_as(client, users, who, sid, **params):
+    r = client.get(f"/sessions/{sid}/coach/messages", params=params,
+                   headers=users[who])
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_operator_and_member_coach_threads_never_mix(client, users,
+                                                     monkeypatch):
+    """Independent review finding 1 counterexample: one shared
+    conversation let an operator turn be returned verbatim to a member.
+    Every turn now carries its immutable audience; the API filters on
+    the stored column (never on prose), so each principal sees exactly
+    their own thread — including after reload."""
+    from srplatform import model_admin as ma
+    sid = _sid(client, users)
+
+    def _down(db, session_id, role):
+        raise ma.ProfileUnavailable("no profile (test)")
+    monkeypatch.setattr(ma, "bind_for", _down)
+
+    r = client.post(f"/sessions/{sid}/coach/messages",
+                    json={"text": "OPERATOR_QUESTION_ONLY"},
+                    headers=users["op"])
+    assert r.status_code == 201, r.text
+    r = client.post(f"/sessions/{sid}/coach/messages",
+                    json={"text": "MEMBER_QUESTION_ONLY"},
+                    headers=users["member"])
+    assert r.status_code == 201, r.text
+
+    member = _msgs_as(client, users, "member", sid)
+    bodies = [m["body"] for m in member["messages"]]
+    assert "OPERATOR_QUESTION_ONLY" not in bodies
+    assert bodies == ["MEMBER_QUESTION_ONLY", member["messages"][1]["body"]]
+    assert {m["audience"] for m in member["messages"]} == {"member"}
+
+    op = _msgs_as(client, users, "op", sid)
+    obodies = [m["body"] for m in op["messages"]]
+    assert "MEMBER_QUESTION_ONLY" not in obodies
+    assert "OPERATOR_QUESTION_ONLY" in obodies
+    assert {m["audience"] for m in op["messages"]} == {"operator"}
+
+
+def test_pending_operator_chat_never_appears_in_member_pending(
+        client, users, monkeypatch):
+    """The reload surface lists PENDING answers from the job row — so
+    the pending list must be audience-filtered too, or a queued operator
+    turn is enumerated to the member even before its answer exists."""
+    import threading
+
+    from srplatform.red_agent import conversation as conv
+    from tests.test_plan19_model_admin import _make_profile
+
+    sid = _sid(client, users)
+    _make_profile(client, users, "coachpend", "http://x/v1")
+    r = client.put("/admin/model/roles", headers=users["op"],
+                   json={"role": "coach", "profile_name": "coachpend"})
+    assert r.status_code == 200, r.text
+
+    release = threading.Event()
+
+    def _hold(*a, **k):
+        release.wait(30)
+        return {"kind": "text", "text": "late answer"}
+    monkeypatch.setattr(conv, "run_text", _hold)
+    try:
+        jop = client.post(f"/sessions/{sid}/coach/messages",
+                          json={"text": "op pending turn"},
+                          headers=users["op"]).json()["job_id"]
+        jmem = client.post(f"/sessions/{sid}/coach/messages",
+                           json={"text": "member pending turn"},
+                           headers=users["member"]).json()["job_id"]
+        m_pend = [p["job_id"] for p in _msgs_as(client, users, "member",
+                                                sid)["pending"]]
+        o_pend = [p["job_id"] for p in _msgs_as(client, users, "op",
+                                                sid)["pending"]]
+        assert jmem in m_pend and jop not in m_pend
+        assert jop in o_pend and jmem not in o_pend
+    finally:
+        release.set()
+
+
+def test_persisted_audience_is_immutable_default_for_direct_rows(client,
+                                                                 users):
+    """Rows written without an audience (legacy shape) are member
+    history via the column default — an absent audience is never an
+    implicit 'visible to everyone'."""
+    from srplatform.db.models import CoachMessage
+    from srplatform.db.session import db as db_ctx
+    sid = _sid(client, users)
+    with db_ctx() as s:
+        s.add(CoachMessage(session_id=U.UUID(sid), role="user",
+                           body="legacy row"))
+        s.commit()
+    member = _msgs_as(client, users, "member", sid)
+    op = _msgs_as(client, users, "op", sid)
+    assert [m["body"] for m in member["messages"]] == ["legacy row"]
+    assert all(m["audience"] == "member" for m in member["messages"])
+    assert [m["body"] for m in op["messages"]] == []
+
+
+def test_citations_only_accept_ids_visible_in_the_rendered_prompt(
+        client, users, monkeypatch):
+    """Independent review finding 8 (server half): the prompt is
+    COMPRESSED, so window membership is not evidence visibility. Events
+    the timeline renderer never displays (and events beyond the
+    compression tail) must not be citable — the enqueue-time allow-list
+    is parsed from the rendered text itself."""
+    from tests.test_plan19_model_admin import _make_profile
+    sid = _sid(client, users)
+    _make_profile(client, users, "coachvis", "http://x/v1")
+    client.put("/admin/model/roles", headers=users["op"],
+               json={"role": "coach", "profile_name": "coachvis"})
+
+    from srplatform.db.models import Event
+    from srplatform.db.session import db as db_ctx
+    now = datetime.now(timezone.utc)
+    with db_ctx() as s:
+        note = Event(session_id=U.UUID(sid), ts=now, actor="blue",
+                     action_type="note", payload={"text": "never rendered"})
+        noise = Event(session_id=U.UUID(sid), ts=now, actor="system",
+                      action_type="detection", payload={"note": "not shown"})
+        shown = Event(session_id=U.UUID(sid), ts=now, actor="red",
+                      host="web01", action_type="tool_call",
+                      payload={"command": "showme", "tool": "exec"})
+        s.add_all([note, noise, shown])
+        s.commit()
+        note_id = note.event_id
+        noise_id = noise.event_id
+        shown_id = shown.event_id
+
+    captured = {}
+    from srplatform import model_jobs
+    real_enqueue = model_jobs.enqueue
+
+    def _spy(db, **kw):
+        captured["payload"] = kw.get("payload")
+        return real_enqueue(db, **kw)
+    monkeypatch.setattr(model_jobs, "enqueue", _spy)
+
+    client.post(f"/sessions/{sid}/coach/messages",
+                json={"text": "what can I cite?"}, headers=users["member"])
+    meta = captured["payload"]["chat_meta"]
+    assert meta["allowed_ids"] == [shown_id]
+    assert note_id not in meta["allowed_ids"]
+    assert noise_id not in meta["allowed_ids"]
+    assert f"#{shown_id}" in captured["payload"]["user"]
+    assert f"#{note_id}" not in captured["payload"]["user"]
+    # and the persisted-citation filter enforces exactly this list
+    assert meta["allowed_ids"] == [shown_id]

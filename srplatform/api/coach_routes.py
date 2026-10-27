@@ -526,6 +526,7 @@ def coach_chat_post(session_id: uuid.UUID, body: ChatIn,
     honest UNAVAILABLE notice is persisted instead of silence: chat is
     never a silently-dropped surface, and it never awards anything."""
     from srplatform.coach import chat as chat
+    audience = "operator" if p.is_operator else "member"
     with _db_ctx() as db:
         sess = db.get(SessionModel, session_id)
         if sess is None:
@@ -535,9 +536,9 @@ def coach_chat_post(session_id: uuid.UUID, body: ChatIn,
         from srplatform.api.visibility import filter_event
         events = [filter_event(db, sess, p, e)
                   for e in _events_of(db, session_id)]
-        history = chat.recent_messages(db, session_id)
+        history = chat.recent_messages(db, session_id, audience=audience)
     system, user, cutoff, allowed = chat.build_chat_prompt(
-        events, history, body.text)
+        events, history, body.text, audience)
 
     from srplatform import model_admin as ma
     from srplatform import model_jobs
@@ -545,7 +546,7 @@ def coach_chat_post(session_id: uuid.UUID, body: ChatIn,
     try:
         with _db_ctx() as db:
             db.add(CoachMessage(session_id=session_id, role="user",
-                                body=body.text))
+                                body=body.text, audience=audience))
             _pin, prof = ma.bind_for(db, session_id, "coach")
             job = model_jobs.enqueue(
                 db, kind="coach-chat", priority=PRIORITY_HINT,
@@ -553,6 +554,7 @@ def coach_chat_post(session_id: uuid.UUID, body: ChatIn,
                          "chat_meta": {"question": body.text,
                                        "cutoff": cutoff,
                                        "allowed_ids": allowed,
+                                       "audience": audience,
                                        "fallback": chat.CHAT_FALLBACK}},
                 session_id=session_id, profile=prof, actor="member",
                 deadline_at=model_jobs.match_deadline(db, session_id))
@@ -564,10 +566,10 @@ def coach_chat_post(session_id: uuid.UUID, body: ChatIn,
         pass
     with _db_ctx() as db:
         db.add(CoachMessage(session_id=session_id, role="user",
-                            body=body.text))
+                            body=body.text, audience=audience))
         db.add(CoachMessage(session_id=session_id, role="coach",
                             body=chat.CHAT_UNAVAILABLE, citations=[],
-                            model_ok=False))
+                            model_ok=False, audience=audience))
     return {"status": "coach-unavailable", "pending": False}
 
 
@@ -577,17 +579,23 @@ def coach_chat_list(session_id: uuid.UUID,
                     before_id: int | None = None,
                     limit: int = 100,
                     p: Principal = Depends(any_member), db: DbSession = None):
-    """The conversation, oldest-first, with the durable PENDING answers
-    (queued/running coach-chat jobs) alongside — a reload always shows
-    what is still cooking. Pagination: ``after_id`` polls forward for
-    new turns; ``before_id`` walks history backwards; neither returns
-    the most recent window. This conversation is the session's own
-    coach exchange (generated from visibility-filtered evidence); it
-    carries no scores and no sealed red payload by construction."""
+    """The conversation FOR THIS PRINCIPAL'S AUDIENCE, oldest-first, with
+    the durable PENDING answers (queued/running coach-chat jobs of the
+    same audience) alongside — a reload always shows what is still
+    cooking. Pagination: ``after_id`` polls forward for new turns;
+    ``before_id`` walks history backwards; neither returns the most
+    recent window. Operator and member conversations are SEPARATE
+    threads: an operator answer built over sealed red evidence never
+    appears here for a member (finding 1, enforced by the stored
+    audience column, not by prose redaction). This conversation carries
+    no scores and no sealed red payload for members by construction."""
     from srplatform.db.models import CoachMessage, ModelJob
     sess = _check_access(db, p, session_id)
+    audience = "operator" if p.is_operator else "member"
     limit = max(1, min(limit, 200))
-    stmt = select(CoachMessage).where(CoachMessage.session_id == session_id)
+    stmt = select(CoachMessage).where(
+        CoachMessage.session_id == session_id,
+        CoachMessage.audience == audience)
     if after_id is not None:
         rows = db.execute(stmt.where(CoachMessage.message_id > after_id)
                           .order_by(CoachMessage.message_id)
@@ -599,15 +607,22 @@ def coach_chat_list(session_id: uuid.UUID,
             stmt.order_by(CoachMessage.message_id.desc())
             .limit(limit)).scalars().all()))
     from srplatform import model_jobs as _mj
-    pending_rows = db.execute(
+    live_jobs = db.execute(
         select(ModelJob).where(
             ModelJob.session_id == session_id,
             ModelJob.kind == "coach-chat",
             ModelJob.state.not_in(_mj.TERMINAL_STATES))
         .order_by(ModelJob.requested_at)).scalars().all()
+
+    def _job_audience(j) -> str:
+        meta = (j.payload or {}).get("chat_meta") or {}
+        return meta.get("audience") or "member"
+
+    pending_rows = [j for j in live_jobs if _job_audience(j) == audience]
     from srplatform.api.visibility import competition_sealed
     return {"messages": [{
         "message_id": m.message_id, "role": m.role, "body": m.body,
+        "audience": m.audience,
         "citations": m.citations or [], "model_ok": m.model_ok,
         "model_job": str(m.model_job) if m.model_job else None,
         "context_cutoff_event_id": m.context_cutoff_event_id,
@@ -625,7 +640,10 @@ def _coach_chat_result_handler(db, job, success: bool) -> None:
     """Persist the coach answer EXACTLY ONCE with the job's final state:
     real answers keep their model_ok mark and only the citations their
     own evidence window allowed; failures record the honest fallback —
-    never an invented hint, never a silent drop."""
+    never an invented hint, never a silent drop. The answer lands in the
+    SAME audience thread that asked (finding 1): an operator answer
+    generated over sealed evidence is stored 'operator' and can never
+    render into member history."""
     from srplatform.coach import chat as chat
     from srplatform.db.models import CoachMessage
     meta = (job.payload or {}).get("chat_meta") or {}
@@ -642,7 +660,8 @@ def _coach_chat_result_handler(db, job, success: bool) -> None:
                         citations=chat.validated_citations(
                             text, meta.get("allowed_ids")),
                         model_job=job.job_id, model_ok=ok,
-                        context_cutoff_event_id=meta.get("cutoff")))
+                        context_cutoff_event_id=meta.get("cutoff"),
+                        audience=meta.get("audience") or "member"))
 
 
 _register_result_handlers()

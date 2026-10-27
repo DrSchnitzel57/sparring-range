@@ -10,6 +10,7 @@ invented hint; the conversation never mints scores or audit events.
 """
 from __future__ import annotations
 
+import json
 import uuid as U
 
 import pytest
@@ -50,8 +51,8 @@ def test_real_coach_answer_persists_with_validated_citations(client, users,
     from datetime import datetime, timezone
     with db_ctx() as s:
         ev = Event(session_id=U.UUID(sid), ts=datetime.now(timezone.utc),
-                   actor="blue", action_type="note",
-                   payload={"text": "web01 responded"})
+                   actor="red", host="web01", action_type="tool_call",
+                   payload={"command": "curl http://web01", "tool": "exec"})
         s.add(ev)
         s.commit()
         eid = ev.event_id
@@ -94,7 +95,7 @@ def test_real_coach_answer_persists_with_validated_citations(client, users,
         kinds = [e.action_type for e in s.execute(
             select(Event).where(Event.session_id == U.UUID(sid))
         ).scalars().all()]
-    assert "note" in kinds  # the seeded evidence, untouched
+    assert "tool_call" in kinds  # the seeded evidence, untouched
     assert not [k for k in kinds if "coach" in k or "score" in k]
 
 
@@ -127,3 +128,72 @@ def test_empty_completion_persists_honest_fallback_not_invention(client,
     got = client.get(f"/sessions/{sid}/coach/messages",
                      headers=users["member"]).json()
     assert got["pending"] == []
+
+
+def test_operator_sealed_answer_never_leaks_to_member_history_or_prompt(
+        client, users, srv):
+    """Independent review finding 1 counterexample on the REAL wire: an
+    operator coach answer containing sealed red evidence used to be
+    returned UNCHANGED to the member and pasted into the member's next
+    provider prompt. Now: the operator thread keeps it (positive
+    control), the member history is empty of it, and the member's next
+    provider REQUEST BODY — the actual bytes on the wire — contains
+    neither the sealed token nor the operator's question."""
+    from srplatform import model_jobs
+    sid = _setup(client, users, srv, "p20aud")
+    sealed = "SEALED_ATTACK_PLAN_BACKDOOR"
+    model_jobs.start_model_jobs()
+
+    srv.script([text_response(
+        f"Understood. The plan hinges on {sealed} at the next stage.")])
+    r = client.post(f"/sessions/{sid}/coach/messages",
+                    json={"text": "operator: status of the sealed plan?"},
+                    headers=users["op"])
+    assert r.status_code == 201, r.text
+    assert _wait_job(U.UUID(r.json()["job_id"])).state == "succeeded"
+
+    # positive control: the operator's OWN thread carries the answer
+    op = client.get(f"/sessions/{sid}/coach/messages",
+                    headers=users["op"]).json()
+    assert any(sealed in m["body"] for m in op["messages"])
+    assert all(m["audience"] == "operator" for m in op["messages"])
+
+    # zero leak: the member sees nothing of it
+    mem = client.get(f"/sessions/{sid}/coach/messages",
+                     headers=users["member"]).json()
+    assert mem["messages"] == []
+    assert mem["pending"] == []
+
+    # the member's next turn: the provider wire must be clean
+    srv.script([text_response("Start by listing listening services.")])
+    r2 = client.post(f"/sessions/{sid}/coach/messages",
+                     json={"text": "what should I look at first?"},
+                     headers=users["member"])
+    assert r2.status_code == 201, r2.text
+    assert _wait_job(U.UUID(r2.json()["job_id"])).state == "succeeded"
+    wire = json.dumps(srv.requests[-1]["body"])
+    assert sealed not in wire
+    assert "operator: status of the sealed plan?" not in wire
+
+    # positive control both ways: the operator's follow-up DOES carry
+    # their own sealed context through history (threading works),
+    # while the member keeps only member turns
+    srv.script([text_response("Yes — your sealed context is retained.")])
+    r3 = client.post(f"/sessions/{sid}/coach/messages",
+                     json={"text": "operator: still have my context?"},
+                     headers=users["op"])
+    assert _wait_job(U.UUID(r3.json()["job_id"])).state == "succeeded"
+    wire3 = json.dumps(srv.requests[-1]["body"])
+    assert sealed in wire3
+    assert "what should I look at first?" not in wire3
+
+    mem2 = client.get(f"/sessions/{sid}/coach/messages",
+                      headers=users["member"]).json()
+    assert not any(sealed in m["body"] for m in mem2["messages"])
+    with db_ctx() as s:
+        rows = s.execute(select(CoachMessage)
+                         .where(CoachMessage.session_id == U.UUID(sid))
+                         .order_by(CoachMessage.message_id)
+                         ).scalars().all()
+    assert all(r.audience in ("member", "operator") for r in rows)
+    assert {r.audience for r in rows} == {"member", "operator"}

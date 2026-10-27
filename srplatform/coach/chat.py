@@ -48,9 +48,33 @@ CHAT_UNAVAILABLE = (
     "ask again once an operator has the model available.")
 
 
-def recent_messages(db: Session, session_id, *, limit: int = HISTORY_WINDOW,
+# Independent review finding 1: ONE conversation cannot be shared across
+# audiences. An operator answer generated over sealed red evidence must
+# never be replayed into a member's history OR a member's next provider
+# prompt, so every persisted message carries an immutable audience and
+# history reconstruction filters on it at the API boundary (never by
+# model redaction, never by role guessing from prose).
+AUDIENCES = ("member", "operator")
+
+AUDIENCE_NOTES = {
+    "member": "",
+    "operator": (
+        " The person you are chatting with is the RANGE OPERATOR for this "
+        "session; the evidence may include sealed attacker activity that "
+        "members cannot see. That context stays in this conversation."),
+}
+
+USER_LABELS = {"member": "Member question", "operator": "Operator question"}
+
+
+def recent_messages(db: Session, session_id, *, audience: str = "member",
+                    limit: int = HISTORY_WINDOW,
                     before_id: int | None = None) -> list[CoachMessage]:
-    stmt = select(CoachMessage).where(CoachMessage.session_id == session_id)
+    """The bounded conversation window FOR ONE AUDIENCE (migration 0026
+    backfilled pre-existing rows as member history)."""
+    stmt = select(CoachMessage).where(
+        CoachMessage.session_id == session_id,
+        CoachMessage.audience == audience)
     if before_id is not None:
         stmt = stmt.where(CoachMessage.message_id < before_id)
     rows = db.execute(stmt.order_by(CoachMessage.message_id.desc())
@@ -68,16 +92,25 @@ def window_events(events: list[dict]) -> list[dict]:
 
 
 def build_chat_prompt(events: list[dict], history: list[CoachMessage],
-                      question: str) -> tuple[str, str, int | None, list[int]]:
+                      question: str,
+                      audience: str = "member"
+                      ) -> tuple[str, str, int | None, list[int]]:
     """(system, user, cutoff_event_id, allowed_citation_ids).
 
     The cutoff and the allowed citation ids are captured AT ENQUEUE:
     a durable answer produced later cannot drift its evidence base, and
-    anything it cites outside this window is dropped on persistence."""
+    anything it cites outside this window is dropped on persistence.
+
+    Independent review finding 8: the prompt is COMPRESSED (max_lines),
+    so window membership is not evidence visibility — allowed ids are
+    parsed from the rendered timeline text itself. A citation to an
+    event the model was never actually shown is rejected exactly like
+    one outside the window. The audience selects the conversation
+    context (finding 1); history must already be audience-filtered."""
     from srplatform.coach.timeline import compress_timeline
     window = window_events(events)
     timeline, _index = compress_timeline(window, max_lines=40)
-    valid_ids = [e["event_id"] for e in window]
+    visible_ids = sorted({int(m) for m in CITE_RE.findall(timeline)})
     lines = []
     for m in history:
         who = "member" if m.role == "user" else "coach"
@@ -86,9 +119,11 @@ def build_chat_prompt(events: list[dict], history: list[CoachMessage],
               f"{timeline or '(no recorded evidence yet)'}\n")
     if lines:
         header += "\nRecent conversation:\n" + "\n".join(lines) + "\n"
-    cutoff = max(valid_ids) if valid_ids else None
-    user = f"{header}\nMember question: {question[:4000]}"
-    return CHAT_SYSTEM, user, cutoff, valid_ids
+    cutoff = max((e["event_id"] for e in window), default=None)
+    label = USER_LABELS.get(audience, "Member question")
+    system = CHAT_SYSTEM + AUDIENCE_NOTES.get(audience, "")
+    user = f"{header}\n{label}: {question[:4000]}"
+    return system, user, cutoff, visible_ids
 
 
 def validated_citations(body: str, allowed_ids: list[int] | None) -> list[int]:

@@ -26,18 +26,18 @@ def _revisions():
     return revs
 
 
-def test_migration_chain_is_linear_with_head_0025():
+def test_migration_chain_is_linear_with_head_0026():
     revs = _revisions()
     children = {down for down, _ in revs.values() if down}
     heads = [r for r in revs if r not in children]
-    assert heads == ["0025"], f"expected single head 0025, got {heads}"
+    assert heads == ["0026"], f"expected single head 0026, got {heads}"
     # walk from head to root: must visit every revision exactly once
-    seen, cur = [], "0025"
+    seen, cur = [], "0026"
     while cur is not None:
         assert cur in revs, f"missing revision file for {cur}"
         seen.append(cur)
         cur = revs[cur][0]
-    assert len(seen) == len(revs) == 25, f"non-linear chain: {seen}"
+    assert len(seen) == len(revs) == 26, f"non-linear chain: {seen}"
 
 
 def test_0016_grants_dml_and_default_privileges_without_ddl():
