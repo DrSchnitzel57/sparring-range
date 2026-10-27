@@ -44,16 +44,19 @@ only addition). Fix commits on the branch:
 | bundle | **FAILED (prerequisite)** — role images come from the images gate (blocked above); with `SR_APPLIANCE_BASE_IMAGE` set the bundle verifies the base but refuses placeholder role bytes |
 | packet | **FAILED (environment, fail-closed)** — needs root + `nft` (approved CI job only; never host namespaces) |
 | journey | **FAILED (prerequisite, fail-closed)** — needs the INSTALLED appliance + operator/member tokens; refused by design |
-| appliance (aggregate) | re-runs the individual gates in order and stops at the images blocker above (receipt `.cache/gate_r6_appliance.log`); nothing the individual gates refuse can pass here |
+| appliance (aggregate) | RUNNING at this receipt's commit — it re-runs the individual gates in order (each already receipted above) and will stop at the images blocker (deterministic pin failure); nothing the individual gates refuse can pass here. Log: `.cache/gate_r6_appliance.log` |
 | release | **FAILED (prerequisite, fail-closed)** — `SR_LIVE_BASE_URL` live job; "nothing about a release is accepted from a sandbox" |
 
 Carried, unchanged by this round and NOT reopened by it: the nginx/package
 mirror pin reproducibility repair is milestone 21's explicit software
 blocker; installed Strata/UID/proc/systemd/nested-KVM/operator
 qualifications remain NOT PROVEN from this sandbox; hypervisor/access
-receipts are labeled-TCG software emulation. `git status` clean at this
-commit; the round's own PG fixture (`sr-r6pg`) and libvirt session were
-created and removed by this operator.
+receipts are labeled-TCG software emulation. `git status` is clean at
+this commit; this operator's own PG fixture (`sr-r6pg`) was removed
+after the final gate runs, and only the libvirt session daemon backing
+the in-flight appliance aggregate (plus that aggregate's own `sr-acc-*`
+fixtures) is still intentionally running — it belongs to the in-flight
+job, not to accepted evidence.
 
 ## Plan-20 implementation — 2026-10-27, branch `practice-upgrades-18-21`
 
