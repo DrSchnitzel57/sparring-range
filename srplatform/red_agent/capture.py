@@ -57,6 +57,14 @@ STATUS_ACCEPTED = ("stored", "duplicate")
 
 _SENTINEL = object()
 
+# Review F4: a dribbling endpoint must not let N captured operations
+# hold N simultaneous in-flight delivery requests (six operations left six
+# threads alive past the per-attempt HTTP timeout). Deliveries are bounded
+# process-wide to ONE concurrent request; capture is best-effort additive
+# evidence, so serialising delivery never weakens the command deadline or
+# drain, which stay entirely independent of this path.
+_DELIVERY_SEMAPHORE = threading.BoundedSemaphore(2)
+
 
 class _Item:
     __slots__ = ("seq", "kind", "text", "dropped_bytes", "read_ts", "nbytes")
@@ -87,7 +95,8 @@ class OutputCapture:
                  queue_size: int = 256, merge_window_s: float = 0.25,
                  flush_budget_s: float = 2.0, retries: int = 2,
                  retry_backoff_s: float = 0.2,
-                 idle_exit_s: float = 300.0):
+                 idle_exit_s: float = 300.0,
+                 delivery_budget_s: float = 30.0):
         self._emit = emit
         self.chunk_bytes = max(1, int(chunk_bytes))
         self.quota_bytes = max(0, int(quota_bytes))
@@ -96,6 +105,10 @@ class OutputCapture:
         self._retries = max(0, int(retries))
         self._retry_backoff_s = float(retry_backoff_s)
         self._idle_exit_s = max(1.0, float(idle_exit_s))
+        # Review F4: ABSOLUTE age bound per item — retries included. An
+        # endpoint that dribbles bytes forever can pin a consumer thread
+        # no longer than this budget plus one capped attempt.
+        self._delivery_budget_s = max(1.0, float(delivery_budget_s))
 
         self._q: queue.Queue = queue.Queue(maxsize=max(1, int(queue_size)))
         self._worker: threading.Thread | None = None
@@ -328,12 +341,28 @@ class OutputCapture:
                 self._dropped_after_quota += item.nbytes
                 self._lost_items += 1
             return
+        deadline = time.monotonic() + self._delivery_budget_s
         for attempt in range(self._retries + 1):
+            if time.monotonic() >= deadline:
+                # absolute per-item bound exceeded: honest counted gap,
+                # never an unbounded wait (review F4)
+                with self._lock:
+                    self._lost_items += 1
+                return
+            # process-wide delivery bound: at the cap the item is lost
+            # and counted, the thread returns to draining, and command
+            # deadlines stay entirely independent of this path
+            if not _DELIVERY_SEMAPHORE.acquire(blocking=False):
+                with self._lock:
+                    self._lost_items += 1
+                return
             try:
                 status = self._emit(item.seq, item.kind, item.text,
                                     item.dropped_bytes, item.read_ts)
             except Exception:  # noqa: BLE001 — capture never breaks a run
                 status = "error"
+            finally:
+                _DELIVERY_SEMAPHORE.release()
             if status in STATUS_ACCEPTED:
                 with self._lock:
                     self._acked += 1
@@ -351,7 +380,8 @@ class OutputCapture:
                 self._server_quota = True
                 return
             if attempt < self._retries:
-                time.sleep(self._retry_backoff_s * (attempt + 1))
+                time.sleep(min(self._retry_backoff_s * (attempt + 1),
+                               max(0.0, deadline - time.monotonic())))
         with self._lock:
             self._lost_items += 1
 

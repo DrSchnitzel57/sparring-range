@@ -315,6 +315,26 @@ def aar_post(session_id: uuid.UUID, body: AarIn, p: Principal = Depends(any_memb
     return {"status": "ok", "persisted": True, "version": version, **report}
 
 
+def _require_audience_safe_schema(db) -> None:
+    """F1 runtime fence: never serve coach history from a half-migrated
+    schema. 0026 alone backfills every legacy row to ``member``; until
+    0027's fail-closed relabel has run, that table cannot be trusted at
+    the audience boundary, so the API refuses instead of starting or
+    continuing mid-history-upgrade. A missing alembic_version (no
+    schema) is handled by the normal readiness path, not here."""
+    from sqlalchemy import text
+    try:
+        heads = db.execute(
+            text("SELECT version_num FROM alembic_version")).scalars().all()
+    except Exception:  # noqa: BLE001 — no table: not our failure to add
+        return
+    if list(heads) == ["0026"]:
+        raise HTTPException(
+            503, "coach history refused: schema is mid-upgrade at 0026 "
+                 "(legacy audience backfill not yet made fail-closed by "
+                 "0027); complete migrations before serving coach threads")
+
+
 def _check_access(db, p, session_id) -> SessionModel:
     sess = db.get(SessionModel, session_id)
     if sess is None:
@@ -528,6 +548,7 @@ def coach_chat_post(session_id: uuid.UUID, body: ChatIn,
     from srplatform.coach import chat as chat
     audience = "operator" if p.is_operator else "member"
     with _db_ctx() as db:
+        _require_audience_safe_schema(db)
         sess = db.get(SessionModel, session_id)
         if sess is None:
             raise HTTPException(404, "session not found")
@@ -591,11 +612,16 @@ def coach_chat_list(session_id: uuid.UUID,
     no scores and no sealed red payload for members by construction."""
     from srplatform.db.models import CoachMessage, ModelJob
     sess = _check_access(db, p, session_id)
+    _require_audience_safe_schema(db)
     audience = "operator" if p.is_operator else "member"
     limit = max(1, min(limit, 200))
+    # F1: 'legacy' (audience unknowable after the 0026 backfill) is NEVER
+    # member-visible; it renders only in the privileged operator thread,
+    # explicitly labelled, and never enters any provider prompt.
+    visible = [audience] + (["legacy"] if p.is_operator else [])
     stmt = select(CoachMessage).where(
         CoachMessage.session_id == session_id,
-        CoachMessage.audience == audience)
+        CoachMessage.audience.in_(visible))
     if after_id is not None:
         rows = db.execute(stmt.where(CoachMessage.message_id > after_id)
                           .order_by(CoachMessage.message_id)
@@ -616,7 +642,9 @@ def coach_chat_list(session_id: uuid.UUID,
 
     def _job_audience(j) -> str:
         meta = (j.payload or {}).get("chat_meta") or {}
-        return meta.get("audience") or "member"
+        # F1: a job WITHOUT audience metadata is legacy work; its
+        # eventual outcome must never default into a member thread.
+        return meta.get("audience") or "legacy"
 
     pending_rows = [j for j in live_jobs if _job_audience(j) == audience]
     from srplatform.api.visibility import competition_sealed
@@ -661,7 +689,7 @@ def _coach_chat_result_handler(db, job, success: bool) -> None:
                             text, meta.get("allowed_ids")),
                         model_job=job.job_id, model_ok=ok,
                         context_cutoff_event_id=meta.get("cutoff"),
-                        audience=meta.get("audience") or "member"))
+                        audience=meta.get("audience") or "legacy"))
 
 
 _register_result_handlers()

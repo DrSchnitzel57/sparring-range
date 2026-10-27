@@ -1867,6 +1867,12 @@ def complete_run_operation(run_id: uuid.UUID, op_id: str, body: OperationDoneIn,
 # worker-claimed dropped-byte total is clamped, never trusted.
 _CAPTURE_MAX_TEXT_BYTES = 64 * 1024
 _CAPTURE_MAX_CLAIMED_DROPPED = 1_000_000_000
+# The server-generated truncation marker is itself stored bytes: its full
+# size is RESERVED inside every budget (review F2: a 63-byte marker was
+# inserted through a 10-byte remainder, exceeding the declared cap).
+_CAPTURE_MARKER_TEXT = ("server capture quota reached — further chunks "
+                        "were not stored")
+_CAPTURE_MARKER_BYTES = len(_CAPTURE_MARKER_TEXT.encode("utf-8"))
 
 
 class OperationOutputIn(BaseModel):
@@ -1898,11 +1904,20 @@ def _capture_quota_response(db, run_id, session_id, op_id, dropped):
         db.execute(OperationOutput.__table__.insert().values(
             run_id=run_id, session_id=session_id, op_id=op_id,
             seq=int(next_seq) + 1, kind="truncated",
-            text="server capture quota reached — further chunks were "
-                 "not stored",
+            text=_CAPTURE_MARKER_TEXT,
             dropped_bytes=dropped))
     db.commit()
     return JSONResponse({"ok": True, "status": "quota"}, status_code=200)
+
+
+def _capture_marker_exists(db, run_id, op_id) -> bool:
+    from srplatform.db.models import OperationOutput
+    return db.execute(
+        select(OperationOutput.id)
+        .where(OperationOutput.run_id == run_id,
+               OperationOutput.op_id == op_id,
+               OperationOutput.kind == "truncated")
+        .limit(1)).first() is not None
 
 
 @app.post("/internal/runs/{run_id}/operations/{op_id}/output", status_code=201)
@@ -1976,47 +1991,65 @@ def append_operation_output(run_id: uuid.UUID, op_id: str,
         return JSONResponse({"ok": True, "status": "conflict"},
                             status_code=200)
 
+    # A closed operation stores nothing further — the marker already
+    # exists, and a racing or repeated explicit marker answers the
+    # idempotent protocol instead of colliding with the unique index in
+    # a 500 (review F2).
+    if _capture_marker_exists(db, run_id, op_id):
+        db.commit()
+        return JSONResponse({"ok": True, "status": "quota"}, status_code=200)
+
     s = get_settings()
-    if body.text:
-        from sqlalchemy import func as sa_func
-        incoming = len(body.text.encode("utf-8", "replace"))
+    # EVERY kind of row is admitted under the SAME atomic bounds — output,
+    # gap and marker alike, with OR without text (review F2: the old
+    # `if body.text:` gate let 20 null-text gap rows past a 5-row cap).
+    from sqlalchemy import func as sa_func
 
-        def _op_bytes():
-            # EVERY stored text counts against the operation budget —
-            # output, gap and marker alike (finding 3: charging only
-            # non-empty output text made gap/marker rows unbounded)
-            return db.execute(
-                select(sa_func.coalesce(
-                    sa_func.sum(sa_func.octet_length(OperationOutput.text)), 0))
-                .where(OperationOutput.run_id == run_id,
-                       OperationOutput.op_id == op_id)).scalar() or 0
+    def _op_bytes():
+        return db.execute(
+            select(sa_func.coalesce(
+                sa_func.sum(sa_func.octet_length(OperationOutput.text)), 0))
+            .where(OperationOutput.run_id == run_id,
+                   OperationOutput.op_id == op_id)).scalar() or 0
 
-        def _sess_bytes():
-            return db.execute(
-                select(sa_func.coalesce(
-                    sa_func.sum(sa_func.octet_length(OperationOutput.text)), 0))
-                .where(OperationOutput.session_id == run.session_id)).scalar() \
-                or 0
+    def _sess_bytes():
+        return db.execute(
+            select(sa_func.coalesce(
+                sa_func.sum(sa_func.octet_length(OperationOutput.text)), 0))
+            .where(OperationOutput.session_id == run.session_id)).scalar() \
+            or 0
 
-        def _op_rows():
-            return db.execute(
-                select(sa_func.count())
-                .where(OperationOutput.run_id == run_id,
-                       OperationOutput.op_id == op_id)).scalar() or 0
+    def _op_rows():
+        return db.execute(
+            select(sa_func.count())
+            .where(OperationOutput.run_id == run_id,
+                   OperationOutput.op_id == op_id)).scalar() or 0
 
-        if (incoming > s.runner_op_capture_bytes
-                or _op_bytes() + incoming > s.runner_op_capture_bytes
-                or _sess_bytes() + incoming > s.runner_session_capture_bytes
-                or _op_rows() >= s.runner_op_capture_rows):
-            return _capture_quota_response(db, run_id, run.session_id, op_id,
-                                           dropped)
+    incoming = len(body.text.encode("utf-8", "replace")) if body.text else 0
+    if (_op_rows() >= s.runner_op_capture_rows
+            or incoming + _CAPTURE_MARKER_BYTES > s.runner_op_capture_bytes
+            or _op_bytes() + incoming + _CAPTURE_MARKER_BYTES
+            > s.runner_op_capture_bytes
+            or _sess_bytes() + incoming + _CAPTURE_MARKER_BYTES
+            > s.runner_session_capture_bytes):
+        return _capture_quota_response(db, run_id, run.session_id, op_id,
+                                       dropped)
 
-    res = db.execute(
-        pg_insert(OperationOutput)
-        .values(run_id=run_id, session_id=run.session_id, op_id=op_id,
-                seq=body.seq, kind=body.kind, text=body.text,
-                dropped_bytes=dropped, read_ts=body.read_ts)
-        .on_conflict_do_nothing(index_elements=["run_id", "op_id", "seq"]))
+    from sqlalchemy.exc import IntegrityError
+    try:
+        res = db.execute(
+            pg_insert(OperationOutput)
+            .values(run_id=run_id, session_id=run.session_id, op_id=op_id,
+                    seq=body.seq, kind=body.kind, text=body.text,
+                    dropped_bytes=dropped, read_ts=body.read_ts)
+            .on_conflict_do_nothing(
+                index_elements=["run_id", "op_id", "seq"]))
+    except IntegrityError:
+        # a partial-unique collision (e.g. a second truncation marker on
+        # a legacy schema predating the forward guard) is a controlled
+        # outcome, never a 500
+        db.rollback()
+        return JSONResponse({"ok": True, "status": "quota"}, status_code=200)
     if res.rowcount == 0:
         # cannot happen under the session lock with the pre-check, but a
         # conflict is NEVER silently folded into success
