@@ -420,11 +420,22 @@ def list_sessions(mine: bool = Query(True),
     ``view=active`` is what is (or was just) in flight; ``history`` is
     everything finished. Flags ride each row so the dashboard can say
     what needs attention WITHOUT loading each session: ``interrupted``
-    (failed / worker failure / stop unconfirmed), ``unscored`` (finished
-    without any scorecard snapshot), ``cleanup_pending`` (an operation
-    whose cessation is still unresolved). Members only ever see their
-    own sessions; operators may pass ``mine=false`` for the all-session
-    view — authorization, not a filter checkbox, enforces this."""
+    (failed / worker failure / stop unconfirmed / the match lifecycle's
+    own INTERRUPTED state), ``unscored`` (finished without any
+    scorecard snapshot), ``cleanup_pending`` (cleanup still retrying or
+    never completed, or an operation whose cessation is unresolved).
+    Members only ever see their own sessions; operators may pass
+    ``mine=false`` for the all-session view — authorization, not a
+    filter checkbox, enforces this.
+
+    Independent review finding 19-FIX/7: the flags derive from
+    DURABLE LIFECYCLE FACTS ONLY — match state, run state, operation
+    state, scorecard presence. The old prose probe (``agent_note LIKE
+    '%worker failure%'``) is gone: warnings were hidden or invented by
+    wording, and a completed session with an INTERRUPTED match and a
+    teardown_incomplete fact rendered as fully healthy. UNSCORED stays
+    a distinct fact: an AI failure never folds it in and never removes
+    it."""
     from sqlalchemy import func as sa_func
     from sqlalchemy import select as sa_select
     from sqlalchemy import text as sa_text
@@ -445,10 +456,22 @@ def list_sessions(mine: bool = Query(True),
     rows = db.execute(q.limit(limit).offset(offset)).scalars().all()
 
     sids = [r.session_id for r in rows]
-    interrupted_extra, unscored, cleanup = set(), set(), set()
+    match_interrupted, cleanup, unscored, run_unconfirmed = (
+        set(), set(), set(), set())
     if sids:
         # one batched probe per flag — a list page never runs a per-row
         # scan, and never claims a flag it cannot prove
+        for row in db.execute(sa_text(
+                "SELECT session_id, state FROM matches "
+                "WHERE session_id = ANY(CAST(:ids AS uuid[]))"),
+                {"ids": [str(s) for s in sids]}).fetchall():
+            if row[1] == "interrupted":
+                match_interrupted.add(str(row[0]))
+            if row[1] in ("interrupted", "finalizing"):
+                # 'finalizing' is the durable cleanup-intent marker: an
+                # unfinished or crashed cleanup keeps it until retried
+                # to completion (lifecycle contract)
+                cleanup.add(str(row[0]))
         for row in db.execute(sa_text(
                 "SELECT DISTINCT session_id FROM run_operations "
                 "WHERE session_id = ANY(CAST(:ids AS uuid[])) "
@@ -456,16 +479,19 @@ def list_sessions(mine: bool = Query(True),
                 {"ids": [str(s) for s in sids]}).fetchall():
             cleanup.add(str(row[0]))
         for row in db.execute(sa_text(
+                "SELECT DISTINCT session_id FROM runs "
+                "WHERE session_id = ANY(CAST(:ids AS uuid[])) "
+                "AND status = 'cancel-unknown'"),
+                {"ids": [str(s) for s in sids]}).fetchall():
+            # a run whose cessation never got confirmed: the attacker
+            # process may still exist — interrupted AND unclean
+            run_unconfirmed.add(str(row[0]))
+            cleanup.add(str(row[0]))
+        for row in db.execute(sa_text(
                 "SELECT DISTINCT session_id FROM events "
                 "WHERE session_id = ANY(CAST(:ids AS uuid[])) AND action_type = "
                 "'score_snapshot'"), {"ids": [str(s) for s in sids]}).fetchall():
             unscored.add(str(row[0]))
-        for row in db.execute(sa_text(
-                "SELECT DISTINCT session_id FROM events "
-                "WHERE session_id = ANY(CAST(:ids AS uuid[])) AND action_type = 'agent_note' "
-                "AND payload->>'note' LIKE '%worker failure%'"),
-                {"ids": [str(s) for s in sids]}).fetchall():
-            interrupted_extra.add(str(row[0]))
     return {"sessions": [{
         "session_id": str(r.session_id), "scenario_id": r.scenario_id,
         "user_id": str(r.user_id) if r.user_id else None,
@@ -475,7 +501,8 @@ def list_sessions(mine: bool = Query(True),
         "interrupted": (r.status == "failed"
                         or r.outcome in ("worker_failure", "cancel_unconfirmed",
                                          "canceled")
-                        or str(r.session_id) in interrupted_extra),
+                        or str(r.session_id) in match_interrupted
+                        or str(r.session_id) in run_unconfirmed),
         "unscored": (r.status == "complete"
                      and str(r.session_id) not in unscored),
         "cleanup_pending": str(r.session_id) in cleanup,
