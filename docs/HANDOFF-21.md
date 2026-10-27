@@ -14,7 +14,7 @@ repository backlog (`docs/FINDINGS_CHECKLIST.md`).
 | `463e408` | second plan-20 review recorded; user reprioritization; F5–F9 backlog |
 | `b3df934` | F1 fail-closed legacy audience + 0026 fence; F2 always-on quota; F3 engine prerequisite + forward guard; F4 bounded delivery |
 | `b504a76` | 8 real db-layer proofs + explicit trigger-bracketed relabel (0027) |
-| `f2d8e3b` | `appliance.py upgrade` drives the real engine; bundle `upgrade` contract (BUNDLE_VERSION 2) |
+| `fc025e7` | `appliance.py upgrade` drives the real engine; bundle `upgrade` contract (BUNDLE_VERSION 2) |
 | `3a4d927` | required-mode `acceptance.py upgrade` gate; backup-snapshot integrity hardening |
 
 ## Verification commands (exact)

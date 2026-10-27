@@ -12,7 +12,7 @@ Milestone 20 remains UNACCEPTED; nothing below re-runs or claims its gates.
 | `463e408` | second plan-20 review + user reprioritization + full F5–F9 repository backlog |
 | `b3df934` | F1 forward 0027 + runtime fence; F2 always-on quota, reserved marker budget, no-500 duplicate marker; F3 supported prerequisite in the engine + legacy-safe forward guard; F4 absolute delivery budget + process-wide delivery bound |
 | `b504a76` | real proofs (8/8 on disposable PostgreSQL): naive 0025→head still fails on 0026 (defect shown); engine reaches 0027 with the prerequisite recorded; legacy duplicate markers survive unmodified; sealed row fail-closed `legacy`; fence 503-at-0026; HTTP audience separation; second marker never 500; null-gap row cap; dribbling endpoint bounded; consumer retires with counted drops |
-| `f2d8e3b` | `appliance.py upgrade` drives the real engine (backup→stage→activate→migrate→finalize, journal, resume, restore); bundles carry the MANIFEST `upgrade` contract (BUNDLE_VERSION 2; pre-21 refused) |
+| `fc025e7` | `appliance.py upgrade` drives the real engine (backup→stage→activate→migrate→finalize, journal, resume, restore); bundles carry the MANIFEST `upgrade` contract (BUNDLE_VERSION 2; pre-21 refused) |
 | `3a4d927` | required-mode `acceptance.py upgrade` + backup-snapshot integrity hardening |
 
 Gate receipts (exact commands, this environment, revision `3a4d927`):
