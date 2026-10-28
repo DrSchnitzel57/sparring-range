@@ -433,10 +433,14 @@ the `sr_secret`-style role and its 0600 `secrets/db-secret.env` ONLY when
 missing — old 0019-era appliances need no manual SQL); proven FORWARD-only
 migrations with the installed venv; config re-render; `systemctl
 daemon-reload`; a **checked restart** (every unit restarted AND verified
-active); and a **bounded real readiness gate** — `GET
-<internal>/readyz` and the frontend must answer 200 (`/readyz` itself
-proves the schema head matches the installed package). Only then is the
-version stamp written and the fence dropped. Users, password hashes,
+active); and a **bounded real readiness gate** — the parsed `/readyz`
+contract must hold: HTTP 200 AND `ready: true` with NO issues AND
+`migration_version` equal to the payload's schema head (a 200 reporting
+`ready: false`, or `ready: true` from a stale process at an old head, is
+NOT ready; malformed reports fail closed), and the frontend must answer
+200. Only then is the version stamp written and the fence dropped — and
+the fence is only ever dropped by its OWNING attempt completing; a
+config restore of another attempt never releases it. Users, password hashes,
 keys/pins, closed sessions, audit rows, casts and historical reports are
 never deleted or rewritten; a rerun at the same revision answers `no_op`
 — but an UNFINISHED attempt always outranks that answer.
@@ -462,10 +466,14 @@ Failure and interruption discipline:
   restoring config does not roll back the activated runtime or the
   forward-only schema, so admission stays refused until you complete the
   attempt with `--resume` or resolve it deliberately. Only a restore of
-  an already-COMPLETED attempt clears a fence. Database rollback is
-  deliberately not offered: schema is forward-only; the attempt journal
-  holds your `pg_dump` for an explicit, quiesced `pg_restore` if you
-  ever truly need it.
+  an already-COMPLETED attempt clears a fence — and only when NO other
+  attempt is unresolved and the fence provably belongs to the restored
+  attempt; a fence owned by another identity, or whose identity cannot
+  be read, is kept and reported (releasing it is an explicit recovery
+  decision, never a side effect of a config rollback). Database rollback
+  is deliberately not offered: schema is forward-only; the attempt
+  journal holds your `pg_dump` for an explicit, quiesced `pg_restore`
+  if you ever truly need it.
 * Supported 0025-era databases with duplicate truncation markers take a
   RECORDED prerequisite (0026's index is un-creatable over legacy rows;
   forward 0027 installs the legacy-safe guard). This is automatic,
