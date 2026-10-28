@@ -149,6 +149,15 @@ four artifacts above and verify green).
   installed-systemd/Strata/nested-KVM, the managed-service install half)
   remain explicitly PENDING — never passed, never simulated here.
 
+**Final-HEAD confirmation (`52ce377`, docs-only delta over the built
+bundle's `44ccdc89588d`):** `upgrade` gate PASS again (116.1 s,
+`.cache/gate_r14_upgrade.log` — fourth consecutive deterministic pass of
+the corrected engine), fast suite 661/0/0 (88.3 s), zero owned
+containers or gate tmp directories remaining. The bundle's MANIFEST
+revision remains `44ccdc89588d` (recorded honestly; runtime files are
+byte-identical — the gate's candidate-binding check passed against the
+same tree).
+
 ## Milestone 21 implementation round 1 — 2026-10-27 (branch `practice-upgrades-18-21`)
 
 Scope executed: preserving in-place upgrade (engine + real CLI + required
