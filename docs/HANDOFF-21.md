@@ -1,11 +1,35 @@
-# Handoff — milestone 21 (preserving upgrade), round 3 (review-corrected)
+# Handoff — milestone 21 (preserving upgrade), round 4 (review-corrected)
 
 Entry point for the parent's release-focused re-review and the operator's
-supervised-practice testing. Branch `practice-upgrades-18-21`. Round 1
-(HEAD `2ba575e`) and round 2 (`a2501c8`) each returned **VERDICT: FIX**
+supervised-practice testing. Branch `practice-upgrades-18-21`. Rounds 1
+(HEAD `2ba575e`) and 2 (`a2501c8`) each returned **VERDICT: FIX**
 with seven blockers; every round-3 finding is fixed and re-proven below.
-Milestone 20 is NOT accepted; F5–F9 remain the recorded repository
-backlog (`docs/FINDINGS_CHECKLIST.md`).
+The round-4 review at `f6b57b3` returned **VERDICT: FIX** with five
+findings (readiness contract, cross-attempt fence, named-env leak,
+contract completeness, runbook journal pipeline) — all five are fixed and
+re-proven in the round-4 section. Milestone 20 is NOT accepted; F5–F9
+remain the recorded repository backlog (`docs/FINDINGS_CHECKLIST.md`).
+
+## Round 4 (parent review of `f6b57b3`) — commits and proofs
+
+| Commit | What |
+|---|---|
+| `2654683` | engine/CLI: readiness PARSES the production `/readyz` contract (exact `ready is True`, empty `issues`, `migration_version` == payload head; malformed/HTML/stale-head fail closed); fence records its owning attempt and completion clears only its own; `restore_config` keeps the fence across ANY unresolved attempt or unknown/foreign fence identity; the SELECTED `--db-url-env` name is registered and scrubbed from every unauthorized child by name; REQUIRED_RUNTIME_CONTRACT derived from the unit ExecStart execution surface; runbook journal pipeline never prints "clean boot" on retrieval failure; + 11 fast contract tests incl. the runbook pipeline executed VERBATIM |
+| `8cbe932` | `upgrade` gate re-forged for the round-4 contract: readiness fixtures answer PRODUCTION shapes (200/ready-false, 200 ready-true at the old head, healthy 0027) with refusal+retention assertions; cross-attempt scenario X (two attempts, second valid payload, fence-ownership suite, byte-identical foreign fence, unreadable/foreign identities); scenario A end-to-end over `--db-url-env REVIEW_PRIVATE_OWNER` with the exit-48 wrapper tripwire and the su-shim env capture (54 keys captured, zero credential names); required-contract negatives loop lock + `env.py` + `worker_supervisor.py` |
+
+Proofs: `upgrade` gate **32 probes PASS 407.1 s** (`.cache/gate_r16_upgrade.log`);
+fast **672/0/0**; `db` 322/0/0; `selection`/`install`/`agent`/`python`/
+`authority`/`containment` PASS; `bundle` **PASS 252.8 s** against the
+repackaged runtime at revision `8cbe932d1c20…` (MANIFEST sha256
+`cb5e4712e175…`, 375 files, 242 runtime files bound, images byte-identical
+to the independently verified set, TCG boot, tamper refused). The
+independently-positive round-3 behaviours (real 0019 bootstrap, stop-and-
+drain barrier, same-attempt restore semantics, 0600 secret preservation,
+special-password dumps) are preserved — the gate re-proves all of them in
+the same run. The full finding→fix→proof table and lane receipts are in
+`docs/FINDINGS_CHECKLIST.md` ("review round 4"). Operator procedure:
+`docs/OPERATOR_RUNBOOK.md` §7 (the journal pipeline there is the one the
+tests execute verbatim).
 
 ## Round 3 (parent review of `a2501c8`) — commits and proofs
 
@@ -56,7 +80,7 @@ env SR_PG_ADMIN_URL=... SR_REQUIRE_DB=1 PYTHONDONTWRITEBYTECODE=1 \
   tests/test_plan21_upgrade_compat.py                      # 8 passed
 
 # preserving-upgrade sequences (docker; owns sr-upg-pg-<run>, removes it)
-.venv/bin/python infra/dev/acceptance.py upgrade   # PASS x3, 93.5-94.6s
+.venv/bin/python infra/dev/acceptance.py upgrade   # round 4: 32 probes PASS 407.1 s
 
 # full matrix (operator machine for packet/journey/release)
 .venv/bin/python infra/dev/acceptance.py appliance

@@ -1,5 +1,100 @@
 # Current findings and validation evidence
 
+## Milestone 21 review round 4 — readiness contract, fence ownership, named-env scrub — 2026-10-28 (`2654683`/`8cbe932`)
+
+The independent review at `f6b57b3` returned **VERDICT: FIX** with five
+findings (two HIGH). All five are fixed at `2654683` and re-proven by the
+re-forged `upgrade` gate at `8cbe932` (32 probes, **PASS 407.1 s**,
+`.cache/gate_r16_upgrade.log`) plus 11 new fast tests
+(`tests/test_plan21_review_round4.py`, 11 passed).
+
+Finding → fix → proof:
+
+1. **`/readyz` answers HTTP 200 with `ready:false`; the engine accepted
+   any 200** (HIGH, reviewer-owned real-API reproduction: the CLI stamped
+   0027 while the endpoint reported `schema 0019 behind head 0027`).
+   → `_readiness_probe` PARSES the production contract: exact `ready is
+   True`, `issues == []`, `migration_version ==` the payload's head;
+   non-JSON/HTML, missing fields, non-bool truthiness and
+   ready-with-issues all fail closed, and a stale old process reporting
+   `ready:true` at an OLD head is refused. → Fast: 8 parametrized shapes
+   + a healthy/stale `wait_for_readiness` test against real local servers.
+   Gate: the fixture now answers the REAL shapes (200/ready-false, 200
+   ready-true-0019, healthy 0027 — the fake 503 is gone); the resume
+   refuses both bad shapes naming the violated field, keeps the fence,
+   writes NO stamp, and completes only when the contract holds.
+2. **`--restore-config` of a COMPLETED attempt released a DIFFERENT
+   unfinished attempt's admission fence** (HIGH: reproduced exit 0
+   `maintenance_fence_cleared: true`, services untouched, admission
+   reopened under unresolved work). → The fence JSON records its owning
+   `attempt`; completion clears only its own fence (foreign/unreadable
+   identity → RETAINED + reported). `restore_config` decides against the
+   WHOLE appliance: any other unresolved attempt (corrupt journals count
+   as unresolved) or an unknown/foreign fence identity keeps admission
+   refused. → Gate scenario X (own sandbox + DB `srupg5`): A completes;
+   B — a second VALID payload (same source, different revision stamp) —
+   fails at the admission stop owning the fence; restoring A keeps B's
+   fence BYTE-IDENTICAL with zero service commands; B's own completion
+   releases exactly its own fence; unreadable and foreign fence
+   identities are kept; only with everything resolved does a restore of
+   the done attempt report admission clear.
+3. **`--db-url-env ANYNAME` leaked the selected credential into
+   `pg_dump`/provision children** (MEDIUM: fixed-name filter only;
+   reproduced `REVIEW_PRIVATE_OWNER` present in child envs). → The CLI
+   registers the SELECTED name (`note_credential_env_names`); every
+   scrubber uses `credential_env_names()` — an explicit name set, never
+   a pattern. → Gate: scenario A runs end-to-end with
+   `--db-url-env REVIEW_PRIVATE_OWNER`; the pg_dump wrapper aborts
+   (exit 48) if that name ever reaches a child env, and the su-shim
+   captures every installer-channel child's environment keys — 54 keys
+   captured, zero credential names. Fast: Runner ambient-scrub for a
+   registered custom name.
+4. **REQUIRED_RUNTIME_CONTRACT was incomplete** (MEDIUM: dropping
+   `srplatform/db/migrations/env.py` or `srplatform/worker_supervisor.py`
+   from disk AND inventory passed). → The contract is derived from the
+   actual EXECUTION SURFACE: locks + `alembic.ini` + migrations `env.py`
+   + every unit ExecStart module (`srplatform/api/app.py`,
+   `srplatform/worker_supervisor.py`, `srplatform/bastion/proxy.py`,
+   `infra/appliance/brokerd.py`) + engine files; `srplatform/model_jobs.py`
+   (not an ExecStart module) dropped. → Gate negatives loop all three
+   representative files (lock, env.py, worker_supervisor): refused
+   preflight, zero side effects.
+5. **Runbook journal pipeline mapped retrieval failure to "clean boot"**
+   (MEDIUM: reproduced exit 0 + "clean boot" when journalctl fails). →
+   Retrieval is separated from interpretation: `journalctl` writes to a
+   private `mktemp` file (trap-removed); only a SUCCESSFUL retrieval with
+   no error lines prints `clean boot`; a retrieval failure prints JOURNAL
+   RETRIEVAL FAILED and exits 1. → Fast test extracts the documented
+   pipeline VERBATIM from `docs/OPERATOR_RUNBOOK.md` and executes it
+   against fakes: clean→0/"clean boot"; retrieval-fail→≠0/no clean;
+   error lines→investigate/no clean; missing unit→hard fail first.
+
+Round-4 lane receipts (all at `8cbe932`, serialized, own fixtures):
+fast **672 passed / 0 failed / 0 skipped** (480 deselected, 6 warnings,
+93.9 s); `upgrade` **PASS 407.1 s** (32 probes, +7 round-4 probes);
+`selection` PASS 177.9 s; `db` **PASS 322/0/0** (685.8 s); `install`
+PASS 6.9 s; `agent` PASS 153.6 s; `python` 6.2 s / `authority` 27.9 s /
+`containment` 24.9 s PASS; `bundle` **PASS 252.8 s**. `frontend`/
+`browser` not re-run — `git diff 86323f0..HEAD -- web/` is EMPTY (byte-
+identical tree that passed both at round 3). `images`/`capture`
+intentionally NOT re-run: the verified images are reused BYTE-IDENTICALLY
+(digests re-matched below) and no rebuild was authorized. `hypervisor`/
+`access` not re-run: no change to brokerd/bastion/render paths (the
+`deploy/appliance.py` diff is the Runner scrub + CLI passthrough only).
+`packet`/`journey`/release stay operator-machine PENDING, never simulated.
+
+Artifact refresh (runtime-only repackage; NO image rebuild): release
+bundle at revision **`8cbe932d1c20fa3574dc943313a21942a41d79c0`**, 375
+files, MANIFEST.json sha256 `cb5e4712e1754506ca86449089e219235a77ff93351588ad29b827b2318e6eb9`;
+242 runtime files bound to the tested revision; images carried UNCHANGED
+and byte-verified against the independently verified set — appliance-base
+`6b1fbcb8b1a7…`, mojang-web-local `97d694851c20…`, mojang-web-db
+`7c6072615646…`, attacker `015aeafe5a5f…` (malformed TEST_KEYS blobs
+remain supervised-practice identity only). Shipped-image TCG boot from
+the bundle re-passed (marker `2026-10-28T10:59:12Z`), tamper refused.
+Cleanup verified: zero `sr-*` containers, no gate tmp dirs, no competing
+jobs were displaced.
+
 ## Milestone 21 review round 2 — reproduced FIX and superseding proofs — 2026-10-27 (`0a169e9`)
 
 The second release-focused review at `2ba575e` returned **VERDICT: FIX**

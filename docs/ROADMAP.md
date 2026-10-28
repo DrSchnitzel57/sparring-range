@@ -232,7 +232,18 @@ historical 14–17. Implementation waits for the user's new worktree:
   restore-config keeps the fence while unfinished, installer URL formats
   and child-env secrets are fixed, and the payload inventory is a
   trusted contract — upgrade gate 25/25, fast/selection/db re-passed,
-  and the bundle runtime re-rebuilt against the corrected HEAD. 21
+  and the bundle runtime re-rebuilt against the corrected HEAD. The
+  round-4 review at `f6b57b3` (VERDICT FIX, five findings) is closed at
+  `2654683`/`8cbe932`: readiness parses the real `/readyz` contract
+  (200-with-ready-false and stale-head refusals), the fence records
+  attempt ownership across restores and completions, the selected
+  `--db-url-env` credential name is scrubbed by registration, the
+  runtime contract covers the unit ExecStart surface, and the runbook
+  journal check cannot false-clean — upgrade gate 32/32 407.1 s, fast
+  672/0/0, db 322/0/0, selection/install/agent/python/authority/
+  containment PASS, and the bundle runtime re-repacked at revision
+  `8cbe932d1c20` (MANIFEST sha256 `cb5e4712e175`, images byte-identical
+  to the verified set). 21
   stays UNTICKED — its operator-machine gates (packet/journey/release,
   installed systemd/Strata/nested-KVM) remain pending. Exact receipts in
   [findings](FINDINGS_CHECKLIST.md).
