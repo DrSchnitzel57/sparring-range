@@ -1,5 +1,7 @@
 # 02 — Host-safe authority and fail-closed cessation
 
+> Workflow normalized 2026-10-28: the [native-workflow decision](../../docs/ARCHITECTURE.md#workflow-decision--native-openchamber-2026-10-28) supersedes old procedural rules in this record, not product requirements or acceptance gates. Retained status is not fresh verification.
+
 Approved 2026-10-09; clean master 9393a36. Contract: docs/ARCHITECTURE.md.
 
 ## Goal and context

@@ -1,5 +1,7 @@
 # 12 — Tomorrow pilot: deployable web-only AI-defense practice
 
+> Workflow normalized 2026-10-28: the [native-workflow decision](../../docs/ARCHITECTURE.md#workflow-decision--native-openchamber-2026-10-28) supersedes old procedural rules in this record, not product requirements or acceptance gates. Retained status is not fresh verification.
+
 **Type:** combined overnight delivery plan — authorized 2026-10-13 by the user
 as an explicit exception to one-plan-per-milestone. It does **not** accept or
 replace milestones 03–11; their acceptance states remain exactly as recorded

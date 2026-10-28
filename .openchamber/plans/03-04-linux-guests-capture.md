@@ -1,5 +1,7 @@
 # 03+04 — Linux guests, installed capture and access
 
+> Workflow normalized 2026-10-28: the [native-workflow decision](../../docs/ARCHITECTURE.md#workflow-decision--native-openchamber-2026-10-28) supersedes old procedural rules in this record, not product requirements or acceptance gates. Retained status is not fresh verification.
+
 Approved 2026-10-12; clean master cbaa3a0. Paired plan, separate gates.
 Contract: docs/ARCHITECTURE.md.
 

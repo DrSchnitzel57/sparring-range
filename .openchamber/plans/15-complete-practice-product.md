@@ -1,5 +1,7 @@
 # 15 — Complete integrated individual practice
 
+> Workflow normalized 2026-10-28: the [native-workflow decision](../../docs/ARCHITECTURE.md#workflow-decision--native-openchamber-2026-10-28) supersedes old procedural rules in this record, not product requirements or acceptance gates. Retained status is not fresh verification.
+
 ## Steps
 - [ ] 1. Integrate lifecycle and isolated workers.
 - [ ] 2. Complete presets, capture and defender workflows.

@@ -1,5 +1,7 @@
 # 01 — Reproducible baseline and dependencies
 
+> Workflow normalized 2026-10-28: the [native-workflow decision](../../docs/ARCHITECTURE.md#workflow-decision--native-openchamber-2026-10-28) supersedes old procedural rules in this record, not product requirements or acceptance gates. Retained status is not fresh verification.
+
 Approved 2026-10-08. Contract: docs/ARCHITECTURE.md, docs/ROADMAP.md,
 docs/FINDINGS_CHECKLIST.md.
 

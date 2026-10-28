@@ -1,5 +1,7 @@
 # 20 — Conversational coach, dashboard and replay
 
+> Workflow normalized 2026-10-28: the [native-workflow decision](../../docs/ARCHITECTURE.md#workflow-decision--native-openchamber-2026-10-28) supersedes old procedural rules in this record, not product requirements or acceptance gates. Retained status is not fresh verification.
+
 ## Steps
 - [ ] Build authenticated evidence projections and conversational coaching.
 - [ ] Capture bounded timed attacker output with honest legacy fallback.
@@ -10,8 +12,8 @@
 ## Goal and context
 Requires 18–19 software, ARCHITECTURE J/K, ROADMAP and FINDINGS_CHECKLIST backlog.
 Agreed: hints then direct help, modern dark dashboard, timed new-run playback.
-Approved 2026-10-24. Implement in selected non-default worktree, commit,
-never push. Retain completed live gates; never invent evidence.
+Approved 2026-10-24. Use current task execution choices.
+Retain completed live gates; never invent evidence.
 
 ## Scope
 In: coach chat/AAR, session/history UI and filtered synchronized replay.

@@ -1,5 +1,7 @@
 # 18 — Permanent appliance and recovery repairs
 
+> Workflow normalized 2026-10-28: the [native-workflow decision](../../docs/ARCHITECTURE.md#workflow-decision--native-openchamber-2026-10-28) supersedes old procedural rules in this record, not product requirements or acceptance gates. Retained status is not fresh verification.
+
 ## Steps
 - [ ] Reproduce baselines and reconcile retained defects.
 - [ ] Repair bootstrap, native/runtime provisioning, identities and trust.
@@ -11,10 +13,11 @@
 Replace operator workarounds with reproducible source fixes. Binding references:
 docs/ARCHITECTURE.md J/K, docs/ROADMAP.md and current docs/FINDINGS_CHECKLIST.md.
 Plans 18–21 approved 2026-10-24. Implement
-on a user-selected non-default worktree, coherent commits, never push. Planning
+using the current task's execution choices. Historical planning
 baseline: 571 fast passed/267 deselected/4 warnings; focused memory 37 passed/1
-deselected. Cancelled DB/selection commands were not failures. Separately validate
-and commit the existing memory fix before the agreed merge; do not overwrite it.
+deselected. Cancelled DB/selection commands were not failures. The memory fix was
+subsequently committed as 0fac623 and merged at eb48376; it is not deployed. Do not
+overwrite or recommit that repair as if the historical merge instruction were pending.
 
 ## Scope
 In: retained installer/config/permission/firewall/recovery/legacy CLI defects,

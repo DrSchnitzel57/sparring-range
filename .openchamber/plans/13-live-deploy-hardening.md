@@ -1,5 +1,7 @@
 # Plan 13 — Reproducible full-release installation and deployment hardening
 
+> Workflow normalized 2026-10-28: the [native-workflow decision](../../docs/ARCHITECTURE.md#workflow-decision--native-openchamber-2026-10-28) supersedes old procedural rules in this record, not product requirements or acceptance gates. Retained status is not fresh verification.
+
 Updated 2026-10-14 after repository discovery and operator clarification.
 This replaces the overnight fix list; it is an implementation contract, not
 a claim that the current code or any live deployment has passed acceptance.

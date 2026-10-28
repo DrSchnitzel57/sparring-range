@@ -1,5 +1,7 @@
 # 21 — Preserving upgrade and qualified integrated release
 
+> Workflow normalized 2026-10-28: the [native-workflow decision](../../docs/ARCHITECTURE.md#workflow-decision--native-openchamber-2026-10-28) supersedes old procedural rules in this record, not product requirements or acceptance gates. Retained status is not fresh verification.
+
 ## Steps
 - [ ] Inventory installed overrides and define versioned upgrade/preflight contract.
 - [ ] Deliver preserving in-place upgrade and corrected fresh-install bundle.
@@ -10,7 +12,7 @@
 ## Goal and context
 Ship 18–20 as preserving upgrade and clean install. Binding docs:
 ARCHITECTURE J/K, ROADMAP, FINDINGS_CHECKLIST, plans 18–20. Approved 2026-10-24;
-implement in user's non-default worktree, commit, never push. Baseline 571 fast
+implement using current task execution choices. Historical baseline 571 fast
 passed/267 deselected/4 warnings is not future acceptance. Cancelled DB/selection
 commands were not failures; run later only for needed acceptance.
 

@@ -10,14 +10,15 @@ the agreed competition workflow or deployment is finished.
 **Current direction (2026-10-20):** one Ubuntu/KVM appliance on Proxmox, with
 disposable nested full VMs and the existing external inference endpoint. The
 appliance holds no outer-Proxmox credentials. See the
-[current architecture](docs/ARCHITECTURE.md#ubuntu-kvm-appliance--2026-10-20) and
+[current architecture](docs/ARCHITECTURE.md#ubuntukvm-appliance--2026-10-20) and
 [three-milestone completion sequence](docs/ROADMAP.md#current-completion-sequence--draft-2026-10-20).
-Implementation plans are drafts; actual member SSH is the first promotion gate.
+Subsequent scoped SSH/isolation commissioning is recorded in the findings ledger;
+approved upgrade plans 18–21 and whole-release acceptance remain outstanding.
 Older deployment/baseline prose below is historical, not the new installation path.
 
 ## Current project contract
 
-- [Agent workflow and safety rules](AGENTS.md)
+- [Project guidance and safety boundaries](AGENTS.md)
 - [Release architecture and decisions](docs/ARCHITECTURE.md)
 - [Ordered milestones](docs/ROADMAP.md)
 - [Current findings and exact validation evidence](docs/FINDINGS_CHECKLIST.md)
@@ -26,8 +27,11 @@ Older deployment/baseline prose below is historical, not the new installation pa
 The original master plan and accumulated audit/handoff/completion documents are
 superseded. Their useful requirements/findings are consolidated above; detailed
 historical records remain in Git. No implementation milestone is accepted yet.
-Full implementation plans will be agreed **one milestone at a time** in
-`.openchamber/plans/`; none has been created by this release-design pass.
+OpenChamber Todos hold actionable work; `.openchamber/plans/` contains saved
+implementation agreements. Existing numbered plans and roadmap entries remain
+traceable history, not a required milestone process. Planning/implementation/review
+use native OpenChamber flows and task-selected models, without a custom global
+rulebook. [Historical agent receipts](docs/AGENT_HISTORY.md) are not current policy.
 
 ## Agreed first release
 
@@ -86,7 +90,8 @@ env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 \
   .venv/bin/python -m pytest -q -ra -p no:cacheprovider
 ```
 
-At application revision `23de4f4`, Python 3.13.5: **exit 1, 9 failed, 107 passed,
+Historical baseline at application revision `23de4f4`, Python 3.13.5:
+**exit 1, 9 failed, 107 passed,
 115 skipped, 1 deselected, 4 warnings**. Eight process-test failures need
 namespace/identity investigation; one unmarked test requires unavailable DB.
 Do not weaken containment to satisfy old premises. DB tests need explicitly
@@ -95,7 +100,8 @@ approved disposable PostgreSQL administration; skipped tests are not acceptance.
 From `web/`, frontend commands are `npm ci` and `npm run build`; browser acceptance
 is separate. Fresh lockfile audit: **3 critical / 1 high**, four affected packages;
 applicability/patch validation remains open. Do not displace OpenChamber or another
-service to free browser-test ports.
+service to free browser-test ports. The audit totals above are historical, not
+current findings; consult the dated findings ledger for later repairs and evidence.
 
 Read the runbook before Compose, migration, privileged packet/systemd or live
 testing. No production quick-start is claimed yet; deployment, containment,

@@ -1,5 +1,11 @@
 # Roadmap — first deployed Linux CCDC practice release
 
+This is the retained product scope/acceptance ledger, not a required milestone
+workflow. OpenChamber Todos hold actionable work and saved Plans hold agreements.
+Historical IDs, dependencies and acceptance states remain intact. The
+[native-workflow decision](ARCHITECTURE.md#workflow-decision--native-openchamber-2026-10-28)
+supersedes old branch/model/planning/reporting rules, including dated exceptions.
+
 Design: [ARCHITECTURE.md](ARCHITECTURE.md). Baseline/open evidence:
 [FINDINGS_CHECKLIST.md](FINDINGS_CHECKLIST.md). Operator work:
 [OPERATOR_RUNBOOK.md](OPERATOR_RUNBOOK.md).
@@ -75,11 +81,10 @@ Tests were deferred for that original planning pass; later evidence is dated bel
   installer and the `firstboot` health check); the rehearsal itself is the
   operator's, in their own VM.
 
-Three milestones are the minimum useful split: an accessible/recoverable platform,
-a complete practice product, then a qualified release. Each has internal coding
-checkpoints and its own tests. Implement one at a time on a user-selected
-non-default branch; commit coherent changes, never push. Reviewers run the relevant
-gates independently. Any requirement not met stays open, regardless of plan ticks.
+The original split distinguishes an accessible/recoverable platform, a complete
+practice product and a qualified release. These product dependencies remain;
+they do not prescribe branches, model roles or a future milestone process.
+Any requirement not met stays open, regardless of plan ticks.
 
 ### Post-commissioning backlog — 2026-10-23
 
@@ -137,9 +142,9 @@ historical 14–17. Implementation waits for the user's new worktree:
 Architecture section K records choices/defaults. Do not restart cancelled
 DB/selection runs as though they failed; future acceptance may run them when needed.
 The fast planning baseline is recorded in findings. No deployment or new feature
-implementation was performed during planning. After agreement, validate/commit
-the pre-existing memory fix separately, commit plans, merge `15` into `master`
-without pushing; user creates the new implementation worktree.
+implementation was performed during planning. The memory fix was subsequently
+committed as `0fac623` and the agreed work merged at `eb48376`; it is not deployed.
+This is a historical receipt, not an outstanding merge/worktree instruction.
 
 ### Carry-forward map (no requirements silently dropped)
 
@@ -160,7 +165,7 @@ without pushing; user creates the new implementation worktree.
 
 ### Explicit substitutions, not hidden scope cuts
 
-The architecture's [appliance contract](ARCHITECTURE.md#ubuntu-kvm-appliance--2026-10-20)
+The architecture's [appliance contract](ARCHITECTURE.md#ubuntukvm-appliance--2026-10-20)
 is authoritative for the new backend. Plan 13's product/evidence/failure requirements
 carry forward, but its PVE-specific mechanisms are replaced as follows:
 
@@ -180,17 +185,13 @@ close only with recorded equivalent appliance evidence, explicitly naming change
 mechanisms; there is no need to reimplement the superseded PVE design to tick them.
 No automatic PVE ACL maintenance task or separate broker VM belongs to this plan.
 
-### Execution and handoff
+### Acceptance boundaries
 
-1. Review/approve these drafts, then commit the agreed documentation on master.
-2. User selects the implementation branch. Start 14; inspect current code and
-   reproduce safe baselines then, recording genuine failures before repairs.
-3. Finish each plan's internal steps with coherent commits, exact test evidence
-   and an acceptance table. No speculative future-milestone changes.
-4. Operator supplies the manual 14 promotion evidence. Models do not run live
-   host changes or infer success from old notes. Resume 15 only after that gate.
-5. Complete 15, then 16. Failed proof stays open; narrow fixes return to their
-   owning modules and rerun affected gates, not a new open-ended remediation plan.
+Use the current findings ledger rather than repeating the historical execution
+instructions. Operator/live evidence remains separate from software checks;
+documentation cleanup does not authorize host changes or satisfy release gates.
+Failed or missing proof stays open. Native Plans and task instructions determine
+the working approach without dropping these product/safety requirements.
 
 ## Historical release milestones and acceptance ledger
 
@@ -201,18 +202,17 @@ sequence above and current findings to direct new work.
 These are **new release milestones**, not retroactive completion of the old
 M0–M7 plan. Milestone 01 is accepted (reopened by independent review, then
 closed by the repair round recorded in the findings).
-Architecture and ordered scope are agreed; write the full implementation plan for **one milestone at a
-time**, inspect the then-current code, and obtain agreement before implementing.
-Plans go in `.openchamber/plans/NN-short-name.md`; do not write them all now.
-Exception approved 2026-10-12: milestones 03+04 share one paired plan,
+Historically, planning was restricted to one numbered milestone at a time;
+that workflow restriction is retired. On 2026-10-12 milestones 03+04 shared
+one paired plan,
 [03-04-linux-guests-capture](../.openchamber/plans/03-04-linux-guests-capture.md),
 because guest construction, access and installed capture share the same fixtures.
-Their acceptance gates and checkboxes remain separate; no other milestone is combined.
+Their acceptance gates and checkboxes remain separate product evidence.
 
-Each milestone requires independently executed acceptance, not old reports or
-unchecked implementer claims. Its plan ends with at most ten command/behavior
-criteria and separates operator-only `Manual checks`. A missing software fixture
-is implementation work, not a hardware-only gate. Preserve existing useful fixes.
+Acceptance needs applicable evidence, not unsupported completion claims. Validation
+is chosen for the task without a blanket independent-suite or plan-format mandate.
+A missing required software fixture is implementation work, not a hardware-only
+gate. Preserve existing useful fixes and the distinct operator/safety evidence.
 
 ## 01 — Reproducible baseline and release dependency hygiene
 
@@ -525,9 +525,9 @@ accepted and the roadmap/evidence/runbook accurately reflect the deployed revisi
 Milestone 01 has recorded acceptance at `62939f7`, with the intermittent DB
 finding still open. Milestone 02's approved plan begins by resolving that CI
 prerequisite. No milestone implementation
-session is authorized by this roadmap alone. Implement code only on a user-selected
-non-default branch. Each accepted milestone ticks its checkbox and updates the
-architecture if its design changed; record reasons rather than hiding deviations.
+session is authorized by this roadmap alone. Retained acceptance states and design
+decisions must stay truthful; the old branch/plan/reporting policy is superseded
+by the native-workflow decision above.
 Early operator discovery may de-risk storage/PVE/model inputs, but no real
 model-driven attacks are authorized before the safety gates pass.
 

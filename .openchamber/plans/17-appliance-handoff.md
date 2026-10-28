@@ -1,5 +1,7 @@
 # 17 — Appliance hand-off: install and rehearse in the operator's own VM
 
+> Workflow normalized 2026-10-28: the [native-workflow decision](../../docs/ARCHITECTURE.md#workflow-decision--native-openchamber-2026-10-28) supersedes old procedural rules in this record, not product requirements or acceptance gates. Retained status is not fresh verification.
+
 > **Deferred 2026-10-20 at the user's instruction: milestones 14, 15 and 16 are
 > executed first. This plan is not started and nothing in it has been built.**
 > It is kept because it records the request for a deployable product the

@@ -1,10 +1,25 @@
 # Architecture — Linux-first CCDC practice release
 
+## Workflow decision — native OpenChamber (2026-10-28)
+
+Chosen: native planning, saved Plans, Todos and task-selected model roles. The
+master chat may coordinate sessions; validation is proportionate to the task.
+Rejected: the global procedural rulebook, fixed milestone/plan sizes, prescribed
+branches/models/review loops and output formats. These duplicated maintained
+platform behavior and accumulated stale exceptions. This supersedes procedural
+language below and in historical plans, not product dependencies or safety gates.
+Project Knowledge Todos hold actionable work; this document holds design and
+the findings ledger holds durable evidence. Old plan identifiers/paths are kept
+for traceability, without requiring future milestone numbering. Historical agent
+receipts are in [AGENT_HISTORY.md](AGENT_HISTORY.md). No product acceptance was
+advanced and no application/live tests were run for this documentation cleanup.
+
 Status: **agreed release design, not a claim of implemented or deployed behavior**.
 **Current direction: Ubuntu/KVM appliance, selected by the user 2026-10-20.**
-Read [the appliance contract](#ubuntu-kvm-appliance--2026-10-20) first. It overrides
+Read [the appliance contract](#ubuntukvm-appliance--2026-10-20) first. It overrides
 older direct-Proxmox deployment decisions below; retained release features and
-safety invariants still apply. Plans 14–16 are implementation drafts awaiting approval.
+safety invariants still apply. Later implementation and commissioning receipts are
+in the findings ledger; approved upgrade plans 18–21 remain outstanding.
 Agreed 2026-10-08. Application baseline: `23de4f4`.
 
 Read [ROADMAP.md](ROADMAP.md) for implementation order,
@@ -12,7 +27,8 @@ Read [ROADMAP.md](ROADMAP.md) for implementation order,
 and [OPERATOR_RUNBOOK.md](OPERATOR_RUNBOOK.md) for operator prerequisites.
 This document replaces `plan.markdown` and the overlapping architecture/audit
 handoffs. Historical evidence remains in Git; old completion checkmarks are not
-release acceptance. Full implementation plans are agreed one milestone at a time.
+release acceptance. Saved plans remain implementation agreements, not a required
+one-milestone-at-a-time process.
 
 ## Release goal and scope
 
@@ -828,10 +844,9 @@ not a substitute for consistency or a claim that nested running state restores s
 
 ### H. Acceptance and implementation discipline
 
-Three plans only, implemented sequentially on a user-selected non-default branch.
-Their checklists are internal coherent commit checkpoints; no subagents or new
-sessions unless requested. Each delivers tests of changed runtime contracts and
-records precise results; 16 is final packaging/release proof, not deferred testing.
+The original three-plan split is retained as product history, not a standing
+branch/session policy. Changed runtime contracts still need evidence;
+16 is final packaging/release proof, not deferred product testing.
 Do not mark requirements complete from implementer claims, source-string tests,
 HTTP 200s without results, environment attestations, skips or old totals.
 
@@ -931,7 +946,7 @@ completed; later practice exposed product defects. Receipts: [findings](FINDINGS
 | Structured conversation/tool history and durable API checkpoints | Last few raw telemetry events as memory; provider caches as persistence | Preserve evidence-linked facts, attempts/results, failed hypotheses, plan and next experiment. |
 | Token-aware pressure and reasoning/answer headroom for ~262k local context | Compaction after a handful of events; tiny output caps as containment | Context and output limits differ. Coordinate model-aware resource limits and real deadlines. |
 | One main model through the shared slot | Mandatory auxiliary or unscheduled background calls | Optional small model only after measuring resource/latency benefit, never for authorization/scoring. |
-| Versioned repository docs | Project Knowledge debugging journal | Findings/decisions/backlog travel with code. Migrate/delete notes, retain existing todo/plans. |
+| Repository design/evidence plus native Project Knowledge | Duplicated detailed backlogs or chronological journals in every prompt | Design and evidence travel with code; native Todos hold actionable work and Plans hold implementation agreements (workflow revised 2026-10-28). |
 
 **Agent boundary:** retain separate worker UID, API-only model credential, fixed
 pinned attacker VM, durable operation UUID/intent before dispatch, sequential

@@ -1,5 +1,7 @@
 # 19 — Conversational agent and model administration
 
+> Workflow normalized 2026-10-28: the [native-workflow decision](../../docs/ARCHITECTURE.md#workflow-decision--native-openchamber-2026-10-28) supersedes old procedural rules in this record, not product requirements or acceptance gates. Retained status is not fresh verification.
+
 ## Steps
 - [ ] Define versioned model profiles, secrets, checkpoints and scoped API protocol.
 - [ ] Implement one-slot jobs, streaming/cancellation and admin model GUI.
@@ -10,8 +12,8 @@
 ## Goal and context
 Replace conversation, not execution authority. Depends on 18 software; retain
 completed commissioning. Binding docs: ARCHITECTURE J/K, ROADMAP, FINDINGS_CHECKLIST.
-Approved 2026-10-24. Implement in user-selected
-non-default worktree; commit, never push. Baseline: 571 fast passed/267 deselected/
+Approved 2026-10-24. Use current task execution choices.
+Historical baseline: 571 fast passed/267 deselected/
 4 warnings; focused memory 37 passed/1 deselected.
 
 ## Scope

@@ -1,5 +1,12 @@
 # Current findings and validation evidence
 
+The dated entries below are evidence at their recorded revisions, not standing
+workflow instructions or fresh test runs. Native OpenChamber Todos now hold the
+actionable backlog; retained technical findings, acceptance boundaries and
+commissioning receipts remain authoritative evidence. Earlier migration of 67
+notes is history, not a prohibition on current Project Knowledge. Older agent
+receipts are preserved in [AGENT_HISTORY.md](AGENT_HISTORY.md).
+
 ## Upgrade planning baseline — 2026-10-24, branch `15`
 
 The user approved plans 18–21. The existing memory repair was subsequently
