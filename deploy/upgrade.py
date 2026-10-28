@@ -1256,6 +1256,87 @@ def wait_for_readiness(m, *, web_url: str, expected_head: str,
         time.sleep(2)
 
 
+def _fence_identity(path: pathlib.Path) -> tuple[str, object]:
+    """Classify the admission fence WITHOUT touching it.
+
+    kind is one of: "absent" (no file), "unreadable" (present but not a
+    JSON object), "anonymous" (JSON object with no usable ``attempt``),
+    or "owned" with the owning attempt id. Absence of a journal match is
+    NOT authority over an existing fence — round-5 finding 1."""
+    if not path.is_file():
+        return "absent", None
+    try:
+        doc = json.loads(path.read_text())
+    except Exception:  # noqa: BLE001 — any parse failure is fail closed
+        return "unreadable", None
+    if not isinstance(doc, dict):
+        return "unreadable", None
+    owner = doc.get("attempt")
+    if isinstance(owner, str) and owner:
+        return "owned", owner
+    return "anonymous", None
+
+
+def _require_fence_takeable(kind: str, owner: object) -> None:
+    """Refuse to acquire (overwrite/adopt) a fence whose identity is not
+    absent — a foreign, anonymous or unreadable fence is kept BYTE-EXACT;
+    taking ownership is an explicit operator recovery decision, never a
+    side effect of an upgrade starting."""
+    if kind == "owned":
+        raise UpgradeError(
+            f"the admission fence belongs to attempt {owner!r}; an upgrade "
+            "never overwrites or adopts another owner's fence. Complete "
+            f"that attempt (--resume {owner}) or resolve it explicitly "
+            "before starting new upgrade work")
+    if kind in ("anonymous", "unreadable"):
+        raise UpgradeError(
+            "an admission fence exists whose ownership cannot be proven ("
+            + ("no owning attempt is recorded" if kind == "anonymous"
+               else "the fence file is not readable JSON")
+            + "); absence of a matching journal is not authority over it "
+            "— verify outstanding obligations, then remove the fence "
+            "explicitly or record its owning attempt")
+
+
+def _write_fence_exclusive(path: pathlib.Path, attempt: str) -> None:
+    """Atomically take a fence that was observed ABSENT (round-5 finding
+    1): O_CREAT|O_EXCL means a concurrent operator fence can never be
+    raced-over between the check and the write."""
+    body = json.dumps({
+        "reason": "milestone-21 preserving upgrade in progress",
+        "started_at": _now(),
+        "attempt": attempt,
+        "note": "new work refused with 503; terminality callbacks allowed"},
+        indent=2, sort_keys=True) + "\n"
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        kind, owner = _fence_identity(path)
+        raise UpgradeError(
+            "an admission fence was created concurrently (identity "
+            f"{kind} {owner!r}); this attempt stops WITHOUT touching it")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(body)
+
+
+def _require_fence_owner(path: pathlib.Path, attempt: str) -> None:
+    """Finalization gate (round-5 finding 1): the fence must STILL be
+    verifiably ours before the version stamp or any release of admission.
+    A fence swapped, stripped or removed during the run keeps its bytes
+    and the attempt stays blocked and resumable."""
+    kind, owner = _fence_identity(path)
+    if kind == "owned" and owner == attempt:
+        return
+    why = {"absent": "the fence file disappeared during the attempt",
+           "unreadable": "the fence file is no longer readable JSON",
+           "anonymous": "the fence no longer names an owning attempt"}.get(
+               kind, f"the fence now belongs to attempt {owner!r}")
+    raise UpgradeError(
+        f"admission fence ownership is unresolved: {why} — this process "
+        "neither stamps a release nor opens admission; the fence (if any) "
+        "is kept byte-exact and the attempt stays in progress")
+
+
 def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
                 resume: str | None = None, dry_run: bool = False,
                 python_exe: str | None = None, pg_dump_bin: str | None = None,
@@ -1332,8 +1413,19 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
     # --- attempt + admission fence ---------------------------------------- #
     # NEW work is refused from here until the attempt completes (or the
     # operator resolves it). The fence records WHICH attempt owns it
-    # (round-4 finding 2): a config restore of one attempt may never
-    # release a fence that belongs to a different, unresolved obligation.
+    # (round-4 finding 2) and is a mutex TOKEN whose ownership is
+    # validated on ACQUISITION, atomically (round-5 finding 1): a foreign,
+    # anonymous or unreadable fence is refused and kept byte-exact — an
+    # upgrade never destructively "takes ownership" — and acquisition of
+    # an absent fence uses an exclusive create, so a concurrent operator
+    # cannot be raced between the check and the write.
+    fence.parent.mkdir(parents=True, exist_ok=True)
+    kind0, owner0 = _fence_identity(fence)
+    fence_kept = kind0 == "owned" and prior is not None and owner0 == resume
+    if not fence_kept:
+        # validated BEFORE any mutation and before the journal attempt
+        # exists: a refusal here leaves zero side effects
+        _require_fence_takeable(kind0, owner0)
     if prior is not None:
         attempt = resume
     else:
@@ -1345,13 +1437,8 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
             "manifest_sha256": hashlib.sha256(
                 json.dumps(m.raw, sort_keys=True).encode()).hexdigest(),
         })
-    fence.parent.mkdir(parents=True, exist_ok=True)
-    fence.write_text(json.dumps({
-        "reason": "milestone-21 preserving upgrade in progress",
-        "started_at": _now(),
-        "attempt": attempt,
-        "note": "new work refused with 503; terminality callbacks allowed"},
-        indent=2, sort_keys=True) + "\n")
+    if not fence_kept:
+        _write_fence_exclusive(fence, attempt)
 
     att = journal.path(attempt)
     os.chmod(att, 0o700)
@@ -1677,6 +1764,11 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
                 # the fence-clear.
                 wait_for_readiness(m, web_url=web_url,
                                    expected_head=report["to_head"])
+            # round-5 finding 1: ownership is re-verified THROUGH
+            # finalization — if anything replaced or stripped the fence
+            # while this attempt worked (readiness gap included), this
+            # process keeps the fence byte-exact and refuses to stamp.
+            _require_fence_owner(fence, attempt)
             out["restarted"] = restarted
         except UpgradeError as exc:
             journal.mark(attempt, "restart", "failed", error=str(exc)[-400:])
@@ -1697,21 +1789,19 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
     result = journal.finish(attempt, finished_at=_now(),
                             revision=payload.revision,
                             migration_head=report["to_head"]) | out
-    # Only a COMPLETED attempt releases the admission fence — and only
-    # when the fence is OWNED by this attempt (round-4 finding 2): a
-    # fence replaced by another identity (manual or another attempt) is
-    # reported, never silently cleared by our completion.
-    if fence.is_file():
-        try:
-            fence_owner = json.loads(fence.read_text()).get("attempt")
-        except Exception:  # noqa: BLE001 — unreadable identity: fail closed
-            fence_owner = "unreadable"
-        if fence_owner in (None, attempt):
-            fence.unlink(missing_ok=True)
-        else:
-            result["maintenance_fence"] = (
-                f"RETAINED after completion — fence belongs to attempt "
-                f"{fence_owner!r}, not {attempt}; resolve it explicitly")
+    # Only a COMPLETED attempt releases the admission fence — and ONLY
+    # when the fence is verifiably OWNED by this attempt, exactly (exact
+    # round-5 finding 1): a fence whose identity is absent-in-file,
+    # anonymous, unreadable or foreign is NEVER cleared, and its
+    # retention is reported truthfully instead.
+    kind1, owner1 = _fence_identity(fence)
+    if kind1 == "owned" and owner1 == attempt:
+        fence.unlink(missing_ok=True)
+    else:
+        result["maintenance_fence"] = (
+            f"RETAINED after completion — ownership is {kind1} "
+            f"{owner1!r}, not exactly attempt {attempt}; releasing it is "
+            "an explicit, verified recovery decision")
     return result
 
 

@@ -3042,6 +3042,9 @@ def check_upgrade() -> None:
         seed(url5, "x", coach=False)
         pathsX = iseq._manifest_paths(rootX)
         fenceX = pathsX["state"] / "maintenance"
+        if fenceX.exists():
+            fail("cross-attempt fixture must start with NO fence "
+                 "(fresh-fence-absent positive precondition)")
         ctl_log_x = tmp / "ctlX.log"
         rx = upgrade_cli(rootX, manifest_path, url5,
                          extra_env={"SR_FAKE_SYSTEMCTL_LOG": str(ctl_log_x)})
@@ -3072,6 +3075,24 @@ def check_upgrade() -> None:
                check=True, timeout=300)
         (src2 / "docs" / "CROSS-ATTEMPT-NOTE.md").write_text(
             "synthetic cross-attempt fixture marker\n")
+        # round-5 finding 2: the revision MUST be independent of the
+        # candidate even when TMPDIR points INSIDE the checkout (the
+        # documented disk-backed mode: extracted trees otherwise
+        # DISCOVER the parent repo and stamp the candidate's own HEAD —
+        # reproduced FAIL "cross-attempt fixture needs a second revision
+        # 85efa92…"). A proper isolated git fixture: its own ancestry,
+        # so git discovery inside src2 stops at src2/.git. Production
+        # packaging verification is untouched.
+        for g in (["init", "-q"],
+                  ["config", "user.email", "gate@invalid"],
+                  ["config", "user.name", "sr-upgrade-gate"],
+                  ["config", "commit.gpgsign", "false"],
+                  ["add", "-A"], ["commit", "-qm", "cross-attempt fixture"]):
+            gg = sp.run(["git", *g], cwd=str(src2), capture_output=True,
+                        text=True, timeout=300)
+            if gg.returncode != 0:
+                fail("second-payload isolated git fixture",
+                     f"{g[0]}: {(gg.stdout + gg.stderr)[-300:]}")
         payload2 = tmp / "payload2-bundle"
         b2 = sp.run([sys.executable, str(src2 / "deploy/bundle.py"), "build",
                      "--output", str(payload2), "--base-image",
@@ -3081,8 +3102,13 @@ def check_upgrade() -> None:
         if b2.returncode != 0:
             fail("second payload bundle build", (b2.stdout + b2.stderr)[-400:])
         rev2 = json.loads((payload2 / "MANIFEST.json").read_text())["revision"]
-        if rev2 == payload_manifest["revision"]:
-            fail("cross-attempt fixture needs a second revision", str(rev2))
+        if not (len(rev2) == 40
+                and all(c in "0123456789abcdef" for c in rev2)) or \
+                rev2 == payload_manifest["revision"] or \
+                rev2 == "unknown":
+            fail("cross-attempt fixture needs a second DETERMINISTIC real "
+                 "revision (isolated ancestry, not parent discovery)",
+                 str(rev2))
 
         bstart = upgrade_cli(
             rootX, manifest_path, url5, extra=("--payload", str(payload2)),
@@ -3182,6 +3208,135 @@ def check_upgrade() -> None:
         fenceX.unlink()
         ok("unknown/foreign fence identity: restore fails closed and "
            "keeps admission refused")
+
+        # ===== round-5 finding 1: fence ACQUISITION and FINALIZATION own- #
+        # ===== ership through the actual CLI, with deterministic operator #
+        # ===== interference (reproduced pre-fix: a foreign fence was      #
+        # ===== overwritten and stamped done; a fence stripped to {}       #
+        # ===== during the run was removed and stamped done).              #
+        rootW = tmp / "rootW"
+        apply_sandbox(rootW, manifest_path)
+        pathsW = iseq._manifest_paths(rootW)
+        fenceW = pathsW["state"] / "maintenance"
+        ctl_log_w = tmp / "ctlW.log"
+        fenceW.parent.mkdir(parents=True, exist_ok=True)
+        foreign_w = json.dumps({"reason": "operator maintenance",
+                                "attempt": "manual-op-4242"},
+                               indent=2, sort_keys=True) + "\n"
+
+        def _journal_ids(root):
+            return sorted(p.parent.name for p in
+                          (iseq._manifest_paths(root)["etc"]
+                           / "upgrade").glob("*/journal.json"))
+
+        # (a) a NEW upgrade may never adopt or overwrite a FOREIGN fence
+        fenceW.write_text(foreign_w)
+        wref = upgrade_cli(rootW, manifest_path, url5,
+                           allow_fail=True)
+        if wref.returncode == 0 or "manual-op-4242" not in (
+                wref.stdout + wref.stderr):
+            fail("an upgrade never adopts a FOREIGN-owned fence",
+                 (wref.stdout + wref.stderr)[-400:])
+        if fenceW.read_text() != foreign_w or _journal_ids(rootW) or \
+                (pathsW["etc"] / "release-version.json").exists():
+            fail("foreign-fence refusal is byte-exact with zero attempt "
+                 "and no stamp")
+        # (b) ANONYMOUS ({} / empty owner) and CORRUPT fences: identity
+        #     cannot be proven — refuse, keep bytes, no destructive take
+        for bad in ("{}\n", "{ this is not json\n", '{"attempt": ""}\n'):
+            fenceW.write_text(bad)
+            wb = upgrade_cli(rootW, manifest_path, url5, allow_fail=True)
+            if wb.returncode == 0 or "cannot be proven" not in (
+                    wb.stdout + wb.stderr):
+                fail("anonymous/corrupt fences refuse acquisition",
+                     bad + (wb.stdout + wb.stderr)[-300:])
+            if fenceW.read_text() != bad or _journal_ids(rootW):
+                fail("unprovable-fence refusal is byte-exact and creates "
+                     "no attempt", bad)
+        fenceW.unlink()
+        # (c) fresh ABSENT-fence acquisition is the positive path: the
+        #     stop-fail attempt records its OWN identity on the fence
+        wstart = upgrade_cli(
+            rootW, manifest_path, url5,
+            extra_env={"SR_FAKE_STOP_FAIL": "1",
+                       "SR_FAKE_SYSTEMCTL_LOG": str(ctl_log_w)},
+            allow_fail=True)
+        if wstart.returncode == 0 or "quiesce" not in (
+                wstart.stdout + wstart.stderr):
+            fail("W fixture: stop-fail attempt starts and fails at the "
+                 "stop", (wstart.stdout + wstart.stderr)[-300:])
+        jw_ids = _journal_ids(rootW)
+        if len(jw_ids) != 1:
+            fail("W fixture: exactly one attempt", str(jw_ids))
+        attempt_w = jw_ids[0]
+        if json.loads(fenceW.read_text()).get("attempt") != attempt_w:
+            fail("fresh acquisition records its own attempt on the fence")
+        ok("fence acquisition: foreign/anonymous/corrupt refused "
+           "byte-exact, zero attempt; fresh-absent acquires with identity")
+
+        # (d) ownership swapped DURING a run (deterministic: the fence is
+        #     replaced once the attempt's quiesce stage completes, well
+        #     before finalization): the finalize guard must block — NO
+        #     stamp, fence bytes kept, attempt truthfully resumable
+        pW = cli("upgrade", "--manifest", str(manifest_path),
+                 "--system-root", str(rootW), "--payload", str(payload),
+                 "--pg-dump-bin", str(wrapper), "--allow-fresh-install",
+                 "--web-url", f"http://127.0.0.1:{ready_port}/",
+                 "--resume", attempt_w,
+                 extra_env={"SR_PG_UPGRADE_URL": url5,
+                            "SR_FAKE_SYSTEMCTL_LOG": str(ctl_log_w)},
+                 proc=True)
+        swapped = False
+        deadline = time.time() + 600
+        while time.time() < deadline and pW.poll() is None:
+            if not swapped:
+                try:
+                    jnow = json.loads((pathsW["etc"] / "upgrade" /
+                                       attempt_w / "journal.json")
+                                      .read_text())
+                except Exception:  # noqa: BLE001 — mid-write poll
+                    jnow = {}
+                if jnow.get("stages", {}).get("quiesce", {}).get(
+                        "status") == "done":
+                    fenceW.write_text("{}\n")  # operator interference
+                    swapped = True
+            time.sleep(0.05)
+        outW = ""
+        if pW.poll() is None:
+            pW.kill()
+        outW = pW.stdout.read() if pW.stdout else ""
+        pW.wait(timeout=60)
+        if not swapped:
+            fail("mid-run fence swap fixture", "quiesce never completed")
+        if pW.returncode == 0 or "ownership is unresolved" not in outW \
+                or "NOT written" not in outW:
+            fail("ownership swapped during the run must BLOCK finalize "
+                 "(no stamp, no unfence)", outW[-500:])
+        if fenceW.read_text() != "{}\n":
+            fail("blocked finalize keeps the swapped fence byte-exact")
+        if (pathsW["etc"] / "release-version.json").exists():
+            fail("blocked finalize writes NO version stamp")
+        jW2 = json.loads((pathsW["etc"] / "upgrade" / attempt_w /
+                          "journal.json").read_text())
+        if jW2.get("status") == "done":
+            fail("blocked finalize keeps the attempt truthfully "
+                 "in-progress and resumable")
+        # (e) verified OWN resume: the operator restores the fence to
+        #     this attempt's identity — completion then clears exactly it
+        fenceW.write_text(json.dumps(
+            {"reason": "operator restored ownership", "attempt": attempt_w},
+            indent=2, sort_keys=True) + "\n")
+        wres = upgrade_cli(rootW, manifest_path, url5, resume=attempt_w,
+                           extra_env={"SR_FAKE_SYSTEMCTL_LOG":
+                                      str(ctl_log_w)})
+        outW2 = json.loads(wres.stdout)
+        if outW2.get("status") != "done" or fenceW.exists() or \
+                not (pathsW["etc"] / "release-version.json").is_file():
+            fail("verified-own resume completes and clears exactly its "
+                 "own fence", json.dumps(outW2)[:300])
+        ok("mid-run ownership swap blocks finalize (no stamp/unfence, "
+           "resumable); verified-own resume completes and clears only "
+           "its own fence")
 
         # ============ provisioning failure never claims success ========= #
         bad_tree = tmp / "badlock-src"

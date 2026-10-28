@@ -389,16 +389,32 @@ travels by ENVIRONMENT ONLY — never a CLI argument, because argv is
 world-readable in the process table for the whole upgrade:
 
 ```bash
-python3 deploy/bundle.py verify /srv/sr-release                 # must pass
-# inline environment assignment: invisible to ps, never in journal or logs.
+# Run the release bundle's OWN CLI tree with the INSTALLED release venv:
+# /opt/sparring-range/.venv/bin/python is the interpreter the services and
+# the engine's migrations use, provisioned from the locked requirements and
+# re-verified at every provision stage — a bare `python3` or an old
+# checkout carries no dependency guarantee for deploy/appliance.py's
+# imports (sqlalchemy, alembic). This is the exact tested contract:
+# locked python + payload-tree deploy/appliance.py + cwd = payload tree.
+cd /srv/sr-release
+/opt/sparring-range/.venv/bin/python -c \
+  'import deploy.appliance, deploy.upgrade, sqlalchemy, alembic'  # bootstrap check
+/opt/sparring-range/.venv/bin/python deploy/bundle.py verify /srv/sr-release  # must pass
+# Inline environment assignment: invisible to ps, never in journal or logs.
 # Both URL forms are accepted — the installer's SQLAlchemy format
 # (postgresql+psycopg2://…) and plain postgresql:// — and the credential
 # transport is validated during --dry-run, before any mutation.
 SR_PG_UPGRADE_URL='postgresql+psycopg2://sr_owner:…@127.0.0.1:5432/spranging' \
-  python3 deploy/appliance.py upgrade --manifest \
-  /etc/sparring-range/appliance-manifest.json --payload /srv/sr-release \
-  --dry-run
+  /opt/sparring-range/.venv/bin/python deploy/appliance.py upgrade \
+  --manifest /etc/sparring-range/appliance-manifest.json \
+  --payload /srv/sr-release --dry-run
 ```
+
+If the bootstrap check ever fails on an older venv, that is the venv being
+told you it does not match this payload's lockfile — the real run's
+provision stage (re)builds it from the payload's own `requirements.lock`
+before anything serves; do not hand-install packages to make the check
+pass.
 
 The dry-run verifies the COMPLETE payload (bytes, upgrade contract,
 inventory, migration graph) and every durable-work authority BEFORE it
@@ -484,8 +500,8 @@ Post-upgrade checks before admitting members again (all operator-side,
 on the installed appliance — none of this runs from the upgrade):
 
 ```bash
-python3 deploy/appliance.py doctor --manifest /etc/sparring-range/appliance-manifest.json
-python3 deploy/appliance.py verify --manifest /etc/sparring-range/appliance-manifest.json
+/opt/sparring-range/.venv/bin/python /opt/sparring-range/deploy/appliance.py doctor --manifest /etc/sparring-range/appliance-manifest.json
+/opt/sparring-range/.venv/bin/python /opt/sparring-range/deploy/appliance.py verify --manifest /etc/sparring-range/appliance-manifest.json
 ls /var/lib/sparring-range/maintenance            # must NOT exist
 cat /etc/sparring-range/release-version.json      # the new revision
 curl -fsS https://<appliance>/readyz
