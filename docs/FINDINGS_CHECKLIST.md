@@ -3372,3 +3372,27 @@ PASS (179.0 s); `db` PASS (322/0/0, 677.9 s, owned fixture removed).
 `TMPDIR=$PWD/.cache/tmp` fails 3 unrelated tests (AF_UNIX 108-char path
 limit; "outside checkout" fixtures resolving inside the repo) — TMPDIR
 override belongs to bundle/gate builds only, never to selection/fast.
+
+### Round-3 refreshed release artifact and final confirmations
+
+* **Bundle REPACKAGED runtime-only** against the corrected code at
+  `86323f0` — `.cache/bundle/sparring-range-appliance` (4.5 GiB,
+  BUNDLE_VERSION 2, **revision `86323f0f34fbb6b81b4a563a3c7ef60c9de3eb97`**,
+  MANIFEST sha256 `727e7b236217234c…`), carrying the SAME four verified
+  images (base `6b1fbcb8b1a7…`, mojang-web-local `97d694851c20…`,
+  mojang-web-db `7c6072615646…`, attacker `015aeafe5a5f…` — role inputs
+  unchanged, so no image rebuild was performed or justified).
+* `bundle` gate **PASS** (231.3 s, `.cache/gate_r15_bundle.log`): the
+  release verifies (373 files / 4 images), the candidate binding
+  re-compares **242 runtime files** against this checkout, the operator
+  manifest renders, the SHIPPED role image boots from the bundle (TCG,
+  labelled), and a tampered copy is refused for digest drift.
+* Deterministic second pass at this HEAD: `upgrade` gate **PASS** again
+  (266.6 s, `.cache/gate_r15_upgrade2.log`), fast **661/0/0** (99.7 s).
+* **Cleanup verified at handoff:** no `sr-*` containers, no
+  `sr-upgrade-gate-*`/`sr-bundle-gate-*` directories, `.cache/tmp` empty
+  (residue sub-5K synthetic fixture dirs created by this session's
+  TMPDIR-redirected runs were removed), 27 G free on the workspace
+  filesystem; persistent artifacts kept: `.cache/bundle/…`,
+  `.cache/images/…` + `role-artifacts.json`, `.cache/appliance/…`, all
+  `.cache/gate_r15_*.log` receipts.
