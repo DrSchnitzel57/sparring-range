@@ -29,6 +29,13 @@ ZERO new files / zero `.pyc`; the old unguarded shape then wrote
 exactly 11 unlisted files, and removing only those restored the copy
 byte-identically; the sealed original verified intact afterwards.
 
+Final artifact: revision `59fb5442fede8814c879d29c61fb88748cabc5b2`,
+MANIFEST sha256 `0cfa12f1f48c…` (375 listed / 376 on disk, 4 images
+byte-identical, 242/242 runtime files bound, bundled hand_off.sh
+digest == checkout); `-B` imports/verify/help on the seal write zero
+files; fast 678/0/0. Supersedes `4f421b3e1d07…`. Heavy lanes not
+rerun (scope: script + docs only since their accepted PASSes).
+
 Proofs at `4f421b3`: reproduced failure exactly (11 unlisted files;
 verify exit 1 naming `deploy/__pycache__/appliance.cpython-313.pyc`;
 own-file cleanup restored a byte-identical seal); corrected documented

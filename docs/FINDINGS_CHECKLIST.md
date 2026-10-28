@@ -41,6 +41,27 @@ original (hardlinked throughout) verified intact afterwards: 375 files,
 4 images, zero `.pyc`, MANIFEST sha256 `7e002239ec41…` unchanged. The
 install/firstboot steps stay operator-only; nothing here accepted them.
 
+Final artifact (rebuilt at the correction HEAD; no image was rebuilt —
+digests byte-identical: base `6b1fbcb8b1a7…`, local `97d694851c20…`,
+db `7c6072615646…`, attacker `015aeafe5a5f…`): revision
+**`59fb5442fede8814c879d29c61fb88748cabc5b2`**, MANIFEST.json sha256
+**`0cfa12f1f48cb24e0c37aa4783390f834612023be34ed45f70939ac592052dd3`**,
+375 listed entries / 376 on disk including `MANIFEST.json`, 4 images;
+the gate's runtime-binding comparison re-run standalone (same
+`deploy.bundle` helpers as the `bundle` lane, no TCG boot per scope):
+**242 packaged vs 242 checkout, zero missing/extra/changed**, the
+bundled `deploy/hand_off.sh` digest equals the checkout's. Sealed-
+payload check on this artifact (bytecode env UNSET): `-B` bootstrap
+imports → `-B bundle.py verify .` → `-B appliance.py upgrade --help` →
+`-B appliance.py doctor --help` → verify `ok: true`, **zero new files,
+zero `.pyc`** (pre/post lists `cmp`-equal). Fast suite at this HEAD:
+**678 passed, 0 failed, 0 skipped** (480 deselected, 96.95 s — the
++1 is the new hand-off bytecode-safety contract test). This bundle
+supersedes `4f421b3e1d07…`/`7e002239ec41…` (which lacked the script
+fix); the heavy `upgrade`/`bundle` lanes were NOT rerun (no runtime
+change beyond the tracked script since their accepted 35-probe/TCG
+PASSes at `4f421b3`).
+
 ## Milestone 21 review round 6 — sealed-tree launch hygiene — 2026-10-28 (`4f421b3`)
 
 The independent review at `7f01747` accepted ALL runtime/artifact
