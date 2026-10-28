@@ -1,15 +1,45 @@
-# Handoff — milestone 21 (preserving upgrade), round 5 (review-corrected)
+# Handoff — milestone 21 (preserving upgrade), round 6 (launch-hygiene corrected)
 
-Entry point for the parent's release-focused re-review and the operator's
-supervised-practice testing. Branch `practice-upgrades-18-21`. Rounds 1–3
-(VERDICT: FIX, seven blockers apiece) and round 4 (VERDICT: FIX, five
-findings — all fixed below and independently counterexample-checked in
-the round-5 review) are historical. The round-5 review at `85efa92`
-returned **VERDICT: FIX** with two remaining blockers (fence-ownership
-acquisition/finalization; the gate's disk-backed-TMPDIR revision
-collision) — both are fixed and re-proven in the round-5 section.
-Milestone 20 is NOT accepted; F5–F9 remain the recorded repository
-backlog (`docs/FINDINGS_CHECKLIST.md`).
+Entry point for the parent's release-focused verification and the
+operator's supervised-practice testing. Branch `practice-upgrades-18-21`.
+Rounds 1–3 (VERDICT: FIX, seven blockers apiece), round 4 (VERDICT: FIX,
+five findings) and round 5 (VERDICT: FIX, two blockers) are historical
+and their runtime/artifact scope was independently ACCEPTED at
+`7f01747` (reviewer reruns: fast 677 93.80 s; 34-probe `upgrade` PASS
+449.4 s; in-place `bundle` PASS 226.3 s; DB compat 8 pass 14.72 s;
+ownership CLI PASS 29.1 s; old-lock bootstrap PASS 1.5 s). The round-6
+finding — the documented bootstrap polluted the SEALED payload with 11
+unlisted `.pyc` files, breaking the next `bundle.py verify` — is closed
+below. Milestone 20 is NOT accepted; F5–F9 remain the recorded
+repository backlog (`docs/FINDINGS_CHECKLIST.md`).
+
+## Round 6 (launch hygiene) — commits and proofs
+
+| Commit | What |
+|---|---|
+| `4f421b3` | `-B` on EVERY payload/installed-tree runbook command (sealed-tree contract stated; remaining commands audited as build-machine checkout); the engine's one payload-executing child (alembic, which loads the bundle's own `env.py`/versions through importlib's source loader — probed to write pyc beside those files) carries `PYTHONDONTWRITEBYTECODE=1`; gate mirrors the launch contract and adds the 35th probe (payload byte-clean after the real upgrade); serialized-operator + never-re-own-the-fence-during-a-run rules; verify stays strict |
+| `82f6eac` | Round-6 CORRECTION: the note's claim that `deploy/hand_off.sh` does not exist was WRONG — it is tracked and bundle-listed, and its five payload-tree calls were unguarded. Each now carries `-B`, and `PYTHONDONTWRITEBYTECODE=1` is exported for the whole hand-off (`appliance.py`'s Runner passes the environment to children, covering the apply chain; `-B` is not inherited). Behaviour-preserving; new contract test plus the existing CLI-flag tests pass |
+
+Round-6-correction proof (`.cache/`+FINDINGS receipt): the REAL
+`hand_off.sh` run end-to-end against a hardlink copy of the sealed
+bundle (user+mount-namespace `/etc` overlay; `apply`/`firstboot`
+stubbed via a logging pass-through `--python` wrapper; bytecode env
+UNSET outside) exited 0 with all five calls logged `-B` + env and
+ZERO new files / zero `.pyc`; the old unguarded shape then wrote
+exactly 11 unlisted files, and removing only those restored the copy
+byte-identically; the sealed original verified intact afterwards.
+
+Proofs at `4f421b3`: reproduced failure exactly (11 unlisted files;
+verify exit 1 naming `deploy/__pycache__/appliance.cpython-313.pyc`;
+own-file cleanup restored a byte-identical seal); corrected documented
+sequence under `PYTHONDONTWRITEBYTECODE` UNSET (`-B` bootstrap →
+`-B verify` → `-B upgrade --help`) → **verify `ok: true`, ZERO new
+files**; `upgrade` gate **35/35 PASS 461.6 s**; fast **677/0/0**;
+`bundle` gate PASS 217.3 s against the repacked runtime
+`4f421b3e1d07…` (MANIFEST sha256 `7e002239ec41…`, 375 listed / 376 on
+disk incl. `MANIFEST.json`, images byte-identical, TCG boot, tamper
+refused). Operator commands + serialized rule: `docs/OPERATOR_RUNBOOK.md`
+§7. Operator-machine gates remain PENDING.
 
 ## Round 5 (parent review of `85efa92`) — commits and proofs
 

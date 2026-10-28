@@ -1,5 +1,122 @@
 # Current findings and validation evidence
 
+## Milestone 21 review round 6 correction — `deploy/hand_off.sh` launch contract — 2026-10-28 (`82f6eac`)
+
+The audit found the round-6 note's audit claim itself wrong:
+`deploy/hand_off.sh` exists, is tracked, is listed in the release bundle,
+and its five payload-tree Python calls ran with no bytecode suppression
+— a real hand-off (which runs the bundle's CLI from inside the unpacked
+bundle via `cd "$BUNDLE"`) writes `__pycache__/*.pyc` into the sealed
+tree exactly like the §7 bootstrap did. The round-6 text above is
+corrected in place; nothing else in the runtime or the round-6 engine/
+gate fixes changes.
+
+Fix (`82f6eac`, behaviour-preserving): explicit `-B` on each of the
+five calls AND `export PYTHONDONTWRITEBYTECODE=1` for the whole script.
+Child-path audit: `appliance.py`'s `Runner` builds child envs from
+`os.environ` (stripping only credential names) and execs, so the
+exported value reaches every child interpreter including the apply
+chain; `-B` alone could not (not inherited). No installation behaviour
+changes — bytecode caching only. New contract test
+`test_the_hand_off_launches_its_python_bytecode_safe` asserts `-B` on
+exactly the five calls plus the export; both pre-existing hand-off CLI
+tests still pass; `bash -n` clean.
+
+Focused regression (REAL script; NO live install): run inside a
+user+mount namespace with an overlay on `/etc` (the container has no
+root and no `/etc/sparring-range`), against a HARDLINK copy of the
+sealed bundle, with a pass-through `--python` wrapper that logs every
+interpreter call and stubs only `apply` and `firstboot`, bytecode env
+explicitly UNSET outside so the script's own contract did the work.
+Results: all five calls logged `-B` + `PYTHONDONTWRITEBYTECODE=1`
+(including the stubbed apply call's env — proving child-path coverage);
+the OLD §2/§3/§4 steps ran genuinely (verify `ok: true` on the copy,
+real key generation, real manifest render, real plan); script exited 0
+at "hand-off complete" with **ZERO new files, zero `.pyc`** in the
+bundle tree; the OLD unguarded call shape on the same copy then wrote
+**exactly 11 unlisted files** (deploy/infra `__pycache__` — matching
+the reviewer's reproduction), and removing only those 11 restored the
+copy byte-identically (pre/post file lists `cmp`-equal). The sealed
+original (hardlinked throughout) verified intact afterwards: 375 files,
+4 images, zero `.pyc`, MANIFEST sha256 `7e002239ec41…` unchanged. The
+install/firstboot steps stay operator-only; nothing here accepted them.
+
+## Milestone 21 review round 6 — sealed-tree launch hygiene — 2026-10-28 (`4f421b3`)
+
+The independent review at `7f01747` accepted ALL runtime/artifact
+blockers (its own reruns: fast 677/480 93.80 s; 34-probe `upgrade` PASS
+449.4 s; in-place `bundle` PASS 226.3 s; DB compat 8 pass 14.72 s;
+ownership CLI PASS 29.1 s; old-52ae355-lock bootstrap imports PASS
+1.5 s — no pydantic-AI requirement) and left ONE documentation/launch
+fix: the §7 bootstrap imports INSIDE the unpacked bundle with a bare
+interpreter and wrote 11 unlisted `__pycache__/*.pyc`; the following
+`bundle.py verify` then failed on the polluted seal (reviewer removed
+only their own 11 files; bundle PASS restored).
+
+Reproduced here exactly (receipts `.cache/`+`/tmp/opencode/sealed_*`):
+unguarded bootstrap in the real sealed bundle → **11 new files**;
+`bundle.py verify` → exit 1 naming
+`unlisted file: deploy/__pycache__/appliance.cpython-313.pyc` …; after
+removing ONLY the 11 owned files the seal was byte-identical
+(pre/post sha256 lists `cmp`-equal).
+
+Fixes (scope kept minimal):
+- **Runbook:** `-B` added to EVERY payload/installed-tree Python
+  invocation (bootstrap, `bundle.py verify`, upgrade dry-run/run,
+  resume/restore shorthand, first-install `verify`/`manifest`/`plan`/
+  `apply`, `firstboot`, `status`/`doctor`/`recovery`, post-upgrade
+  `doctor`/`verify`), with the sealed-tree contract stated; remaining
+  unguarded commands audited and CONFIRMED build-machine-checkout
+  context (bundle packaging excludes `__pycache__` — bundle.py line 60;
+  dev-tree bytecode is normal). HANDOFF-21 commands audited (dev
+  checkout only — no contradiction). CORRECTION (same day, audit
+  follow-up): an earlier draft of this section WRONGLY claimed
+  `deploy/hand_off.sh` does not exist — it DOES exist and is tracked,
+  listed in the bundle, and its five payload-tree interpreter calls
+  (bundle verify, bundle manifest, appliance plan/apply/firstboot) were
+  unguarded; fixed and re-proven in the round-6 correction section
+  below (`82f6eac`).
+- **Engine (one necessary line, probed):** `-B` is a per-interpreter
+  flag; the ONE child that executes payload-tree source is the
+  migration runner (alembic loads the payload's own `env.py`/version
+  scripts via importlib's source loader). Probed against the installed
+  alembic: `load_module_py` **writes** `env.cpython-313.pyc` next to
+  the loaded file without a guard; `PYTHONDONTWRITEBYTECODE=1` or `-B`
+  suppress it. `forward_migrate`'s alembic child env now sets
+  `PYTHONDONTWRITEBYTECODE=1` — the seal holds by construction, not by
+  hoping the operator exported anything. Other children import only the
+  INSTALLED tree (runtime bytecode there is normal). Unlisted-file
+  verification stays STRICT: bytecode is refused, never excused.
+- **Gate:** mirrors the documented launch contract (CLI env) and adds a
+  35th probe — after the REAL 0019→0027 upgrade, the payload bundle is
+  asserted byte-clean of `__pycache__`/`*.pyc`. **`upgrade` PASS 35/35
+  461.6 s** (`.cache/gate_r19_upgrade.log`).
+- **Runbook:** serialized-operator rule — one upgrade CLI at a time;
+  NEVER edit/swap/re-own the maintenance fence while a CLI run is live
+  (any ownership change only ever BLOCKS: no stamp, no unfence,
+  resumable); intervene after the run exits fail-closed.
+
+Focused regression (against the NEW sealed bundle, bytecode env
+explicitly UNSET so `-B` did the work): documented sequence
+`python -B -c 'import deploy.appliance, deploy.upgrade, sqlalchemy,
+alembic'` → `python -B deploy/bundle.py verify .` →
+`python -B deploy/appliance.py upgrade --help` → **verify `ok: true`
+(375 files, 4 images), ZERO new files (pre/post sha256 lists
+identical), help rendered** — no credentials in argv, real CLI surface.
+
+Corrected artifact (runtime line change ⇒ repack; images byte-identical
+— base `6b1fbcb8b1a7…`, local `97d694851c20…`, db `7c6072615646…`,
+attacker `015aeafe5a5f…`): revision **`4f421b3e1d074b59229af739c88823623c472722`**,
+MANIFEST.json sha256
+**`7e002239ec41f924332ad5da2785c7f5d7582bba9fac6f867cfaaada3a482705`**,
+375 listed entries (4 images included) / 376 on disk including
+`MANIFEST.json`, 242 runtime files bound; `bundle` gate PASS 217.3 s
+(includes the TCG boot — marker `2026-10-28T13:17:51Z` — and tamper
+refusal as part of that standard lane); fast **677/0/0** (96.1 s).
+Cleanup: only the 11 self-created bytecode files (then the emptied
+`__pycache__` dirs) were removed from the seal, verified
+byte-identical; no other files touched.
+
 ## Milestone 21 review round 5 — fence-ownership acquisition/finalization, deterministic gate revision — 2026-10-28 (`9dcf354`)
 
 The independent review at `85efa92` returned **VERDICT: FIX** with two
