@@ -3338,3 +3338,37 @@ Evidence at `00571e9`: fast suite exit 0, **365 passed, 0 failed,
 Open (operator Manual check): deploy `00571e9` to the service VMs (201
 API / 202 broker / 203 bastion), relaunch/resume the existing deployment once
 so `host_key_pin` backfills, then re-test the recorded SSH login.
+
+## Plan-21 review round 3 (2026-10-28) — reproduced findings, fixes, proofs
+
+Parent independent review of `a2501c8`: **VERDICT: FIX**, seven
+binding findings; bundle independently verified (373 files / 4 images,
+242/242 runtime bytes match, no world-writable, pin hash matches); no
+role-image rebuild needed (inputs unchanged). Each finding below was
+reproduced by the review at `a2501c8` and is now gate-proven at the REAL
+CLI against a REAL old deployment (`ba6a4af`/`849066b`):
+
+| # | Reproduced blocker | Fix | Real proof (upgrade gate, 25 probes, PASS 260.8 s) |
+|---|---|---|---|
+| 1 | 0019-era schema: quiescence died `relation model_jobs does not exist`; 0021 died `role sr_secret does not exist`; gate hid both by starting at 0025 and pre-creating the role | Table-aware quiescence (authority checked per introducing revision; missing table below it = truth, at/above = refusal); engine-side `secrets` stage bootstraps role + API-only 0600 `secrets/db-secret.env` via the installer-equivalent `su postgres` channel before migration (honor existing file/env; generate+ALTER only when missing) | Scenario A starts at REAL 0019 with app role only (fixture no longer creates `sr_usecret`; gate asserts its ABSENCE pre-run): upgrade to 0027 green, role count 1, file 0600 + correct URL, `secrets`+`quiesce` stages journalled; 0019-schema dry-run REFUSES a queued run and never mentions `model_jobs`, passes once empty |
+| 2 | Fence not a barrier: old API queued work under it; `/internal/model/complete` under fence returned 200 + NEW job | Journaled `quiesce` stage stops `sr-api`+`sr-worker-supervisor` and proves `inactive` before the authoritative recheck; middleware exemption split (terminality only); `model_jobs.enqueue`/`runs.start_run` raise `AdmissionFenced` at the transaction boundary → 503 handler | Stateful systemctl double: gate asserts stop-of-admission-units precedes `daemon-reload` precedes restart; stop-refusal → refused+fenced+zero mutation+resumable; `POST /internal/model/complete` fenced → 503 (body-checked), `/internal/worker/claim` exempt (its own non-fence 503 proven distinct); enqueue with a tripwire DB refuses BEFORE any DB use; SIGKILL barrier persistence preserved (round-2 probe kept) |
+| 3 | Restart was active-only, no daemon-reload, zero HTTP probes | `systemctl daemon-reload` after unit rewrites; bounded REAL-HTTP readiness (`/readyz` + frontend 200) before stamp/fence-clear | Gate runs a real HTTP fixture: 503-forever → CLI fails naming READY, fence UP, NO stamp; 503→200 resume completes, stamps, then unfences; readyz binds schema head to installed package |
+| 4 | `--restore-config` unconditionally dropped the fence on an unfinished attempt | Fence kept unless the attempt is done; restore still issues zero service actions | After the readiness-failed attempt: restore returns `maintenance_fence_cleared: false`, fence file remains, control log byte-identical across the restore (zero service commands) |
+| 5 | `postgresql+psycopg2://` (the installer's OWN format) rejected at backup, after fence; owner URL inherited by child env | `make_url` normalization + PREFLIGHT credential validation; `OWNER_ONLY_ENV` stripped from Runner/alembic/pg_dump inherited environments (explicit channel wins) | Unit-proven parse matrix (driver suffix, percent-encoded password/db, IPv6, rejects DSN/socket/wrong-scheme); pg_dump wrapper now FAILS (exit 48) if any owner var appears in its env — gate passes ⇒ clean |
+| 6 | Removing `requirements.lock` from BOTH disk and manifest passed verify | `REQUIRED_RUNTIME_CONTRACT` (lock, alembic config, migrations, unit entrypoints, frontend inputs) enforced against the payload itself before anything qualifies | Gate builds a payload with the lock deleted from disk AND manifest → refused at preflight naming the file, zero journals/fence; complete payload positive unaffected |
+| 7 | Runbook: wrong manifest filename, wrong unit names, journalctl pipeline could print "clean boot" for missing units, member history check implied members see sealed legacy | Commands corrected to shipped `appliance-manifest.json` and real `sr-*` units; explicit `is-active` loop fails the pipeline on any missing/inactive unit; member check states sealed legacy is operator-only (member seeing none is CORRECT) | Documentation itself; commands re-verified against `--help`, `deploy/hand_off.sh` and `UNITS` in `deploy/appliance.py` |
+
+Parent-recorded artifact truths also documented (no code change):
+the bundle's attacker-image `TEST_KEYS` entries are MALFORMED synthetic
+blobs (`ssh-keygen -l` rejects them) — they are NOT usable keys, this
+image set remains the supervised-practice candidate, and NO rebuild is
+justified for them; the upgrade copies RUNTIME ONLY and never replaces
+role images (stated in the runbook activation paragraph).
+
+Round-3 lane receipts (serialized, logs `.cache/gate_r15_*.log`):
+`upgrade` PASS 25 probes 260.8 s; fast 661/0/0 (87.1 s); `selection`
+PASS (179.0 s); `db` PASS (322/0/0, 677.9 s, owned fixture removed).
+**Gate lesson recorded:** running the selection gate with
+`TMPDIR=$PWD/.cache/tmp` fails 3 unrelated tests (AF_UNIX 108-char path
+limit; "outside checkout" fixtures resolving inside the repo) — TMPDIR
+override belongs to bundle/gate builds only, never to selection/fast.

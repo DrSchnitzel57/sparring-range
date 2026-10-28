@@ -390,10 +390,14 @@ world-readable in the process table for the whole upgrade:
 
 ```bash
 python3 deploy/bundle.py verify /srv/sr-release                 # must pass
-# inline environment assignment: invisible to ps, never in journal or logs
-SR_PG_UPGRADE_URL='postgresql://sr_owner:…@127.0.0.1:5432/spranging' \
+# inline environment assignment: invisible to ps, never in journal or logs.
+# Both URL forms are accepted — the installer's SQLAlchemy format
+# (postgresql+psycopg2://…) and plain postgresql:// — and the credential
+# transport is validated during --dry-run, before any mutation.
+SR_PG_UPGRADE_URL='postgresql+psycopg2://sr_owner:…@127.0.0.1:5432/spranging' \
   python3 deploy/appliance.py upgrade --manifest \
-  /etc/sparring-range/manifest.json --payload /srv/sr-release --dry-run
+  /etc/sparring-range/appliance-manifest.json --payload /srv/sr-release \
+  --dry-run
 ```
 
 The dry-run verifies the COMPLETE payload (bytes, upgrade contract,
@@ -408,22 +412,34 @@ What the real run does, journaled under `/etc/sparring-range/upgrade/`
 (the journal tree is never part of the config backup and a restore never
 rewrites any journal): it raises the **admission fence**
 (`/var/lib/sparring-range/maintenance` — the API then answers 503 to NEW
-work while existing callbacks, login and health keep flowing, so nothing
-can race the upgrade and in-flight runs still terminalize), takes the
-private config backup (original modes/ownership recorded; the journal
-tree excluded) and a `pg_dump` whose password arrives ONLY through a
-private 0600 `PGPASSFILE` — no credential is in any argv, log or
-manifest; then digest-verified staging, per-file atomic activation (only
-payload-owned files), **provisioning of the activated release** (locked
+work — including NEW internal generations like model-turn callbacks —
+while terminality callbacks for existing work, login and health keep
+flowing, so nothing can race the upgrade and in-flight runs still
+terminalize), then **stops the admitting services** (`sr-api`,
+`sr-worker-supervisor`) and PROVES them inactive before re-checking every
+durable authority: that stop is the barrier an old, not-yet-fence-aware
+process cannot bypass, and unconfirmed cessation is refused, never
+"ceased" by killing a process. Then the private config backup (original
+modes/ownership recorded; journal tree excluded) and a `pg_dump` whose
+password arrives ONLY through a private 0600 `PGPASSFILE` — no credential
+is in any argv, log or child environment; digest-verified staging;
+per-file atomic activation (only payload-owned files — a bundle's ROLE
+IMAGES are fresh-install material; an upgrade never replaces your running
+guest images); **provisioning of the activated release** (locked
 `requirements.lock` install into the service venv, an entrypoint import
-check with that venv's own interpreter, the locked frontend build — the
-services must RUN the new release, not just store it), proven FORWARD-only
-migrations with the installed venv, config re-render, and a **checked
-restart** (every unit restarted AND verified active). Only after that
-does the version stamp get written and the fence drop. Users, password
-hashes, keys/pins, closed sessions, audit rows, casts and historical
-reports are never deleted or rewritten; a rerun at the same revision
-answers `no_op` — but an UNFINISHED attempt always outranks that answer.
+check with that venv's own interpreter, the locked frontend build); the
+API-only credential-store bootstrap for the 0021 schema contract (creates
+the `sr_secret`-style role and its 0600 `secrets/db-secret.env` ONLY when
+missing — old 0019-era appliances need no manual SQL); proven FORWARD-only
+migrations with the installed venv; config re-render; `systemctl
+daemon-reload`; a **checked restart** (every unit restarted AND verified
+active); and a **bounded real readiness gate** — `GET
+<internal>/readyz` and the frontend must answer 200 (`/readyz` itself
+proves the schema head matches the installed package). Only then is the
+version stamp written and the fence dropped. Users, password hashes,
+keys/pins, closed sessions, audit rows, casts and historical reports are
+never deleted or rewritten; a rerun at the same revision answers `no_op`
+— but an UNFINISHED attempt always outranks that answer.
 
 Failure and interruption discipline:
 
@@ -439,12 +455,17 @@ Failure and interruption discipline:
   retained rather than guessing a schema.
 * Config-only rollback: `... upgrade --manifest ... --restore-config
   <ATTEMPT>` validates the COMPLETE backup BEFORE writing (a corrupt
-  late file changes ZERO files), restores original modes/ownership,
-  clears the fence and issues NO service action — you start services
-  yourself, so a restore can never resume an engagement. Database
-  rollback is deliberately not offered: schema is forward-only; the
-  attempt journal holds your `pg_dump` for an explicit, quiesced
-  `pg_restore` if you ever truly need it.
+  late file changes ZERO files), restores original modes/ownership and
+  issues NO service action — you start services yourself, so a restore
+  can never resume an engagement. While the attempt is UNFINISHED the
+  restore KEEPS the admission fence up (the output says so explicitly):
+  restoring config does not roll back the activated runtime or the
+  forward-only schema, so admission stays refused until you complete the
+  attempt with `--resume` or resolve it deliberately. Only a restore of
+  an already-COMPLETED attempt clears a fence. Database rollback is
+  deliberately not offered: schema is forward-only; the attempt journal
+  holds your `pg_dump` for an explicit, quiesced `pg_restore` if you
+  ever truly need it.
 * Supported 0025-era databases with duplicate truncation markers take a
   RECORDED prerequisite (0026's index is un-creatable over legacy rows;
   forward 0027 installs the legacy-safe guard). This is automatic,
@@ -455,17 +476,30 @@ Post-upgrade checks before admitting members again (all operator-side,
 on the installed appliance — none of this runs from the upgrade):
 
 ```bash
-python3 deploy/appliance.py doctor --manifest /etc/sparring-range/manifest.json
-python3 deploy/appliance.py verify --manifest /etc/sparring-range/manifest.json
+python3 deploy/appliance.py doctor --manifest /etc/sparring-range/appliance-manifest.json
+python3 deploy/appliance.py verify --manifest /etc/sparring-range/appliance-manifest.json
 ls /var/lib/sparring-range/maintenance            # must NOT exist
 cat /etc/sparring-range/release-version.json      # the new revision
 curl -fsS https://<appliance>/readyz
-journalctl -u sparring-api -u sparring-web -u sparring-brokerd -b --since \
-  "-15 min" | grep -iE "error|refus" || echo "clean boot"
+# Every unit must ACTUALLY be active — journalctl exits clean for missing
+# units, so a bare grep below it can print "clean boot" as a false clean.
+for u in sr-appliance-broker.service sr-api.service sr-appliance-ingest.service \
+         sr-worker-supervisor.service sr-bastion.service sr-web.service; do
+  systemctl is-active --quiet "$u" || { echo "NOT ACTIVE: $u"; exit 1; }
+done
+journalctl -u sr-api.service -u sr-web.service -u sr-appliance-broker.service \
+  -b --since "-15 min" | grep -iE "error|refus" \
+  && echo "error/refusal lines found — investigate before admitting members" \
+  || echo "clean boot"
 ```
 
-Then log in with a real member account (existing password, not a reset),
-open the coach thread of an old session (sealed history renders), start
+Then log in with a real member account (existing password, not a reset)
+and open an old session: member-visible threads must show ONLY
+member-audience coach content — sealed legacy coach history is
+operator-only by policy (the upgrade fail-closed relabels historical
+rows to `legacy`), so a member seeing none of it is the CORRECT result,
+not a data-loss symptom; verify the relabel itself as operator, e.g.
+`SELECT audience, count(*) FROM coach_messages GROUP BY 1`. Then start
 one supervised practice engagement, end it, and replay a pre-upgrade
 recording byte-for-byte. Only after all of that remove the pre-upgrade
 VM snapshot.

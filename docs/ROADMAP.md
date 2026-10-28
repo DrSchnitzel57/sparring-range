@@ -222,9 +222,19 @@ historical 14–17. Implementation waits for the user's new worktree:
   `capture`, `bundle` ×2 (persistent release bundle built and verified
   at `.cache/bundle/sparring-range-appliance`, revision `44ccdc89588d`,
   shipped-image boot from the bundle, tamper refused), plus
-  selection/db/agent/install/fast green. 21 stays UNTICKED — its
-  operator-machine gates (packet/journey/release, installed
-  systemd/Strata/nested-KVM) remain pending. Exact receipts in
+  selection/db/agent/install/fast green. Round 3 (`ba6a4af`/`849066b`)
+  then closed the seven round-3 compatibility/safety blockers found by
+  independent review at `a2501c8`: the gate now begins at the REAL 0019
+  deployment (engine-side secret bootstrap, table-aware quiescence), the
+  admission barrier actually stops old admitting services and refuses
+  new generations at the transaction boundary, restart gained
+  daemon-reload + bounded real-HTTP readiness before the stamp,
+  restore-config keeps the fence while unfinished, installer URL formats
+  and child-env secrets are fixed, and the payload inventory is a
+  trusted contract — upgrade gate 25/25, fast/selection/db re-passed,
+  and the bundle runtime re-rebuilt against the corrected HEAD. 21
+  stays UNTICKED — its operator-machine gates (packet/journey/release,
+  installed systemd/Strata/nested-KVM) remain pending. Exact receipts in
   [findings](FINDINGS_CHECKLIST.md).
 - [ ] **21 — Upgrade and qualified integrated release.**
   [Plan](../.openchamber/plans/21-upgrade-and-integrated-release.md). Supported preserving

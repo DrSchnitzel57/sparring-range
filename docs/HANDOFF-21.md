@@ -1,11 +1,35 @@
-# Handoff — milestone 21 (preserving upgrade), round 2 (review-corrected)
+# Handoff — milestone 21 (preserving upgrade), round 3 (review-corrected)
 
 Entry point for the parent's release-focused re-review and the operator's
 supervised-practice testing. Branch `practice-upgrades-18-21`. Round 1
-(HEAD `2ba575e`) returned **VERDICT: FIX** with seven blockers; all seven
-are fixed and re-proven here (round-2 code `431f2c1` + gate `a2ee8c9` +
-supporting fixes `0a169e9`). Milestone 20 is NOT accepted; F5–F9 remain
-the recorded repository backlog (`docs/FINDINGS_CHECKLIST.md`).
+(HEAD `2ba575e`) and round 2 (`a2501c8`) each returned **VERDICT: FIX**
+with seven blockers; every round-3 finding is fixed and re-proven below.
+Milestone 20 is NOT accepted; F5–F9 remain the recorded repository
+backlog (`docs/FINDINGS_CHECKLIST.md`).
+
+## Round 3 (parent review of `a2501c8`) — commits and proofs
+
+| Commit | What |
+|---|---|
+| `ba6a4af` | engine/CLI/API: table-aware old-schema quiescence + engine-side 0021 secret-role/db-secret bootstrap; stop-and-drain admission barrier + transaction-boundary `AdmissionFenced` + middleware admission/terminality split; `daemon-reload` + bounded REAL-HTTP readiness before stamp; restore-config KEEPS the fence while unfinished; `make_url` URL normalization + PREFLIGHT credential validation + child-env secret stripping; `REQUIRED_RUNTIME_CONTRACT` inventory |
+| `849066b` | `upgrade` gate re-forged around the REAL 0019 deployment (no manufactured prereqs), stateful systemctl double, real HTTP readiness fixture (503→ready + timeout negatives), restore-keeps-fence, env-leak exit-48 tripwire, required-inventory negatives, API generation-vs-terminality probes |
+
+The finding→fix→proof table, round-3 lane receipts (upgrade 25/25
+260.8 s, fast 661/0/0, selection PASS, db 322/0/0) and the parent-
+recorded artifact truths (malformed TEST_KEYS blobs = supervised-practice
+identity only, upgrade copies runtime not role images) are in
+`docs/FINDINGS_CHECKLIST.md` ("review round 3"). Operator procedure:
+`docs/OPERATOR_RUNBOOK.md` §7 (corrected manifest filename, real `sr-*`
+units, no-false-clean log pipeline, fence-keeps-on-restore semantics,
+member-vs-legacy history policy).
+
+---
+
+## Round 2 (HEAD `a2501c8`) — historical
+
+Round 1 (HEAD `2ba575e`) returned **VERDICT: FIX** with seven blockers;
+all seven were fixed and re-proven there (round-2 code `431f2c1` + gate
+`a2ee8c9` + supporting fixes `0a169e9`).
 
 ## Commit map
 
