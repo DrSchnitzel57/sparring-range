@@ -2098,14 +2098,35 @@ def check_upgrade() -> None:
     ctl.write_text(
         "#!/usr/bin/env bash\n"
         'echo "$@" >> "${SR_FAKE_SYSTEMCTL_LOG:-/dev/null}"\n'
+        'unit=""; quiet=0\n'
+        'if [[ "$2" == "--quiet" ]]; then unit="$3"; quiet=1; '
+        'else unit="$2"; fi\n'
+        'stfile="${SR_FAKE_STATE_DIR:-.}/unit-$unit"\n'
         'case "$1" in\n'
-        '  restart)   if [[ -n "${SR_FAKE_RESTART_FAIL:-}" ]]; then '
-        'echo "double: refusing restart" >&2; exit 5; fi;;\n'
-        "  is-active) exit 0;;\n"
+        '  stop)\n'
+        '    if [[ -n "${SR_FAKE_STOP_FAIL:-}" ]]; then '
+        'echo "double: refusing stop" >&2; exit 5; fi\n'
+        '    mkdir -p "${SR_FAKE_STATE_DIR:-.}"; echo inactive > '
+        '"$stfile"; exit 0;;\n'
+        '  restart)\n'
+        '    if [[ -n "${SR_FAKE_RESTART_FAIL:-}" ]]; then '
+        'echo "double: refusing restart" >&2; exit 5; fi\n'
+        '    mkdir -p "${SR_FAKE_STATE_DIR:-.}"; echo active > "$stfile"; '
+        'exit 0;;\n'
+        '  daemon-reload)\n'
+        '    if [[ -n "${SR_FAKE_RELOAD_FAIL:-}" ]]; then '
+        'echo "double: daemon-reload failed" >&2; exit 5; fi\n'
+        '    exit 0;;\n'
+        '  is-active)\n'
+        '    s=active; [[ -f "$stfile" ]] && s=$(cat "$stfile")\n'
+        '    if [[ "$quiet" == 1 ]]; then [[ "$s" == active ]] && exit 0 '
+        '|| exit 3; else echo "$s"; [[ "$s" == active ]] && exit 0 '
+        '|| exit 3; fi;;\n'
         "esac\n"
         "exit 0\n")
     ctl.chmod(0o755)
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["SR_FAKE_STATE_DIR"] = str(tmp / "ctl-state")
 
     def docker(*args: str, timeout: int = 120) -> sp.CompletedProcess:
         return sp.run(["docker", *args], capture_output=True, text=True,
@@ -2145,22 +2166,81 @@ def check_upgrade() -> None:
         port = docker("port", cname, "5432/tcp").stdout.split()[0]
         host_port = int(str(port).rsplit(":", 1)[1])
         for stmt in (
-                'CREATE ROLE sr_uapp', 'CREATE ROLE sr_usecret',
+                'CREATE ROLE sr_uapp',
                 'CREATE DATABASE srupg OWNER postgres ENCODING \'UTF8\' '
                 "TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'",
                 'CREATE DATABASE srupg2 OWNER postgres ENCODING \'UTF8\' '
                 "TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'",
                 'CREATE DATABASE srupg3 OWNER postgres ENCODING \'UTF8\' '
+                "TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'",
+                'CREATE DATABASE srupg4 OWNER postgres ENCODING \'UTF8\' '
                 "TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'"):
             r = docker("exec", cname, "psql", "-U", "postgres", "-v",
                        "ON_ERROR_STOP=1", "-c", stmt, timeout=60)
             if r.returncode != 0:
                 fail("postgres fixture bootstrap",
                      f"{stmt[:40]}: {r.stderr[-200:]}")
+        # NO sr_usecret here (round-3 finding 1): the gate no longer
+        # manufactures the secret-role prerequisite — the ENGINE must
+        # bootstrap it through the installer-equivalent channel, which in
+        # the sandbox is the same `su postgres -c psql` path a real
+        # appliance uses, shimmed into the fixture container.
+        su_shim = fake_bin / "su"
+        su_shim.write_text(
+            "#!/usr/bin/env python3\n"
+            "import shlex, subprocess, sys\n"
+            "assert sys.argv[1] == 'postgres', sys.argv[1:2]\n"
+            "cmd = shlex.split(sys.argv[3])\n"
+            "assert cmd[0] == 'psql' and '-f' in cmd, cmd\n"
+            "sql = open(cmd[cmd.index('-f') + 1]).read()\n"
+            f"p = subprocess.run(['docker', 'exec', '-i', '{cname}', "
+            "'psql', '-U', 'postgres', '-v', 'ON_ERROR_STOP=1', '-d', "
+            "'postgres', '-f', '-'], "
+            " input=sql, capture_output=True, text=True)\n"
+            "sys.stderr.write(p.stderr)\n"
+            "sys.exit(p.returncode)\n")
+        su_shim.chmod(0o755)
+
+        # ---- readiness fixtures (round-3 finding 3): REAL HTTP ---------- #
+        # /readyz answers 503 while the flag file exists (and 200 after it
+        # is removed — the exact old-service-503 -> ready transition the
+        # engine must wait for), and / answers 200 as the frontend. The
+        # manifest's internal URL points here, so the engine's bounded
+        # readiness wait runs over a real socket, never a mock hook.
+        import http.server
+        import threading
+        ready_flag = tmp / "readyz-not-ready"
+
+        class _ReadyHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                if self.path.startswith("/readyz"):
+                    if ready_flag.exists():
+                        code, body = 503, (
+                            b'{"detail": "schema 0025 behind head 0027"}')
+                    else:
+                        code, body = 200, b'{"status": "ready"}'
+                elif self.path == "/":
+                    code, body = 200, b'{"page": "frontend"}'
+                else:
+                    code, body = 404, b"{}"
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):  # silence
+                pass
+
+        ready_srv = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), _ReadyHandler)
+        threading.Thread(target=ready_srv.serve_forever,
+                         daemon=True).start()
+        ready_port = ready_srv.server_address[1]
         url = (f"postgresql://postgres:{fake_secret}@127.0.0.1:{host_port}"
                "/srupg")
         url2 = url.replace("/srupg", "/srupg2")
         url3 = url.replace("/srupg", "/srupg3")
+        url4 = url.replace("/srupg", "/srupg4")
 
         # pg_dump WRAPPER around the real pg_dump INSIDE the fixture. NEW
         # credential contract: endpoint FLAGS in argv, password via
@@ -2172,6 +2252,13 @@ def check_upgrade() -> None:
             "for a in \"$@\"; do\n"
             f"  if [[ \"$a\" == *'{fake_secret}'* ]]; then\n"
             "    echo 'ARGV SECRET LEAK' >&2; exit 47; fi\n"
+            "done\n"
+            # round-3 finding 5: the OWNER URL must never travel in this
+            # child's environment either — only endpoint argv + PGPASSFILE.
+            "for k in POSTGRES_URL_OWNER SR_POSTGRES_URL_OWNER "
+            "SR_PG_UPGRADE_URL SR_PG_SECRET_URL; do\n"
+            '  if [[ -n "${!k:-}" ]]; then\n'
+            "    echo \"CHILD ENV SECRET LEAK: $k\" >&2; exit 48; fi\n"
             "done\n"
             '[[ -z "${PGPASSFILE:-}" || ! -r "${PGPASSFILE}" ]] && '
             '{ echo "PGPASSFILE channel missing" >&2; exit 46; }\n'
@@ -2228,7 +2315,7 @@ def check_upgrade() -> None:
             if r.returncode != 0:
                 fail("sandbox fresh install", (r.stdout + r.stderr)[-500:])
 
-        def seed(url_x: str, tag: str) -> None:
+        def seed(url_x: str, tag: str, *, coach: bool = True) -> None:
             eng = sa_create(url_x)
             with eng.begin() as c:
                 c.execute(sa_text(
@@ -2241,17 +2328,19 @@ def check_upgrade() -> None:
                     "VALUES (gen_random_uuid(), 'web-foothold-01', "
                     "'complete') RETURNING session_id"
                 )).scalar()
-                c.execute(sa_text(
-                    "INSERT INTO coach_messages (session_id, role, body) "
-                    "VALUES (:sid, 'coach', 'P21-SEALED-HISTORY-KEEP')"),
-                    {"sid": sid})
+                if coach:
+                    c.execute(sa_text(
+                        "INSERT INTO coach_messages (session_id, role, body) "
+                        "VALUES (:sid, 'coach', 'P21-SEALED-HISTORY-KEEP')"),
+                        {"sid": sid})
             eng.dispose()
 
         def upgrade_cli(root, manifest, db_url, *, resume=None, extra=(),
                         extra_env=None, fresh=True, allow_fail=False):
             args = ["upgrade", "--manifest", str(manifest),
                     "--system-root", str(root), "--payload", str(payload),
-                    "--pg-dump-bin", str(wrapper), *extra]
+                    "--pg-dump-bin", str(wrapper),
+                    "--web-url", f"http://127.0.0.1:{ready_port}/", *extra]
             if fresh:
                 args += ["--allow-fresh-install"]
             if resume:
@@ -2266,11 +2355,23 @@ def check_upgrade() -> None:
             return r
 
         # ---- scenario A: real preserving upgrade, provisioned + restarted #
+        # Starts at the REAL deployed-52ae355 revision (0019): old schema,
+        # old config, app role only — NO sr_secret role and no db-secret
+        # file exist here (round-3 finding 1: the gate must not manufacture
+        # the prereqs the engine is supposed to satisfy).
         manifest_path = iseq.build_manifest(tmp / "appliance-input")
+        man_raw = json.loads(manifest_path.read_text())
+        man_raw["urls"]["internal"] = f"http://127.0.0.1:{ready_port}"
+        manifest_path.write_text(json.dumps(man_raw))
         rootA = tmp / "rootA"
         apply_sandbox(rootA, manifest_path)
-        assert alembic(url, "upgrade", "0025").returncode == 0
-        seed(url, "a")
+        assert alembic(url, "upgrade", "0019").returncode == 0
+        seed(url, "a", coach=False)
+        secret_roles_before = db_q(
+            url, "SELECT count(*) FROM pg_roles WHERE rolname='sr_usecret'")
+        if secret_roles_before != [(0,)]:
+            fail("scenario A starts WITHOUT the secret role (real 0019 "
+                 "prereq state)", str(secret_roles_before))
         paths = iseq._manifest_paths(rootA)
         token_bytes = paths["token"].read_bytes()
         sentinel = paths["state"] / "sentinel.db"
@@ -2289,23 +2390,41 @@ def check_upgrade() -> None:
                         extra_env={"SR_FAKE_SYSTEMCTL_LOG": str(ctl_log_a)})
         outA = json.loads(r.stdout)
         stages = outA.get("stages", {})
-        missing = [s for s in ("backup", "stage", "activate", "provision",
-                               "migrate", "finalize", "restart")
+        missing = [s for s in ("quiesce", "backup", "stage", "activate",
+                               "provision", "secrets", "migrate",
+                               "finalize", "restart")
                    if stages.get(s, {}).get("status") != "done"]
         if outA.get("status") != "done" or missing:
             fail("preserving upgrade journal completeness "
-                 "(backup..provision..restart)",
+                 "(quiesce..backup..provision..secrets..restart)",
                  f"status={outA.get('status')} missing={missing}")
         heads = {row[0] for row in
                  db_q(url, "SELECT version_num FROM alembic_version")}
         if heads != {"0027"}:
             fail("preserving upgrade reached head", f"heads {heads}")
-        aud = db_q(url, "SELECT audience FROM coach_messages "
-                        "WHERE body LIKE 'P21-SEALED%'")
-        if aud != [("legacy",)]:
-            fail("upgrade path fail-closed legacy relabel",
-                 f"audience {aud} (sealed history must never default "
-                 "member)")
+        # round-3 finding 1: the ENGINE bootstrapped the 0021 prerequisite
+        # itself — role created through the installer channel, API-only
+        # 0600 file, and no other role re-keyed.
+        secret_roles = db_q(
+            url, "SELECT count(*) FROM pg_roles WHERE rolname='sr_usecret'")
+        if secret_roles != [(1,)]:
+            fail("upgrade bootstrapped the credential-store role",
+                 f"sr_usecret count {secret_roles}")
+        secret_file = paths["etc"] / "secrets" / "db-secret.env"
+        if not secret_file.is_file() or \
+                secret_file.stat().st_mode & 0o777 != 0o600 or \
+                "SR_PG_SECRET_URL=postgresql+psycopg2://sr_usecret:" \
+                not in secret_file.read_text():
+            fail("credential-store file is API-only 0600 and complete",
+                 f"mode {secret_file.stat().st_mode & 0o777:04o}")
+        if stages.get("secrets", {}).get("status") != "done" or \
+                stages.get("quiesce", {}).get("status") != "done":
+            fail("journal carries the quiesce + secret-bootstrap stages",
+                 str({k: v.get("status") for k, v in stages.items()}))
+        mj_now = db_q(url, "SELECT count(*) FROM information_schema.tables "
+                           "WHERE table_name = 'model_jobs'")
+        if mj_now != [(1,)]:
+            fail("old-schema upgrade created the newer tables", str(mj_now))
         users = db_q(url, "SELECT password_hash FROM users "
                           "WHERE username = 'p21-witness-a'")
         if users != [("scrypt$witness$keep",)]:
@@ -2356,6 +2475,21 @@ def check_upgrade() -> None:
         if not restarted or set(restarted) - set(verified):
             fail("restart verified every unit active",
                  f"restarted={restarted} verified={verified}")
+        # round-3 findings 2+3: the admission services were STOPPED (the
+        # barrier an old fence-unaware process cannot bypass), and the
+        # manager RELOADED the rewritten units before any restart.
+        stops = [l.split()[1] for l in ctl_lines if l.startswith("stop ")]
+        for u in ("sr-api.service", "sr-worker-supervisor.service"):
+            if u not in stops:
+                fail("upgrade stopped the admission services before "
+                     "mutating anything", f"{u} not stopped: {stops}")
+        idx_first = lambda pref: min(
+            (i for i, l in enumerate(ctl_lines) if l.startswith(pref)),
+            default=-1)
+        if not (0 <= idx_first("stop sr-api.service")
+                < idx_first("daemon-reload")
+                < idx_first("restart sr-api.service")):
+            fail("order: stop -> daemon-reload -> restart", str(idx_first))
         stamp = json.loads((paths["etc"] / "release-version.json")
                            .read_text())
         if stamp.get("attempt") != outA["attempt"] or \
@@ -2526,6 +2660,7 @@ def check_upgrade() -> None:
         pB = cli("upgrade", "--manifest", str(manifest_path),
                  "--system-root", str(rootB), "--payload", str(payload),
                  "--pg-dump-bin", str(wrapper), "--allow-fresh-install",
+                 "--web-url", f"http://127.0.0.1:{ready_port}/",
                  extra_env={"SR_PG_UPGRADE_URL": url2,
                             "SR_FAKE_SYSTEMCTL_LOG": str(ctl_log_b)},
                  proc=True)
@@ -2648,10 +2783,153 @@ def check_upgrade() -> None:
         if outD.get("status") != "done":
             fail("resume after a fixed restart completes",
                  json.dumps(outD)[:300])
+        aud = db_q(url3, "SELECT audience FROM coach_messages "
+                         "WHERE body LIKE 'P21-SEALED%'")
+        if aud != [("legacy",)]:
+            fail("upgrade path fail-closed legacy relabel",
+                 f"audience {aud} (sealed history must never default "
+                 "member)")
         if not stampD.is_file():
             fail("version stamp written only after the verified restart",
                  "stamp missing after completed resume")
         ok("verified restart then (and only then) the version stamp")
+
+        # ===== round-3 finding 1: old-schema quiescence tells the truth == #
+        # A REAL 0019 schema has no model_jobs; durable work must be proven
+        # from the authorities that exist there (runs), and the missing
+        # newer tables may never surface as unreadable-check errors.
+        assert alembic(url4, "upgrade", "0019").returncode == 0
+        rootR = tmp / "rootR"
+        apply_sandbox(rootR, manifest_path)
+        pathsR = iseq._manifest_paths(rootR)
+        eng = sa_create(url4)
+        with eng.begin() as c:
+            sid_r = c.execute(sa_text(
+                "INSERT INTO sessions (session_id, scenario_id, status) "
+                "VALUES (gen_random_uuid(), 'web-foothold-01', 'active') "
+                "RETURNING session_id")).scalar()
+            rid_r = c.execute(sa_text(
+                "INSERT INTO runs (run_id, session_id, scenario_id, status)"
+                " VALUES (gen_random_uuid(), :sid, 'web-foothold-01', "
+                "'queued') RETURNING run_id"), {"sid": sid_r}).scalar()
+        eng.dispose()
+        oldq = upgrade_cli(rootR, manifest_path, url4,
+                           extra=("--dry-run",), allow_fail=True)
+        oldq_all = oldq.stdout + oldq.stderr
+        if oldq.returncode == 0 or "durable state" not in oldq_all:
+            fail("0019-schema dry-run REFUSES a queued run (old-schema "
+                 "authorities are read, not skipped)", oldq_all[-400:])
+        if "model_jobs" in oldq_all:
+            fail("old-schema check does not error on missing newer tables",
+                 oldq_all[-400:])
+        eng = sa_create(url4)
+        with eng.begin() as c:
+            c.execute(sa_text("DELETE FROM runs WHERE run_id = :r"),
+                      {"r": rid_r})
+        eng.dispose()
+        oldok = upgrade_cli(rootR, manifest_path, url4,
+                            extra=("--dry-run",))
+        if "dry_run" not in oldok.stdout:
+            fail("0019-schema dry-run passes once quiesced",
+                 (oldok.stdout + oldok.stderr)[-300:])
+        ok("real 0019 schema: quiescence refuses queued runs and passes "
+           "truthfully when empty — no manual prereqs")
+
+        # ===== round-3 findings 2/3/4: stop failure, readiness 503, and a
+        # ===== config-only restore that KEEPS the fence on unfinished work #
+        ctl_log_r = tmp / "ctlR.log"
+        sfail = upgrade_cli(rootR, manifest_path, url4,
+                            extra_env={"SR_FAKE_STOP_FAIL": "1",
+                                       "SR_FAKE_SYSTEMCTL_LOG": str(ctl_log_r)},
+                            allow_fail=True)
+        if sfail.returncode == 0 or "quiesce" not in (
+                sfail.stdout + sfail.stderr):
+            fail("a refusing admission-stop fails the upgrade before any "
+                 "mutation", (sfail.stdout + sfail.stderr)[-400:])
+        jR = next((json.loads(j.read_text())
+                   for j in (pathsR["etc"] / "upgrade").glob(
+                       "*/journal.json")), {})
+        if not jR or not (pathsR["state"] / "maintenance").is_file():
+            fail("failed admission-stop keeps the fence and journal",
+                 json.dumps(jR)[:200])
+        if list((pathsR["etc"] / "upgrade" / jR["attempt"]).glob(
+                "database.dump")):
+            fail("failed admission-stop mutated nothing", "dump exists")
+        ok("admission services cannot be stopped -> refused, fenced, "
+           "resumable, zero mutation")
+        ready_flag.touch()  # the old service answers 503 forever now
+        rfail = upgrade_cli(rootR, manifest_path, url4, resume=jR["attempt"],
+                            extra_env={"SR_FAKE_SYSTEMCTL_LOG":
+                                       str(ctl_log_r)},
+                            allow_fail=True)
+        if rfail.returncode == 0 or "READY" not in (rfail.stdout +
+                                                    rfail.stderr):
+            fail("active-but-503 services fail the readiness gate",
+                 (rfail.stdout + rfail.stderr)[-400:])
+        if (pathsR["etc"] / "release-version.json").exists():
+            fail("readiness failure writes NO version stamp")
+        if not (pathsR["state"] / "maintenance").is_file():
+            fail("readiness failure keeps the fence")
+        ok("real HTTP 503 after restart: fence UP, no stamp, resumable "
+           "(the stamp is never advertised for an unhealthy release)")
+        ctl_before_restore = (ctl_log_r.read_text().splitlines()
+                              if ctl_log_r.is_file() else [])
+        rrR = cli("upgrade", "--manifest", str(manifest_path),
+                  "--system-root", str(rootR),
+                  "--restore-config", jR["attempt"])
+        outRR = json.loads(rrR.stdout) if rrR.returncode == 0 else {}
+        if rrR.returncode != 0 or outRR.get("service_actions") != [] or \
+                outRR.get("maintenance_fence_cleared") is not False:
+            fail("config-only restore on an unfinished attempt keeps the "
+                 "fence", (rrR.stdout + rrR.stderr)[-400:])
+        if not (pathsR["state"] / "maintenance").is_file():
+            fail("restore of an unfinished attempt must NOT open "
+                 "admission — a config rollback cannot undo the runtime "
+                 "or the schema")
+        ctl_after_restore = (ctl_log_r.read_text().splitlines()
+                             if ctl_log_r.is_file() else [])
+        if ctl_after_restore != ctl_before_restore:
+            fail("restore issues ZERO service commands",
+                 str(ctl_after_restore[len(ctl_before_restore):])[:200])
+        ok("restore-config on an unfinished attempt: config restored, "
+           "fence KEPT, zero service actions")
+        ready_flag.unlink()  # operator fixed the service
+        rres = upgrade_cli(rootR, manifest_path, url4, resume=jR["attempt"],
+                           extra_env={"SR_FAKE_SYSTEMCTL_LOG":
+                                      str(ctl_log_r)})
+        outR = json.loads(rres.stdout)
+        if outR.get("status") != "done" or \
+                (pathsR["state"] / "maintenance").exists() or \
+                not (pathsR["etc"] / "release-version.json").is_file():
+            fail("resume once readyz turns ready completes, stamps and "
+                 "unfences", json.dumps(outR)[:300])
+        ok("503 -> ready transition: resume completes; fence only ever "
+           "drops on a READY, completed attempt")
+
+        # ===== round-3 finding 6: the required runtime contract is not a
+        # ===== self-declared manifest list — dropping a required file from
+        # ===== BOTH disk and manifest is refused before any side effect.
+        inv = tmp / "missing-lock-bundle"
+        shutil.copytree(payload, inv)
+        (inv / "requirements.lock").unlink()
+        man_i = json.loads((inv / "MANIFEST.json").read_text())
+        man_i["files"].pop("requirements.lock")
+        (inv / "MANIFEST.json").write_text(json.dumps(man_i))
+        attempts_before_inv = len(list(
+            (paths["etc"] / "upgrade").glob("*/journal.json")))
+        ineg = upgrade_cli(rootA, manifest_path, url,
+                           extra=("--dry-run", "--payload", str(inv)),
+                           allow_fail=True)
+        if ineg.returncode == 0 or "requirements.lock" not in (
+                ineg.stdout + ineg.stderr):
+            fail("payload omitting requirements.lock (manifest AND disk) "
+                 "refused", (ineg.stdout + ineg.stderr)[-400:])
+        if len(list((paths["etc"] / "upgrade").glob(
+                "*/journal.json"))) != attempts_before_inv or \
+                (paths["state"] / "maintenance").exists():
+            fail("required-contract refusal causes zero side effects")
+        ok("required runtime contract enforced against the manifest's own "
+           "inventory, refused preflight with zero mutation")
 
         # ============ provisioning failure never claims success ========= #
         bad_tree = tmp / "badlock-src"
@@ -2720,20 +2998,50 @@ def check_upgrade() -> None:
             r_login = client.post("/auth/login", json={})
             r_internal = client.post("/internal/runs/x/heartbeat", json={})
             r_health = client.get("/healthz")
+            # round-3 finding 2: NEW generations inside /internal/ are
+            # refused; only terminality callbacks stay exempt.
+            r_gen = client.post("/internal/model/complete", json={})
+            r_claim = client.post("/internal/worker/claim", json={})
             if r_new.status_code != 503:
                 fail("fenced API refuses NEW work with 503",
                      f"POST /sessions -> {r_new.status_code}")
+            if r_gen.status_code != 503 or "preserving upgrade" not in \
+                    str(r_gen.json()):
+                fail("fence refuses NEW internal generations",
+                     f"POST /internal/model/complete -> {r_gen.status_code} "
+                     f"{str(r_gen.json())[:120]}")
             if r_login.status_code == 503 or r_internal.status_code == 503 \
                     or r_health.status_code == 503:
-                fail("fence exempts login, internal callbacks and health",
+                fail("fence exempts login, terminality callbacks and health",
                      f"login={r_login.status_code} "
                      f"internal={r_internal.status_code} "
                      f"health={r_health.status_code}")
+            # claim reaches its OWN route (exempt), so any 503 it produces
+            # must be the route's own condition, never the fence:
+            if r_claim.status_code == 503 and "preserving upgrade" in \
+                    str(r_claim.json()):
+                fail("terminality callback was fence-refused",
+                     str(r_claim.json())[:200])
+            # transaction-boundary backstop: even a caller that bypasses
+            # HTTP entirely cannot write a new durable generation while
+            # the fence exists (and the refusal happens BEFORE any DB use)
+            from srplatform import model_jobs as _mj
+
+            class _NoDB:
+                def execute(self, *a, **k):  # noqa: ANN401
+                    raise AssertionError("db touched before fence check")
+            try:
+                _mj.enqueue(_NoDB(), kind="probe", priority=5, payload={})
+                fail("enqueue refuses at the transaction boundary",
+                     "AdmissionFenced not raised while fenced")
+            except _mj.AdmissionFenced:
+                pass
             flag.unlink()
             if client.post("/sessions", json={}).status_code == 503:
                 fail("fence removal re-admits work", "still 503")
-            ok("admission fence: 503 for new work, callbacks/login/health "
-               "unblocked, removal re-admits")
+            ok("admission fence: 503 for new work AND internal generations,"
+               " terminality/login/health unblocked, enqueue boundary holds,"
+               " removal re-admits")
         finally:
             if "_s" in dir():
                 _s.get_settings.cache_clear()
