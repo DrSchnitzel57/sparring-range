@@ -1,14 +1,41 @@
-# Handoff — milestone 21 (preserving upgrade), round 4 (review-corrected)
+# Handoff — milestone 21 (preserving upgrade), round 5 (review-corrected)
 
 Entry point for the parent's release-focused re-review and the operator's
-supervised-practice testing. Branch `practice-upgrades-18-21`. Rounds 1
-(HEAD `2ba575e`) and 2 (`a2501c8`) each returned **VERDICT: FIX**
-with seven blockers; every round-3 finding is fixed and re-proven below.
-The round-4 review at `f6b57b3` returned **VERDICT: FIX** with five
-findings (readiness contract, cross-attempt fence, named-env leak,
-contract completeness, runbook journal pipeline) — all five are fixed and
-re-proven in the round-4 section. Milestone 20 is NOT accepted; F5–F9
-remain the recorded repository backlog (`docs/FINDINGS_CHECKLIST.md`).
+supervised-practice testing. Branch `practice-upgrades-18-21`. Rounds 1–3
+(VERDICT: FIX, seven blockers apiece) and round 4 (VERDICT: FIX, five
+findings — all fixed below and independently counterexample-checked in
+the round-5 review) are historical. The round-5 review at `85efa92`
+returned **VERDICT: FIX** with two remaining blockers (fence-ownership
+acquisition/finalization; the gate's disk-backed-TMPDIR revision
+collision) — both are fixed and re-proven in the round-5 section.
+Milestone 20 is NOT accepted; F5–F9 remain the recorded repository
+backlog (`docs/FINDINGS_CHECKLIST.md`).
+
+## Round 5 (parent review of `85efa92`) — commits and proofs
+
+| Commit | What |
+|---|---|
+| `9dcf354` | fence is a validated mutex token end-to-end: identity classified BEFORE mutation (foreign/anonymous/corrupt refused, byte-exact, no adoption, no first-upgrade waiver), absent-fence acquisition via `O_EXCL` exclusive create (no check→write race), ownership re-required at finalization (mid-run swap → blocked: no stamp, fence kept, resumable), completion clears only exactly-its-own fence; second payload built in an ISOLATED git fixture so the gate is deterministic under any TMPDIR (distinct-revision assertion tightened, production packaging untouched); gate scenario W (actual-CLI foreign/`{}`/corrupt acquisition refusals, fresh-absent positive, deterministic mid-run swap block, verified-own resume completion); runbook §7 runs the payload CLI under the installed dependency-bearing venv (bootstrap-import preflight, cwd contract); + 5 fast contract tests |
+
+Proofs at `9dcf354`: `upgrade` gate **34 probes PASS in BOTH modes** —
+default TMPDIR 426.2 s and documented `TMPDIR=$PWD/.cache/tmp` 463.4 s
+(`.cache/gate_r18_upgrade_{defaulttmp,disktmp}.log`) — with all
+cross-attempt, ownership and later negatives actually executing;
+fast **677/0/0**; `selection` 181.9 s; `python`/`authority`/
+`containment`/`install` PASS; `bundle` **PASS 222.6 s** against the
+repacked runtime revision `9dcf3547cd92…` (MANIFEST sha256
+`47b1774a460e…`, 375 manifest entries incl. 4 images — 376 files on
+disk counting `MANIFEST.json`, 242 runtime files bound, images
+byte-identical, TCG boot, tamper refused). `db`/`agent` not re-run
+(zero `srplatform/` change; lanes passed at `8cbe932`), `frontend`/
+`browser` (`web/` byte-identical), `images`/`capture` (images reused
+byte-identically, no rebuild authorized); operator gates PENDING.
+The finding→fix→proof table, the reproduced TMPDIR-collision mechanism,
+and the file-count correction (374 listed at round 4 vs 375 on-disk
+including `MANIFEST.json`) are in `docs/FINDINGS_CHECKLIST.md`
+("review round 5"). Operator procedure: `docs/OPERATOR_RUNBOOK.md` §7
+(payload-tree CLI under `/opt/sparring-range/.venv/bin/python`, cwd =
+`/srv/sr-release`, bootstrap-import preflight before `--dry-run`).
 
 ## Round 4 (parent review of `f6b57b3`) — commits and proofs
 
@@ -21,8 +48,9 @@ Proofs: `upgrade` gate **32 probes PASS 407.1 s** (`.cache/gate_r16_upgrade.log`
 fast **672/0/0**; `db` 322/0/0; `selection`/`install`/`agent`/`python`/
 `authority`/`containment` PASS; `bundle` **PASS 252.8 s** against the
 repackaged runtime at revision `8cbe932d1c20…` (MANIFEST sha256
-`cb5e4712e175…`, 375 files, 242 runtime files bound, images byte-identical
-to the independently verified set, TCG boot, tamper refused). The
+`cb5e4712e175…`, 374 manifest-listed entries, 242 runtime files bound,
+images byte-identical to the independently verified set, TCG boot,
+tamper refused). The
 independently-positive round-3 behaviours (real 0019 bootstrap, stop-and-
 drain barrier, same-attempt restore semantics, 0600 secret preservation,
 special-password dumps) are preserved — the gate re-proves all of them in

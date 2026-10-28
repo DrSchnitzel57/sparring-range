@@ -243,7 +243,18 @@ historical 14–17. Implementation waits for the user's new worktree:
   672/0/0, db 322/0/0, selection/install/agent/python/authority/
   containment PASS, and the bundle runtime re-repacked at revision
   `8cbe932d1c20` (MANIFEST sha256 `cb5e4712e175`, images byte-identical
-  to the verified set). 21
+  to the verified set). The round-5 review at `85efa92` (VERDICT FIX,
+  two blockers) is closed at `9dcf354`: the admission fence is an
+  identity-bearing mutex token validated at acquisition (refused and
+  kept byte-exact against foreign/anonymous/corrupt fences; exclusive
+  create, no check→write race), at finalization (mid-run ownership swap
+  blocks without stamp or unfence, resumable) and at completion (only
+  exactly-own fence cleared), and the gate is deterministic under the
+  documented disk-backed TMPDIR via an isolated-git second payload —
+  upgrade gate 34/34 in BOTH TMPDIR modes (426.2 s / 463.4 s), fast
+  677/0/0, selection/python/authority/containment/install PASS, bundle
+  re-repacked at `9dcf3547cd92` (MANIFEST sha256 `47b1774a460e`, images
+  byte-identical). 21
   stays UNTICKED — its operator-machine gates (packet/journey/release,
   installed systemd/Strata/nested-KVM) remain pending. Exact receipts in
   [findings](FINDINGS_CHECKLIST.md).

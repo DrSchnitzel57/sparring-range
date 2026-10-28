@@ -1,5 +1,96 @@
 # Current findings and validation evidence
 
+## Milestone 21 review round 5 — fence-ownership acquisition/finalization, deterministic gate revision — 2026-10-28 (`9dcf354`)
+
+The independent review at `85efa92` returned **VERDICT: FIX** with two
+actionable blockers (the other five round-4 counterexamples were
+confirmed repaired). Both fixed at `9dcf354`; the re-forged `upgrade`
+gate passes **34/34 probes in BOTH TMPDIR modes** — default
+(`.cache/gate_r18_upgrade_defaulttmp.log`, PASS 426.2 s) and the
+DOCUMENTED disk-backed `TMPDIR=$PWD/.cache/tmp`
+(`.cache/gate_r18_upgrade_disktmp.log`, PASS 463.4 s) — proving every
+cross-attempt and ownership probe actually executes on a disk-backed
+temp root.
+
+Finding → fix → proof:
+
+1. **HIGH — fence ACQUISITION and FINALIZATION ignored ownership**
+   (reviewer's actual-CLI/PG reproduction at `85efa92`: an existing
+   FOREIGN-owned fence was overwritten and the run stamped done; a
+   fence replaced with `{}` during the readiness window was removed and
+   stamped done — the round-4 fix covered only the RESTORE side).
+   → Acquisition now classifies the fence (absent/owned/anonymous/
+   unreadable) and REFUSES a foreign, anonymous or corrupt fence BEFORE
+   any mutation or journal attempt — kept byte-exact, never adopted, no
+   waiver for the first upgrade; an absent fence is taken with
+   `O_CREAT|O_EXCL` so no operator can be raced between check and write
+   (a concurrent creation stops the attempt without touching the file);
+   FINALIZATION re-requires `owned == attempt` after readiness — a
+   mid-run swap blocks with NO stamp, byte-exact fence, and a truthful
+   in-progress resumable journal; completion clears ONLY its exactly-
+   owned fence (never None/unknown/foreign); a resume proceeds only
+   over its own verified fence identity. → Fast: 5 contract tests
+   (`tests/test_plan21_review_round5.py`). Gate scenario W (actual CLI,
+   deterministic): foreign `manual-op-4242` refusal (fence byte-exact,
+   zero attempts, no stamp); `{}`/corrupt/empty-owner refusals
+   ("cannot be proven"); fresh absent-fence positive records its own
+   attempt; swap-to-`{}` once quiesce completes blocks finalize (no
+   stamp/unfence, bytes kept, journal resumable); verified-own resume
+   completes and clears exactly its own fence. Existing cross-attempt
+   restore (X) unchanged and passing.
+2. **MEDIUM — the required gate FAILED under the documented disk-backed
+   TMPDIR** (reproduced here at the mechanism level AND by the reviewer
+   full-gate run: exit 1, 403.7 s, "cross-attempt fixture needs a second
+   revision — 85efa92…": an extracted tree inside the checkout
+   DISCOVERS the parent repo, so `_revision()` returned the candidate's
+   own HEAD; all cross-attempt and later negatives never ran). → The
+   second payload is now built in a proper ISOLATED git fixture (its own
+   ancestry inside `src2`, so discovery stops at `src2/.git`); the
+   assertion was TIGHTENED (40-hex real revision, ≠ candidate, ≠
+   "unknown") — production git packaging verification untouched, the
+   distinct-revision requirement not relaxed. → Proven by the full gate
+   PASSing under both default and `TMPDIR=$PWD/.cache/tmp`, with the
+   scenario-X revision-independent path and all later negatives
+   executing (34 probes both modes).
+
+Operator-handoff corrections: §7 now runs the payload tree's CLI under
+the INSTALLED dependency-bearing venv `/opt/sparring-range/.venv/bin/
+python` with `cwd = /srv/sr-release` — the tested contract (acceptance
+drives exactly: locked python + payload-tree `deploy/appliance.py` +
+tree cwd) — plus an explicit bootstrap-import preflight
+(`import deploy.appliance, deploy.upgrade, sqlalchemy, alembic`,
+verified to import under the locked dependency set) and the rule that
+an older venv is repaired by the provision stage, never hand-patched.
+File-count claim corrected and derived explicitly: the round-4 bundle
+listed **374 manifest entries** (including the 4 image files) — 375
+files on disk only when counting `MANIFEST.json` itself; the current
+round-5 bundle lists **375 entries / 376 on disk** (+1: the new
+round-5 test file, a manifest-listed tests/ input). Earlier prose
+conflated the two counts.
+
+Round-5 lane receipts (serialized, own resources, cleanup verified):
+fast **677 passed / 0 failed / 0 skipped** (480 deselected, 6 warnings,
+95.8 s); `upgrade` **PASS 426.2 s (default TMP)** and **PASS 463.4 s
+(disk-backed TMP)**; `selection` PASS 181.9 s; `python` 4.6 s,
+`authority` 25.7 s, `containment` 24.9 s, `install` 7.2 s PASS;
+`bundle` **PASS 222.6 s**. `db`/`agent` not re-run — the diff is
+`deploy/upgrade.py` + gate + runbook + tests, zero `srplatform/` change
+(both lanes passed at `8cbe932`; fast suite includes all affected
+boundary tests); `frontend`/`browser` — `web/` still byte-identical;
+`images`/`capture` — verified images reused BYTE-IDENTICALLY (digests
+re-matched), no rebuild authorized; `packet`/`journey`/release remain
+operator-machine PENDING, never simulated.
+
+Artifact refresh (runtime-only; NO image rebuild): bundle revision
+**`9dcf3547cd92f34cec5ad752723e6a53f3b40539`**, MANIFEST.json sha256
+`47b1774a460edb59dab40f977cc52bb305c3c2e3821d3f94b2e55da94a6a0eb4`;
+375 manifest entries (4 images included), 376 files on disk including
+`MANIFEST.json`; 242 runtime files bound to the tested revision; images
+byte-verified unchanged (base `6b1fbcb8b1a7…`, mojang-web-local
+`97d694851c20…`, mojang-web-db `7c6072615646…`, attacker
+`015aeafe5a5f…`); shipped-image TCG boot re-passed (marker
+`2026-10-28T12:19:13Z`), tamper refused.
+
 ## Milestone 21 review round 4 — readiness contract, fence ownership, named-env scrub — 2026-10-28 (`2654683`/`8cbe932`)
 
 The independent review at `f6b57b3` returned **VERDICT: FIX** with five
@@ -84,8 +175,10 @@ intentionally NOT re-run: the verified images are reused BYTE-IDENTICALLY
 `packet`/`journey`/release stay operator-machine PENDING, never simulated.
 
 Artifact refresh (runtime-only repackage; NO image rebuild): release
-bundle at revision **`8cbe932d1c20fa3574dc943313a21942a41d79c0`**, 375
-files, MANIFEST.json sha256 `cb5e4712e1754506ca86449089e219235a77ff93351588ad29b827b2318e6eb9`;
+bundle at revision **`8cbe932d1c20fa3574dc943313a21942a41d79c0`**, 374
+manifest-listed file entries (the 4 image files included; 375 files on
+disk only counting `MANIFEST.json` itself — wording corrected after
+review round 5), MANIFEST.json sha256 `cb5e4712e1754506ca86449089e219235a77ff93351588ad29b827b2318e6eb9`;
 242 runtime files bound to the tested revision; images carried UNCHANGED
 and byte-verified against the independently verified set — appliance-base
 `6b1fbcb8b1a7…`, mojang-web-local `97d694851c20…`, mojang-web-db
