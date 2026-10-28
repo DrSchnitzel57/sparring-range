@@ -111,6 +111,44 @@ the attacker artifact carries the gate's SYNTHETIC keys (TEST_KEYS), so
 this set is the supervised-practice candidate; the production contract
 remains the operator's key-bearing template rebuild per the runbook.
 
+`sha256(base)` = `6b1fbcb8b1a7cec2d4aa…` (2357 MiB) — the appliance
+guest base carried into the bundle (its MANIFEST image digests match the
+four artifacts above and verify green).
+
+### Final local-software lane receipts — 2026-10-27/28 at `44ccdc8` (serialized, logs `.cache/gate_r13_*.log`, `.cache/gate_r14_bundle.log`)
+
+* `fast` **PASS** — 661 passed, 0 failed, 0 skipped, 480 deselected (86.8 s).
+* `selection` **PASS** (174.1 s); `db` **PASS** (667.8 s — 322/0/0, 819
+  deselected, owned fixture removed); `agent` **PASS** (150.3 s —
+  123/0/0); `install` **PASS** (7.3 s — real sandbox sequences; the
+  managed-service half stays the operator's).
+* `upgrade` **PASS ×3** (93.5–94.6 s) — see the round-2 table above.
+* `images` **PASS** (323.8 s) — 19 passed, 0 skipped: real builds
+  (cache-BUILD-CACHED on the input hashes above, verify batteries boot
+  the chains under labelled TCG, seeds/flaws/fixes/readiness), owned DB
+  and QEMU run dirs cleaned.
+* `capture` **PASS** (228.4 s).
+* `bundle` **PASS ×2** — build+verify (266.7 s) and then the gate
+  **verifying the persistent release in place** (219.1 s): 373 files,
+  4 images, revision `44ccdc89588d`; bound to the checkout under test
+  (242 runtime files compared); operator manifest renders and
+  validates; the SHIPPED role image boots from the bundle (TCG, serial
+  marker); tampered bundle refused for digest drift.
+* **Persistent release artifact:** `.cache/bundle/sparring-range-appliance`
+  (4.5 GiB, BUNDLE_VERSION 2, revision `44ccdc89588d8ea8a4bf9ccef7182dea928de293`),
+  images `appliance-base 6b1fbcb8b1a7…`, `mojang-web-local 97d694851c20…`,
+  `mojang-web-db 7c6072615646…`, `attacker 015aeafe5a5f…`. Verify with
+  `python3 deploy/bundle.py verify .cache/bundle/sparring-range-appliance`.
+* **Capacity lesson recorded (caused one externally-killed run, not a
+  test failure):** bundle building on `/tmp` here means tmpfs = 16 GiB
+  RAM; the gate now runs with `TMPDIR=$PWD/.cache/tmp` (disk-backed).
+  The OOM-risky killed run's owned tmp (9.9 G) was removed; the builder
+  and gate self-clean everything else (verified: no `sr-bundle-gate-*`,
+  no `sr-*` containers, `.cache/tmp` empty).
+* Operator-machine gates (`packet`, `journey`, `release`,
+  installed-systemd/Strata/nested-KVM, the managed-service install half)
+  remain explicitly PENDING — never passed, never simulated here.
+
 ## Milestone 21 implementation round 1 — 2026-10-27 (branch `practice-upgrades-18-21`)
 
 Scope executed: preserving in-place upgrade (engine + real CLI + required

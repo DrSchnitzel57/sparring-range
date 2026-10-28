@@ -217,12 +217,15 @@ historical 14–17. Implementation waits for the user's new worktree:
   upgrade contract, pulled blockers F1–F4 fixed with real proofs. The
   release review at `2ba575e` returned VERDICT: FIX (seven engine/CLI
   blockers); round 2 (`431f2c1`/`a2ee8c9`/`0a169e9`) fixed all seven with
-  the re-forged `upgrade` gate PASS ×3 deterministically (93.5–94.6 s),
-  and role-image artifacts built from the repaired pins (self-contained,
-  digests in FINDINGS); the release bundle is rebuilt from the corrected
-  HEAD. 21 stays UNTICKED — bundle verification receipt and
-  packet/journey/release (operator-machine) gates remain. Exact receipts
-  in [findings](FINDINGS_CHECKLIST.md).
+  the re-forged `upgrade` gate PASS ×3 deterministically (93.5–94.6 s).
+  All local-software lanes then passed at `44ccdc8`: `images` 19/0/0,
+  `capture`, `bundle` ×2 (persistent release bundle built and verified
+  at `.cache/bundle/sparring-range-appliance`, revision `44ccdc89588d`,
+  shipped-image boot from the bundle, tamper refused), plus
+  selection/db/agent/install/fast green. 21 stays UNTICKED — its
+  operator-machine gates (packet/journey/release, installed
+  systemd/Strata/nested-KVM) remain pending. Exact receipts in
+  [findings](FINDINGS_CHECKLIST.md).
 - [ ] **21 — Upgrade and qualified integrated release.**
   [Plan](../.openchamber/plans/21-upgrade-and-integrated-release.md). Supported preserving
   in-place upgrade, corrected fresh-install bundle, changed-artifact rebuilds,

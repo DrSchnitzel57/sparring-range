@@ -2,7 +2,7 @@
 
 ## Steps
 - [x] Inventory installed overrides and define versioned upgrade/preflight contract.
-- [ ] Deliver preserving in-place upgrade and corrected fresh-install bundle.
+- [x] Deliver preserving in-place upgrade and corrected fresh-install bundle.
 - [ ] Prove real install/upgrade/failure/recovery sequences and integrated journeys.
 - [ ] Reconcile full backlog, evidence, manuals and handoff.
 - [ ] Tick 21 only on its gates; update roadmap/architecture and retained manual status.

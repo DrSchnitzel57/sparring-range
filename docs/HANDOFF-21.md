@@ -56,10 +56,15 @@ env SR_PG_ADMIN_URL=... SR_REQUIRE_DB=1 PYTHONDONTWRITEBYTECODE=1 \
 * Round-1 upgrade-gate PASSes at `2ba575e` are RETRACTED as proof (the
   reviewer reproduced the journal-in-backup defect there; the gate has
   since been re-forged and re-run against the fix).
-* `bundle` gate against final artifacts: the release bundle must be
-  rebuilt from the corrected HEAD so its `upgrade` contract matches the
-  fixed engine; receipt recorded when built (role images: see the
-  artifact receipt in FINDINGS — built from the same role inputs).
+* THE release bundle is now built and gate-verified at
+  `.cache/bundle/sparring-range-appliance` (4.5 GiB, BUNDLE_VERSION 2,
+  revision `44ccdc89588d`): digests, candidate binding (242 runtime
+  files), operator-manifest render, shipped-image boot from the bundle,
+  tamper refusal — `images` 19/0/0 and `capture` PASS the same day.
+  Exact receipts and digests in `docs/FINDINGS_CHECKLIST.md`.
+* Operator reproduction needs disk-backed `TMPDIR` (this host's `/tmp`
+  is RAM-backed); the bundle images carry SYNTHETIC attacker keys
+  (supervised-practice identity, stated in FINDINGS).
 * `packet` (root+nft), `journey`/`release`, installed systemd/Strata/
   nested-KVM: operator-machine gates, fail closed by design, never
   simulated here.
