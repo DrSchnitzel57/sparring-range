@@ -194,26 +194,32 @@ def _chain_between(versions_dir: pathlib.Path, from_heads: set[str],
 # the release payload (a built bundle directory)                              #
 # --------------------------------------------------------------------------- #
 
-#: The REQUIRED runtime contract (milestone 21 review round 3): a payload
-#: that hashes whatever its own untrusted manifest lists still lets the
-#: manifest itself omit requirements.lock and survive. These paths are the
-#: trusted release definition — the dependency lock, the migration chain,
-#: the unit entrypoints and the frontend's locked inputs MUST be in the
-#: inventory AND on disk, or the payload cannot provision what the units
-#: execute. Missing pieces are refused before anything qualifies.
+#: The REQUIRED runtime contract (milestone 21 review rounds 3–4): a
+#: payload that hashes whatever its own untrusted manifest lists lets the
+#: manifest itself omit pieces of the release. This is the TRUSTED release
+#: definition DERIVED FROM THE EXECUTION SURFACE — the dependency/build
+#: locks, the alembic script contract (alembic refuses to run a chain
+#: without its env.py), every module a shipped unit's ExecStart executes,
+#: and the upgrade/installer engine those units' lifecycle depends on.
+#: Migrations additionally require a NON-EMPTY versions tree carrying the
+#: contract head (checked in verify()). These are what the services must
+#: be able to RUN after activation; missing pieces are refused before
+#: anything qualifies — never self-declared by the artifact being verified.
 REQUIRED_RUNTIME_CONTRACT = (
     "requirements.lock",
-    "alembic.ini",
     "pyproject.toml",
+    "web/package.json",
+    "web/package-lock.json",
+    "alembic.ini",
+    "srplatform/db/migrations/env.py",
+    "srplatform/api/app.py",
+    "srplatform/worker_supervisor.py",
+    "srplatform/bastion/proxy.py",
+    "infra/appliance/brokerd.py",
     "deploy/upgrade.py",
     "deploy/appliance.py",
     "deploy/appliance_services.py",
     "deploy/bundle.py",
-    "srplatform/api/app.py",
-    "srplatform/model_jobs.py",
-    "infra/appliance/brokerd.py",
-    "web/package.json",
-    "web/package-lock.json",
 )
 
 
@@ -922,7 +928,7 @@ def forward_migrate(python_exe: str, db_url: str, cwd: str,
         # authorized channel).
         from deploy import appliance_services as svc
         env = {k: v for k, v in os.environ.items()
-               if k not in svc.OWNER_ONLY_ENV}
+               if k not in svc.credential_env_names()}
         env["POSTGRES_URL_OWNER"] = db_url
         return subprocess.run(
             [python_exe, "-m", "alembic", *args],
@@ -1153,44 +1159,97 @@ def bootstrap_secret_store(layout, *, run, db_url: str,
             "file_written": wrote}
 
 
-def wait_for_readiness(m, *, web_url: str, timeout_s: int = 120,
-                       probe_timeout_s: int = 5) -> dict:
-    """Bounded REAL-HTTP readiness after restart (round-3 finding 3):
-    ``active`` is not ``ready``. ``GET {internal_url}/readyz`` must answer
-    200 — that endpoint proves the schema head equals the INSTALLED
-    package's head, the database answers, and the runner is available —
-    and the frontend must answer 200 at its bound address. A service that
-    is restarted but broken (or migrated to a head the release does not
-    ship) fails HERE, with the fence still up and no version stamp, and
-    the attempt stays resumable. Only ever probes the manifest's own local
-    endpoints; nothing remote."""
+def _readiness_probe(url: str, *, timeout_s: int,
+                     expected_head: str) -> tuple[bool, str]:
+    """ONE readiness probe over a REAL socket. Returns (ready, reason).
+
+    This is the round-4 contract: HTTP status alone is NOT readiness —
+    the installed /readyz answers 200 with {"ready": false, "issues":
+    [...]} when the schema is behind or the controller is lost, and a
+    stale old process answers 200/ready:true about a head the release
+    never installed. So the parsed JSON must satisfy: ``ready`` is the
+    exact boolean True, ``issues`` is an EMPTY list, and
+    ``migration_version`` equals the expected schema head. Anything
+    malformed — non-JSON, HTML, missing fields, non-bool truthiness, a
+    contradictory ready-with-issues — is NOT ready (fail closed)."""
+    import json as _json
     import urllib.error
     import urllib.request
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+            if resp.status != 200:
+                return False, f"HTTP {resp.status}"
+            body = resp.read(65536)
+    except urllib.error.HTTPError as exc:
+        return False, f"HTTP {exc.code}"
+    except Exception as exc:  # connection refused, timeout, …
+        return False, f"{type(exc).__name__}: {str(exc)[:120]}"
+    try:
+        doc = _json.loads(body.decode("utf-8"))
+    except Exception:
+        return False, "readiness body is not JSON (fail closed)"
+    if not isinstance(doc, dict):
+        return False, "readiness body is not a JSON object (fail closed)"
+    if doc.get("ready") is not True:
+        return False, (f"ready is {doc.get('ready')!r}, not the exact "
+                       "boolean true")
+    issues = doc.get("issues")
+    if not isinstance(issues, list) or issues:
+        return False, f"issues not empty: {str(issues)[:200]}"
+    version = doc.get("migration_version")
+    if version != expected_head:
+        return False, (f"migration_version {version!r} is not the expected "
+                       f"{expected_head!r} (stale or migrating process?)")
+    return True, "ready"
+
+
+def wait_for_readiness(m, *, web_url: str, expected_head: str,
+                       timeout_s: int = 120, probe_timeout_s: int = 5) -> dict:
+    """Bounded REAL-HTTP readiness after restart (round-3 finding 3,
+    round-4 finding 1): ``active`` is not ``ready``, and an HTTP 200 is
+    not ``ready`` either — the parsed production readiness contract must
+    hold (see ``_readiness_probe``). ``GET {internal_url}/readyz`` must
+    report ready with no issues and the payload's schema head; the
+    frontend must answer 200 at its bound address. A service that is
+    restarted but unhealthy (schema behind, controller lost, stale old
+    process, malformed reporter) fails HERE, with the fence still up and
+    no version stamp, and the attempt stays resumable. Only ever probes
+    the manifest's own local endpoints; nothing remote."""
+    if not expected_head:
+        raise UpgradeError("readiness requires the expected schema head")
     targets = {
         "api": str(m.internal_url).rstrip("/") + "/readyz",
         "web": web_url,
     }
+    import urllib.request
+
+    def _web(url: str) -> tuple[bool, str]:
+        # the frontend has no JSON contract; a 200 with a body is the
+        # documented signal, anything else retries/fails closed
+        try:
+            with urllib.request.urlopen(url, timeout=probe_timeout_s) as r:
+                if r.status != 200 or not r.read(16):
+                    return False, f"HTTP {r.status} or empty body"
+                return True, "ready"
+        except Exception as exc:  # noqa: BLE001
+            return False, f"{type(exc).__name__}: {str(exc)[:120]}"
+
     deadline = time.monotonic() + timeout_s
     last: dict[str, str] = {}
     while True:
         for name, url in targets.items():
-            try:
-                with urllib.request.urlopen(url,
-                                            timeout=probe_timeout_s) as resp:
-                    last[name] = f"HTTP {resp.status}"
-                    if resp.status != 200:
-                        break
-            except urllib.error.HTTPError as exc:
-                last[name] = f"HTTP {exc.code}"
-                break
-            except Exception as exc:  # connection refused, timeout, …
-                last[name] = f"{type(exc).__name__}: {str(exc)[:120]}"
+            ok, why = (_readiness_probe(url, timeout_s=probe_timeout_s,
+                                        expected_head=expected_head)
+                       if name == "api" else _web(url))
+            last[name] = why
+            if not ok:
                 break
         else:
-            return last  # every endpoint answered 200
+            return last  # every endpoint satisfied its contract
         if time.monotonic() >= deadline:
             raise UpgradeError(
-                "services never became READY within the bounded wait: "
+                "services never satisfied the readiness CONTRACT within "
+                "the bounded wait: "
                 + "; ".join(f"{k} {v}" for k, v in sorted(last.items()))
                 + " — the fence stays UP and NO version stamp was written; "
                 "the attempt remains resumable")
@@ -1204,7 +1263,8 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
                 skip_provision: bool = False, skip_frontend: bool = False,
                 allow_fresh_install: bool = False,
                 maintenance_flag: pathlib.Path | None = None,
-                web_url: str = "http://127.0.0.1:3000/") -> dict:
+                web_url: str = "http://127.0.0.1:3000/",
+                credential_env_names: tuple[str, ...] = ()) -> dict:
     """Run (or resume) one preserving upgrade.  Returns the journal.
 
     Ordering is part of the safety contract (milestone 21 review):
@@ -1215,6 +1275,13 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
     stamp is written only after the restart and readiness verification
     succeeded; and the fence drops only on a COMPLETED attempt."""
     python_exe = python_exe or default_migration_python(layout)
+    if credential_env_names:
+        # register the SELECTED credential variable name(s) so EVERY
+        # unauthorized child env is scrubbed by name, not pattern
+        # (round-4 finding 3); the one authorized migration channel
+        # passes its URL explicitly, never by ambient inheritance.
+        from deploy import appliance_services as _svc0
+        _svc0.note_credential_env_names(credential_env_names)
     journal = Journal(layout.etc)
     fence = (pathlib.Path(maintenance_flag) if maintenance_flag
              else pathlib.Path(layout.state) / "maintenance")
@@ -1262,17 +1329,11 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
     if dry_run:
         return {"dry_run": True, "preflight": report}
 
-    # --- admission fence: NEW work is refused from here until the attempt
-    # --- completes (or the operator resolves it); durable quiescence was
-    # --- proven in preflight with the fence contract understood, and the
-    # --- fence closes any race window between check and mutation.
-    fence.parent.mkdir(parents=True, exist_ok=True)
-    fence.write_text(json.dumps({
-        "reason": "milestone-21 preserving upgrade in progress",
-        "started_at": _now(),
-        "note": "new work refused with 503; existing callbacks allowed"},
-        indent=2, sort_keys=True) + "\n")
-
+    # --- attempt + admission fence ---------------------------------------- #
+    # NEW work is refused from here until the attempt completes (or the
+    # operator resolves it). The fence records WHICH attempt owns it
+    # (round-4 finding 2): a config restore of one attempt may never
+    # release a fence that belongs to a different, unresolved obligation.
     if prior is not None:
         attempt = resume
     else:
@@ -1284,6 +1345,13 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
             "manifest_sha256": hashlib.sha256(
                 json.dumps(m.raw, sort_keys=True).encode()).hexdigest(),
         })
+    fence.parent.mkdir(parents=True, exist_ok=True)
+    fence.write_text(json.dumps({
+        "reason": "milestone-21 preserving upgrade in progress",
+        "started_at": _now(),
+        "attempt": attempt,
+        "note": "new work refused with 503; terminality callbacks allowed"},
+        indent=2, sort_keys=True) + "\n")
 
     att = journal.path(attempt)
     os.chmod(att, 0o700)
@@ -1352,7 +1420,7 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
                 # ambient owner URL is scrubbed (round-3 finding 5; the
                 # gate's pg_dump wrapper proves nothing else arrives)
                 child_env = {k: v for k, v in os.environ.items()
-                             if k not in _svc.OWNER_ONLY_ENV}
+                             if k not in _svc.credential_env_names()}
                 child_env.update(cred.env())
                 proc = subprocess.run(
                     argv, capture_output=True, text=True, timeout=3600,
@@ -1603,9 +1671,12 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
                         " — rewritten units would not be honored")
                 restarted = checked_service_restart(runner, intended)
             if "restart_pending_operator" not in out:
-                # active != ready: bounded REAL HTTP probes must pass
-                # before the stamp or the fence-clear.
-                wait_for_readiness(m, web_url=web_url)
+                # active != ready: the bounded REAL HTTP probes must
+                # satisfy the parsed readiness contract (ready true, no
+                # issues, THIS payload's schema head) before the stamp or
+                # the fence-clear.
+                wait_for_readiness(m, web_url=web_url,
+                                   expected_head=report["to_head"])
             out["restarted"] = restarted
         except UpgradeError as exc:
             journal.mark(attempt, "restart", "failed", error=str(exc)[-400:])
@@ -1626,8 +1697,21 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
     result = journal.finish(attempt, finished_at=_now(),
                             revision=payload.revision,
                             migration_head=report["to_head"]) | out
-    # only a COMPLETED attempt releases the admission fence
-    fence.unlink(missing_ok=True)
+    # Only a COMPLETED attempt releases the admission fence — and only
+    # when the fence is OWNED by this attempt (round-4 finding 2): a
+    # fence replaced by another identity (manual or another attempt) is
+    # reported, never silently cleared by our completion.
+    if fence.is_file():
+        try:
+            fence_owner = json.loads(fence.read_text()).get("attempt")
+        except Exception:  # noqa: BLE001 — unreadable identity: fail closed
+            fence_owner = "unreadable"
+        if fence_owner in (None, attempt):
+            fence.unlink(missing_ok=True)
+        else:
+            result["maintenance_fence"] = (
+                f"RETAINED after completion — fence belongs to attempt "
+                f"{fence_owner!r}, not {attempt}; resolve it explicitly")
     return result
 
 
@@ -1664,17 +1748,46 @@ def restore_config(m, layout, attempt: str, *, dry_run: bool = False) -> dict:
     # completed; this is a plain config rollback) clears a fence.
     fence = pathlib.Path(layout.state) / "maintenance"
     unfinished = data.get("status") != "done"
+    # Round-4 finding 2: the decision is made against the WHOLE appliance,
+    # not just the selected attempt. A config restore may release the
+    # admission fence ONLY when (a) this attempt is done, (b) NO other
+    # attempt is unresolved, and (c) the fence (if present) is verifiably
+    # owned by THIS attempt. An unknown/foreign/unreadable fence identity
+    # is kept: releasing it would open admission while an obligation the
+    # restore knows nothing about still exists, and the restore can never
+    # roll back the runtime or the forward-only schema.
     fence_cleared = False
+    other = sorted(set(journal.in_progress()) - {attempt})
     if dry_run:
         fence_state = "unchanged (dry run)"
     elif unfinished:
         fence_state = ("KEPT — attempt unfinished; complete it with "
                        f"--resume {attempt} or resolve it explicitly "
                        "before admission resumes")
-    else:
-        fence.unlink(missing_ok=True)
+    elif other:
+        fence_state = (f"KEPT — attempt(s) {other} are still unresolved; "
+                       "restoring a completed attempt's config may never "
+                       "release an admission fence that protects work "
+                       "those attempts own")
+    elif not fence.is_file():
         fence_cleared = True
-        fence_state = "cleared (attempt already done)"
+        fence_state = "cleared (attempt done, no other obligation, no fence present)"
+    else:
+        try:
+            fence_owner = json.loads(fence.read_text()).get("attempt")
+        except Exception:  # noqa: BLE001 — unknown identity: fail closed
+            fence_owner = "unreadable"
+        if fence_owner == attempt:
+            fence.unlink(missing_ok=True)
+            fence_cleared = True
+            fence_state = "cleared (attempt done and fence was its own)"
+        elif fence_owner in (None, "unreadable"):
+            fence_state = ("KEPT — fence identity is missing/unreadable; "
+                           "an explicit verified recovery must release it, "
+                           "never a config restore")
+        else:
+            fence_state = (f"KEPT — fence belongs to attempt {fence_owner!r}, "
+                           "not the restored one")
     entry["restores"][-1]["maintenance_fence"] = fence_state
     journal._save(attempt, entry)
     return {"restored": len(restored), "dry_run": dry_run,

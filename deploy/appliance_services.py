@@ -449,6 +449,26 @@ OWNER_ONLY_ENV = frozenset({
     "PGPASSFILE",
 })
 
+#: Round-4 finding 3: ``--db-url-env`` accepts ANY variable name, so the
+#: fixed set above is not enough. The CLI registers the SELECTED name(s)
+#: for this process before any privileged child spawns; every scrubber
+#: uses ``credential_env_names()`` — an explicit, name-specific list, not
+#: a pattern guess. Append-only and process-local (the deploy CLI is
+#: single-purpose; nothing here runs inside the API).
+_CREDENTIAL_ENV_EXTRA: set[str] = set()
+
+
+def note_credential_env_names(names) -> None:
+    for n in names:
+        if n:
+            if not n.replace("_", "").isalnum() or n[0].isdigit():
+                raise RuntimeError(f"not an environment variable name: {n!r}")
+            _CREDENTIAL_ENV_EXTRA.add(n)
+
+
+def credential_env_names() -> frozenset[str]:
+    return OWNER_ONLY_ENV | frozenset(_CREDENTIAL_ENV_EXTRA)
+
 
 def _read_env_file(path: pathlib.Path) -> dict[str, str]:
     values: dict[str, str] = {}

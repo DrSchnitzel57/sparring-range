@@ -487,10 +487,23 @@ for u in sr-appliance-broker.service sr-api.service sr-appliance-ingest.service 
          sr-worker-supervisor.service sr-bastion.service sr-web.service; do
   systemctl is-active --quiet "$u" || { echo "NOT ACTIVE: $u"; exit 1; }
 done
-journalctl -u sr-api.service -u sr-web.service -u sr-appliance-broker.service \
-  -b --since "-15 min" | grep -iE "error|refus" \
-  && echo "error/refusal lines found — investigate before admitting members" \
-  || echo "clean boot"
+# Retrieval is separate from interpretation: if journalctl itself fails,
+# that is NOT a clean boot. Output goes to a private file (removed after)
+# so the pipeline's exit status is trustworthy.
+jlog=$(mktemp) || { echo "cannot create private log file"; exit 1; }
+trap 'rm -f "$jlog"' EXIT
+if journalctl -u sr-api.service -u sr-web.service \
+     -u sr-appliance-broker.service -b --since "-15 min" \
+     >"$jlog" 2>/dev/null; then
+  if grep -iqE "error|refus" "$jlog"; then
+    echo "error/refusal lines found — investigate before admitting members"
+  else
+    echo "clean boot"
+  fi
+else
+  echo "JOURNAL RETRIEVAL FAILED — status unknown, this is NOT a clean boot"
+  exit 1
+fi
 ```
 
 Then log in with a real member account (existing password, not a reset)

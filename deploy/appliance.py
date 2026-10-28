@@ -831,7 +831,7 @@ class Runner:
         # children. A call site that authorizes a channel passes it
         # explicitly in env= — explicit wins, ambient never.
         environ = {**{k: v for k, v in os.environ.items()
-                      if k not in svc.OWNER_ONLY_ENV},
+                      if k not in svc.credential_env_names()},
                    **(env or {})}
         # subprocess requires every environment value to be a str; an
         # IPv4Address (live find 2026-10-23: HTTPS_IP reached the TLS
@@ -1810,7 +1810,9 @@ def main(argv: list[str] | None = None) -> int:
                 allow_fresh_install=args.allow_fresh_install,
                 maintenance_flag=(pathlib.Path(args.maintenance_flag)
                                   if args.maintenance_flag else None),
-                web_url=args.web_url)
+                web_url=args.web_url,
+                credential_env_names=(
+                    tuple(n for n in (args.db_url_env,) if n)))
             print(json.dumps(out, indent=2, sort_keys=True))
         elif args.cmd == "firstboot":
             lay = _layout(args)
