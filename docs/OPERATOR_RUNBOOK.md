@@ -193,6 +193,11 @@ sudo ./deploy/hand_off.sh \
     --model-base-url http://127.0.0.1:8001/v1 --model-alias my-model
 ```
 
+The script carries the sealed-tree hygiene itself: every bundle-Python
+call runs with `-B` and `PYTHONDONTWRITEBYTECODE=1` exported for its
+children, so the hand-off never writes bytecode into the sealed bundle
+(§7's contract holds without the operator exporting anything).
+
 The steps it performs, if you prefer to run them by hand:
 
 ```bash

@@ -336,6 +336,26 @@ def test_the_appliance_cli_accepts_the_hand_off_flags():
                 "does not accept it")
 
 
+def test_the_hand_off_launches_its_python_bytecode_safe():
+    """Round-6 (sealed tree): the hand-off runs the bundle's own CLI INSIDE
+    the unpacked bundle, whose `verify` refuses any unlisted file — one
+    stray __pycache__/*.pyc breaks every later verify. Every direct
+    interpreter call must carry -B, and the script must export
+    PYTHONDONTWRITEBYTECODE=1 so child interpreters stay suppressed too
+    (-B is not inherited; the runner passes the environment through)."""
+    script = (REPO / "deploy" / "hand_off.sh").read_text()
+    assert "export PYTHONDONTWRITEBYTECODE=1" in script.splitlines(), (
+        "the hand-off does not suppress bytecode for child interpreters")
+    calls = [line for line in script.splitlines()
+             if '"$PYTHON"' in line and not line.lstrip().startswith("#")]
+    assert len(calls) == 5, (
+        "expected the five payload-tree interpreter calls "
+        f"(verify/manifest/plan/apply/firstboot), found {len(calls)}: {calls}")
+    for line in calls:
+        assert '"$PYTHON" -B ' in line, (
+            f"payload-tree call missing -B: {line.strip()}")
+
+
 def test_each_service_environment_holds_only_its_own_credentials():
     """The bastion never sees the supervisor capability; the API never sees
     the bastion's dial key."""

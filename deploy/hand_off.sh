@@ -39,6 +39,16 @@ DB_HOST="127.0.0.1"
 DB_NAME="sparring_range"
 MEMBER_USER="member"
 PYTHON="${SR_PYTHON:-python3}"
+# Sealed-tree hygiene (same contract as docs/OPERATOR_RUNBOOK.md §7): every
+# python call below executes the BUNDLE's own CLI from inside the unpacked
+# bundle, and `bundle.py verify` refuses ANY file the manifest does not
+# list — one stray __pycache__/*.pyc would fail every later verify. So the
+# whole hand-off runs bytecode-suppressed: explicit -B on each direct call
+# AND PYTHONDONTWRITEBYTECODE=1 exported for every child interpreter
+# (the -B flag is not inherited; appliance.py's runner passes this
+# environment through to its children). This only suppresses bytecode
+# caching — no installation behaviour changes.
+export PYTHONDONTWRITEBYTECODE=1
 
 usage() {
   sed -n '2,21p' "$0" >&2
@@ -78,7 +88,7 @@ cd "$BUNDLE"
 say() { printf '\n== %s\n' "$*"; }
 
 say "1/7 verify the bundle"
-"$PYTHON" deploy/bundle.py verify .
+"$PYTHON" -B deploy/bundle.py verify .
 
 say "2/7 prepare the operator's keys and secrets"
 install -d -m 0750 "$KEYS_DIR"
@@ -141,7 +151,7 @@ say "3/7 render the operator manifest from the bundle"
 if [ -z "$INGEST_URL" ]; then
   INGEST_URL="https://$(printf '%s' "$RANGE_CIDR" | awk -F. '{print $1"."$2"."$3".1"}'):8443"
 fi
-"$PYTHON" deploy/bundle.py manifest . --out "$MANIFEST" \
+"$PYTHON" -B deploy/bundle.py manifest . --out "$MANIFEST" \
   --installation-id "$INSTALLATION_ID" \
   --lan-address "$LAN_ADDRESS" --range-cidr "$RANGE_CIDR" \
   --public-url "$PUBLIC_URL" --internal-url "$INTERNAL_URL" \
@@ -155,14 +165,14 @@ fi
   --model-base-url "$MODEL_BASE_URL" --model-alias "$MODEL_ALIAS"
 
 say "4/7 plan the installation"
-"$PYTHON" deploy/appliance.py plan --manifest "$MANIFEST"
+"$PYTHON" -B deploy/appliance.py plan --manifest "$MANIFEST"
 
 say "5/7 apply the installation"
 if [ "$(id -u)" != "0" ]; then
   echo "apply needs root: re-run this step with sudo" >&2
   exit 1
 fi
-"$PYTHON" deploy/appliance.py apply --manifest "$MANIFEST"
+"$PYTHON" -B deploy/appliance.py apply --manifest "$MANIFEST"
 
 say "6/7 apply the range network and start the services"
 cat <<'NOTE'
@@ -185,7 +195,7 @@ say "7/7 check that the appliance came up"
 # firstboot before that window is therefore PENDING, not broken: the
 # installer distinguishes the two (exit 3 = pending manual steps) and this
 # hand-off reports it honestly instead of a confusing all-FAIL report.
-"$PYTHON" deploy/appliance.py firstboot --manifest "$MANIFEST" && FB=0 || FB=$?
+"$PYTHON" -B deploy/appliance.py firstboot --manifest "$MANIFEST" && FB=0 || FB=$?
 
 if [ "$FB" = "3" ]; then
   printf '\nfirstboot is PENDING: complete the step-6 manual sequence first,\n'
