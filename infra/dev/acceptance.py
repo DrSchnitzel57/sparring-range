@@ -2089,6 +2089,13 @@ def check_upgrade() -> None:
                                 "POSTGRES_URL"))}
     env.update(DB_APP_ROLE="sr_uapp", DB_SECRET_ROLE="sr_usecret")
     env["NPM_CONFIG_FUND"] = "false"
+    # round-6 launch contract: the release bundle is a SEALED tree and
+    # its verify refuses unlisted files (including __pycache__/*.pyc).
+    # Operators run every payload-tree command with -B; the gate mirrors
+    # that for the CLI parent via the env (the engine's own alembic
+    # child carries the guard in code), and scenario A asserts the
+    # payload stayed byte-clean through the real upgrade.
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     # round-4 finding 3: the su-shim installer channel appends its own
     # environment KEYS here; scenario A asserts the SELECTED credential
     # name never appears (private to the CLI + authorized channels only).
@@ -2568,6 +2575,20 @@ def check_upgrade() -> None:
         ok("the SELECTED credential name never reached an installer-channel "
            f"child ({len(set(captured))} distinct env keys captured, zero "
            "credential names)")
+
+        # round-6: the real upgrade left the SEALED payload tree byte-
+        # clean — no unlisted bytecode from the CLI, alembic, or any
+        # other child (that pollution used to break the operator's next
+        # `bundle.py verify`).
+        strays = sorted({str(p.relative_to(payload))
+                         for p in payload.rglob("__pycache__")} |
+                        {str(p.relative_to(payload))
+                         for p in payload.rglob("*.pyc")})
+        if strays:
+            fail("real upgrade leaves ZERO bytecode in the sealed payload",
+                 str(strays[:6]))
+        ok("sealed payload tree byte-clean after the real upgrade "
+           "(no __pycache__/*.pyc anywhere)")
 
         r2 = upgrade_cli(rootA, manifest_path, url)
         if r2.returncode != 0 or '"no_op"' not in r2.stdout:

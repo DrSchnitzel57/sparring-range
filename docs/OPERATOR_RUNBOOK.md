@@ -197,14 +197,15 @@ The steps it performs, if you prefer to run them by hand:
 
 ```bash
 cd /opt/sparring-range            # the unpacked bundle
-python3 deploy/bundle.py verify .            # the bundle root
+python3 -B deploy/bundle.py verify .         # the bundle root (-B: never write
+                                         # bytecode into the sealed tree)
 mkdir -p /etc/sparring-range/keys
 ssh-keygen -t ed25519 -N '' -f /etc/sparring-range/keys/runner
 ssh-keygen -t ed25519 -N '' -f /etc/sparring-range/keys/bastion
 ssh-keygen -t ed25519 -N '' -f /etc/sparring-range/keys/mgmt
 install -m 0600 /dev/null /etc/sparring-range/secrets/model.key   # then put the model key in it
 
-python3 deploy/bundle.py manifest . --out /etc/sparring-range/appliance-manifest.json \
+python3 -B deploy/bundle.py manifest . --out /etc/sparring-range/appliance-manifest.json \
     --installation-id "$(uuidgen)" \
     --lan-address 10.10.10.50 --range-cidr 10.66.0.0/24 \
     --public-url https://sr.example.edu \
@@ -248,9 +249,9 @@ writes both files for you. If the owner URL ever appears in
 ### 3. Plan, then apply
 
 ```bash
-python3 deploy/appliance.py plan  --manifest /etc/sparring-range/appliance-manifest.json
-python3 deploy/appliance.py apply --manifest /etc/sparring-range/appliance-manifest.json --dry-run
-python3 deploy/appliance.py apply --manifest /etc/sparring-range/appliance-manifest.json
+python3 -B deploy/appliance.py plan  --manifest /etc/sparring-range/appliance-manifest.json
+python3 -B deploy/appliance.py apply --manifest /etc/sparring-range/appliance-manifest.json --dry-run
+python3 -B deploy/appliance.py apply --manifest /etc/sparring-range/appliance-manifest.json
 ```
 
 `apply` installs the pinned native packages, builds the locked venv, creates
@@ -331,7 +332,7 @@ refused and no member could authenticate), so an empty file fails loudly.
 ### 5. Check the appliance came up
 
 ```bash
-python3 deploy/appliance.py firstboot --manifest /etc/sparring-range/appliance-manifest.json
+python3 -B deploy/appliance.py firstboot --manifest /etc/sparring-range/appliance-manifest.json
 ```
 
 Every check is named and reported; the command exits non-zero if any of them
@@ -344,9 +345,9 @@ the remediation hint — that is "not your window yet", not a failure; exit
 
 ### 6. Prove it, and keep the evidence
 
-* `python3 deploy/appliance.py status` — units, the broker's inventory.
-* `python3 deploy/appliance.py doctor` — prerequisites and the KVM state.
-* `python3 deploy/appliance.py recovery status` — the broker's obligations;
+* `python3 -B deploy/appliance.py status` — units, the broker's inventory.
+* `python3 -B deploy/appliance.py doctor` — prerequisites and the KVM state.
+* `python3 -B deploy/appliance.py recovery status` — the broker's obligations;
   an unresolved obligation keeps the range reserved and is released only
   with fresh evidence (`recovery resolve --obligation N --evidence FILE`).
 * The rehearsal itself (fresh launch → member SSH → sudo → reconnect →
@@ -396,16 +397,25 @@ world-readable in the process table for the whole upgrade:
 # checkout carries no dependency guarantee for deploy/appliance.py's
 # imports (sqlalchemy, alembic). This is the exact tested contract:
 # locked python + payload-tree deploy/appliance.py + cwd = payload tree.
+#
+# EVERY python below carries -B: the unpacked bundle is a SEALED tree and
+# its `verify` refuses ANY unlisted file — a single __pycache__/*.pyc
+# written into /srv/sr-release makes every later verify fail. (-B is not
+# inherited by child interpreters; the one engine child that executes
+# payload-tree source — the migration runner loading this bundle's own
+# alembic env.py/versions — carries the same bytecode guard in code, so
+# the seal holds by construction. If bytecode ever appears anyway, the
+# verify refusing it is the guard working: never loosen verification.)
 cd /srv/sr-release
-/opt/sparring-range/.venv/bin/python -c \
+/opt/sparring-range/.venv/bin/python -B -c \
   'import deploy.appliance, deploy.upgrade, sqlalchemy, alembic'  # bootstrap check
-/opt/sparring-range/.venv/bin/python deploy/bundle.py verify /srv/sr-release  # must pass
+/opt/sparring-range/.venv/bin/python -B deploy/bundle.py verify /srv/sr-release  # must pass
 # Inline environment assignment: invisible to ps, never in journal or logs.
 # Both URL forms are accepted — the installer's SQLAlchemy format
 # (postgresql+psycopg2://…) and plain postgresql:// — and the credential
 # transport is validated during --dry-run, before any mutation.
 SR_PG_UPGRADE_URL='postgresql+psycopg2://sr_owner:…@127.0.0.1:5432/spranging' \
-  /opt/sparring-range/.venv/bin/python deploy/appliance.py upgrade \
+  /opt/sparring-range/.venv/bin/python -B deploy/appliance.py upgrade \
   --manifest /etc/sparring-range/appliance-manifest.json \
   --payload /srv/sr-release --dry-run
 ```
@@ -468,13 +478,20 @@ Failure and interruption discipline:
   silently resumes on half-verified bytes) and writes NO version stamp —
   the appliance never claims a release that never ran. Fix the cause,
   then resume exactly that attempt: `... upgrade ... --resume
-  <ATTEMPT>`; only unfinished stages re-run. A new upgrade is refused
+  <ATTEMPT>` (same venv interpreter, `-B`, and cwd as the block above);
+  only unfinished stages re-run. A new upgrade is refused
   while any attempt is in progress; never delete a journal to unstick it.
+* Operator actions are SERIALIZED: run one upgrade CLI at a time, and
+  never edit, remove, swap, or "re-own" the maintenance fence while an
+  upgrade CLI run is live — the engine treats any such ownership change
+  as a reason to BLOCK (no stamp, no unfence, resumable). If you must
+  intervene, wait for the run to exit (it always fails closed), then
+  resolve the fence explicitly and resume.
 * Migration state after an interruption is PROVEN from the database
   before continuing; an unrecognizable position stops with the attempt
   retained rather than guessing a schema.
 * Config-only rollback: `... upgrade --manifest ... --restore-config
-  <ATTEMPT>` validates the COMPLETE backup BEFORE writing (a corrupt
+  <ATTEMPT>` (same venv, `-B`, cwd) validates the COMPLETE backup BEFORE writing (a corrupt
   late file changes ZERO files), restores original modes/ownership and
   issues NO service action — you start services yourself, so a restore
   can never resume an engagement. While the attempt is UNFINISHED the
@@ -500,8 +517,8 @@ Post-upgrade checks before admitting members again (all operator-side,
 on the installed appliance — none of this runs from the upgrade):
 
 ```bash
-/opt/sparring-range/.venv/bin/python /opt/sparring-range/deploy/appliance.py doctor --manifest /etc/sparring-range/appliance-manifest.json
-/opt/sparring-range/.venv/bin/python /opt/sparring-range/deploy/appliance.py verify --manifest /etc/sparring-range/appliance-manifest.json
+/opt/sparring-range/.venv/bin/python -B /opt/sparring-range/deploy/appliance.py doctor --manifest /etc/sparring-range/appliance-manifest.json
+/opt/sparring-range/.venv/bin/python -B /opt/sparring-range/deploy/appliance.py verify --manifest /etc/sparring-range/appliance-manifest.json
 ls /var/lib/sparring-range/maintenance            # must NOT exist
 cat /etc/sparring-range/release-version.json      # the new revision
 curl -fsS https://<appliance>/readyz

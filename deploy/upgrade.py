@@ -929,6 +929,15 @@ def forward_migrate(python_exe: str, db_url: str, cwd: str,
         from deploy import appliance_services as svc
         env = {k: v for k, v in os.environ.items()
                if k not in svc.credential_env_names()}
+        # Round 6 (operator-launch audit): alembic loads the PAYLOAD's
+        # env.py and version scripts through importlib's source loader,
+        # which writes __pycache__/*.pyc NEXT TO those files (probed:
+        # alembic.util.pyfiles.load_module_py honors only the interpreter
+        # startup flags). Without this guard a real upgrade stamps
+        # unlisted bytecode into the sealed release tree and the
+        # operator's later `bundle.py verify` fails. The seal is kept by
+        # construction, not by loosening verification.
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["POSTGRES_URL_OWNER"] = db_url
         return subprocess.run(
             [python_exe, "-m", "alembic", *args],
