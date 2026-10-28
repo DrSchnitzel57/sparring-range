@@ -825,7 +825,14 @@ class Runner:
               flush=True)
         if self.dry_run:
             return subprocess.CompletedProcess(list(cmd), 0, "", "")
-        environ = {**os.environ, **(env or {})}
+        from deploy import appliance_services as svc
+        # Round-3 finding 5: owner/secret database URLs inherited from the
+        # invoking shell NEVER reach provisioning, build or native helper
+        # children. A call site that authorizes a channel passes it
+        # explicitly in env= — explicit wins, ambient never.
+        environ = {**{k: v for k, v in os.environ.items()
+                      if k not in svc.OWNER_ONLY_ENV},
+                   **(env or {})}
         # subprocess requires every environment value to be a str; an
         # IPv4Address (live find 2026-10-23: HTTPS_IP reached the TLS
         # bootstrap as a real IPv4Address and died inside subprocess with a
@@ -1710,6 +1717,11 @@ def main(argv: list[str] | None = None) -> int:
     pu.add_argument("--maintenance-flag", help="path of the admission-fence "
                                                "file (default: "
                                                "<state-dir>/maintenance)")
+    pu.add_argument("--web-url", default="http://127.0.0.1:3000/",
+                    help="frontend readiness URL probed after restart "
+                         "(default: the sr-web bind address); the version "
+                         "stamp is written only after this AND /readyz "
+                         "answer 200")
     pu.add_argument("--dry-run", action="store_true")
 
     pr = sub.add_parser("recovery")
@@ -1797,7 +1809,8 @@ def main(argv: list[str] | None = None) -> int:
                 skip_frontend=args.skip_frontend,
                 allow_fresh_install=args.allow_fresh_install,
                 maintenance_flag=(pathlib.Path(args.maintenance_flag)
-                                  if args.maintenance_flag else None))
+                                  if args.maintenance_flag else None),
+                web_url=args.web_url)
             print(json.dumps(out, indent=2, sort_keys=True))
         elif args.cmd == "firstboot":
             lay = _layout(args)

@@ -194,6 +194,29 @@ def _chain_between(versions_dir: pathlib.Path, from_heads: set[str],
 # the release payload (a built bundle directory)                              #
 # --------------------------------------------------------------------------- #
 
+#: The REQUIRED runtime contract (milestone 21 review round 3): a payload
+#: that hashes whatever its own untrusted manifest lists still lets the
+#: manifest itself omit requirements.lock and survive. These paths are the
+#: trusted release definition — the dependency lock, the migration chain,
+#: the unit entrypoints and the frontend's locked inputs MUST be in the
+#: inventory AND on disk, or the payload cannot provision what the units
+#: execute. Missing pieces are refused before anything qualifies.
+REQUIRED_RUNTIME_CONTRACT = (
+    "requirements.lock",
+    "alembic.ini",
+    "pyproject.toml",
+    "deploy/upgrade.py",
+    "deploy/appliance.py",
+    "deploy/appliance_services.py",
+    "deploy/bundle.py",
+    "srplatform/api/app.py",
+    "srplatform/model_jobs.py",
+    "infra/appliance/brokerd.py",
+    "web/package.json",
+    "web/package-lock.json",
+)
+
+
 class ReleasePayload:
     """The upgrade payload: a bundle directory with MANIFEST.json digests."""
 
@@ -269,7 +292,20 @@ class ReleasePayload:
         the contract, path safety and duplicates are ALL checked here;
         nothing about the appliance is consulted first."""
         problems = self._verify_contract()
-        for rel in self.manifest.get("files") or {}:
+        inventory = self.manifest.get("files") or {}
+        for rel in REQUIRED_RUNTIME_CONTRACT:
+            if rel not in inventory:
+                problems.append(
+                    f"required runtime contract entry missing from the "
+                    f"manifest inventory: {rel}")
+        migs = sorted((self.dir / "srplatform/db/migrations/versions")
+                      .glob("0*.py")) if (
+                          self.dir / "srplatform/db/migrations/versions"
+                      ).is_dir() else []
+        if not migs:
+            problems.append("required runtime contract: the payload carries "
+                            "no migration versions")
+        for rel in inventory:
             p = pathlib.Path(rel)
             if p.is_absolute() or ".." in p.parts:
                 problems.append(f"manifest path escapes the payload: {rel}")
@@ -529,22 +565,38 @@ class _OwnerCredential:
     child's argv carries."""
 
     def __init__(self, db_url: str):
-        from urllib.parse import unquote, urlsplit
-        parts = urlsplit(db_url)
-        if parts.scheme not in ("postgresql", "postgres") or not parts.hostname \
-                or not parts.path.strip("/"):
+        # Parsed with SQLAlchemy's URL parser — the SAME one the installed
+        # application uses — because the installer writes driver-qualified
+        # URLs (``postgresql+psycopg2://`` in deploy/hand_off.sh) and a
+        # naive urlsplit treats "+psycopg2" as part of the scheme and
+        # refuses the installer's own format (round-3 finding 5). Going
+        # through the real parser also means percent-encoded passwords and
+        # database names, and bracketed IPv6 hosts, decode exactly the way
+        # the application's children will send them to the pg tools.
+        from sqlalchemy.engine import make_url
+        try:
+            url = make_url(db_url)
+        except Exception as exc:  # noqa: BLE001 — naming a URL is not a leak
+            raise UpgradeError(
+                "the owner database URL is not parseable as a database URL: "
+                f"{type(exc).__name__}: {str(exc)[:160]}") from exc
+        if not url.drivername or \
+                url.drivername.split("+", 1)[0] not in ("postgresql",
+                                                        "postgres") \
+                or not url.host or not url.database:
             raise UpgradeError(
                 "the owner database URL must be a TCP postgresql URL "
-                "(scheme, host and database): the preserving backup cannot "
-                "pass credentials by any other channel")
-        if parts.password is None or parts.username is None:
+                "(scheme, host and database; a driver suffix like "
+                "+psycopg2 is accepted): the preserving backup cannot pass "
+                "credentials by any other channel")
+        if url.password is None or url.username is None:
             raise UpgradeError("the owner URL carries no username:password — "
                                "the PGPASSFILE channel needs both")
-        self.host = parts.hostname
-        self.port = str(parts.port or 5432)
-        self.database = unquote(parts.path.lstrip("/"))
-        self.user = unquote(parts.username)
-        self._password = unquote(parts.password)
+        self.host = url.host
+        self.port = str(url.port or 5432)
+        self.database = url.database
+        self.user = url.username
+        self._password = url.password
         self._passfile: pathlib.Path | None = None
 
     def env(self) -> dict[str, str]:
@@ -664,9 +716,29 @@ def quiescence_problems(m, *, db_url: str | None = None,
     return problems
 
 
+#: The durable-authority tables and the FIRST schema revision each was
+#: introduced by (milestone-21 review round 3, finding 1): on a real old
+#: appliance (deployed 52ae355 = migrations through 0019) the newer tables
+#: legitimately do not exist yet — their ABSENCE below the introducing
+#: revision is truth, not an unreadable unknown. At or above it, a missing
+#: table IS a problem.
+_DURABLE_TABLE_SINCE: dict[str, str] = {
+    "runs": "0001",
+    "run_operations": "0008",
+    "model_jobs": "0020",
+}
+
+
+def _revision_number(revision: str) -> int:
+    digits = "".join(ch for ch in revision if ch.isdigit())
+    return int(digits) if digits else -1
+
+
 def durable_work_problems(db_url: str | None) -> list[str]:
     """Authoritative in-database checks: runs, model jobs (including
-    cessation_unknown obligations) and dispatched-command inventory."""
+    cessation_unknown obligations) and dispatched-command inventory —
+    TABLE-AWARE, so the check tells the truth against an old schema
+    (0018/0019 deployments) as well as the current one."""
     if not db_url:
         return []  # the caller already refuses an upgrade without a DB URL
     from sqlalchemy import create_engine, text
@@ -674,30 +746,54 @@ def durable_work_problems(db_url: str | None) -> list[str]:
     problems = []
     try:
         with engine.connect() as conn:
-            for status, count in conn.execute(text(
-                    "SELECT status, count(*) FROM runs WHERE status = ANY(:s) "
-                    "GROUP BY status"), {"s": list(OPEN_RUN_STATUSES)}):
-                problems.append(f"{count} run(s) in durable state "
-                                f"{status!r}")
-            for state, count in conn.execute(text(
-                    "SELECT state, count(*) FROM model_jobs WHERE state = "
-                    "ANY(:s) GROUP BY state"),
-                                              {"s": list(
-                                                  OPEN_MODEL_JOB_STATES)}):
-                if state == "cessation_unknown":
-                    problems.append(
-                        f"{count} model job(s) in cessation_unknown — work "
-                        "whose provider-side cessation is UNCONFIRMED; an "
-                        "upgrade may never restart over it (record a "
-                        "bounded resolution first)")
-                else:
-                    problems.append(f"{count} model job(s) {state}")
-            n = conn.execute(text(
-                "SELECT count(*) FROM run_operations WHERE state IN "
-                "('active', 'cancel-unknown')")).scalar()
-            if n:
-                problems.append(f"{n} dispatched command operation(s) whose "
-                                "cessation is not confirmed")
+            version = conn.execute(text(
+                "SELECT max(version_num) FROM alembic_version")).scalar()
+            if not version:
+                problems.append("alembic_version carries no revision: the "
+                                "schema state is unknown, and unknown is "
+                                "not quiesced")
+                return problems
+            present = {row for (row,) in conn.execute(text(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'public'"))}
+            for table, since in _DURABLE_TABLE_SINCE.items():
+                if table not in present:
+                    if _revision_number(version) >= _revision_number(since):
+                        problems.append(
+                            f"schema at {version} should carry {table} "
+                            f"(introduced at {since}) but the table is "
+                            "missing: durable work cannot be proven")
+                    # else: this authority did not exist at the deployed
+                    # revision — nothing durable can live in it
+            if "runs" in present:
+                for status, count in conn.execute(text(
+                        "SELECT status, count(*) FROM runs WHERE status = "
+                        "ANY(:s) GROUP BY status"),
+                                                  {"s": list(
+                                                      OPEN_RUN_STATUSES)}):
+                    problems.append(f"{count} run(s) in durable state "
+                                    f"{status!r}")
+            if "model_jobs" in present:
+                for state, count in conn.execute(text(
+                        "SELECT state, count(*) FROM model_jobs WHERE state"
+                        " = ANY(:s) GROUP BY state"),
+                                                  {"s": list(
+                                                      OPEN_MODEL_JOB_STATES)}):
+                    if state == "cessation_unknown":
+                        problems.append(
+                            f"{count} model job(s) in cessation_unknown — "
+                            "work whose provider-side cessation is "
+                            "UNCONFIRMED; an upgrade may never restart over "
+                            "it (record a bounded resolution first)")
+                    else:
+                        problems.append(f"{count} model job(s) {state}")
+            if "run_operations" in present:
+                n = conn.execute(text(
+                    "SELECT count(*) FROM run_operations WHERE state IN "
+                    "('active', 'cancel-unknown')")).scalar()
+                if n:
+                    problems.append(f"{n} dispatched command operation(s) "
+                                    "whose cessation is not confirmed")
     except Exception as exc:  # noqa: BLE001 — unknown state is NOT quiesced
         problems.append(f"durable-work database check failed unreadably: "
                         f"{type(exc).__name__}: {str(exc)[:160]}")
@@ -722,6 +818,16 @@ def preflight(m, layout, payload: ReleasePayload, *, db_url: str | None,
         # before any qualification, quiesce or no-op question is answered
         raise UpgradeError(f"upgrade payload refused before any other check: "
                            f"{exc}") from exc
+    # --- credential transport is validated HERE (round-3 finding 5): the
+    # --- installer's own driver-qualified SQLAlchemy URLs must parse, and
+    # --- an unreadable URL must never first surface mid-backup, after an
+    # --- attempt and fence exist. Parsing creates no passfile; close() is
+    # --- belt-and-braces for a future constructor side effect.
+    if db_url:
+        try:
+            _OwnerCredential(db_url).close()
+        except UpgradeError as exc:
+            problems.append(f"owner credential channel refused: {exc}")
     if not layout.receipt.is_file():
         problems.append(f"no installation receipt at {layout.receipt}: "
                         "nothing to upgrade (run apply first)")
@@ -747,8 +853,8 @@ def preflight(m, layout, payload: ReleasePayload, *, db_url: str | None,
                 "never reverse or guess a schema")
     else:
         problems.append("no database owner URL (POSTGRES_URL_OWNER or "
-                        "--db-url): a preserving upgrade must be able to "
-                        "verify and back the schema up")
+                        "--db-url-env NAME): a preserving upgrade must be "
+                        "able to verify and back the schema up")
 
     if payload_head and live_heads == {payload_head} and current.get(
             "revision") == payload.revision:
@@ -809,7 +915,15 @@ def forward_migrate(python_exe: str, db_url: str, cwd: str,
     guard. No row is deleted or modified; any other failure propagates.
     """
     def _alembic(*args: str) -> subprocess.CompletedProcess:
-        env = {**os.environ, "POSTGRES_URL_OWNER": db_url}
+        # Alembic gets the owner URL through ITS explicit channel only:
+        # ambient copies of the owner/secret variables (the operator's
+        # exported upgrade URL) are stripped from the child env
+        # (round-3 finding 5 — no secret travels further than its one
+        # authorized channel).
+        from deploy import appliance_services as svc
+        env = {k: v for k, v in os.environ.items()
+               if k not in svc.OWNER_ONLY_ENV}
+        env["POSTGRES_URL_OWNER"] = db_url
         return subprocess.run(
             [python_exe, "-m", "alembic", *args],
             cwd=cwd, env=env, capture_output=True, text=True, timeout=1800)
@@ -914,6 +1028,41 @@ def provision_release(layout, payload: ReleasePayload, *, run,
     return receipt
 
 
+#: The services that ADMIT new durable work (round-3 finding 2). The fence
+#: file teaches only NEW code — the barrier that an OLD running API cannot
+#: bypass is that the admitting services are STOPPED and verifiably
+#: inactive while the authoritative durable re-check happens. Bastion
+#: sessions, ingest and the broker are not admission paths and stay up;
+#: nothing remote is ever "ceased" by killing a local process — obligations
+#: whose cessation is unconfirmed are refused BEFORE this stage runs.
+ADMISSION_UNITS = ("sr-worker-supervisor.service", "sr-api.service")
+
+
+def stop_admission_services(run) -> list[str]:
+    """Stop and PROVE-inactive the admission services (checked, like every
+    other service command). Raises with everything left exactly as found
+    plus the fence UP if a unit cannot be proven stopped."""
+    stopped: list[str] = []
+    for unit in ADMISSION_UNITS:
+        proc = run("systemctl", "stop", unit, check=False)
+        if proc.returncode != 0:
+            raise UpgradeError(
+                f"cannot quiesce for upgrade: systemctl stop {unit} exited "
+                f"{proc.returncode}: {(proc.stdout + proc.stderr)[-200:]} — "
+                "the upgrade barrier requires the admitting service "
+                "stopped; nothing was mutated")
+        state = run("systemctl", "is-active", unit, check=False)
+        status = (state.stdout or "").strip()
+        if status != "inactive":
+            raise UpgradeError(
+                f"{unit} is not verifiably stopped (is-active reported "
+                f"{status!r}): an admitting service in another state may "
+                "still hold or create durable work — refusing to upgrade "
+                "under it rather than guessing")
+        stopped.append(unit)
+    return stopped
+
+
 def checked_service_restart(run, units: list[str], *,
                             timeout_checks: int = 60) -> list[str]:
     """Restart through the real service manager and VERIFY: every unit is
@@ -940,13 +1089,122 @@ def checked_service_restart(run, units: list[str], *,
     return list(units)
 
 
+def bootstrap_secret_store(layout, *, run, db_url: str,
+                           secret_role: str | None = None) -> dict:
+    """Installer-equivalent, API-only credential-store bootstrap (round-3
+    finding 1): a deployed 0019 appliance has neither the ``sr_secret``
+    role nor ``secrets/db-secret.env``, and migration 0021 GRANTs to that
+    role — an upgrade over that schema would die mid-chain otherwise.
+
+    SAME identity, same minimal boundary, same file contract as a fresh
+    install (this mirrors ``ensure_database``'s secret section exactly):
+    an existing file or explicit ``SR_PG_SECRET_URL`` is honored (the role
+    is created FROM it), a password is generated and ALTERed ONLY when
+    this step generated it — an existing file is never re-keyed. Role
+    creation goes through the local postgres superuser socket exactly like
+    install: no operator SQL, no re-keying of app/owner roles, no other
+    file touched, nothing logged."""
+    from deploy import appliance_services as svc
+    secret_role = secret_role or os.environ.get("DB_SECRET_ROLE",
+                                                "sr_secret")
+    etc = pathlib.Path(layout.etc)
+    secret_env = etc / "secrets" / "db-secret.env"
+    owner = _OwnerCredential(db_url)
+    try:
+        existing = os.environ.get("SR_PG_SECRET_URL") or \
+            svc._read_env_file(secret_env).get("SR_PG_SECRET_URL")
+        generated = existing is None
+        if generated:
+            import secrets as _secrets
+            url = (f"postgresql+psycopg2://{secret_role}:"
+                   f"{_secrets.token_urlsafe(24)}@"
+                   f"{owner.host}:{owner.port}/{owner.database}")
+        else:
+            url = existing
+        parsed = svc._parse_url(url)
+        if parsed["user"] != secret_role:
+            raise UpgradeError(
+                f"the provided secret-store URL uses role "
+                f"{parsed['user']!r} but migrations grant to "
+                f"{secret_role!r} (DB_SECRET_ROLE); refusing to create a "
+                "role the release will not use")
+        svc._psql_as_postgres(run, [
+            f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE "
+            f"rolname='{parsed['user']}') THEN CREATE ROLE "
+            f"{parsed['user']} LOGIN PASSWORD '{parsed['password']}';"
+            f"ELSIF '{str(generated).lower()}' = 'true' THEN "
+            f"ALTER ROLE {parsed['user']} WITH LOGIN "
+            f"PASSWORD '{parsed['password']}'; END IF; END $$;"])
+        secret_env.parent.mkdir(parents=True, exist_ok=True)
+        wrote = False
+        if not secret_env.exists():
+            svc._write_secret_file_securely(secret_env, (
+                "# API-only identity for the provider-credential table "
+                "ONLY\n# (migration 0021 onward). systemd loads it as "
+                "root for\n# sr-api.service ONLY — no service USER may "
+                "read this file:\n# 0600 root:root, delivered through "
+                "the unit environment.\n"
+                f"SR_PG_SECRET_URL={url}\n"))
+            wrote = True
+        svc._verify_secret_file(secret_env, sandboxed=layout.sandboxed)
+    finally:
+        owner.close()
+    return {"secret_role": secret_role, "generated": generated,
+            "file_written": wrote}
+
+
+def wait_for_readiness(m, *, web_url: str, timeout_s: int = 120,
+                       probe_timeout_s: int = 5) -> dict:
+    """Bounded REAL-HTTP readiness after restart (round-3 finding 3):
+    ``active`` is not ``ready``. ``GET {internal_url}/readyz`` must answer
+    200 — that endpoint proves the schema head equals the INSTALLED
+    package's head, the database answers, and the runner is available —
+    and the frontend must answer 200 at its bound address. A service that
+    is restarted but broken (or migrated to a head the release does not
+    ship) fails HERE, with the fence still up and no version stamp, and
+    the attempt stays resumable. Only ever probes the manifest's own local
+    endpoints; nothing remote."""
+    import urllib.error
+    import urllib.request
+    targets = {
+        "api": str(m.internal_url).rstrip("/") + "/readyz",
+        "web": web_url,
+    }
+    deadline = time.monotonic() + timeout_s
+    last: dict[str, str] = {}
+    while True:
+        for name, url in targets.items():
+            try:
+                with urllib.request.urlopen(url,
+                                            timeout=probe_timeout_s) as resp:
+                    last[name] = f"HTTP {resp.status}"
+                    if resp.status != 200:
+                        break
+            except urllib.error.HTTPError as exc:
+                last[name] = f"HTTP {exc.code}"
+                break
+            except Exception as exc:  # connection refused, timeout, …
+                last[name] = f"{type(exc).__name__}: {str(exc)[:120]}"
+                break
+        else:
+            return last  # every endpoint answered 200
+        if time.monotonic() >= deadline:
+            raise UpgradeError(
+                "services never became READY within the bounded wait: "
+                + "; ".join(f"{k} {v}" for k, v in sorted(last.items()))
+                + " — the fence stays UP and NO version stamp was written; "
+                "the attempt remains resumable")
+        time.sleep(2)
+
+
 def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
                 resume: str | None = None, dry_run: bool = False,
                 python_exe: str | None = None, pg_dump_bin: str | None = None,
                 provision_hook=None, restart_hook=None,
                 skip_provision: bool = False, skip_frontend: bool = False,
                 allow_fresh_install: bool = False,
-                maintenance_flag: pathlib.Path | None = None) -> dict:
+                maintenance_flag: pathlib.Path | None = None,
+                web_url: str = "http://127.0.0.1:3000/") -> dict:
     """Run (or resume) one preserving upgrade.  Returns the journal.
 
     Ordering is part of the safety contract (milestone 21 review):
@@ -1031,24 +1289,49 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
     os.chmod(att, 0o700)
     out: dict = {"attempt": attempt}
 
+    # ---------------- stage: quiesce (the barrier OLD code cannot ignore) -- #
+    # The fence file refuses new work in NEW code; the admission services
+    # being STOPPED is what an old, fence-unaware running process cannot
+    # bypass. The authoritative durable re-check then runs while nothing
+    # that admits work is alive — a request that entered before the fence
+    # is caught here, before any mutation, instead of being upgraded under.
+    if journal.load(attempt)["stages"].get("quiesce", {}).get("status") \
+            != "done":
+        journal.mark(attempt, "quiesce", "started",
+                     units=list(ADMISSION_UNITS))
+        from deploy.appliance import Runner as _R
+        from deploy.appliance import sandbox_manifest as _sm
+        try:
+            if shutil.which("systemctl"):
+                stop_admission_services(_R(dry_run=False))
+                quiesced_note = ("stopped and proven inactive: "
+                                 + ", ".join(ADMISSION_UNITS))
+            else:
+                # sandbox without a service manager (or its double): the
+                # durable re-check below is still authoritative, and the
+                # scope of this proof is recorded, never inflated.
+                quiesced_note = ("no service manager present: sandbox "
+                                 "scope, durable re-check only")
+            raced = quiescence_problems(_sm(m, pathlib.Path(layout.root)),
+                                        db_url=db_url,
+                                        allow_fresh_install=allow_fresh_install)
+            if raced:
+                raise UpgradeError(
+                    "upgrade refused after the fence went up and admission "
+                    f"services were stopped — work exists at the boundary: "
+                    f"{raced}. Attempt {attempt} stays in progress with "
+                    "the fence UP and the admission services left STOPPED "
+                    "(fail closed, nothing resumes itself); resolve the "
+                    f"work and `--resume {attempt}`")
+        except UpgradeError as exc:
+            journal.mark(attempt, "quiesce", "refused",
+                         error=str(exc)[-400:])
+            raise
+        journal.mark(attempt, "quiesce", "done", note=quiesced_note)
+    out["quiesced"] = True
+
     # ---------------- stage: backup (private, durable manifest) ----------- #
     if journal.load(attempt)["stages"].get("backup", {}).get("status") != "done":
-        # quiescence is RE-proved under the fence: work admitted in the
-        # race window between the preflight check and the fence is caught
-        # here, before any mutation, instead of being upgraded under.
-        from deploy.appliance import sandbox_manifest as _sm
-        raced = quiescence_problems(_sm(m, pathlib.Path(layout.root)),
-                                    db_url=db_url,
-                                    allow_fresh_install=allow_fresh_install)
-        if raced:
-            journal.mark(attempt, "backup", "refused",
-                         error="admission fence re-check found work: "
-                               + "; ".join(raced)[:400])
-            raise UpgradeError(
-                "upgrade refused after the admission fence went up — new "
-                f"work appeared at the boundary: {raced}. Attempt {attempt} "
-                "stays in progress with the fence UP; drain the work and "
-                f"`--resume {attempt}`")
         journal.mark(attempt, "backup", "started")
         config_backup = att / "config-backup"
         # the journal tree is NEVER config: it is mutable attempt state
@@ -1060,13 +1343,20 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
             {"taken_at": _now(), "files": files}, indent=2, sort_keys=True))
         dump = att / "database.dump"
         if not (dump.is_file() and dump.stat().st_size > 0):
+            from deploy import appliance_services as _svc
             with _OwnerCredential(db_url) as cred:
                 argv = (_resolve_dump_binary(pg_dump_bin)
                         + _dump_endpoint_args(cred)
                         + ["--format=custom", "--file", str(dump) + ".part"])
+                # the dump child gets endpoint argv + PGPASSFILE only: the
+                # ambient owner URL is scrubbed (round-3 finding 5; the
+                # gate's pg_dump wrapper proves nothing else arrives)
+                child_env = {k: v for k, v in os.environ.items()
+                             if k not in _svc.OWNER_ONLY_ENV}
+                child_env.update(cred.env())
                 proc = subprocess.run(
                     argv, capture_output=True, text=True, timeout=3600,
-                    env={**os.environ, **cred.env()})
+                    env=child_env)
             if proc.returncode != 0 or not (dump.with_suffix(".dump.part").is_file()):
                 journal.mark(attempt, "backup", "failed",
                              error=f"pg_dump exit {proc.returncode}: "
@@ -1170,6 +1460,27 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
         journal.mark(attempt, "provision", "done",
                      web="skipped" if skip_frontend else "built")
     out["provisioned"] = "skipped" if skip_provision else "done"
+
+    # ---------------- stage: secret-store bootstrap (round-3 finding 1) ---- #
+    # 0021 GRANTs to sr_secret; a real 0019 appliance has never seen that
+    # role. The installer provisions it at install; an upgrade brings the
+    # SAME identity up through the SAME channel BEFORE the chain steps on
+    # it — no operator SQL, no manual prereq, idempotent on resume.
+    if journal.load(attempt)["stages"].get("secrets", {}).get("status") \
+            != "done":
+        journal.mark(attempt, "secrets", "started")
+        from deploy.appliance import Runner as _Rs
+        try:
+            secret_receipt = bootstrap_secret_store(
+                layout, run=_Rs(dry_run=False), db_url=db_url)
+        except (UpgradeError, RuntimeError) as exc:
+            journal.mark(attempt, "secrets", "failed",
+                         error=str(exc)[-400:])
+            raise UpgradeError(
+                f"credential-store bootstrap failed before migration: {exc} "
+                "— attempt stays in progress with the fence up; the "
+                "database was not migrated") from exc
+        journal.mark(attempt, "secrets", "done", **secret_receipt)
 
     # ---------------- stage: forward migrations (proven, never guessed) --- #
     stages = journal.load(attempt)["stages"]
@@ -1277,9 +1588,25 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
                 restarted = intended
                 out["restart_pending_operator"] = intended
             else:
-                restarted = checked_service_restart(
-                    _Runner(dry_run=False), intended)
-                out["restarted"] = restarted
+                runner = _Runner(dry_run=False)
+                # finalize may have rewritten unit files: the manager must
+                # reload its units BEFORE a restart honors them (round-3
+                # finding 3) — a stale in-memory unit restarting the old
+                # ExecStart looked active while the release never ran.
+                reload_proc = runner("systemctl", "daemon-reload",
+                                     check=False)
+                if reload_proc.returncode != 0:
+                    raise UpgradeError(
+                        "systemctl daemon-reload exited "
+                        f"{reload_proc.returncode}: "
+                        f"{(reload_proc.stdout + reload_proc.stderr)[-200:]}"
+                        " — rewritten units would not be honored")
+                restarted = checked_service_restart(runner, intended)
+            if "restart_pending_operator" not in out:
+                # active != ready: bounded REAL HTTP probes must pass
+                # before the stamp or the fence-clear.
+                wait_for_readiness(m, web_url=web_url)
+            out["restarted"] = restarted
         except UpgradeError as exc:
             journal.mark(attempt, "restart", "failed", error=str(exc)[-400:])
             raise UpgradeError(
@@ -1326,16 +1653,35 @@ def restore_config(m, layout, attempt: str, *, dry_run: bool = False) -> dict:
     entry.setdefault("restores", []).append(
         {"at": _now(), "files": len(restored), "dry_run": dry_run,
          "note": "config-only restore; no service was started or resumed"})
-    # A config rollback is the operator's chosen resolution for a failed
-    # attempt: the admission fence is dropped as part of the rollback (it
-    # is mutable state, not config), and the attempt journal records that
-    # the restore happened. NO service command is issued either way.
+    # Round-3 finding 4: a config rollback is NOT admission recovery. A
+    # restoring config does not roll back the activated runtime, the
+    # forward-only schema, or the admission services this attempt stopped
+    # — so for an UNFINISHED attempt the fence stays UP: the box keeps
+    # refusing new work until the operator completes it (`--resume`) or
+    # resolves it through a verified recovery. Dropping the fence here
+    # would un-pause an appliance whose runtime state is, by construction,
+    # unknown. Only a restore against an already-DONE attempt (the attempt
+    # completed; this is a plain config rollback) clears a fence.
     fence = pathlib.Path(layout.state) / "maintenance"
-    if not dry_run:
+    unfinished = data.get("status") != "done"
+    fence_cleared = False
+    if dry_run:
+        fence_state = "unchanged (dry run)"
+    elif unfinished:
+        fence_state = ("KEPT — attempt unfinished; complete it with "
+                       f"--resume {attempt} or resolve it explicitly "
+                       "before admission resumes")
+    else:
         fence.unlink(missing_ok=True)
+        fence_cleared = True
+        fence_state = "cleared (attempt already done)"
+    entry["restores"][-1]["maintenance_fence"] = fence_state
     journal._save(attempt, entry)
     return {"restored": len(restored), "dry_run": dry_run,
             "service_actions": [], "attempt": attempt,
-            "maintenance_fence_cleared": not dry_run,
-            "operator_next_step": "review config, then start services "
-                                  "yourself; nothing was started or resumed"}
+            "maintenance_fence": fence_state,
+            "maintenance_fence_cleared": fence_cleared,
+            "operator_next_step": "review config; for an unfinished attempt"
+                                  " the fence REMAINS and admission stays "
+                                  "refused — resume the attempt or resolve "
+                                  "it; nothing was started or resumed"}

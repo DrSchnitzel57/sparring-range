@@ -126,7 +126,34 @@ _FENCE_EXEMPT_PATHS = frozenset({
     "/auth/login", "/auth/logout", "/healthz", "/readyz",
     "/enroll/confirm", "/ingest/auditd",
 })
-_FENCE_EXEMPT_PREFIXES = ("/internal/",)  # worker/supervisor callbacks
+#: Round-3 finding 2: the blanket ``/internal/`` exemption was the hole —
+#: ``/internal/model/*`` ADMITS NEW durable generations (every completion
+#: callback queues the next turn/summary), and an OLD process that never
+#: knew the fence existed was serving those routes. Only TERMINALITY
+#: callbacks are exempt now; generation-admitting internal routes are
+#: refused like any other new work, and the transaction-boundary check in
+#: ``model_jobs.enqueue`` backstops even these exempt paths.
+_FENCE_EXEMPT_PREFIXES = (
+    "/internal/worker/",       # claim/assign/heartbeat/failed bookkeeping
+    "/internal/runs/",         # run terminality + dispatched-command ledger
+)
+
+
+from srplatform import model_jobs as _model_jobs_fence
+
+
+@app.exception_handler(_model_jobs_fence.AdmissionFenced)
+async def _admission_fenced_handler(request, exc):  # noqa: ARG001
+    """One mapping for the transaction-boundary refusal: wherever
+    ``model_jobs.enqueue``/``runs.start_run`` raise AdmissionFenced (an
+    exempt path that raced the fence, a re-entrancy), the client-visible
+    contract is the same 503 + Retry-After the middleware gives."""
+    return JSONResponse(
+        {"detail": "maintenance: the appliance is completing a "
+                   "preserving upgrade; new work is refused at the "
+                   "admission boundary",
+         "retry_after_s": 30},
+        status_code=503, headers={"Retry-After": "30"})
 _FENCE_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 

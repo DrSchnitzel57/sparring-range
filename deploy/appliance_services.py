@@ -434,6 +434,22 @@ def ensure_venv(run, *, prefix: pathlib.Path, source: pathlib.Path,
     return venv
 
 
+#: Environment variables that carry OWNER/SECRET database credentials.
+#: They are stripped from the INHERITED environment of every privileged
+#: child (round-3 finding 5: the owner URL an operator exported in the
+#: upgrade shell was inherited by venv-build, frontend and native helper
+#: processes for no reason). A call site that AUTHORIZES a channel passes
+#: the variable explicitly in ``env=`` — explicit wins, ambient never.
+OWNER_ONLY_ENV = frozenset({
+    "POSTGRES_URL_OWNER",
+    "SR_POSTGRES_URL_OWNER",
+    "SR_PG_UPGRADE_URL",
+    "SR_PG_SECRET_URL",
+    "PGPASSWORD",
+    "PGPASSFILE",
+})
+
+
 def _read_env_file(path: pathlib.Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.is_file():

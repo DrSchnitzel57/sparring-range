@@ -278,9 +278,26 @@ def start_run(db: Session, session_id, scenario_id: str) -> Run:
     if not ok:
         raise GateRefused(reasons)
 
-    run = Run(session_id=session_id, scenario_id=scenario_id, status="queued")
+    # transaction-boundary admission fence (milestone-21 review round 3):
+    # a NEW engagement is refused where the durable row is written, not
+    # only in whichever HTTP layer the calling process runs — an old or
+    # racing process cannot enqueue past this either. Fail closed on a
+    # stat error, exactly like the model-job admission boundary.
+    from srplatform.model_jobs import AdmissionFenced
+    import pathlib as _pl
     from srplatform.settings import get_settings
     s = get_settings()
+    try:
+        _fenced = _pl.Path(s.maintenance_flag).exists()
+    except OSError:
+        _fenced = True
+    if _fenced:
+        raise AdmissionFenced(
+            "maintenance: the appliance is completing a preserving "
+            "upgrade; new engagements are refused at the admission "
+            "boundary")
+
+    run = Run(session_id=session_id, scenario_id=scenario_id, status="queued")
     if s.worker_dispatch != "supervisor":
         # The credential belongs to the INSERT, not to a later UPDATE: the
         # durable commit must not leave a dirty ORM object (and its row lock)

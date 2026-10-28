@@ -35,6 +35,7 @@ terminal write are separate short transactions.
 """
 from __future__ import annotations
 
+import pathlib
 import threading
 import time
 import uuid
@@ -61,6 +62,16 @@ OBLIGATION_STATES = ("running", "cessation_unknown")
 
 class QueueFull(RuntimeError):
     """Visible overflow — bounded queue, never silent memory growth."""
+
+
+class AdmissionFenced(RuntimeError):
+    """The upgrade admission fence is UP: a NEW durable generation may
+    not be created (milestone-21 review round 3). The middleware refuses
+    fenced requests at the HTTP edge, but an OLD running process or a
+    request that entered before the fence existed must still meet the
+    barrier AT the transaction boundary — this check lives where the
+    database write happens, so the invariant is enforced by the store,
+    not by one process's awareness of the file."""
 
 
 class JobProblem(ValueError):
@@ -130,6 +141,21 @@ def enqueue(db, *, kind: str, priority: int, payload: dict,
     a job whose deadline elapsed before dispatch fails WITHOUT touching
     the provider. Overflow of the bounded queue is QueueFull."""
     from srplatform.settings import get_settings
+    s0 = get_settings()
+    # transaction-boundary admission fence (round-3 finding 2): the NEW
+    # generation is refused HERE, where the durable row is about to be
+    # written — not only in whichever middleware the calling process
+    # happens to run. A stat error is treated as fenced (fail closed).
+    try:
+        if pathlib.Path(s0.maintenance_flag).exists():
+            raise AdmissionFenced(
+                "maintenance: the appliance is completing a preserving "
+                "upgrade; new model work is refused at the admission "
+                "boundary")
+    except OSError:
+        raise AdmissionFenced(
+            "maintenance fence state unreadable; new model work is "
+            "refused (fail closed)")
     n = db.execute(text(
         "SELECT count(*) FROM model_jobs "
         "WHERE state IN ('queued','running')")).scalar_one()
