@@ -2089,6 +2089,11 @@ def check_upgrade() -> None:
                                 "POSTGRES_URL"))}
     env.update(DB_APP_ROLE="sr_uapp", DB_SECRET_ROLE="sr_usecret")
     env["NPM_CONFIG_FUND"] = "false"
+    # round-4 finding 3: the su-shim installer channel appends its own
+    # environment KEYS here; scenario A asserts the SELECTED credential
+    # name never appears (private to the CLI + authorized channels only).
+    su_env_capture = tmp / "su-env-capture.txt"
+    env["SR_ENV_CAPTURE"] = str(su_env_capture)
     port = None
     # a `systemctl` service DOUBLE on PATH: the engine's restart path is
     # the REAL checked one; only the service manager itself is a double.
@@ -2174,6 +2179,8 @@ def check_upgrade() -> None:
                 'CREATE DATABASE srupg3 OWNER postgres ENCODING \'UTF8\' '
                 "TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'",
                 'CREATE DATABASE srupg4 OWNER postgres ENCODING \'UTF8\' '
+                "TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'",
+                'CREATE DATABASE srupg5 OWNER postgres ENCODING \'UTF8\' '
                 "TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'"):
             r = docker("exec", cname, "psql", "-U", "postgres", "-v",
                        "ON_ERROR_STOP=1", "-c", stmt, timeout=60)
@@ -2188,7 +2195,14 @@ def check_upgrade() -> None:
         su_shim = fake_bin / "su"
         su_shim.write_text(
             "#!/usr/bin/env python3\n"
-            "import shlex, subprocess, sys\n"
+            "import os, shlex, subprocess, sys\n"
+            "# round-4 finding 3: capture the FULL environment keys this "
+            "authorized-channel child received, so the gate can prove the "
+            "SELECTED --db-url-env credential name never reached it.\n"
+            "cap = os.environ.get('SR_ENV_CAPTURE')\n"
+            "if cap:\n"
+            "    with open(cap, 'a') as fh:\n"
+            "        fh.write('\\n'.join(sorted(os.environ)) + '\\n')\n"
             "assert sys.argv[1] == 'postgres', sys.argv[1:2]\n"
             "cmd = shlex.split(sys.argv[3])\n"
             "assert cmd[0] == 'psql' and '-f' in cmd, cmd\n"
@@ -2201,29 +2215,47 @@ def check_upgrade() -> None:
             "sys.exit(p.returncode)\n")
         su_shim.chmod(0o755)
 
-        # ---- readiness fixtures (round-3 finding 3): REAL HTTP ---------- #
-        # /readyz answers 503 while the flag file exists (and 200 after it
-        # is removed — the exact old-service-503 -> ready transition the
-        # engine must wait for), and / answers 200 as the frontend. The
-        # manifest's internal URL points here, so the engine's bounded
-        # readiness wait runs over a real socket, never a mock hook.
+        # ---- readiness fixtures (round-4 finding 1): PRODUCTION SHAPES --- #
+        # The installed /readyz answers HTTP 200 with ready:false when the
+        # schema is behind — the engine must parse the JSON contract, and
+        # the gate reproduces the REAL shapes: 200/ready-false (old
+        # service mid-upgrade), 200/ready-true with a WRONG
+        # migration_version (stale old process), and the healthy
+        # production shape at the payload head. Fake 503s no longer model
+        # anything here.
         import http.server
         import threading
-        ready_flag = tmp / "readyz-not-ready"
+        ready_flag = tmp / "readyz-not-ready"       # 200 ready:false
+        badhead_flag = tmp / "readyz-wrong-head"    # 200 ready:true 0019
 
         class _ReadyHandler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
                 if self.path.startswith("/readyz"):
+                    code = 200
                     if ready_flag.exists():
-                        code, body = 503, (
-                            b'{"detail": "schema 0025 behind head 0027"}')
+                        body = json.dumps({
+                            "ready": False, "migration_version": "0019",
+                            "issues": ["schema 0019 behind head 0027"],
+                            "controller": {"ok": True, "detail": ""},
+                            "runner": {"ok": True, "detail": ""},
+                            "recordings_writable": True,
+                            "safety": {}}).encode()
+                    elif badhead_flag.exists():
+                        body = json.dumps({
+                            "ready": True, "migration_version": "0019",
+                            "issues": []}).encode()
                     else:
-                        code, body = 200, b'{"status": "ready"}'
+                        body = json.dumps({
+                            "ready": True, "migration_version": "0027",
+                            "issues": []}).encode()
+                    ctype = "application/json"
                 elif self.path == "/":
                     code, body = 200, b'{"page": "frontend"}'
+                    ctype = "application/json"
                 else:
-                    code, body = 404, b"{}"
+                    code, body, ctype = 404, b"{}", "application/json"
                 self.send_response(code)
+                self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -2241,6 +2273,7 @@ def check_upgrade() -> None:
         url2 = url.replace("/srupg", "/srupg2")
         url3 = url.replace("/srupg", "/srupg3")
         url4 = url.replace("/srupg", "/srupg4")
+        url5 = url.replace("/srupg", "/srupg5")
 
         # pg_dump WRAPPER around the real pg_dump INSIDE the fixture. NEW
         # credential contract: endpoint FLAGS in argv, password via
@@ -2256,7 +2289,7 @@ def check_upgrade() -> None:
             # round-3 finding 5: the OWNER URL must never travel in this
             # child's environment either — only endpoint argv + PGPASSFILE.
             "for k in POSTGRES_URL_OWNER SR_POSTGRES_URL_OWNER "
-            "SR_PG_UPGRADE_URL SR_PG_SECRET_URL; do\n"
+            "SR_PG_UPGRADE_URL SR_PG_SECRET_URL REVIEW_PRIVATE_OWNER; do\n"
             '  if [[ -n "${!k:-}" ]]; then\n'
             "    echo \"CHILD ENV SECRET LEAK: $k\" >&2; exit 48; fi\n"
             "done\n"
@@ -2336,16 +2369,22 @@ def check_upgrade() -> None:
             eng.dispose()
 
         def upgrade_cli(root, manifest, db_url, *, resume=None, extra=(),
-                        extra_env=None, fresh=True, allow_fail=False):
+                        extra_env=None, fresh=True, allow_fail=False,
+                        url_env=None):
             args = ["upgrade", "--manifest", str(manifest),
                     "--system-root", str(root), "--payload", str(payload),
                     "--pg-dump-bin", str(wrapper),
                     "--web-url", f"http://127.0.0.1:{ready_port}/", *extra]
+            if url_env:
+                # round-4 finding 3: --db-url-env accepts ANY name; the
+                # engine must register it and scrub it from every
+                # unauthorized child by that explicit name
+                args += ["--db-url-env", url_env]
             if fresh:
                 args += ["--allow-fresh-install"]
             if resume:
                 args += ["--resume", resume]
-            e = {"SR_PG_UPGRADE_URL": db_url}
+            e = {url_env or "SR_PG_UPGRADE_URL": db_url}
             if extra_env:
                 e.update(extra_env)
             r = cli(*args, extra_env=e, timeout=2400)
@@ -2386,7 +2425,13 @@ def check_upgrade() -> None:
         plain.write_text("plain\n")
         plain.chmod(0o644)
         ctl_log_a = tmp / "ctlA.log"
+        # round-4 finding 3 end-to-end: the owner URL travels in a
+        # CUSTOM-named variable (--db-url-env REVIEW_PRIVATE_OWNER). The
+        # pg_dump wrapper aborts with 48 if it ever sees that name in a
+        # child env, and the su-shim captures every installer-channel
+        # child's environment keys for the assertion after this block.
         r = upgrade_cli(rootA, manifest_path, url,
+                        url_env="REVIEW_PRIVATE_OWNER",
                         extra_env={"SR_FAKE_SYSTEMCTL_LOG": str(ctl_log_a)})
         outA = json.loads(r.stdout)
         stages = outA.get("stages", {})
@@ -2503,6 +2548,26 @@ def check_upgrade() -> None:
         ok("preserving upgrade (journal, fence, backups, provisioning, "
            "migrations, verified restart, users, keys, restore-listable "
            "dump)", f"attempt {outA['attempt']}, heads {sorted(heads)}")
+
+        # round-4 finding 3 (REAL child envs): the installer-channel child
+        # actually ran (the capture is not empty), and NONE of them saw an
+        # owner credential — the custom name the CLI was invoked with, the
+        # fixed names, or the PGPASSFILE channel.
+        captured = (su_env_capture.read_text().splitlines()
+                    if su_env_capture.is_file() else [])
+        if not captured:
+            fail("installer-channel environments were captured",
+                 "the su-shim never ran during scenario A")
+        forbidden = {"REVIEW_PRIVATE_OWNER", "SR_PG_UPGRADE_URL",
+                     "SR_POSTGRES_URL_OWNER", "POSTGRES_URL_OWNER",
+                     "SR_PG_SECRET_URL", "PGPASSFILE", "PGPASSWORD"}
+        leaked = sorted(forbidden.intersection(captured))
+        if leaked:
+            fail("named --db-url-env credential reached an unauthorized "
+                 "child environment", str(leaked))
+        ok("the SELECTED credential name never reached an installer-channel "
+           f"child ({len(set(captured))} distinct env keys captured, zero "
+           "credential names)")
 
         r2 = upgrade_cli(rootA, manifest_path, url)
         if r2.returncode != 0 or '"no_op"' not in r2.stdout:
@@ -2857,21 +2922,27 @@ def check_upgrade() -> None:
             fail("failed admission-stop mutated nothing", "dump exists")
         ok("admission services cannot be stopped -> refused, fenced, "
            "resumable, zero mutation")
-        ready_flag.touch()  # the old service answers 503 forever now
+        ready_flag.touch()  # the old service now answers 200 + ready:false
         rfail = upgrade_cli(rootR, manifest_path, url4, resume=jR["attempt"],
                             extra_env={"SR_FAKE_SYSTEMCTL_LOG":
                                        str(ctl_log_r)},
                             allow_fail=True)
-        if rfail.returncode == 0 or "READY" not in (rfail.stdout +
-                                                    rfail.stderr):
-            fail("active-but-503 services fail the readiness gate",
-                 (rfail.stdout + rfail.stderr)[-400:])
+        rfail_all = rfail.stdout + rfail.stderr
+        # round-4 finding 1: the fixture answers HTTP 200 (like the real
+        # /readyz) with ready:false + issues — the engine must PARSE the
+        # contract, and an HTTP-success status alone may never pass.
+        if rfail.returncode == 0 or "readiness CONTRACT" not in rfail_all \
+                or "ready is False" not in rfail_all:
+            fail("active-but-200-ready:false services fail the readiness "
+                 "CONTRACT gate (status alone is not readiness)",
+                 rfail_all[-400:])
         if (pathsR["etc"] / "release-version.json").exists():
             fail("readiness failure writes NO version stamp")
         if not (pathsR["state"] / "maintenance").is_file():
             fail("readiness failure keeps the fence")
-        ok("real HTTP 503 after restart: fence UP, no stamp, resumable "
-           "(the stamp is never advertised for an unhealthy release)")
+        ok("real 200/ready:false after restart: fence UP, no stamp, "
+           "resumable (the stamp is never advertised for an unhealthy "
+           "release)")
         ctl_before_restore = (ctl_log_r.read_text().splitlines()
                               if ctl_log_r.is_file() else [])
         rrR = cli("upgrade", "--manifest", str(manifest_path),
@@ -2893,7 +2964,28 @@ def check_upgrade() -> None:
                  str(ctl_after_restore[len(ctl_before_restore):])[:200])
         ok("restore-config on an unfinished attempt: config restored, "
            "fence KEPT, zero service actions")
-        ready_flag.unlink()  # operator fixed the service
+        # round-4 finding 1 (stale OLD process): HTTP 200, ready:true,
+        # issues empty — but reporting the OLD migration head. The parsed
+        # contract must refuse THIS too: a ready process at a head the
+        # payload did not install is not the upgraded release.
+        ready_flag.unlink()
+        badhead_flag.touch()
+        bfail = upgrade_cli(rootR, manifest_path, url4, resume=jR["attempt"],
+                            extra_env={"SR_FAKE_SYSTEMCTL_LOG":
+                                       str(ctl_log_r)},
+                            allow_fail=True)
+        if bfail.returncode == 0 or "migration_version" not in (
+                bfail.stdout + bfail.stderr):
+            fail("ready:true at the WRONG migration head (stale old "
+                 "process) fails the readiness CONTRACT gate",
+                 (bfail.stdout + bfail.stderr)[-400:])
+        if (pathsR["etc"] / "release-version.json").exists():
+            fail("wrong-head readiness failure writes NO version stamp")
+        if not (pathsR["state"] / "maintenance").is_file():
+            fail("wrong-head readiness failure keeps the fence")
+        ok("200/ready:true at the old head is refused — only the payload's "
+           "own schema head counts as ready")
+        badhead_flag.unlink()  # operator fixed the service
         rres = upgrade_cli(rootR, manifest_path, url4, resume=jR["attempt"],
                            extra_env={"SR_FAKE_SYSTEMCTL_LOG":
                                       str(ctl_log_r)})
@@ -2901,35 +2993,195 @@ def check_upgrade() -> None:
         if outR.get("status") != "done" or \
                 (pathsR["state"] / "maintenance").exists() or \
                 not (pathsR["etc"] / "release-version.json").is_file():
-            fail("resume once readyz turns ready completes, stamps and "
-                 "unfences", json.dumps(outR)[:300])
-        ok("503 -> ready transition: resume completes; fence only ever "
-           "drops on a READY, completed attempt")
+            fail("resume once readyz satisfies the contract completes, "
+                 "stamps and unfences", json.dumps(outR)[:300])
+        ok("unhealthy -> contract-satisfied transition: resume completes; "
+           "the fence only ever drops on a READY, completed attempt")
 
-        # ===== round-3 finding 6: the required runtime contract is not a
-        # ===== self-declared manifest list — dropping a required file from
-        # ===== BOTH disk and manifest is refused before any side effect.
-        inv = tmp / "missing-lock-bundle"
-        shutil.copytree(payload, inv)
-        (inv / "requirements.lock").unlink()
-        man_i = json.loads((inv / "MANIFEST.json").read_text())
-        man_i["files"].pop("requirements.lock")
-        (inv / "MANIFEST.json").write_text(json.dumps(man_i))
+        # ===== round-3 finding 6 / round-4 finding 4: the required runtime
+        # ===== contract is not a self-declared manifest list, and it is
+        # ===== derived from the EXECUTION SURFACE (locks, alembic env, the
+        # ===== ExecStart modules). Dropping any of them from BOTH disk and
+        # ===== manifest is refused before any side effect — env.py and
+        # ===== worker_supervisor.py used to pass verification.
         attempts_before_inv = len(list(
             (paths["etc"] / "upgrade").glob("*/journal.json")))
-        ineg = upgrade_cli(rootA, manifest_path, url,
-                           extra=("--dry-run", "--payload", str(inv)),
-                           allow_fail=True)
-        if ineg.returncode == 0 or "requirements.lock" not in (
-                ineg.stdout + ineg.stderr):
-            fail("payload omitting requirements.lock (manifest AND disk) "
-                 "refused", (ineg.stdout + ineg.stderr)[-400:])
-        if len(list((paths["etc"] / "upgrade").glob(
-                "*/journal.json"))) != attempts_before_inv or \
-                (paths["state"] / "maintenance").exists():
-            fail("required-contract refusal causes zero side effects")
-        ok("required runtime contract enforced against the manifest's own "
-           "inventory, refused preflight with zero mutation")
+        for rel in ("requirements.lock", "srplatform/db/migrations/env.py",
+                    "srplatform/worker_supervisor.py"):
+            inv = tmp / f"missing-contract-{rel.replace('/', '_')}"
+            shutil.copytree(payload, inv)
+            (inv / rel).unlink()
+            man_i = json.loads((inv / "MANIFEST.json").read_text())
+            man_i["files"].pop(rel)
+            (inv / "MANIFEST.json").write_text(json.dumps(man_i))
+            ineg = upgrade_cli(rootA, manifest_path, url,
+                               extra=("--dry-run", "--payload", str(inv)),
+                               allow_fail=True)
+            if ineg.returncode == 0 or rel not in (ineg.stdout + ineg.stderr):
+                fail(f"payload omitting {rel} (manifest AND disk) refused",
+                     (ineg.stdout + ineg.stderr)[-400:])
+            if len(list((paths["etc"] / "upgrade").glob(
+                    "*/journal.json"))) != attempts_before_inv or \
+                    (paths["state"] / "maintenance").exists():
+                fail("required-contract refusal causes zero side effects")
+        ok("required runtime contract (locks + alembic env + ExecStart "
+           "modules) enforced against the manifest's own inventory, "
+           "refused preflight with zero mutation")
+
+        # ===== round-4 finding 2: a config restore of a COMPLETED attempt
+        # ===== may NEVER release an admission fence owned by a DIFFERENT,
+        # ===== unresolved attempt. REAL two-attempt reproduction in one
+        # ===== sandbox: A completes normally; B (a second valid payload —
+        # ===== same source, different revision stamp, exactly like the
+        # ===== provisioning-failure bundle's build) is started and fails
+        # ===== at the admission stop, so its fence stays up; restoring
+        # ===== A's config must keep B's fence untouched.
+        rootX = tmp / "rootX"
+        apply_sandbox(rootX, manifest_path)
+        assert alembic(url5, "upgrade", "0025").returncode == 0
+        seed(url5, "x", coach=False)
+        pathsX = iseq._manifest_paths(rootX)
+        fenceX = pathsX["state"] / "maintenance"
+        ctl_log_x = tmp / "ctlX.log"
+        rx = upgrade_cli(rootX, manifest_path, url5,
+                         extra_env={"SR_FAKE_SYSTEMCTL_LOG": str(ctl_log_x)})
+        outXA = json.loads(rx.stdout)
+        attempt_xa = outXA.get("attempt")
+        if outXA.get("status") != "done" or fenceX.exists() or not attempt_xa:
+            fail("cross-attempt fixture: attempt A completes cleanly",
+                 json.dumps(outXA)[:300])
+        if json.loads((pathsX["etc"] / "release-version.json")
+                      .read_text()).get("attempt") != attempt_xa:
+            fail("cross-attempt fixture: A stamped its own attempt")
+
+        # second payload: same runtime source, different revision (the
+        # build tree is not a git checkout — the same stamp path the
+        # provisioning-failure scenario already relies on), so the CLI
+        # must treat it as a real upgrade, never a no-op.
+        from deploy import bundle as _bundle
+        src2 = tmp / "payload2-src"
+        src2.mkdir()
+        tar2 = sp.run(
+            ["tar", "-C", str(REPO), "-cf", "-", "--exclude=node_modules",
+             "--exclude=__pycache__", "--exclude=.next",
+             *_bundle.APP_DIRS, *_bundle.APP_FILES],
+            capture_output=True, timeout=300)
+        if tar2.returncode != 0:
+            fail("second payload source tree", tar2.stderr[-300:])
+        sp.run(["tar", "-C", str(src2), "-xf", "-"], input=tar2.stdout,
+               check=True, timeout=300)
+        (src2 / "docs" / "CROSS-ATTEMPT-NOTE.md").write_text(
+            "synthetic cross-attempt fixture marker\n")
+        payload2 = tmp / "payload2-bundle"
+        b2 = sp.run([sys.executable, str(src2 / "deploy/bundle.py"), "build",
+                     "--output", str(payload2), "--base-image",
+                     str(fake_base)],
+                    cwd=str(src2), capture_output=True, text=True,
+                    timeout=1800, env=env)
+        if b2.returncode != 0:
+            fail("second payload bundle build", (b2.stdout + b2.stderr)[-400:])
+        rev2 = json.loads((payload2 / "MANIFEST.json").read_text())["revision"]
+        if rev2 == payload_manifest["revision"]:
+            fail("cross-attempt fixture needs a second revision", str(rev2))
+
+        bstart = upgrade_cli(
+            rootX, manifest_path, url5, extra=("--payload", str(payload2)),
+            extra_env={"SR_FAKE_STOP_FAIL": "1",
+                       "SR_FAKE_SYSTEMCTL_LOG": str(ctl_log_x)},
+            allow_fail=True)
+        if bstart.returncode == 0 or "quiesce" not in (
+                bstart.stdout + bstart.stderr):
+            fail("cross-attempt fixture: attempt B fails at the stop",
+                 (bstart.stdout + bstart.stderr)[-400:])
+        jX = {path.parent.name: json.loads(path.read_text())
+              for path in (pathsX["etc"] / "upgrade").glob("*/journal.json")}
+        unfinished_x = [a for a, d in jX.items() if d.get("status") != "done"]
+        if len(jX) != 2 or len(unfinished_x) != 1:
+            fail("cross-attempt fixture: exactly one unresolved attempt B",
+                 str({a: d.get("status") for a, d in jX.items()}))
+        attempt_xb = unfinished_x[0]
+        fence_doc = json.loads(fenceX.read_text())
+        if fence_doc.get("attempt") != attempt_xb:
+            fail("the admission fence records the attempt that OWNS it",
+                 f"fence attempt {fence_doc.get('attempt')!r} != B "
+                 f"{attempt_xb!r}")
+        ok("fence ownership recorded: attempt B owns the admission fence")
+
+        ctl_before_x = ctl_log_x.read_text() if ctl_log_x.is_file() else ""
+        fence_bytes_before = fenceX.read_bytes()
+        rrx = cli("upgrade", "--manifest", str(manifest_path),
+                  "--system-root", str(rootX),
+                  "--restore-config", attempt_xa)
+        outRX = json.loads(rrx.stdout) if rrx.returncode == 0 else {}
+        if rrx.returncode != 0 or outRX.get("service_actions") != [] or \
+                outRX.get("maintenance_fence_cleared") is not False or \
+                "unresolved" not in str(outRX.get("maintenance_fence", "")):
+            fail("restore of a COMPLETED attempt while ANOTHER attempt is "
+                 "unresolved must keep the fence",
+                 (rrx.stdout + rrx.stderr)[-400:])
+        if fenceX.read_bytes() != fence_bytes_before:
+            fail("cross-attempt restore leaves the foreign fence "
+                 "byte-identical")
+        if (ctl_log_x.read_text() if ctl_log_x.is_file() else "") != \
+                ctl_before_x:
+            fail("cross-attempt restore issues ZERO service commands")
+        ok("restore-config of completed A NEVER releases unfinished B's "
+           "fence (config restored, zero service actions, fence intact)")
+
+        # Completing B is what releases B's fence — completion checks the
+        # OWNER and clears only its own.
+        rxb = upgrade_cli(rootX, manifest_path, url5, resume=attempt_xb,
+                          extra=("--payload", str(payload2)),
+                          extra_env={"SR_FAKE_SYSTEMCTL_LOG":
+                                     str(ctl_log_x)})
+        outXB = json.loads(rxb.stdout)
+        if outXB.get("status") != "done" or fenceX.exists():
+            fail("resuming B completes it and B's own completion releases "
+                 "B's fence", json.dumps(outXB)[:300])
+        ok("attempt B's verified completion releases exactly its own fence")
+
+        # With every attempt resolved and no fence present, a restore of
+        # the done attempt reports admission clear...
+        rr2x = cli("upgrade", "--manifest", str(manifest_path),
+                   "--system-root", str(rootX),
+                   "--restore-config", attempt_xa)
+        out2x = json.loads(rr2x.stdout) if rr2x.returncode == 0 else {}
+        if rr2x.returncode != 0 or \
+                out2x.get("maintenance_fence_cleared") is not True:
+            fail("with all attempts resolved and no fence, restoring the "
+                 "done attempt reports admission clear",
+                 (rr2x.stdout + rr2x.stderr)[-300:])
+        # ...but an operator fence whose identity cannot be PROVEN to
+        # belong to the restored attempt is never released by a restore:
+        # corrupt identity first, foreign identity second.
+        fenceX.parent.mkdir(parents=True, exist_ok=True)
+        fenceX.write_text("{ not a fence\n")
+        rr3x = cli("upgrade", "--manifest", str(manifest_path),
+                   "--system-root", str(rootX),
+                   "--restore-config", attempt_xa)
+        out3x = json.loads(rr3x.stdout) if rr3x.returncode == 0 else {}
+        if rr3x.returncode != 0 or \
+                out3x.get("maintenance_fence_cleared") is not False or \
+                "unreadable" not in str(out3x.get("maintenance_fence", "")) \
+                or not fenceX.exists():
+            fail("an unreadable fence identity is never released by a "
+                 "config restore", (rr3x.stdout + rr3x.stderr)[-300:])
+        fenceX.write_text(json.dumps({"reason": "manual operator fence",
+                                      "attempt": "manual-op-9999"}))
+        rr4x = cli("upgrade", "--manifest", str(manifest_path),
+                   "--system-root", str(rootX),
+                   "--restore-config", attempt_xa)
+        out4x = json.loads(rr4x.stdout) if rr4x.returncode == 0 else {}
+        if rr4x.returncode != 0 or \
+                out4x.get("maintenance_fence_cleared") is not False or \
+                "manual-op-9999" not in str(out4x.get("maintenance_fence",
+                                                      "")) or \
+                not fenceX.exists():
+            fail("a fence owned by another identity is never released by "
+                 "a config restore", (rr4x.stdout + rr4x.stderr)[-300:])
+        fenceX.unlink()
+        ok("unknown/foreign fence identity: restore fails closed and "
+           "keeps admission refused")
 
         # ============ provisioning failure never claims success ========= #
         bad_tree = tmp / "badlock-src"
