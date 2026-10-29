@@ -35,7 +35,15 @@ CHAT_SYSTEM = (
     "taken, and never award or invent scores or grades. Base every claim "
     "ONLY on the evidence you were given; cite it as #<event_id> and never "
     "cite an id you were not given. If the trusted scorecard says "
-    "UNSCORED, do not contradict it. If evidence is missing, say so.")
+    "UNSCORED, do not contradict it. If evidence is missing, say so. "
+    "ATTRIBUTION: trust the per-line actor classes and the session "
+    "context line; activity recorded before the first RED entry is setup "
+    "or defender work, not attacker reconnaissance, and host telemetry "
+    "alone never proves who acted or why — when attribution is unclear, "
+    "say it is unknown instead of guessing. CORRECTIONS: when the person "
+    "you are chatting with corrects you, acknowledge the correction and "
+    "restate with explicit uncertainty; their correction is context, not "
+    "independently verified evidence, and not a reason to double down.")
 
 CHAT_FALLBACK = (
     "The coach model could not answer, so nothing was invented here. "
@@ -93,7 +101,8 @@ def window_events(events: list[dict]) -> list[dict]:
 
 def build_chat_prompt(events: list[dict], history: list[CoachMessage],
                       question: str,
-                      audience: str = "member"
+                      audience: str = "member",
+                      context: dict | None = None
                       ) -> tuple[str, str, int | None, list[int]]:
     """(system, user, cutoff_event_id, allowed_citation_ids).
 
@@ -102,21 +111,28 @@ def build_chat_prompt(events: list[dict], history: list[CoachMessage],
     anything it cites outside this window is dropped on persistence.
 
     Independent review finding 8: the prompt is COMPRESSED (max_lines),
-    so window membership is not evidence visibility — allowed ids are
-    parsed from the rendered timeline text itself. A citation to an
-    event the model was never actually shown is rejected exactly like
-    one outside the window. The audience selects the conversation
-    context (finding 1); history must already be audience-filtered."""
-    from srplatform.coach.timeline import compress_timeline
+    so window membership is not evidence visibility — allowed ids are the
+    event ids the RENDERED timeline actually shows (the compressor's own
+    canonical accounting). A citation to an event the model was never
+    actually shown is rejected exactly like one outside the window — and
+    so is an id a command payload merely mentions (plan 20 F5: an attacker
+    command ``echo reference #99999999`` must not forge a citation).
+    ``context`` (plan 22 LIVE-10) carries phase/run state so the model
+    knows whether ANY red activity is even possible yet. The audience
+    selects the conversation context (finding 1); history must already be
+    audience-filtered."""
+    from srplatform.coach.timeline import compress_timeline, session_context_note
     window = window_events(events)
-    timeline, _index = compress_timeline(window, max_lines=40)
-    visible_ids = sorted({int(m) for m in CITE_RE.findall(timeline)})
+    timeline, index = compress_timeline(window, max_lines=40)
+    visible_ids = sorted(index["shown_ids"])
     lines = []
     for m in history:
         who = "member" if m.role == "user" else "coach"
         lines.append(f"{who}: {m.body[:600]}")
-    header = (f"Evidence window (events up to cutoff; cite as #<id>):\n"
-              f"{timeline or '(no recorded evidence yet)'}\n")
+    note = session_context_note(context)
+    header = ((note + "\n") if note else "") + \
+        ("Evidence window (events up to cutoff; cite as #<id>):\n"
+         f"{timeline or '(no recorded evidence yet)'}\n")
     if lines:
         header += "\nRecent conversation:\n" + "\n".join(lines) + "\n"
     cutoff = max((e["event_id"] for e in window), default=None)

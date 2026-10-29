@@ -530,6 +530,13 @@ class ChatIn(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
 
 
+def _agent_phase(db, session_id) -> str | None:
+    """The red agent's rolling phase (AgentState), if it has one."""
+    from srplatform.db.models import AgentState
+    st = db.get(AgentState, session_id)
+    return st.current_phase if st else None
+
+
 @router.post("/sessions/{session_id}/coach/messages", status_code=201)
 def coach_chat_post(session_id: uuid.UUID, body: ChatIn,
                     p: Principal = Depends(any_member)):
@@ -558,8 +565,17 @@ def coach_chat_post(session_id: uuid.UUID, body: ChatIn,
         events = [filter_event(db, sess, p, e)
                   for e in _events_of(db, session_id)]
         history = chat.recent_messages(db, session_id, audience=audience)
+        # LIVE-10: capture phase/run state AT ENQUEUE — the coach must know
+        # whether any red run has started at all (a READY session has seen
+        # zero agent operations; setup/telemetry noise is not recon).
+        from srplatform.api import runs as runs_svc
+        active = runs_svc.active_run_for_session(db, session_id)
+        context = {"session_status": sess.status,
+                   "red_run_state": active.status if active else None,
+                   "phase": getattr(active, "current_phase", None)
+                   or _agent_phase(db, session_id)}
     system, user, cutoff, allowed = chat.build_chat_prompt(
-        events, history, body.text, audience)
+        events, history, body.text, audience, context=context)
 
     from srplatform import model_admin as ma
     from srplatform import model_jobs

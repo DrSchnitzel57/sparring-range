@@ -131,7 +131,10 @@ def build_aar(events: list[dict], scenario: dict, scorecard: dict | None,
     # Review finding 8: citations are valid only against the evidence the
     # report ACTUALLY shows (the rendered, compressed timeline) — never
     # against every id that existed in the window but was compressed away.
-    visible_ids = {int(m) for m in CITE_RE.findall(timeline)}
+    # Plan 20 F5: the set is the compressor's CANONICAL accounting of the
+    # events it rendered, not a regex over the text — a payload that says
+    # ``echo reference #99999999`` adds nothing to what exists.
+    visible_ids = set(idx["shown_ids"])
     if narrative:
         narrative = validate_narrative(narrative, visible_ids)
         if narrative.strip():
