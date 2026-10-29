@@ -1083,6 +1083,7 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
                 run("usermod", "-a", "-G", extra, user, check=False)
     _ensure_dirs(m, run, lay)
     token_action = _ensure_supervisor_token(lay.etc, run, lay)
+    model_key_action = None
     if not lay.sandboxed and not dry_run:
         # The operator's runtime environment is read by the API, the ingest
         # listener and the bastion: it must be readable by them and by
@@ -1092,14 +1093,21 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
         if runtime_env.is_file():
             run("chown", "root:srrange", str(runtime_env), check=False)
             run("chmod", "0640", str(runtime_env), check=False)
-        # The MODEL credential belongs to the API identity alone (plan 18):
-        # 0640 root:srrange. Not the supervisor (srworker), not the bastion,
-        # not the broker; the API requests every model call through its own
-        # gateway, so no other identity needs it.
+        # The MODEL credential belongs to the API identity alone (plan 18).
+        # Not the supervisor (srworker), not the bastion, not the broker;
+        # the API requests every model call through its own gateway, so no
+        # other identity needs it. LIVE-01: the reach is a NAMED POSIX ACL
+        # (traverse the secrets directory, read this one file) instead of a
+        # group chmod, so the same repair also runs from upgrade
+        # provisioning — where no apply ever ran — and never touches the
+        # operator's ownership, mode or secret bytes.
         model_key = pathlib.Path(m.model_api_key_file)
+        from deploy import appliance_services as svc
         if model_key.is_file():
-            run("chown", "root:srrange", str(model_key), check=False)
-            run("chmod", "0640", str(model_key), check=False)
+            model_key_action = svc.ensure_model_key_access(
+                run, key_file=model_key, secrets_dir=m.secrets_dir)
+        else:
+            model_key_action = {"skipped": "no model key file yet"}
     services: dict = {}
     if not lay.sandboxed and not dry_run:
         # Storage headroom BEFORE any effect (plan 18): a nearly-full
@@ -1183,6 +1191,7 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
         for unit in [*plan.units, NETRULES_UNIT]:
             run("systemctl", "enable", unit, check=False)
     return {"changed": changed, "supervisor_token": token_action,
+            "model_key": model_key_action,
             "services": services, "dry_run": dry_run}
 
 

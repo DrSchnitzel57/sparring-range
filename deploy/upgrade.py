@@ -1038,7 +1038,9 @@ def default_migration_python(layout) -> str:
 
 def provision_release(layout, payload: ReleasePayload, *, run,
                       skip_frontend: bool = False,
-                      public_url: str = "") -> dict:
+                      public_url: str = "",
+                      model_key_file: str = "",
+                      secrets_dir: str = "") -> dict:
     """The SUPPORTED production provisioning path (milestone 21 review):
     the SAME service helpers a fresh install runs — locked Python
     dependencies, the selected Node runtime, the per-UID runtime
@@ -1080,6 +1082,20 @@ def provision_release(layout, payload: ReleasePayload, *, run,
             "the installed venv cannot import the release entrypoints "
             f"(exit {proc.returncode}): "
             f"{(proc.stdout + proc.stderr)[-400:]}")
+    if not layout.sandboxed:
+        # LIVE-01: repair the model-credential reach BEFORE anything is
+        # allowed to claim the release is ready. A preserving upgrade
+        # never re-applies, so this is where an installed appliance whose
+        # operator-created 0600 credential the API could not read becomes
+        # readable — named ACL only, no rotation, fail-closed.
+        if not model_key_file or not secrets_dir:
+            raise UpgradeError(
+                "provisioning requires the model credential path and the "
+                "secrets directory; an upgrade that cannot prove the API "
+                "can read its credential must not reach readiness")
+        receipt["model_key"] = svc.ensure_model_key_access(
+            run, key_file=pathlib.Path(model_key_file),
+            secrets_dir=pathlib.Path(secrets_dir))
     if not layout.sandboxed:
         receipt["runtime_verification"] = svc.verify_service_runtime(
             run, venv, node_binary=receipt["node"].get("binary"))
@@ -1660,7 +1676,10 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
             # always passed it; the upgrade path now does too.
             receipt = (hook(layout, payload, run=Runner(dry_run=False),
                             skip_frontend=skip_frontend,
-                            public_url=getattr(m, "public_url", ""))
+                            public_url=getattr(m, "public_url", ""),
+                            model_key_file=getattr(m, "model_api_key_file",
+                                                   ""),
+                            secrets_dir=getattr(m, "secrets_dir", ""))
                        if provision_hook is None
                        else hook(layout, payload))
             (att / "provision-receipt.json").write_text(

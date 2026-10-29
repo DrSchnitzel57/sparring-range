@@ -1146,3 +1146,42 @@ def _node_version() -> tuple[int, int] | None:
 
 def quote_all(args) -> str:
     return " ".join(shlex.quote(str(a)) for a in args)
+
+
+def ensure_model_key_access(run, *, key_file, secrets_dir,
+                            api_user: str = "srrange") -> dict:
+    """LIVE-01: let the API identity read the MODEL credential with a named
+    POSIX ACL — no rotation, no mode widening, no group membership change.
+
+    The operator creates ``model.key`` root:root 0600 inside the root-owned
+    secrets directory, and the installer must never rewrite the secret or
+    broaden its reach. The previous group-chmod repair only ran at fresh
+    ``apply``; a preserving upgrade (which re-provisions, never re-applies)
+    left the credential unreadable and readiness stayed 500. A named entry
+    on exactly the two objects the API needs — traverse the secrets
+    directory, read the one key — is the minimal durable grant, and this
+    function is idempotent so every upgrade re-proves it before readiness:
+
+      * file ownership, mode owner-bits and the secret BYTES are untouched;
+      * the grant is one named user, not the whole group;
+      * any failure (no ACL feature, unparsable ACL, verification miss)
+        raises — provisioning fails closed instead of shipping an API
+        that 500s on the model settings check.
+    """
+    import pwd
+
+    from deploy import posixacl
+    key = pathlib.Path(key_file)
+    secrets = pathlib.Path(secrets_dir)
+    if not key.is_file():
+        raise RuntimeError(f"model credential {key} is missing — refusing "
+                           "to provision without it (hand_off preflight)")
+    try:
+        uid = pwd.getpwnam(api_user).pw_uid
+    except KeyError as exc:
+        raise RuntimeError(
+            f"service user {api_user!r} does not exist yet — apply must "
+            "create it before the credential grant") from exc
+    actions = posixacl.ensure_named_read_access(secrets, key, uid=uid)
+    actions["api_user"] = api_user
+    return actions

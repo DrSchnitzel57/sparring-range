@@ -36,7 +36,8 @@ import uuid
 REPO = pathlib.Path(__file__).resolve().parents[2]
 PY = sys.executable
 LAYERS = ("db", "containment", "packet", "authority", "browser", "live",
-          "images", "capture", "hypervisor", "access", "journey", "agent")
+          "images", "capture", "hypervisor", "access", "journey", "agent",
+          "practice")
 COUNT_RE = re.compile(r"(\d+) (passed|failed|errors?|skipped|deselected)")
 
 
@@ -211,7 +212,7 @@ def check_selection() -> None:
              f"{sorted(leaked)[:5]}")
     for layer in ("db", "containment", "packet", "authority", "browser",
                   "images", "capture", "hypervisor", "access", "journey",
-                  "agent"):
+                  "agent", "practice"):
         if not layer_ids[layer]:
             fail(f"layer {layer} non-empty", "layer selection is empty")
     ok("all tests classified",
@@ -505,6 +506,95 @@ def check_agent() -> None:
            f"{counts.get('deselected', 0)} deselected")
     finally:
         fx.cleanup()
+
+
+def check_practice() -> None:
+    """Plan 22 installed-practice repairs on REAL fixtures (required mode).
+
+    These are the tests that reproduce the installed findings with actual
+    enforcement rather than mocks: real kernel DAC decisions across distinct
+    UIDs in unprivileged user namespaces (LIVE-01 credential access), and
+    the later plan-22 practice-lane regressions. A skip is never
+    acceptance: SR_REQUIRE_PRACTICE converts skips to failures, and an
+    environment without unprivileged user namespaces + subuid mappings FAILS
+    this gate with the exact missing prerequisite — it never passes empty.
+    """
+    import subprocess
+    probe = subprocess.run(
+        ["unshare", "--user", "--map-users=0:10000:2",
+         "--map-groups=0:10000:2", "true"],
+        capture_output=True, text=True, timeout=30)
+    if probe.returncode != 0:
+        prereq_fail(
+            "practice prerequisites (unprivileged user namespaces + "
+            "subuid/subgid mappings)",
+            f"unshare probe exit {probe.returncode}: "
+            f"{(probe.stderr or probe.stdout)[:200]}")
+    env = {"SR_REQUIRE_PRACTICE": "1"}
+    r, counts = pytest_run(["-m", "practice"], env=env, timeout=1200)
+    require_selection(counts, "practice")
+    if r.returncode != 0:
+        fail("installed-practice repair layer (real DAC/namespaces)",
+             f"exit {r.returncode}, counts {counts}:\n{r.stdout[-6000:]}")
+    ok("practice layer passes in required mode",
+       f"{counts.get('passed', 0)} passed, {counts.get('failed', 0)} failed, "
+       f"{counts.get('skipped', 0)} skipped, "
+       f"{counts.get('deselected', 0)} deselected")
+
+
+def check_practice() -> None:
+    """Plan 22 installed-practice repair batch (required mode).
+
+    Reproduces the installed findings against REAL enforcement instead of
+    mocks — kernel DAC across distinct UIDs in unprivileged user
+    namespaces, disposable DB and browser lanes where a practice test needs
+    them. A required layer never passes on skips: SR_REQUIRE_PRACTICE is
+    set, any skipped test fails, and an environment without the namespace
+    prerequisites FAILS the gate with the exact missing piece rather than
+    vacuously passing.
+    """
+    import os
+    import shutil
+    import subprocess
+
+    if shutil.which("unshare") is None:
+        prereq_fail("practice prerequisites", "the unshare binary is absent")
+    probe = subprocess.run(
+        ["unshare", "--user",
+         f"--map-users=0:{os.getuid()}:1", "--map-users=1:10000:2",
+         f"--map-groups=0:{os.getgid()}:1", "--map-groups=1:10000:2",
+         "true"],
+        capture_output=True, text=True, timeout=30)
+    if probe.returncode != 0:
+        prereq_fail(
+            "practice prerequisites (unprivileged user namespaces + "
+            "subuid/subgid mappings)",
+            f"unshare probe exit {probe.returncode}: "
+            f"{(probe.stderr or probe.stdout).strip()[:200]}")
+    fx = None
+    env = {"SR_REQUIRE_PRACTICE": "1"}
+    try:
+        fx = _pg_fixture()
+        env["SR_PG_ADMIN_URL"] = fx.admin_url()
+        env["SR_REQUIRE_DB"] = "1"
+    except Exception as exc:  # noqa: BLE001 — no docker: db practice tests decide
+        print(f"  (no disposable DB for the practice lane: {str(exc)[:120]})")
+    try:
+        r, counts = pytest_run(["-m", "practice"], env=env, timeout=1800)
+        require_selection(counts, "practice")
+        if r.returncode != 0:
+            fail("installed-practice repairs (real DAC/namespaces/DB)",
+                 f"exit {r.returncode}, counts {counts}:\n{r.stdout[-6000:]}")
+        if counts.get("skipped", 0):
+            fail("practice layer never accepts skips", str(counts))
+        ok("practice layer passes in required mode",
+           f"{counts.get('passed', 0)} passed, 0 skipped, "
+           f"{counts.get('deselected', 0)} deselected")
+    finally:
+        if fx is not None:
+            problems = fx.cleanup()
+            if problems:
+                fail("practice DB fixture cleanup", "; ".join(problems))
 
 
 def check_db() -> None:
@@ -3589,7 +3679,7 @@ def check_upgrade() -> None:
 APPLIANCE_GATES = ("selection", "python", "db", "authority", "agent",
                    "install", "hypervisor", "containment", "images",
                    "capture", "access", "frontend", "browser", "compose",
-                   "bundle", "upgrade")
+                   "bundle", "upgrade", "practice")
 
 # The gates that need the OPERATOR's machine: root + nft for the packet
 # layer, the INSTALLED appliance with operator/member tokens for the
@@ -3677,6 +3767,7 @@ CHECKS = {
     "python": check_python,
     "db": check_db,
     "agent": check_agent,
+    "practice": check_practice,
     "containment": check_containment,
     "authority": check_authority,
     "pve-contract": check_pve_contract,
