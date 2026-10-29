@@ -1283,6 +1283,19 @@ compatibility story lives in the forward path plus the engine.
 | The gate's second payload is built in a PROPER ISOLATED git fixture (its own ancestry), keeping the distinct-revision requirement deterministic under every TMPDIR | Extracting the tree inside the checkout and letting git DISCOVER the parent repo (reproduced: disk-backed `TMPDIR=$PWD/.cache/tmp` made rev2 == candidate HEAD, the gate failed at 403.7 s and every later cross-attempt probe silently stopped running); relaxing the distinct-revision assertion or special-casing "unknown" | A required acceptance gate must fail or pass truthfully in the documented operator environment; determinism comes from the fixture's ancestry, not from weakening the property under test. Production packaging verification is untouched. |
 | §7 drives the upgrade CLI as `cwd = payload tree` + `/opt/sparring-range/.venv/bin/python deploy/appliance.py …` with an explicit bootstrap-import preflight (`deploy.appliance`, `deploy.upgrade`, `sqlalchemy`, `alembic`) | Unqualified `python3` or an old checkout (no dependency guarantee for the CLI's imports — the exact shape the acceptance gate does NOT test) | The installed venv is the provisioned, lockfile-verified interpreter the services and migrations use; the tested invocation contract and the documented one must be the same thing. |
 
+### Installed-practice repair decisions — 2026-10-29
+
+The user authorized plan 22 and autonomous Qwen-high implementation/review on the
+existing implementation branch. This consolidates the installed test findings and
+retained plan-20 review defects; it does not authorize agents to update the VM.
+
+| Decision | Rejected alternatives | Why |
+|---|---|---|
+| Separate configuration/contract-bound commissioning qualification from bounded automatic non-disruptive admission health; qualification age is displayed, not by itself treated as a failed test | Repeating manual commissioning every 24 hours or every session; silently increasing TTL; minting new passed receipts from old observations; disabling safety wholesale | Observations do not become false at midnight. Ordinary use must remain practical while changed, failed, incompatible or unknown safety state still blocks. Original evidence and its scope remain explicit; legacy compatibility must be proved, not assumed. |
+| Preserve latch/unknown-cessation/ownership fences and invalidate qualification for relevant changes or safety transitions; automatic checks use fixed typed existing authorities | Model/worker host-shell or firewall privileges; destructive killswitch exercises on every Begin; unobserved automatic attestations | Usability cannot weaken containment, manufacture proof or interrupt other active work. No extra privileged operator service is authorized implicitly. |
+| Repair installed identity/configuration paths and verify a real browser login after upgrade; preserve old receipts and version new verified baselines | Manual world-readable secrets, account reset, receipt overwrites to hide drift, HTTP-200-only release claims | The installed test exposed production-path omissions despite green sandbox gates. Actual identities and client routing are acceptance inputs. |
+| Ground coaching in phase and authenticated actor provenance, with explicitly unknown telemetry attribution | Calling member setup commands attacker actions because of a host label or citation; accepting user assertions as verified scores | Hints must be useful without inventing attribution or authority. Subjective feedback remains separate from deterministic scoring. |
+
 ## Risks and explicitly unverified inputs (historical baseline; see reevaluation above)
 
 - Same physical host retains hypervisor/resource-contention risk even with no

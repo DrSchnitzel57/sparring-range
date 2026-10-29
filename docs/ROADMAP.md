@@ -81,6 +81,22 @@ checkpoints and its own tests. Implement one at a time on a user-selected
 non-default branch; commit coherent changes, never push. Reviewers run the relevant
 gates independently. Any requirement not met stays open, regardless of plan ticks.
 
+### Installed-practice repair batch — authorized 2026-10-29
+
+- [ ] **22 — Installed practice repairs and usable safety admission.**
+  [Plan](../.openchamber/plans/22-installed-practice-repairs.md).
+  Consolidates LIVE-01–10 and retained plan-20 F5–F9: permanent credential/client
+  routing fixes, truthful upgrade diagnostics/receipts, account-bound SSH
+  onboarding, configuration-bound commissioning with automatic non-disruptive
+  admission checks, grounded coach/citations and remaining replay/output repairs.
+  LIVE-08's operator-resolved external outage is not a product regression.
+  User authorized plan creation followed directly by Qwen Flash Next high
+  implementation and autonomous independent review on the existing branch.
+  No push, merge, automatic deployment or repeated unchanged live commissioning.
+  Current baseline: 678 fast passed, 480 deselected, zero failed/skipped, six
+  warnings, 95.97s at `1083f22`. Manual installed/provider qualification remains
+  distinct; milestones 20/21 are not retroactively marked accepted by this batch.
+
 ### Post-commissioning backlog — 2026-10-23
 
 Commissioning for the supervised AI run is complete: readiness, SSH/sudo/replay,
