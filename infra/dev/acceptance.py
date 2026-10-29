@@ -2411,6 +2411,16 @@ def check_upgrade() -> None:
         manifest_path.write_text(json.dumps(man_raw))
         rootA = tmp / "rootA"
         apply_sandbox(rootA, manifest_path)
+        # LIVE-04 reproduction shape: the installed upgrade carried a
+        # configuration change, so finalize re-renders files the OLD
+        # install receipt still baselines. Capture the pre-upgrade
+        # baseline, then change the manifest exactly like a real operator
+        # upgrade would.
+        old_receipt_text = (iseq._manifest_paths(rootA)["receipt"]
+                            .read_text())
+        man_raw = json.loads(manifest_path.read_text())
+        man_raw["appliance"]["timezone"] = "Europe/Berlin"
+        manifest_path.write_text(json.dumps(man_raw))
         assert alembic(url, "upgrade", "0019").returncode == 0
         seed(url, "a", coach=False)
         secret_roles_before = db_q(
@@ -2567,6 +2577,42 @@ def check_upgrade() -> None:
         ok("preserving upgrade (journal, fence, backups, provisioning, "
            "migrations, verified restart, users, keys, restore-listable "
            "dump)", f"attempt {outA['attempt']}, heads {sorted(heads)}")
+
+        # ---- LIVE-04: a SUCCESSFUL upgrade re-versions the verified
+        # baseline; the previous receipt is archived (evidence kept) and
+        # a genuine CURRENT drift still fails.
+        ver = sp.run(
+            [sys.executable, str(REPO / "deploy/appliance.py"), "verify",
+             "--manifest", str(manifest_path), "--system-root",
+             str(rootA), "--json"],
+            capture_output=True, text=True, timeout=120)
+        vout = json.loads(ver.stdout or "{}")
+        if ver.returncode != 0 or not vout.get("ok"):
+            fail("post-upgrade verify is clean against the refreshed "
+                 "baseline (LIVE-04)",
+                 json.dumps({"code": ver.returncode,
+                             "drift": vout.get("drift", [])[:5]})[:500])
+        archived = (paths["etc"] / "install-receipts"
+                    / f"{outA['attempt']}.json")
+        if not archived.is_file() or archived.read_text() != old_receipt_text:
+            fail("previous install receipt archived byte-identically, "
+                 "never deleted", str(archived))
+        victim = paths["env"]
+        original_env = victim.read_text()
+        victim.write_text(original_env + "\n# drifted\n")
+        ver2 = sp.run(
+            [sys.executable, str(REPO / "deploy/appliance.py"), "verify",
+             "--manifest", str(manifest_path), "--system-root", str(rootA),
+             "--json"],
+            capture_output=True, text=True, timeout=120)
+        vout2 = json.loads(ver2.stdout or "{}")
+        victim.write_text(original_env)
+        if ver2.returncode == 0 or not any(
+                d.get("path") == str(victim) for d in vout2.get("drift", [])):
+            fail("the refreshed baseline still detects CURRENT drift",
+                 json.dumps(vout2.get("drift", []))[:300])
+        ok("LIVE-04: verified baseline re-versioned on success, prior "
+           "receipt archived, current drift still detected")
 
         # round-4 finding 3 (REAL child envs): the installer-channel child
         # actually ran (the capture is not empty), and NONE of them saw an

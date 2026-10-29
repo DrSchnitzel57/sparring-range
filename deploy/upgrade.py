@@ -436,6 +436,37 @@ def version_file(layout) -> pathlib.Path:
     return layout.etc / VERSION_FILE_NAME
 
 
+def refresh_install_receipt(m, layout, *, attempt: str) -> dict:
+    """LIVE-04: re-version the verified installation baseline after a
+    SUCCESSFUL upgrade (call site: after the stamp, never before).
+
+    The install receipt is the baseline `appliance.py verify` compares
+    against. apply() wrote it for the OLD release; after a preserving
+    upgrade rewrote the configuration, the old baseline reports real
+    content drift forever. The refresh re-computes the baseline from the
+    same renderer that wrote the files, ARCHIVES the previous receipt
+    under etc/install-receipts/<attempt>.json (prior evidence is kept,
+    never deleted), and atomically replaces the live baseline.
+    """
+    from deploy.appliance import (_atomic_write, _receipt, render_files,
+                                  sandbox_manifest)
+    lay = layout
+    sm = sandbox_manifest(m, lay.root)
+    plan = render_files(sm, layout=lay)
+    receipt = _receipt(sm, plan, lay)
+    archived: str | None = None
+    if lay.receipt.is_file():
+        archive_dir = pathlib.Path(lay.etc) / "install-receipts"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archived_path = archive_dir / f"{attempt}.json"
+        shutil.copyfile(lay.receipt, archived_path)
+        archived = str(archived_path)
+    _atomic_write(lay.receipt, json.dumps(receipt, indent=2, sort_keys=True)
+                  + "\n", 0o644, os.getuid(), os.getgid())
+    return {"baseline_files": len(receipt["files"]),
+            "baseline_archived": archived or "none"}
+
+
 def installed_version(layout) -> dict:
     path = version_file(layout)
     if path.is_file():
@@ -1815,7 +1846,16 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
             "from_revision": report["from_revision"],
             "upgraded_at": _now(), "attempt": attempt},
             indent=2, sort_keys=True) + "\n")
-        journal.mark(attempt, "restart", "done", restarted=len(restarted))
+        # LIVE-04: the release is now VERIFIED running, so the install
+        # baseline is re-versioned from the same renderer that wrote the
+        # configuration — the previous receipt is archived, never
+        # deleted, and `appliance.py verify` stays an honest current-state
+        # check instead of crying drift after every successful upgrade.
+        # A failed attempt never reaches this line, so a half-upgraded
+        # appliance keeps its old baseline and still reports drift.
+        refresh = refresh_install_receipt(m, layout, attempt=attempt)
+        journal.mark(attempt, "restart", "done", restarted=len(restarted),
+                     **refresh)
 
     result = journal.finish(attempt, finished_at=_now(),
                             revision=payload.revision,
