@@ -349,9 +349,30 @@ AAR_NARRATIVE_SYSTEM = (
     "Cite only events you were given (as #<event_id>). Be blunt and specific.")
 
 
-def _jobs_root_ids(db, session_id, *, sealed: bool) -> list:
+def _is_operator_chat(job) -> bool:
+    """F7: a coach-chat job's audience is captured immutably in its
+    payload at enqueue. Operator coach conversations (which may cite
+    sealed evidence) belong to the OPERATOR audience — members can
+    neither enumerate, open nor stream them, sealed or not."""
+    if getattr(job, "kind", None) != "coach-chat":
+        return False
+    return ((job.payload or {}).get("chat_meta") or
+            {}).get("audience") == "operator"
+
+
+def _jobs_root_ids(db, session_id, *, sealed: bool,
+                   member_audience: bool = False) -> list:
+    from sqlalchemy import or_
     from srplatform.db.models import ModelJob
     stmt = select(ModelJob).where(ModelJob.session_id == session_id)
+    if member_audience:
+        # F7: even UNSEALED, a member never sees the operator's coach
+        # work. Coach rows predating audience capture had exactly one
+        # audience (member), so only an explicit operator stamp hides.
+        stmt = stmt.where(or_(
+            ModelJob.kind != "coach-chat",
+            ModelJob.payload["chat_meta"]["audience"].as_string() !=
+            "operator"))
     if sealed:
         # Competition visibility is ENFORCED in the API (finding 4 +
         # the standing boundary "enforce in APIs, not just the UI"):
@@ -380,7 +401,8 @@ def model_jobs_list(session_id: uuid.UUID, limit: int = 25,
     sess = _check_access(db, p, session_id)
     sealed = competition_sealed(db, sess, p)
     limit = max(1, min(limit, 100))
-    rows = _jobs_root_ids(db, session_id, sealed=sealed)[:limit]
+    rows = _jobs_root_ids(db, session_id, sealed=sealed,
+                          member_audience=not p.is_operator)[:limit]
     return {"jobs": [{
         "job_id": str(j.job_id),
         "kind": j.kind if not sealed else "model-work",
@@ -410,6 +432,8 @@ def model_job_detail(session_id: uuid.UUID, job_id: uuid.UUID,
         raise HTTPException(404, "job not found")
     if sealed and job.kind not in ("hint", "aar-narrative", "coach-chat"):
         raise HTTPException(404, "job not found")
+    if not p.is_operator and _is_operator_chat(job):
+        raise HTTPException(404, "job not found")   # F7 audience isolation
     body = chain_status_body(db, job_id, errors=False, result_kind=False)
     return strip_sealed(body) if sealed else strip_results(body)
 
@@ -437,6 +461,8 @@ def model_job_stream(session_id: uuid.UUID, job_id: uuid.UUID,
         if sealed and job.kind not in ("hint", "aar-narrative",
                                        "coach-chat"):
             raise HTTPException(404, "job not found")
+        if not p.is_operator and _is_operator_chat(job):
+            raise HTTPException(404, "job not found")  # F7 audience isolation
     from srplatform.settings import get_settings
     s0 = get_settings()
 

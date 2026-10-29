@@ -88,3 +88,37 @@ def test_chat_prompt_carries_context_and_correction_rules():
     assert "Session context:" not in user2         # nothing claimed without state
     for rule in ("CORRECTIONS", "acknowledge the correction", "unknown"):
         assert rule in _sys
+
+
+# ------------------------------------------------------------- API (db) ----
+def test_operator_coach_jobs_are_invisible_to_member_job_surfaces(client, users):
+    """F7: the model-jobs LIST, DETAIL and stream previously ignored
+    audience — a member enumerated the operator's coach work (state and
+    timing). The audience captured at enqueue is now enforced at every
+    member job surface; operators still see the whole picture."""
+    from tests.test_plan19_model_admin import _make_profile
+    sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
+                      headers=users["member"]).json()["session_id"]
+    _make_profile(client, users, "coachf7", "http://x/v1")
+    r = client.put("/admin/model/roles", headers=users["op"],
+                   json={"role": "coach", "profile_name": "coachf7"})
+    assert r.status_code == 200, r.text
+    jop = client.post(f"/sessions/{sid}/coach/messages",
+                      json={"text": "operator turn"},
+                      headers=users["op"]).json()["job_id"]
+    jmem = client.post(f"/sessions/{sid}/coach/messages",
+                       json={"text": "member turn"},
+                       headers=users["member"]).json()["job_id"]
+    listing = client.get(f"/sessions/{sid}/model-jobs",
+                         headers=users["member"]).json()
+    ids = [j["job_id"] for j in listing["jobs"]]
+    assert jmem in ids and jop not in ids
+    assert client.get(f"/sessions/{sid}/model-jobs/{jop}",
+                      headers=users["member"]).status_code == 404
+    assert client.get(f"/sessions/{sid}/model-jobs/{jmem}",
+                      headers=users["member"]).status_code == 200
+    assert client.get(f"/sessions/{sid}/model-jobs/{jop}/stream",
+                      headers=users["member"]).status_code == 404
+    oids = [j["job_id"] for j in client.get(
+        f"/sessions/{sid}/model-jobs", headers=users["op"]).json()["jobs"]]
+    assert jop in oids and jmem in oids

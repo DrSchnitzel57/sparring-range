@@ -94,19 +94,31 @@ def test_output_append_requires_worker_and_registered_op(client, users):
 
 def test_chunk_redelivery_distinguishes_duplicate_from_conflict(client,
                                                                 users):
-    """Finding 9's server half: an idempotent re-delivery answers
-    ``duplicate`` (success), DIFFERENT content at the same seq answers
-    ``conflict`` — never silently stored, never overwritten."""
+    """Finding 9's server half + plan 22 F8: an idempotent re-delivery
+    (same seq, kind, text AND timing/drop metadata) answers ``duplicate``
+    (200); ANY divergence at a known seq answers ``conflict`` with HTTP
+    409 — never silently stored, never overwritten, never a silent 200."""
     sid = _running_session(client, users)
     rid, token = _run_with_token(sid)
     op = _register(client, rid, token)
-    first = _append(client, rid, token, op, seq=0, text="first delivery")
+    import time as _t
+    ts_now = _t.time()
+    first = _append(client, rid, token, op, seq=0, text="first delivery",
+                    read_ts=ts_now, dropped_bytes=7)
     assert first.json()["status"] == "stored"
 
-    same = _append(client, rid, token, op, seq=0, text="first delivery")
+    same = _append(client, rid, token, op, seq=0, text="first delivery",
+                   read_ts=ts_now, dropped_bytes=7)
     assert same.status_code == 200 and same.json()["status"] == "duplicate"
     clash = _append(client, rid, token, op, seq=0, text="different bytes")
-    assert clash.status_code == 200 and clash.json()["status"] == "conflict"
+    assert clash.status_code == 409 and clash.json()["status"] == "conflict"
+    # F8: same text but a divergent timing/drop claim is STILL a conflict
+    ts_clash = _append(client, rid, token, op, seq=0, text="first delivery",
+                       read_ts=ts_now + 0.5, dropped_bytes=7)
+    assert ts_clash.status_code == 409, ts_clash.text
+    drop_clash = _append(client, rid, token, op, seq=0, text="first delivery",
+                         read_ts=ts_now, dropped_bytes=8)
+    assert drop_clash.status_code == 409, drop_clash.text
     rows = _rows(rid)
     assert len(rows) == 1 and rows[0][1] == "first delivery"
 

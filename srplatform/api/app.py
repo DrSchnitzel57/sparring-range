@@ -1976,6 +1976,11 @@ _CAPTURE_MAX_CLAIMED_DROPPED = 1_000_000_000
 _CAPTURE_MARKER_TEXT = ("server capture quota reached — further chunks "
                         "were not stored")
 _CAPTURE_MARKER_BYTES = len(_CAPTURE_MARKER_TEXT.encode("utf-8"))
+# F9: plausibility window for worker-claimed pipe-read instants. The age
+# bound is generous (lab fixtures legitimately carry recent-but-not-now
+# stamps); the point is refusing absurd epochs, not second-level trust.
+_CAPTURE_READ_TS_MAX_AGE_S = 400 * 24 * 3600
+_CAPTURE_READ_TS_MAX_SKEW_S = 300
 
 
 class OperationOutputIn(BaseModel):
@@ -2059,6 +2064,16 @@ def append_operation_output(run_id: uuid.UUID, op_id: str,
     run = _require_worker(db, run_id, x_worker_token)
     if body.kind not in ("output", "gap", "truncated"):
         raise HTTPException(422, "kind must be output, gap or truncated")
+    # F9: a worker-claimed read instant is only kept if PLAUSIBLE inside a
+    # window around server time (read_ts=1 is a broken clock, not evidence).
+    # The BYTES are still stored — completeness outranks a bad timestamp —
+    # but the out-of-window claim is dropped, the row honestly degrades to
+    # persist-time, and replay labels the provenance either way.
+    if body.read_ts is not None:
+        now_s = _now().timestamp()
+        if not (now_s - _CAPTURE_READ_TS_MAX_AGE_S <= body.read_ts
+                <= now_s + _CAPTURE_READ_TS_MAX_SKEW_S):
+            body.read_ts = None
     if body.text is not None and body.text == "" and body.kind == "output":
         raise HTTPException(422, "output chunks must carry text")
     if body.text is not None and \
@@ -2081,18 +2096,28 @@ def append_operation_output(run_id: uuid.UUID, op_id: str,
                .with_for_update())
 
     existing = db.execute(
-        select(OperationOutput.kind, OperationOutput.text)
+        select(OperationOutput.kind, OperationOutput.text,
+               OperationOutput.read_ts, OperationOutput.dropped_bytes)
         .where(OperationOutput.run_id == run_id,
                OperationOutput.op_id == op_id,
                OperationOutput.seq == body.seq)
         .limit(1)).first()
     if existing is not None:
         db.commit()
-        if existing[0] == body.kind and existing[1] == body.text:
+        # F8: idempotence means EQUAL, not merely same-text. A re-delivery
+        # must carry the same kind, text AND claimed timing/drop metadata;
+        # anything else at a known seq is a genuine conflict and answers
+        # 409 — the caller's stream diverged, and silent 200s would let a
+        # lying or buggy worker rewrite history one retry at a time.
+        if (existing[0] == body.kind and existing[1] == body.text
+                and existing[2] == body.read_ts
+                and existing[3] == dropped):
             return JSONResponse({"ok": True, "status": "duplicate"},
                                 status_code=200)
-        return JSONResponse({"ok": True, "status": "conflict"},
-                            status_code=200)
+        return JSONResponse({"ok": False, "status": "conflict",
+                             "detail": "same seq, different content or "
+                                       "timing metadata — nothing stored"},
+                            status_code=409)
 
     # A closed operation stores nothing further — the marker already
     # exists, and a racing or repeated explicit marker answers the

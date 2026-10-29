@@ -281,23 +281,27 @@ export default function ReplayPanel({ sid }) {
   }, [cast?.recording_id]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---- the session clock --------------------------------------------------
-  // t0 anchors on the defender cast's epoch when present; without any cast
-  // the clock starts at the earliest attacker-side timestamp (command-only
-  // playback is honest playback, not a fake cast).
+  // F6: the anchor is the SERVER's canonical session_t0 (the session's first
+  // event, unfiltered) — never a client-side min() over whatever the current
+  // actor/type filters happen to show, which used to shift the cast offset
+  // mid-view. Only when the server gives no anchor (old deployments) does
+  // the clock fall back to the earliest observed stamp (attacker-only
+  // playback stays honest playback, not a fake cast).
   const { t0, duration } = useMemo(() => {
+    const canon = data?.session_t0 ? Date.parse(data.session_t0) / 1000 : null;
     const stamps = [];
     if (epoch) stamps.push(epoch);
     ops.forEach(o => { if (o.ts) stamps.push(Date.parse(o.ts) / 1000);
                        if (o.end_ts) stamps.push(Date.parse(o.end_ts) / 1000); });
     (chunkRows || []).forEach(c => { if (c.at != null) stamps.push(c.at); });
     timeline.forEach(e => stamps.push(Date.parse(e.ts) / 1000));
-    if (!stamps.length) return { t0: null, duration: 0 };
-    const start = Math.min(...stamps);
-    const end = Math.max(...stamps) + 5;
+    if (canon === null && !stamps.length) return { t0: null, duration: 0 };
+    const start = canon !== null ? canon : Math.min(...stamps);
+    const end = Math.max(...(canon === null ? stamps : [...stamps, canon])) + 5;
     let dur = Math.max(1, end - start);
     if (epoch && cast?.duration_s) dur = Math.max(dur, cast.duration_s + (epoch - start));
     return { t0: start, duration: dur };
-  }, [epoch, cast, ops, chunkRows, timeline]);
+  }, [data?.session_t0, epoch, cast, ops, chunkRows, timeline]);
   clockT0Ref.current = t0;
 
   // once the clock resolves, the lookahead window at t=0 must load promptly
@@ -337,7 +341,15 @@ export default function ReplayPanel({ sid }) {
     setNow(c);
     const p = playerRef.current;
     const playerT = c - castRelRef.current;
-    if (p?.seek) { try { if (playerT >= 0) p.seek(playerT); } catch { /* surfaced below */ } }
+    if (p?.seek) {
+      try {
+        // F6: seeking back before the cast START must not leave the player
+        // frozen on its last in-cast frame — the documented contract is
+        // "before the epoch the player holds frame zero".
+        if (playerT >= 0) p.seek(playerT);
+        else if (p.getCurrentTime && p.getCurrentTime() > 0) p.seek(0);
+      } catch { /* surfaced below */ }
+    }
     readPlayerAt();
     if (t0 !== null) void pumpOps(t0 + c + OPS_LOOKAHEAD / 2);
     void pumpChunks();
@@ -360,12 +372,17 @@ export default function ReplayPanel({ sid }) {
         const p = playerRef.current;
         if (p?.getCurrentTime && p?.seek) {
           const target = c.t - castRelRef.current;
-          if (target >= 0) {
-            try {
+          try {
+            if (target >= 0) {
               const dt = p.getCurrentTime();
               if (Math.abs(dt - target) > 0.4) p.seek(target);
-            } catch { /* player not ready yet */ }
-          }
+            } else if (p.getCurrentTime() > 0) {
+              // F6: before the cast epoch the player HOLDS FRAME ZERO —
+              // it follows the session clock instead of freezing wherever
+              // the last in-cast frame left it.
+              p.seek(0);
+            }
+          } catch { /* player not ready yet */ }
         }
         if (t0 !== null && c.t > (horizonRef.current ?? 0) - OPS_LOOKAHEAD)
           void pumpOps(t0 + c + OPS_LOOKAHEAD);
@@ -518,6 +535,12 @@ export default function ReplayPanel({ sid }) {
             {cast && Math.round(castRel) > 0 && ` · cast starts ${Math.round(castRel)}s after the session clock begins`}
           </p>
           {epochMissing && <p className="bad">selected cast has no epoch header — cross-track alignment disabled</p>}
+          {(chunkRows || []).length > 0 &&
+            <p className="dim" data-testid="timing-provenance" style={{ fontSize: ".82rem" }}>
+              attacker timing: {(chunkRows || []).some(c => c.read_ts != null)
+                ? "WORKER-CLAIMED pipe-read time (advisory: window-bounded at ingest, not server-verified)"
+                : "server persist time (fallback — coarser than the capture)"}
+            </p>}
           {(opsNext !== null || ops.some(o => o.has_output)) &&
             <p className="dim" style={{ fontSize: ".82rem" }}>output loads as the clock reaches each command (bounded pages; nothing bulk-downloaded).</p>}
         </div>

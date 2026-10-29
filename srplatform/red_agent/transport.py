@@ -130,6 +130,8 @@ class HttpTransport:
                 status = (r.json() or {}).get("status")
                 return (status if status in _DELIVERY_STATUSES
                         else "stored")
+            if r.status_code == 409:
+                return "conflict"   # F8: server-refused divergence, still typed
             return "error"
         except Exception:  # noqa: BLE001 — honest gap, never an abort
             return "error"
@@ -212,6 +214,8 @@ class TestClientTransport:
                 status = (r.json() or {}).get("status")
                 return (status if status in _DELIVERY_STATUSES
                         else "stored")
+            if r.status_code == 409:
+                return "conflict"   # F8: server-refused divergence, still typed
             return "error"
         except Exception:  # noqa: BLE001 — capture never breaks the run
             return "error"

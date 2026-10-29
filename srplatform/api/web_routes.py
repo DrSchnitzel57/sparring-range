@@ -208,8 +208,17 @@ def replay(session_id: uuid.UUID,
         "WHERE session_id = :sid AND actor = 'red' AND action_type IN "
         "('action_intent','action_result')"),
         {"sid": str(session_id)}).scalar() or 0
+    # F6: ONE canonical session-clock anchor for the replay view — the
+    # session's first recorded event, UNFILTERED. Deriving t0 client-side
+    # from whatever the current filters happen to show made the cast
+    # offset shift when an actor filter changed (100 -> 50), desyncing
+    # the defender player from the session clock.
+    first_ts = db.execute(sa_text(
+        "SELECT min(ts) FROM events WHERE session_id = :sid"),
+        {"sid": str(session_id)}).scalar()
     return {"session_id": str(session_id), "scenario_id": sess.scenario_id,
             "sealed": sealed,
+            "session_t0": first_ts.isoformat() if first_ts else None,
             "casts_total": int(casts_total), "operations_total": int(ops_total),
             "timeline": timeline,
             "total_events": total, "has_more": has_more,
@@ -427,7 +436,15 @@ def operation_output(session_id: uuid.UUID, op_id: str,
         params).fetchall()
     has_more = len(rows) > limit
     rows = rows[:limit]
+    # F9: timing honesty at the surface. read_ts is WORKER-CLAIMED pipe
+    # read time (bounded to a plausibility window at ingest, never
+    # server-verified); persist time is a coarser server-side fallback.
+    # Replay may order by either, but must say which one it is showing.
     return {"op_id": op_id,
+            "timing_provenance": ("worker-claimed pipe-read time "
+                                  "(advisory)" if any(r.read_ts
+                                                      for r in rows)
+                                  else "server persist time (fallback)"),
             "chunks": [{"seq": r.seq, "ts": r.ts.isoformat(),
                         "read_ts": r.read_ts,
                         "kind": r.kind, "text": r.text,
