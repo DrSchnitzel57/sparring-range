@@ -397,6 +397,22 @@ class Journal:
     def mark(self, attempt: str, stage: str, status: str, **detail) -> dict:
         data = self.load(attempt)
         entry = data.setdefault("stages", {}).setdefault(stage, {})
+        if status == "started" and any(
+                key not in ("status", "at", "prior")
+                for key in entry) or (
+                status == "started" and entry.get("status") in
+                ("failed", "started")):
+            # LIVE-02: re-entering a stage (the normal resume path after a
+            # failure) must not leave the PREVIOUS attempt's facts —
+            # especially `error` — sitting in the stage entry, where they
+            # read as a current unresolved failure after the eventual
+            # success. They move to the entry's `prior` list instead: the
+            # evidence is retained, only its presentation changes.
+            entry.setdefault("prior", []).append(
+                {k: v for k, v in entry.items() if k != "prior"})
+            for key in list(entry):
+                if key not in ("status", "at", "prior"):
+                    del entry[key]
         entry.update({"status": status, "at": _now()})
         entry.update({k: (redact_url(v) if isinstance(v, str) and "://" in v
                           else v) for k, v in detail.items()})
