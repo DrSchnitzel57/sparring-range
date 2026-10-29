@@ -26,6 +26,7 @@ export default function LiveSession() {
   const [sess, setSess] = useState(null);
   const [live, setLive] = useState(null);
   const [conns, setConns] = useState(null);
+  const [keyEnroll, setKeyEnroll] = useState(null);
   const [injects, setInjects] = useState(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
@@ -64,7 +65,7 @@ export default function LiveSession() {
         }
         if (stop) return;
         const c = await api(`/sessions/${id}/connections`);
-        if (!stop) setConns(c.connections);
+        if (!stop) { setConns(c.connections); setKeyEnroll(c.key_enrollment || null); }
       } catch { if (!stop) setConns(null); }
     };
     loadConns();
@@ -151,6 +152,7 @@ export default function LiveSession() {
     try { await awaitOperation(acc.operation_id); } finally { setOpNote(null); }
     const c = await api(`/sessions/${id}/connections`);
     setConns(c.connections);
+    setKeyEnroll(c.key_enrollment || null);
     setSess(await api(`/sessions/${id}`));
   }, "redeploy");
   const submitInject = (releaseId) => act(async () => {
@@ -266,17 +268,36 @@ function Overview({ id, sess, live, conns, injects, busy, opNote,
         <div className="panel">
           <h3>connections</h3>
           {conns && conns.length ? (
-            <ul>{conns.map(c => (
-              <li key={c.host}><code>{c.ssh}</code></li>))}</ul>
+            <ul data-testid="connections-list">{conns.map(c => (
+              <li key={c.host} data-testid={`connection-${c.host}`}>
+                {c.member_ssh === false ? (
+                  <span className="dim" data-testid={`connection-note-${c.host}`}>
+                    {c.note || "no member SSH for this host"}
+                  </span>
+                ) : (
+                  <code>{c.ssh}</code>
+                )}
+                {c.role && <span className="dim"> — {c.role}</span>}
+              </li>))}</ul>
           ) : conns ? (
             <p className="dim">no active connection capability — launch/redeploy to
               {" "}<a href="#" onClick={e => { e.preventDefault(); redeploy(); }}>re-issue</a></p>
           ) : (
             <p className="dim">loading…</p>
           )}
+          {keyEnroll && keyEnroll.enrolled === false && (
+            <p className="bad" data-testid="key-enrollment-warning">
+              Your account has NO public key enrolled — the bastion will refuse
+              SSH even with a valid token. Add your desktop’s PUBLIC key
+              (operator: “rangectl bastion enroll &lt;account&gt; key.pub”,
+              or the bastion admin page). Fingerprints confirm the enrollment
+              only — they never expose key material.
+            </p>
+          )}
           <p className="dim">Defend: SSH through the bastion with the token login; every keystroke
-            is recorded and replayable. SSH also requires this device’s public key to be enrolled
-            by the operator for your account — the token username alone is not sufficient.</p>
+            is recorded and replayable. SSH also requires your account’s public key
+            to be enrolled — the token username alone is not sufficient. The attacker
+            machine is red-operator territory (dispatched red operations), not an SSH host.</p>
         </div>
         <div className="panel">
           <h3>web uptime</h3>

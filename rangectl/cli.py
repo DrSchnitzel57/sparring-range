@@ -22,10 +22,12 @@ from pathlib import Path
 import typer
 
 from rangectl import client as c
+from rangectl.commands import bastion as bastion_cmds
 from rangectl.commands import db as db_cmds
 from rangectl.commands import safety as safety_cmds
 
 app = typer.Typer(name="rangectl", help="AI Red-Team Sparring Range control CLI.", no_args_is_help=True)
+app.add_typer(bastion_cmds.app, name="bastion")
 app.add_typer(db_cmds.app, name="db")
 app.add_typer(safety_cmds.app, name="safety")
 

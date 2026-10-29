@@ -25,6 +25,7 @@ from typing import Awaitable, Callable, Protocol
 
 import asyncssh
 
+from srplatform.bastion import enrollment
 from srplatform.bastion.cast import CastWriter
 from srplatform.settings import get_settings
 
@@ -120,13 +121,39 @@ class BastionProxy:
         self.recordings_dir.mkdir(parents=True, exist_ok=True)
         self.host_key_path = Path(host_key_path or s.bastion_host_key_path)
         self._auth_keys = load_authorized_keys(s.bastion_authorized_keys_file)
+        # plan 22 LIVE-06: merge the API-managed enrollment store. The
+        # operator file is NEVER rewritten here; the enrollment file is
+        # re-read by mtime at authentication time, so enrolling a key
+        # takes effect on the NEXT login with no restart and no signal
+        # that would need privileges.
+        self._enroll_path = enrollment.enrolled_keys_path(s)
+        self._enrolled = (enrollment.parse(self._enroll_path)
+                          if self._enroll_path is not None else {})
+        self._enrolled_mtime = self._enroll_mtime()
         self._authorized_keys_override = authorized_keys
         self._server: asyncssh.SSHListener | None = None
+
+    def _enroll_mtime(self):
+        if self._enroll_path is None:
+            return None
+        try:
+            return self._enroll_path.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def _keys_for(self, username: str) -> list[str]:
+        if self._enroll_path is not None:
+            m = self._enroll_mtime()
+            if m != self._enrolled_mtime:
+                self._enrolled = enrollment.parse(self._enroll_path)
+                self._enrolled_mtime = m
+        return list(self._auth_keys.get(username, [])) + \
+            list(self._enrolled.get(username, []))
 
     def authorized_keys(self, username: str, key) -> bool:
         if self._authorized_keys_override is not None:
             return self._authorized_keys_override(username, key)
-        keys = self._auth_keys.get(username)
+        keys = self._keys_for(username)
         if not keys:
             return False
         # asyncssh renamed the renderer across versions; try both, then str()

@@ -22,6 +22,7 @@ function Nav() {
           {link("/progress", "progress")}
           {link("/safety", "safety")}
           {getRole() === "operator" && link("/admin/models", "models")}
+          {getRole() === "operator" && link("/admin/bastion", "bastion")}
         </nav>
       </div>
       <nav aria-label="Account">

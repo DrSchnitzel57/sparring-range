@@ -42,6 +42,8 @@ app = FastAPI(title="sparring-range API", version="0.2.0")
 
 # LAN origins are EXPLICIT (F23) — never wildcard, never silently localhost.
 from srplatform.controller_lock import ControllerLock
+from srplatform import host_roles  # noqa: E402
+from srplatform.bastion import enrollment  # noqa: E402
 from srplatform.settings import bastion_login_target, get_settings  # noqa: E402
 
 
@@ -646,22 +648,45 @@ def get_connections(session_id: uuid.UUID, p: Principal = Depends(any_member),
                                               Deployment.status == "ready")
                      .order_by(Deployment.created_at.desc())).scalars().first()
     name_by_ip = {}
+    tmpl_by_ip = {}
     if dep:
         for r in (dep.resources or []):
             if r.get("ip"):
                 name_by_ip[r["ip"]] = r.get("host")
+                tmpl_by_ip[r["ip"]] = r.get("template_vmid")
     out = []
     for lt in db.execute(select(LoginToken).where(
             LoginToken.session_id == session_id,
             LoginToken.user_id == p.user_id,
             LoginToken.revoked_at.is_(None),
             LoginToken.expires_at > _now())).scalars():
-        out.append({"host": name_by_ip.get(lt.target_host, lt.target_host),
-                    "ip": lt.target_host, "login_token": lt.token,
-                    "ssh": f"ssh {bastion_login_target(s)} "
-                           f"-p {s.bastion_listen_port} -l {lt.token}",
-                    "expires_at": lt.expires_at.isoformat() if lt.expires_at else None})
-    return {"session_id": str(session_id), "connections": out}
+        entry = {"host": name_by_ip.get(lt.target_host, lt.target_host),
+                 "ip": lt.target_host, "login_token": lt.token,
+                 "template_vmid": tmpl_by_ip.get(lt.target_host),
+                 "ssh": f"ssh {bastion_login_target(s)} "
+                        f"-p {s.bastion_listen_port} -l {lt.token}",
+                 "expires_at": lt.expires_at.isoformat() if lt.expires_at else None}
+        host_roles.annotate(entry)          # plan 22 LIVE-09 role policy
+        out.append(entry)
+    # plan 22 LIVE-06: tell the account whether its OWN public key can
+    # authenticate at all — the desktop failure was an unenrolled account,
+    # not a broken network. Fingerprints only; the file is never exposed.
+    enroll_hint = {"enrolled": None, "fingerprints": []}
+    try:
+        import pathlib
+        epath = enrollment.enrolled_keys_path(s)
+        fps = enrollment.status(epath).get(p.username or "", []) \
+            if epath is not None else []
+        op_file = s.bastion_authorized_keys_file
+        operator_file_has = bool(
+            enrollment.parse(pathlib.Path(op_file)).get(p.username or "")) \
+            if op_file else False
+        enroll_hint = {"enrolled": bool(fps) or operator_file_has,
+                       "fingerprints": fps}
+    except OSError:
+        pass
+    return {"session_id": str(session_id), "connections": out,
+            "key_enrollment": enroll_hint}
 
 
 # --- launch / end / reset / teardown (F08/F13) ----------------------------------
@@ -2622,6 +2647,72 @@ class ProfileIn(BaseModel):
 class RoleOverrideIn(BaseModel):
     role: str
     profile_name: str
+
+
+# --- bastion public-key enrollment (plan 22 LIVE-06) ---------------------------
+# PUBLIC keys only; SHA256 fingerprints are the display currency. The
+# operator-provisioned commissioning file stays untouched; this store is
+# API-managed and hot-reloaded by the bastion (mtime), so an enrollment
+# takes effect on the NEXT authentication — no restart, no privileged
+# signal, and a mistake here can never evict the operator's key.
+
+class EnrollmentIn(BaseModel):
+    username: str
+    public_key: str
+
+
+def _enrollment_path():
+    path = enrollment.enrolled_keys_path(get_settings())
+    if path is None:
+        raise HTTPException(503, "enrollment store unconfigured — set "
+                                 "SR_BASTION_ENROLLED_KEYS_FILE or a "
+                                 "safety state path")
+    return path
+
+
+@app.get("/admin/bastion/enrollment")
+def admin_bastion_enrollment(p: Principal = Depends(operator)):
+    s = get_settings()
+    return {"enrolled": enrollment.status(_enrollment_path()),
+            "operator_file_configured": bool(s.bastion_authorized_keys_file)}
+
+
+@app.post("/admin/bastion/enrollment", status_code=201)
+def admin_bastion_enroll(body: EnrollmentIn, p: Principal = Depends(operator)):
+    user = (body.username or "").strip()
+    if not user or len(user) > 64:
+        raise HTTPException(400, "username must be 1-64 characters")
+    try:
+        created, fps = enrollment.enroll(_enrollment_path(), user, body.public_key)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"created": created, "username": user, "fingerprints": fps}
+
+
+@app.delete("/admin/bastion/enrollment")
+def admin_bastion_revoke(username: str = Query(...), fingerprint: str = Query(...),
+                         p: Principal = Depends(operator)):
+    if not enrollment.revoke(_enrollment_path(), username.strip(),
+                             fingerprint.strip()):
+        raise HTTPException(404, "that fingerprint is not enrolled "
+                                 "for that account")
+    return {"revoked": True}
+
+
+@app.get("/bastion/enrollment/me")
+def my_bastion_enrollment(p: Principal = Depends(any_member)):
+    """Own-account self-diagnosis (the LIVE-06 failure was an unenrolled
+    account): is there ANY public key enrolled for ME, and which
+    fingerprints? Public material only; never other accounts."""
+    s = get_settings()
+    import pathlib
+    fps = enrollment.status(_enrollment_path()).get(p.username or "", [])
+    operator_file_has = False
+    if s.bastion_authorized_keys_file:
+        operator_file_has = bool(enrollment.parse(
+            pathlib.Path(s.bastion_authorized_keys_file)).get(p.username or ""))
+    return {"username": p.username, "enrolled": bool(fps) or operator_file_has,
+            "fingerprints": fps}
 
 
 class RebindIn(BaseModel):

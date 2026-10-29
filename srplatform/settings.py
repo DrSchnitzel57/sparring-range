@@ -321,6 +321,10 @@ class Settings(BaseSettings):
     bastion_listen_host: str = "0.0.0.0"
     bastion_listen_port: int = 2222
     bastion_authorized_keys_file: str = ""  # member public keys, provisioned by operator
+    # plan 22 LIVE-06: API-managed account-bound enrollment (PUBLIC keys
+    # only). Empty -> derived beside the safety state; the operator file
+    # above is never rewritten, both sources are merged by the bastion.
+    bastion_enrolled_keys_file: str = ""
     bastion_targets_known_hosts: str = ""   # pinned range host keys (F08)
     # Guest-side identity for recorded dials (pilot step 7): DEFENDER, not
     # root — the bastion never needs guest root. The bastion authenticates

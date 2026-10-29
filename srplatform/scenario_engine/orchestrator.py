@@ -32,6 +32,7 @@ from srplatform.db.models import (Deployment, Event, LoginToken, OperationClaim,
                                   RangeLease,
                                   ServiceToken,
                                   Session as SessionModel)
+from srplatform import host_roles
 from srplatform.scenario_engine.loader import load_scenario
 from srplatform.settings import bastion_login_target, get_settings
 
@@ -250,10 +251,15 @@ def finalize_ready(db: Session, session_id, user_id, result) -> tuple[list, dict
                           target_host=r["ip"], target_port=22,
                           expires_at=_now() + timedelta(
                               hours=s.web_token_ttl_hours)))
-        instructions.append({"host": r["host"], "ip": r["ip"],
-                             "login_token": tok,
-                             "ssh": f"ssh {bastion_login_target(s)} -p "
-                                    f"{s.bastion_listen_port} -l {tok}"})
+        entry = {"host": r["host"], "ip": r["ip"],
+                 "template_vmid": r.get("template_vmid"),
+                 "login_token": tok,
+                 "ssh": f"ssh {bastion_login_target(s)} -p "
+                        f"{s.bastion_listen_port} -l {tok}"}
+        # plan 22 LIVE-09: one role policy decides what is ADVERTISED —
+        # the attacker host has no member SSH login to offer.
+        host_roles.annotate(entry)
+        instructions.append(entry)
     sess.status = "ready"
     db.add(Event(session_id=session_id, ts=_now(), actor="system",
                  action_type="session_ready",
