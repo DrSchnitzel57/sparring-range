@@ -304,11 +304,24 @@ def release_stages(p: Principal = Depends(operator), db: DbSession = None):
         except Exception as e:  # noqa: BLE001
             broker = {"ok": False, "detail": str(e)[:200]}
     lab_ready = install_ready and bool(broker and broker.get("ok"))
+    # LIVE-07: the stage ladder carries the SAME Begin eligibility the gate
+    # applies, so the safety page, the stage page and Begin cannot disagree.
+    try:
+        qual = get_supervisor().qualification_report()
+        safety = {"begin_allowed": qual["begin_allowed"],
+                  "begin_blockers": qual["begin_blockers"],
+                  "advisories": qual["advisories"]}
+    except Exception as e:  # noqa: BLE001 — a stage report never 500s
+        safety = {"begin_allowed": False,
+                  "begin_blockers": [f"safety report unavailable: "
+                                     f"{str(e)[:150]}"],
+                  "advisories": []}
     return {"install_ready": install_ready,
             "lab_ready": lab_ready,
             "attack_authorized": lab_ready and s.attack_authorized,
             "operator_gate": s.attack_authorized,
             "broker": broker,
+            "safety": safety,
             "issues": issues}
 
 
@@ -2383,6 +2396,18 @@ def killswitch_release(p: Principal = Depends(operator)):
 @app.get("/safety/status")
 def safety_status(p: Principal = Depends(operator)):
     return get_supervisor().verify()
+
+
+@app.get("/safety/qualification")
+def safety_qualification(p: Principal = Depends(principal)):
+    """Plan 22 LIVE-07: the ONE Begin-eligibility classification — config-
+    bound commissioning qualification (age advisory only), the bounded
+    non-disruptive admission probes, and the actionable blockers Begin will
+    cite. Authenticated (members must see why their own Begin is refused
+    BEFORE clicking); read-only; the values are safety posture, never
+    match content. /stages and the safety/session pages consume this same
+    report, so the UI can never disagree with the gate."""
+    return get_supervisor().qualification_report()
 
 
 @app.get("/safety/panel")

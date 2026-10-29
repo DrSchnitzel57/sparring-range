@@ -31,6 +31,7 @@ export default function LiveSession() {
   const [err, setErr] = useState(null);
   const [opNote, setOpNote] = useState(null);
   const [seconds, setSeconds] = useState(0);
+  const [qualBlockers, setQualBlockers] = useState(null);
   const startRef = useRef(null);
   const tabsRef = useRef(null);
 
@@ -74,7 +75,17 @@ export default function LiveSession() {
         setLive(d);
         if (!startRef.current && d.started_at) startRef.current = new Date(d.started_at).getTime();
         if (startRef.current) setSeconds(Math.max(0, Math.floor((Date.now() - startRef.current) / 1000)));
-        api(`/sessions/${id}`).then(s => { if (!stop) setSess(s); }).catch(() => {});
+        api(`/sessions/${id}`).then(s => {
+          if (stop) return;
+          setSess(s);
+          // LIVE-07: show WHAT blocks Begin (and why) before the click —
+          // the same classification the server gate applies.
+          if (s.match && s.match.state === "ready")
+            api("/safety/qualification")
+              .then(q => setQualBlockers(q.begin_blockers || []))
+              .catch(() => setQualBlockers(null));
+          else setQualBlockers(null);
+        }).catch(() => {});
       } catch { /* transient */ }
     };
     tick();
@@ -231,7 +242,16 @@ function Overview({ id, sess, live, conns, injects, busy, opNote,
           )}
           <div className="row" style={{ marginTop: 8 }}>
             {match && match.state === "ready" && !running &&
-              <button onClick={beginMatch} disabled={busy}>▶ begin match ({match.duration_minutes} min)</button>}
+              qualBlockers && qualBlockers.length > 0 && (
+              <p className="bad" data-testid="begin-blockers">
+                begin is blocked: {qualBlockers.join(" · ")}
+              </p>)}
+            {match && match.state === "ready" && !running &&
+              <button onClick={beginMatch} disabled={busy}
+                      data-testid="begin-button"
+                      data-blocked={qualBlockers && qualBlockers.length ? "yes" : "no"}
+                      title={qualBlockers && qualBlockers.length
+                        ? qualBlockers.join(" · ") : undefined}>▶ begin match ({match.duration_minutes} min)</button>}
             {(!match || match.state !== "ready") && !running &&
               sess.status !== "complete" && sess.status !== "failed" &&
               (!match || !["finalizing", "interrupted"].includes(match.state)) &&

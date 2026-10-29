@@ -43,6 +43,21 @@ def _now() -> datetime:
 # "isolation observed" from "egress reachable": observations that describe  #
 # working connectivity are structurally rejected, not silently recorded.     #
 # -------------------------------------------------------------------------- #
+# -------------------------------------------------------------------------- #
+# Plan 22 LIVE-07: qualification versus admission health.                    #
+# The three commissioning kinds below are QUALIFICATION evidence: collected  #
+# once per configuration/contract, valid while that configuration and the    #
+# safety latches are unchanged, with age shown as an advisory only. A fourth,#
+# machine-written kind records the bounded non-disruptive ADMISSION probes   #
+# the controller runs itself at every start — evidence of health now, never  #
+# a renewed qualification. `qualification_contract` marks the schema version #
+# a record was collected under; earlier accepted releases wrote the same    #
+# kinds without a marker and are classified "legacy-compatible".             #
+# -------------------------------------------------------------------------- #
+QUALIFICATION_KINDS = ("baseline_check", "datapath_proof", "killswitch_test")
+ADMISSION_KIND = "admission_probe"
+QUALIFICATION_CONTRACT = 1
+
 ISOLATION_MARKERS = (
     "100% packet loss", "100.0% packet loss", "unreachable", "fail", "failures",
     "timed out", "timeout", "no route to host", "no default route", "no answer",
@@ -208,6 +223,12 @@ class Supervisor:
         (audit N07: a record that could not be persisted must deny starts,
         not silently vanish)."""
         identity = config_identity(self.settings)
+        if kind in QUALIFICATION_KINDS:
+            # new qualifications carry the contract marker; older accepted
+            # records without one are classified, not rewritten (the record
+            # you recorded is the record that stays — append-only)
+            detail = {**(detail or {}),
+                      "qualification_contract": QUALIFICATION_CONTRACT}
         if self._mirror_dh is not None:
             self._mirror_dh.append({"kind": kind, "ok": ok, "config_identity": identity,
                                     "detail": detail or {}, "recorded_at": time.time()})
@@ -258,7 +279,9 @@ class Supervisor:
                 with db() as s:
                     rows = s.execute(select(SafetyRecord).order_by(
                         SafetyRecord.record_id)).scalars().all()
-                    return [{"kind": r.kind, "ok": r.ok, "config_identity": r.config_identity,
+                    return [{"kind": r.kind, "ok": r.ok,
+                             "config_identity": r.config_identity,
+                             "detail": r.detail,
                              "recorded_at": r.recorded_at.timestamp() if r.recorded_at else 0}
                             for r in rows]
             except Exception:
@@ -283,31 +306,162 @@ class Supervisor:
             pass
         return out
 
-    def _record_fresh(self, kind: str) -> tuple[bool, str]:
-        recs = self._latest_records()
+    def _qualification(self, kind: str,
+                       recs: dict | None = None) -> dict:
+        """Classify the newest record of one kind (plan 22 LIVE-07).
+
+        A qualification is COMMISSIONING evidence: it stays usable for the
+        exact configuration/contract it was collected under, and its AGE
+        ALONE is an advisory, never a failed test. What DOES invalidate it:
+        a failed newest record, a changed config identity, a safety
+        engage/release transition after it, or evidence this build cannot
+        classify (unknown provenance fails closed). Legacy records written
+        by accepted earlier releases — same kinds, structured detail — are
+        classified "legacy-compatible" and honored; that re-classifies old
+        truth, it never mints a new passed observation.
+        """
+        recs = self._latest_records() if recs is None else recs
+        out: dict = {"kind": kind, "usable": False, "provenance": "missing",
+                     "problems": [], "advisories": [], "age_h": None}
         rec = recs.get(kind)
         if not rec:
-            return False, f"no {kind} record"
+            out["problems"] = [f"no {kind} record"]
+            return out
+        detail = rec.get("detail")
+        if detail is not None and not isinstance(detail, dict):
+            out["provenance"] = "incompatible"
+            out["problems"] = [
+                f"{kind} record detail is not structured — this build "
+                "cannot classify its scope; re-collect through the "
+                "supported operator flow"]
+            return out
+        marker = (detail or {}).get("qualification_contract")
+        if marker is None:
+            out["provenance"] = "legacy-compatible"
+        elif marker != QUALIFICATION_CONTRACT:
+            out["provenance"] = "incompatible"
+            out["problems"] = [
+                f"{kind} record carries qualification contract "
+                f"{marker!r}, this build understands "
+                f"{QUALIFICATION_CONTRACT} — re-collect"]
+            return out
+        else:
+            out["provenance"] = "current"
         if not rec.get("ok"):
-            return False, f"latest {kind} FAILED"
+            out["problems"] = [f"latest {kind} FAILED"]
         identity = config_identity(self.settings)
         if rec.get("config_identity") != identity:
-            return False, f"{kind} record predates a configuration/network change (identity mismatch)"
-        # ENGAGE/RELEASE INVALIDATE PRIOR EVIDENCE (audit R04): a killswitch
-        # engagement or release means the datapath changed — every baseline
-        # check / datapath proof recorded BEFORE that event says nothing about
-        # the current state and must not re-authorize a start.
+            out.setdefault("problems", []).append(
+                f"{kind} record predates a configuration/network change "
+                "(identity mismatch) — re-collect for the current "
+                "configuration")
         rec_ts = float(rec.get("recorded_at", 0))
         if kind not in ("engage", "release"):
             for gate in ("engage", "release"):
                 g = recs.get(gate)
                 if g and float(g.get("recorded_at", 0)) >= rec_ts:
-                    return False, (f"{kind} record predates the last {gate} — "
-                                   "evidence invalidated, re-run the check")
-        age_h = (time.time() - rec_ts) / 3600
-        if age_h > self.settings.safety_evidence_max_age_h:
-            return False, f"{kind} record is stale ({age_h:.0f}h > {self.settings.safety_evidence_max_age_h}h)"
-        return True, "fresh"
+                    out.setdefault("problems", []).append(
+                        f"{kind} record predates the last {gate} — "
+                        "evidence invalidated, re-run the check")
+        out["recorded_at"] = rec_ts
+        if rec_ts:
+            age_h = (time.time() - rec_ts) / 3600
+            out["age_h"] = round(age_h, 1)
+            if age_h > self.settings.safety_evidence_max_age_h:
+                out["advisories"] = [
+                    f"{kind} qualification is {age_h:.0f}h old (advisory "
+                    f"lifetime {self.settings.safety_evidence_max_age_h}h); "
+                    "still valid for this unchanged configuration — renewal "
+                    "is optional, age alone does not reprove or disprove "
+                    "isolation"]
+        out["usable"] = not out["problems"]
+        return out
+
+    def _record_fresh(self, kind: str) -> tuple[bool, str]:
+        """Compatibility wrapper: (usable, why). LIVE-07 changed AGE to an
+        advisory; usability now means provenance-compatible, newest-passed,
+        config-bound and not invalidated by a safety transition."""
+        v = self._qualification(kind)
+        if v["usable"]:
+            return True, "fresh"
+        return False, "; ".join(v["problems"]) or "unusable"
+
+    # ------------------------------------------------------- admission health ---
+    def admission_probes(self) -> dict:
+        """Bounded, NON-DESTRUCTIVE, authoritative health of RIGHT NOW
+        (plan 22 LIVE-07): only fixed typed checks through authorities the
+        controller already holds — no host shell, no model-selected
+        destinations, no killswitch exercise. A failed or unknown probe
+        fails closed; a not-applicable mechanism is reported, not faked."""
+        checks: list[dict] = []
+        ok_runner, why = self.runner_available()
+        checks.append({"check": "runner", "ok": ok_runner, "detail": why})
+        mechanism = getattr(self.datapath, "mechanism", None)
+        if mechanism == "nft":
+            from srplatform.safety.firewall import validate_port_coverage
+            cov_ok, cov_why = validate_port_coverage(self.settings)
+            checks.append({"check": "bridge_port_coverage", "ok": cov_ok,
+                           "detail": cov_why})
+        try:
+            base = self.datapath.baseline_status()
+            applicable = base.get("ok") is not None
+            checks.append({"check": "datapath_structure",
+                           "ok": bool(base.get("ok")) if applicable else True,
+                           "applicable": applicable,
+                           "detail": str(base.get("detail", base))[:300]})
+        except Exception as exc:  # noqa: BLE001 — unknown is not healthy
+            checks.append({"check": "datapath_structure", "ok": False,
+                           "detail": f"controller error: {exc}"[:300]})
+        return {"ok": all(c["ok"] for c in checks), "checks": checks,
+                "config_identity": config_identity(self.settings),
+                "at": time.time()}
+
+    def _evidence_required(self) -> bool:
+        """Non-production noop datapaths (plain dev) carry no isolation to
+        qualify — same exemption the historical start_gate applied."""
+        return (getattr(self.datapath, "mechanism", None) != "noop"
+                or self.settings.sr_env == "production")
+
+    def qualification_report(self) -> dict:
+        """ONE classification shared by readiness, stages, the safety page
+        and Begin (plan 22 LIVE-07: UI/readiness/stages/Begin must agree).
+        Read-only: performs no writes and records nothing."""
+        recs = self._latest_records()
+        quals = [self._qualification(k, recs) for k in QUALIFICATION_KINDS]
+        probes = self.admission_probes()
+        st = self.latch_status()
+        reasons: list[str] = []
+        if st["latched"]:
+            reasons.append(
+                f"SAFETY LATCHED since {st['latched_at']} ({st['reason']}) — "
+                "operator release required")
+        if st.get("persistence_error"):
+            reasons.append(f"safety state persistence problem: "
+                           f"{st['persistence_error']}")
+        if getattr(self, "_record_failures", []):
+            reasons.append("safety record persistence failed since startup: "
+                           + "; ".join(self._record_failures[-3:])
+                           + " — re-run the checks with working storage")
+        for c in probes["checks"]:
+            if not c["ok"]:
+                label = {"runner": "runner unavailable"}.get(
+                    c["check"], c["check"])
+                reasons.append(f"{label}: {c['detail']}")
+        advisories: list[str] = []
+        if self._evidence_required():
+            for q in quals:
+                if not q["usable"]:
+                    label = {"baseline_check": "baseline verification",
+                             "datapath_proof": "operator datapath proof",
+                             "killswitch_test":
+                                 "killswitch stop/isolation test"}[q["kind"]]
+                    for p in q["problems"]:
+                        reasons.append(f"{label}: {p}")
+                advisories.extend(q["advisories"])
+        return {"qualifications": quals, "admission": probes,
+                "latch": st, "advisories": advisories,
+                "config_identity": config_identity(self.settings),
+                "begin_allowed": not reasons, "begin_blockers": reasons}
 
     # ------------------------------------------------------------ operations ---
     def kill_workers(self, extra_groups: list[tuple] | None = None) -> dict:
@@ -461,39 +615,21 @@ class Supervisor:
         engagement) bound to the current configuration identity — baseline
         and proof records alone never proved the stop/isolation mechanism
         works. Persistence failures also deny (state/evidence that cannot be
-        established cannot authorize a start)."""
-        reasons: list[str] = []
-        st = self.latch_status()
-        if st["latched"]:
-            reasons.append(f"SAFETY LATCHED since {st['latched_at']} ({st['reason']}) — "
-                           "operator release required")
-        if st.get("persistence_error"):
-            reasons.append(f"safety state persistence problem: {st['persistence_error']}")
-        if getattr(self, "_record_failures", []):
-            reasons.append("safety record persistence failed since startup: "
-                           + "; ".join(self._record_failures[-3:]) +
-                           " — re-run the checks with working storage")
-        runner_ok, why = self.runner_available()
-        if not runner_ok:
-            reasons.append(f"runner unavailable: {why}")
-        dp_available = getattr(self.datapath, "mechanism", None) != "noop" or self.settings.sr_env == "production"
-        if getattr(self.datapath, "mechanism", None) == "nft":
-            # LIVE TOPOLOGY BEFORE AUTHORIZING A RUN (audit T03): the recorded
-            # evidence identity contains the CONFIGURED port list — config
-            # string equality is not live coverage. Re-discover the current
-            # bridge inventory through the same mechanism nft uses and refuse
-            # if it no longer matches.
-            from srplatform.safety.firewall import validate_port_coverage
-            cov_ok, cov_why = validate_port_coverage(self.settings)
-            if not cov_ok:
-                reasons.append(f"live bridge topology: {cov_why}")
-        for kind, label in (("baseline_check", "baseline verification"),
-                            ("datapath_proof", "operator datapath proof"),
-                            ("killswitch_test", "killswitch stop/isolation test")):
-            ok, why_r = self._record_fresh(kind)
-            if not ok and dp_available:
-                reasons.append(f"{label}: {why_r}")
-        return (len(reasons) == 0), reasons
+        established cannot authorize a start).
+
+        Plan 22 LIVE-07: the decision is exactly the shared
+        ``qualification_report()`` — commissioning qualification
+        (config-bound, provenance-classified, age advisory) PLUS the bounded
+        automatic admission probes. Before deciding, the probes' outcome is
+        appended as an ``admission_probe`` record: what the machine checked
+        at admission is durable evidence, never dressed up as a renewed
+        baseline/proof/killswitch qualification."""
+        report = self.qualification_report()
+        self.record(ADMISSION_KIND, bool(report["admission"]["ok"]),
+                    {"checks": report["admission"]["checks"],
+                     "begin_allowed": report["begin_allowed"],
+                     "blockers": report["begin_blockers"][:10]})
+        return report["begin_allowed"], report["begin_blockers"]
 
     # -------------------------------------------------------------- verify ----
     def verify(self) -> dict:
