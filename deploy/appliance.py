@@ -1242,6 +1242,29 @@ def _broker_status(m: ApplianceManifest) -> dict:
         client = BrokerClient(HttpTransport(f"unix://{m.broker_socket}"))
         return {"ok": True, "inventory": client.inventory()}
     except Exception as exc:  # noqa: BLE001 — status reports, never crashes
+        # LIVE-03: a REFUSAL is not an outage. The broker allowlists the
+        # service identities that may query it (and deliberately refuses
+        # root); when the socket answers with HTTP 403, the honest
+        # diagnostic is "your identity is not allowed here", not
+        # "broker unreachable" — which previously sent operators hunting
+        # for a broker failure while /readyz proved the broker healthy.
+        try:
+            from infra.broker.errors import PolicyViolation
+        except ImportError:  # pragma: no cover - protocol always present
+            PolicyViolation = ()  # type: ignore[assignment]
+        if isinstance(exc, PolicyViolation):
+            return {
+                "ok": False,
+                "reason": "peer-identity-refused",
+                "error": str(exc)[:300],
+                "advice": ("the broker answered and REFUSED this process's "
+                           "identity (peer-UID allowlist; root is "
+                           "deliberately not authorized). Re-run this "
+                           "diagnostic as the API service identity (for "
+                           "example sudo -u srrange) — do NOT widen the "
+                           "allowlist; a refused identity proves the "
+                           "broker is listening, not failing"),
+            }
         return {"ok": False, "error": str(exc)[:300]}
 
 
@@ -1288,7 +1311,9 @@ def doctor(m: ApplianceManifest, *, as_json: bool = False) -> dict:
     for unit in UNITS:
         state = _unit_state(unit)
         add(f"unit {unit}", state == "active", state)
-    add("broker reachable", _broker_status(m)["ok"])
+    broker_now = _broker_status(m)
+    add("broker reachable", broker_now["ok"],
+        str(broker_now.get("advice") or broker_now.get("error", ""))[:300])
     # libvirt/KVM visibility is a broker-UID concern; a root doctor can still
     # report it without granting the API anything.
     try:
@@ -1354,7 +1379,8 @@ def firstboot_report(m: ApplianceManifest, layout: Layout) -> dict:
         pending_if_manual=True)
     broker = _broker_status(m)
     add("broker answers", broker.get("ok", False),
-        "inventory" if broker.get("ok") else str(broker.get("error", ""))[:120],
+        "inventory" if broker.get("ok")
+        else str(broker.get("advice") or broker.get("error", ""))[:300],
         pending_if_manual=True)
 
     def http(url: str) -> tuple[bool, str]:
