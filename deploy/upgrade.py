@@ -1622,8 +1622,14 @@ def run_upgrade(m, layout, payload: ReleasePayload, *, db_url: str,
         from deploy.appliance import Runner
         try:
             hook = provision_hook or provision_release
+            # LIVE-05: the frontend bakes NEXT_PUBLIC_API_URL at BUILD time.
+            # An upgrade that provisions without the manifest's public URL
+            # leaves the browser talking to localhost:8000 — a healthy
+            # appliance whose login page cannot submit. The install path
+            # always passed it; the upgrade path now does too.
             receipt = (hook(layout, payload, run=Runner(dry_run=False),
-                            skip_frontend=skip_frontend)
+                            skip_frontend=skip_frontend,
+                            public_url=getattr(m, "public_url", ""))
                        if provision_hook is None
                        else hook(layout, payload))
             (att / "provision-receipt.json").write_text(

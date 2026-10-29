@@ -2516,6 +2516,18 @@ def check_upgrade() -> None:
         if chk.returncode != 0:
             fail("installed venv runs the release entrypoints",
                  (chk.stdout + chk.stderr)[-300:])
+        # LIVE-05: the upgrade-time frontend build must bake the MANIFEST's
+        # public API URL (NEXT_PUBLIC_API_URL). The installed defect was an
+        # upgrade that provisioned with an empty URL: the browser then
+        # posted login to localhost:8000 and every sign-in "Failed to
+        # fetch" despite a healthy appliance. The receipt is the proof.
+        web_receipt = receipt.get("web") or {}
+        if web_receipt.get("next_public_api_url") != "https://sr.example.edu/api":
+            fail("upgrade frontend baked the manifest's public API URL",
+                 f"receipt next_public_api_url="
+                 f"{web_receipt.get('next_public_api_url')!r}")
+        ok("upgrade provisioned the frontend with the public API URL",
+           str(web_receipt.get("next_public_api_url")))
         # F5: the CHECKED restart ran against the service double — every
         # unit restarted and then verified active; stamp only after that
         ctl_lines = ctl_log_a.read_text().splitlines() if \
@@ -2879,6 +2891,24 @@ def check_upgrade() -> None:
             fail("version stamp written only after the verified restart",
                  "stamp missing after completed resume")
         ok("verified restart then (and only then) the version stamp")
+
+        # LIVE-02: after the successful resume the journal's CURRENT view
+        # of the restart stage is clean (status done, no `error` key), and
+        # the failure remains visible as prior-attempt history — stale
+        # errors must not read as unresolved after recovery, and recovery
+        # must not delete the evidence.
+        jD2 = json.loads((pathsD["etc"] / "upgrade" / jD["attempt"] /
+                          "journal.json").read_text())
+        restart_now = jD2.get("stages", {}).get("restart", {})
+        if restart_now.get("status") != "done" or "error" in restart_now:
+            fail("resumed stage presents a clean current view",
+                 json.dumps(restart_now)[:300])
+        if not [p for p in restart_now.get("prior", [])
+                if p.get("status") == "failed" and p.get("error")]:
+            fail("failed restart retained as prior history",
+                 json.dumps(restart_now.get("prior"))[:300])
+        ok("journal separates the historical restart failure from the "
+           "successful current stage")
 
         # ===== round-3 finding 1: old-schema quiescence tells the truth == #
         # A REAL 0019 schema has no model_jobs; durable work must be proven
