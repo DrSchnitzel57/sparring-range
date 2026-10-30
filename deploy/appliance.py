@@ -103,6 +103,25 @@ SECRET_DIR_GROUP = "sr-secrets"
 SSH_DIR_MODE = 0o750
 SSH_DIR_GROUP = "srbastion"
 
+# Account-bound bastion enrollment (plan 22 LIVE-06, sharpened by review):
+# ONE explicit shared location for the API-enrolled PUBLIC keys — the API
+# is the only writer, the bastion only reads. It must NOT live inside the
+# API's 0700 controller directory (the bastion may not traverse it) and
+# must not be a relative path resolved per-service. Parent: srrange owns
+# it (the API creates/replaces the file), group root, 0775 so the bastion
+# identity traverses and reads the 0644 file it holds. PUBLIC keys only —
+# no secret ever enters this location. Both service environments render
+# the same absolute path; drift between writer and reader is the defect
+# this constant exists to prevent.
+ENROLLMENT_DIR_NAME = "enrollment"
+ENROLLMENT_FILE_NAME = "enrolled_keys"
+
+
+def enrolled_keys_file(m: "ApplianceManifest") -> str:
+    """The rendered absolute enrollment path (writer AND reader side)."""
+    return str(pathlib.Path(m.state_dir) / ENROLLMENT_DIR_NAME
+               / ENROLLMENT_FILE_NAME)
+
 
 # --------------------------------------------------------------------------- #
 # pure rendering                                                              #
@@ -249,6 +268,11 @@ def render_control_env(m: ApplianceManifest, *, etc: pathlib.Path = DEFAULT_ETC,
         ("SR_SAFETY_STATE_FILE", str(pathlib.Path(m.state_dir) / "controller" / "safety_state.json")),
         ("SR_BASTION_HOST_KEY_PATH", str(etc / "ssh/bastion_ed25519")),
         ("SR_BASTION_AUTHORIZED_KEYS_FILE", str(etc / "ssh/authorized_keys")),
+        # The API ENROLLS account-bound public keys here (the only writer);
+        # the bastion reads the very same rendered path. Relative or
+        # controller-internal fallbacks are how writer and reader silently
+        # diverged (plan 22 review) — the render is the contract.
+        ("SR_BASTION_ENROLLED_KEYS_FILE", enrolled_keys_file(m)),
         # RUNTIME host pins live under the STATE directory, never under
         # /etc (plan 18): every appliance unit runs with ProtectSystem=strict
         # — /etc is read-only for the services that must WRITE fresh
@@ -371,6 +395,11 @@ def render_bastion_env(m: ApplianceManifest, *,
         # handshake (plan 18 review); the telemetry anchor stays api-ca.
         ("SR_API_TLS_CA_FILE", str(etc / "tls/https.crt")),
         ("SR_BASTION_AUTHORIZED_KEYS_FILE", str(etc / "ssh/authorized_keys")),
+        # READ side of the enrollment contract: the SAME absolute path the
+        # API's environment renders, never a per-service relative fallback
+        # (plan 22 review — enrolled keys must reach the live bastion with
+        # no manual file placement and no restart).
+        ("SR_BASTION_ENROLLED_KEYS_FILE", enrolled_keys_file(m)),
         ("SR_BASTION_HOST_KEY_PATH", str(etc / "ssh/bastion_ed25519")),
         ("SR_BASTION_CLIENT_KEY_PATH", str(etc / "ssh/bastion_client_ed25519")),
         # The bastion READS the runtime pins the API publishes; they live
@@ -915,6 +944,14 @@ def _ensure_dirs(m: ApplianceManifest, run: Runner, lay: Layout) -> None:
             # public host keys carry no secret.
             (pathlib.Path(m.state_dir) / "known_hosts", 0o755, "srrange",
              "srrange"),
+            # Account-bound bastion enrollment (plan 22 review): the API
+            # (srrange) creates and replaces the file inside; the bastion
+            # identity only needs TRAVERSAL here plus the 0644 file — the
+            # 0700 controller directory stays private and is NOT widened.
+            # Provisioned on fresh AND populated-upgrade apply, since apply
+            # runs _ensure_dirs on every path through here.
+            (pathlib.Path(m.state_dir) / ENROLLMENT_DIR_NAME, 0o775,
+             "srrange", "root"),
             (lay.run, 0o750, "srbroker", "sr-broker-clients"),
             (lay.etc / "tls", 0o755, "root", "root"),
             (lay.etc / "ssh", SSH_DIR_MODE, "root", SSH_DIR_GROUP)]

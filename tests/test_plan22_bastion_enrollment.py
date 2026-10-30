@@ -14,6 +14,7 @@ its entry carries no `ssh` string and an honest note instead.
 from __future__ import annotations
 
 import os
+import pathlib
 
 import pytest
 
@@ -73,6 +74,160 @@ def test_enrolled_keys_path_explicit_setting_wins_over_derivation(tmp_path):
     assert str(en.enrolled_keys_path(s)) == str(tmp_path / "elsewhere")
     # synthetic settings without either knob: enrollment is OFF, not broken
     assert en.enrolled_keys_path(SimpleNamespace()) is None
+
+
+# --------------------------------- the installed writer/reader contract ---- #
+def _appliance_manifest(tmp_path):
+    from tests.test_appliance_contract import _manifest
+    from infra.appliance.manifest import ApplianceManifest
+    return ApplianceManifest.from_dict(_manifest(tmp_path),
+                                       verify_images=False)
+
+
+def _env_value(rendered: str, key: str) -> str:
+    lines = [ln for ln in rendered.splitlines() if ln.startswith(key + "=")]
+    assert len(lines) == 1, (key, lines)
+    return lines[0].split("=", 1)[1]
+
+
+def test_service_envs_render_one_shared_enrollment_path(tmp_path):
+    """Review item 3: BOTH service environments must name the SAME
+    absolute, state-tree location — outside the API's 0700 controller
+    subtree, which the bastion may not traverse. The rendered env is the
+    contract; divergence here is what silently un-enrolled every member
+    on the installed appliance."""
+    import pathlib
+
+    import deploy.appliance as ap
+    m = _appliance_manifest(tmp_path)
+    etc, prefix = tmp_path / "etc", tmp_path / "prefix"
+    control = ap.render_control_env(m, etc=etc, prefix=prefix)
+    bastion = ap.render_bastion_env(m, etc=etc, prefix=prefix)
+    w = _env_value(control, "SR_BASTION_ENROLLED_KEYS_FILE")
+    r = _env_value(bastion, "SR_BASTION_ENROLLED_KEYS_FILE")
+    assert w == r, "writer and reader rendered DIFFERENT enrollment paths"
+    p = pathlib.Path(w)
+    assert p.is_absolute() and w == ap.enrolled_keys_file(m)
+    assert p.parent.parent == pathlib.Path(m.state_dir)
+    assert p.parent.name == ap.ENROLLMENT_DIR_NAME
+    assert "controller" not in p.parts
+
+
+def test_enrollment_dir_provisioned_fresh_and_on_populated_upgrade(tmp_path):
+    """Fresh AND populated-upgrade apply both provision the shared
+    location (mode 0775 srrange:root); an existing enrollment file
+    survives re-provisioning untouched — the upgrade must not un-enroll
+    anyone, and mode drift is repaired."""
+    import pathlib
+
+    import deploy.appliance as ap
+    m = _appliance_manifest(tmp_path)
+    run = ap.Runner(dry_run=False)
+    lay = ap.default_layout(root=tmp_path / "root",
+                            etc=tmp_path / "root/etc")
+    d = pathlib.Path(m.state_dir) / ap.ENROLLMENT_DIR_NAME
+    ap._ensure_dirs(m, run, lay)                      # fresh
+    assert d.is_dir() and d.stat().st_mode & 0o777 == 0o775
+    f = d / ap.ENROLLMENT_FILE_NAME
+    f.write_text("alice ssh-ed25519 AAAAC3NzaC1lZDI1 test\n")
+    f.chmod(0o644)
+    d.chmod(0o700)                                     # operator drift
+    ap._ensure_dirs(m, run, lay)                      # populated upgrade
+    assert f.read_text().startswith("alice ")
+    assert d.stat().st_mode & 0o777 == 0o775
+
+
+def test_rendered_path_is_the_shared_reader_writer_location(tmp_path):
+    """With EXACTLY the env values the installer renders, an enrollment
+    written through the API-side settings is immediately visible through
+    the bastion-side settings — and the file the API creates is 0644 even
+    under a private umask (public keys; the bastion identity must be able
+    to open it)."""
+    import os
+
+    from srplatform.settings import Settings
+    from srplatform.bastion import enrollment as en
+
+    import deploy.appliance as ap
+    m = _appliance_manifest(tmp_path)
+    rendered = ap.enrolled_keys_file(m)
+    api_s = Settings(sr_env="production",
+                     safety_state_file=str(pathlib.Path(m.state_dir)
+                                           / "controller"
+                                           / "safety_state.json"),
+                     bastion_enrolled_keys_file=rendered)
+    bastion_s = Settings(sr_env="production",
+                         bastion_enrolled_keys_file=rendered)
+    assert en.enrolled_keys_path(api_s) == en.enrolled_keys_path(bastion_s)
+    _, line = _pubkey()
+    old = os.umask(0o077)               # hostile umask for the writer
+    try:
+        created, _fps = en.enroll(en.enrolled_keys_path(api_s), "alice",
+                                  line)
+    finally:
+        os.umask(old)
+    assert created
+    read_path = en.enrolled_keys_path(bastion_s)
+    assert en.has_any(read_path, "alice")
+    assert read_path.stat().st_mode & 0o777 == 0o644
+
+
+# -------------------------------------- concurrent enrollments (item 4) --- #
+def test_cross_process_enrollments_never_lose_an_update(tmp_path):
+    """Review item 4: atomic REPLACE protects READERS, but two writer
+    processes that read the same base used to silently lose one update —
+    both enrollments reported created=True and only one account survived.
+    The flock on the stable sidecar serializes them: a first process that
+    HOLDS the lock forces the second to WAIT (deterministic), and a
+    concurrent burst of distinct enrollments all persist."""
+    import multiprocessing as mp
+    import os
+    import time
+
+    from srplatform.bastion import enrollment as en
+    ctx = mp.get_context("fork")
+    path = tmp_path / "enrolled_keys"
+
+    def child(i, barrier, n=3):
+        keys = []
+        for j in range(n):
+            _, line = _pubkey()
+            keys.append(line)
+            barrier.wait(timeout=30) if j == 0 else None
+            created, _ = en.enroll(path, f"user{i}-j{j}", line)
+            assert created, f"lost update for user{i}-j{j}"
+
+    barrier = ctx.Barrier(6)
+    procs = [ctx.Process(target=child, args=(i, barrier)) for i in range(6)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(60)
+        assert p.exitcode == 0, f"child exit {p.exitcode}"
+    st = en.status(path)
+    assert len(st) == 18, sorted(st)
+
+    # deterministic serialization: while one process holds the lock, an
+    # enrollment from ANOTHER process must block, then succeed on release
+    lock_fd = os.open(path.with_name(path.name + ".lock"),
+                      os.O_CREAT | os.O_RDWR, 0o644)
+    import fcntl
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    _, line = _pubkey()
+
+    def late():
+        created, _ = en.enroll(path, "late-user", line)
+        assert created
+
+    p = ctx.Process(target=late)
+    p.start()
+    time.sleep(0.4)
+    assert p.is_alive(), "the second writer overtook the lock holder"
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    p.join(30)
+    assert p.exitcode == 0
+    os.close(lock_fd)
+    assert en.has_any(path, "late-user")
 
 
 # ------------------------------------------------- bastion merge + reload ---

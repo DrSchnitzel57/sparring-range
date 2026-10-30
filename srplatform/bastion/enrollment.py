@@ -23,6 +23,8 @@ material is not secret, but the interface keeps it minimal anyway.
 from __future__ import annotations
 
 import base64
+import contextlib
+import fcntl
 import hashlib
 import os
 import pathlib
@@ -36,11 +38,15 @@ MAX_KEY_BYTES = 2000
 
 
 def enrolled_keys_path(settings) -> pathlib.Path | None:
-    """The single enrollment path both the API and the bastion derive:
-    explicit setting first, otherwise beside the safety state (the API's
-    writable state tree). Identical derivation for both processes is the
-    whole contract — no env plumbing that can drift between units.
-    Returns None only when NEITHER knob exists (synthetic/dev settings):
+    """The enrollment path the API and the bastion each derive from THEIR
+    OWN settings. On an installed appliance BOTH service environments
+    render the same explicit ``SR_BASTION_ENROLLED_KEYS_FILE`` — that
+    render is the writer/reader contract (plan 22 review: the state-tree
+    fallback below is shared only when the state file itself is shared,
+    and the API's controller subtree is deliberately untraversable by the
+    bastion, so an installed system MUST carry the explicit path). The
+    beside-the-state fallback remains for dev/fixture single-process use.
+    Returns None only when NEITHER knob exists (synthetic settings):
     enrollment is then simply off, never a crash for a bystander."""
     s = str(getattr(settings, "bastion_enrolled_keys_file", "") or "")
     if s:
@@ -126,32 +132,55 @@ def _write(path: pathlib.Path, users: dict[str, list[str]]) -> None:
         raise
 
 
+@contextlib.contextmanager
+def _locked(path: pathlib.Path):
+    """Serialize read-modify-write ACROSS PROCESSES (plan 22 review): the
+    atomic REPLACE protects readers, but two writers that read the same
+    base silently lose one update. The lock is taken on a STABLE sidecar
+    file — never on the enrollment inode itself, which os.replace swaps —
+    so an exclusive holder is honoured for the whole parse-write-replace
+    window. Only public keys ever live in the directory, so a 0644 lock
+    file leaks nothing."""
+    lock = path.with_name(path.name + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)          # closing the descriptor releases the lock
+
+
 def enroll(path: pathlib.Path, username: str, public_key: str
            ) -> tuple[bool, list[str]]:
     """Idempotent: an already-enrolled identical key changes nothing.
-    Returns (created, fingerprints-of-account)."""
+    Returns (created, fingerprints-of-account). Concurrent enrollments for
+    OTHER accounts both persist — a lost update here once evicted a working
+    desktop's key."""
     key = validate_public_key(public_key)
-    users = parse(path)
-    entries = users.get(username, [])
-    created = key not in entries
-    if created:
-        entries = entries + [key]
-        users[username] = entries
-        _write(path, users)
+    with _locked(path):
+        users = parse(path)
+        entries = users.get(username, [])
+        created = key not in entries
+        if created:
+            entries = entries + [key]
+            users[username] = entries
+            _write(path, users)
     return created, [fingerprint(k) for k in users[username]]
 
 
 def revoke(path: pathlib.Path, username: str, want_fp: str) -> bool:
-    users = parse(path)
-    entries = users.get(username, [])
-    keep = [k for k in entries if fingerprint(k) != want_fp]
-    if len(keep) == len(entries):
-        return False
-    if keep:
-        users[username] = keep
-    else:
-        users.pop(username, None)
-    _write(path, users)
+    with _locked(path):
+        users = parse(path)
+        entries = users.get(username, [])
+        keep = [k for k in entries if fingerprint(k) != want_fp]
+        if len(keep) == len(entries):
+            return False
+        if keep:
+            users[username] = keep
+        else:
+            users.pop(username, None)
+        _write(path, users)
     return True
 
 

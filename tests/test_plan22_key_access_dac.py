@@ -119,6 +119,9 @@ def test_named_acl_grants_only_the_api_identity(tmp_path):
 
 def _helper_main(stage: pathlib.Path) -> None:
     """Executed as namespace root (== the invoking host user)."""
+    if (stage / "ENROLLMENT-SCENARIO").exists():
+        _enrollment_helper(stage)
+        return
     import pwd
 
     from deploy import appliance_services as svc
@@ -204,6 +207,120 @@ def _helper_main(stage: pathlib.Path) -> None:
     os.removexattr(str(secrets), posixacl.XATTR_NAME)
     ok, how = read_as(API)
     print(f"AFTER-ACL-REMOVAL-{how}")
+
+
+def test_enrollment_layout_gives_the_bastion_read_without_the_controller(
+        tmp_path):
+    """Plan 22 review (item 3) under REAL kernel DAC: the shared enrollment
+    location (API-owned 0775 directory under the shared state tree, 0644
+    public-key file) is readable by the bastion identity — while the API's
+    0700 controller subtree, where the writer previously dropped the file,
+    stays REFUSED to that same identity. This is the pair of live DAC
+    decisions the writer/reader mismatch hinged on."""
+    reason = _namespace_prereq()
+    if reason:
+        msg = f"namespace DAC fixture unavailable: {reason}"
+        if os.environ.get("SR_REQUIRE_PRACTICE") == "1":
+            pytest.fail(msg)
+        pytest.skip(msg)
+
+    stage = tmp_path / "stage"
+    p = tmp_path
+    while str(p) != "/tmp" and len(p.parts) > 1:
+        p.chmod(0o711)
+        p = p.parent
+    stage.mkdir()
+    (stage / "ENROLLMENT-SCENARIO").write_text("")
+    out = _run_in_namespace(stage)
+    assert "BASTION-ENROLLMENT-READ-OK" in out, out
+    assert "BASTION-CONTROLLER-READ-DENIED" in out, out
+    assert "BASTION-CONTROLLER-WRITE-DENIED" in out, out
+    assert "API-ENROLLMENT-WRITE-OK" in out, out
+    assert "BASTION-TRAVERSAL-ONLY-ON-STATE" in out, out
+
+
+def _enrollment_helper(stage: pathlib.Path) -> None:
+    """Namespace-root provisioning of the installed layout, then live
+    access decisions taken as the REAL bastion and API uids."""
+    API, BASTION = 1, 2
+    PUB = ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP0ZVC6C3vHKlKm8ZGZz3"
+           "vVL0VXmVXU9sQqZ4Y4QgG0m sr-test\n")
+
+    def build(root: pathlib.Path, dirname: str, mode: int, *,
+              owner: int, group: int) -> pathlib.Path:
+        d = root / dirname
+        d.mkdir(parents=True)
+        os.chmod(d, mode)
+        os.chown(d, owner, group)
+        f = d / "enrolled_keys"
+        f.write_text(PUB)
+        f.chmod(0o644)
+        os.chown(f, owner, 0)      # group root, like the installer creates
+        return f
+
+    state = stage / "state"
+    state.mkdir()
+    os.chmod(state, 0o751)          # the shared state tree (0751 srbroker)
+    os.chown(state, 3, 1)
+    share = build(state, "enrollment", 0o775, owner=API, group=0)
+    private = build(state, "controller", 0o700, owner=API, group=API)
+
+    def read_as(uid: int, path: pathlib.Path) -> str:
+        pid = os.fork()
+        if pid == 0:
+            try:
+                os.setgid(uid)
+                os.setuid(uid)
+                ok = path.read_text() == PUB
+                os._exit(0 if ok else 2)
+            except PermissionError:
+                os._exit(3)
+            except OSError:
+                os._exit(4)
+        _, status = os.waitpid(pid, 0)
+        return {0: "OK", 2: "WRONG-BYTES", 3: "DENIED"}.get(
+            os.waitstatus_to_exitcode(status), "ERR")
+
+    print(f"BASTION-ENROLLMENT-READ-{read_as(BASTION, share)}")
+    print(f"BASTION-CONTROLLER-READ-{read_as(BASTION, private)}")
+
+    def write_as(uid: int, directory: pathlib.Path) -> str:
+        """The enrollment write is an atomic REPLACE inside the directory —
+        the real permission the API needs (and the bastion must not have)."""
+        pid = os.fork()
+        if pid == 0:
+            try:
+                os.setgid(uid)
+                os.setuid(uid)
+                tmp = directory / ".enrolled-tmp"
+                tmp.write_text(PUB)
+                os.replace(tmp, directory / "enrolled_keys.probe")
+                (directory / "enrolled_keys.probe").unlink()
+                os._exit(0)
+            except PermissionError:
+                os._exit(3)
+            except OSError:
+                os._exit(4)
+        _, status = os.waitpid(pid, 0)
+        return {0: "OK", 3: "DENIED"}.get(
+            os.waitstatus_to_exitcode(status), "ERR")
+
+    print(f"BASTION-CONTROLLER-WRITE-{write_as(BASTION, private.parent)}")
+    print(f"API-ENROLLMENT-WRITE-{write_as(API, share.parent)}")
+
+    # the shared state parent grants TRAVERSAL only, never enumeration
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.setgid(BASTION)
+            os.setuid(BASTION)
+            os.listdir(state)
+            os._exit(0)
+        except PermissionError:
+            os._exit(3)
+    _, status = os.waitpid(pid, 0)
+    listing = os.waitstatus_to_exitcode(status) == 3
+    print(f"BASTION-TRAVERSAL-ONLY-ON-STATE-{('OK' if listing else 'ERR')}")
 
 
 if os.environ.get("SR_DAC_HELPER") == "1":
