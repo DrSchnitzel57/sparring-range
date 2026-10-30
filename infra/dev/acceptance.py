@@ -2182,6 +2182,7 @@ def _upgrade_browser_login(tmp: pathlib.Path, rootA: pathlib.Path,
     web_log = (tmp / "login-web.log").open("w")
     api = proc_web = None
     proxy_srv = pw_session = None
+    pw_alias = None
     try:
         api = subprocess.Popen(
             [str(venv_py), "-m", "uvicorn", "srplatform.api.app:app",
@@ -2291,12 +2292,31 @@ def _upgrade_browser_login(tmp: pathlib.Path, rootA: pathlib.Path,
         def pw(*args, timeout=120):
             r = subprocess.run([str(pw_cli), f"-s={session}", *args],
                                capture_output=True, text=True,
-                               timeout=timeout, cwd=str(REPO))
+                               timeout=timeout, cwd=str(REPO), env=_PW_ENV)
             if r.returncode != 0:
                 raise AssertionError(
                     f"playwright-cli {' '.join(str(a) for a in args)} -> "
                     f"{r.returncode}\n{r.stdout[-500:]}\n{r.stderr[-500:]}")
             return r
+
+        # Chromium's dev-tools socket lives under TMPDIR and unix socket
+        # paths are capped (~107 chars). A gate run directory on a deep
+        # disk path is legitimate but breaks the FIRST socket bind (observed
+        # in independent review: the initial 49.8 s attempt failed exactly
+        # this way, then passed under a short alias). Give the browser a
+        # SHORT owned alias into this run's own disk-backed directory —
+        # data still lands on disk (tmp), only the socket prefix is short.
+        pw_home = tmp / "pw-tmp"
+        pw_home.mkdir(exist_ok=True)
+        pw_alias = pathlib.Path(f"/tmp/sr-pw-{os.getpid()}")
+        try:
+            pw_alias.unlink(missing_ok=True)
+            os.symlink(pw_home, pw_alias)
+        except OSError as exc:
+            prereq_fail("short browser socket alias (Chromium unix path)",
+                        f"cannot create {pw_alias}: {exc}")
+        _PW_ENV = {**os.environ, "TMPDIR": str(pw_alias),
+                   "XDG_RUNTIME_DIR": str(pw_alias)}
 
         pw_session = session
         pw("open", "about:blank", "--browser=chromium", timeout=240)
@@ -2348,6 +2368,11 @@ def _upgrade_browser_login(tmp: pathlib.Path, rootA: pathlib.Path,
         if pw_session:
             subprocess.run([str(pw_cli), f"-s={pw_session}", "close"],
                            capture_output=True, timeout=30, check=False)
+        if pw_alias is not None:
+            try:
+                pw_alias.unlink(missing_ok=True)
+            except OSError:
+                pass
         for p in (api, proc_web):
             if p is None:
                 continue
