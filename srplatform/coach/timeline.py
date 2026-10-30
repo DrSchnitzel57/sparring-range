@@ -35,24 +35,27 @@ def compress_timeline(events: list[dict], max_lines: int = 80) -> tuple[str, dic
       wins       – explicit remediation events
       detections – verifier/detection events (rendered, source time)
       shown_ids  – CANONICAL citable ids: the events this render actually
-                   shows (plan 20 F5 — never ids a payload merely mentions)
+                   shows (plan 20 F5 — never ids a payload merely mentions;
+                   plan 22 review — also never ids the max_lines trim cut)
     """
     events = sorted(events, key=lambda e: (e.get("event_id") or 0))
     lines, misses, gaps, wins, detections = [], [], [], [], []
-    shown_ids: set[int] = set()
+    line_ids: list[int | None] = []     # citable id PARALLEL to each line
     responses: list[tuple[datetime, str | None, dict]] = []
     telemetry_hosts: set[str] = set()
 
     def emit(e: dict, text: str) -> None:
-        """Citations are canonical (plan 20 F5): only events THIS render
-        actually shows join the citable set — never ids that a command
-        payload merely mentions (`echo reference #99999999` must not
-        forge a link into evidence that never existed)."""
+        """Citations are canonical (plan 20 F5, sharpened by plan 22
+        review): the citable id is bound to the RENDER LINE at emit time
+        (paired, never re-parsed out of the text — a payload containing
+        `#99999999` must not forge a citation), and only lines the FINAL
+        render keeps become citable: events the max_lines TRIM cut leave
+        the allowed set too."""
         lines.append(text)
         try:
-            shown_ids.add(int(e.get("event_id")))
+            line_ids.append(int(e.get("event_id")))
         except (TypeError, ValueError):
-            pass
+            line_ids.append(None)
 
     for e in events:
         ts, kind = _t(e), e.get("action_type", "?")
@@ -128,9 +131,15 @@ def compress_timeline(events: list[dict], max_lines: int = 80) -> tuple[str, dic
                                "reason": "no correlated defender action on this host within "
                                          f"{int(RESPONSE_WINDOW.total_seconds()//60)} min"})
 
-    return "\n".join(lines[-max_lines:]), {"misses": misses, "telemetry_gaps": gaps,
-                                           "wins": wins, "detections": detections,
-                                           "shown_ids": sorted(shown_ids)}
+    # The allowed citation set comes from the EXACT final render window
+    # (plan 22 review): pairing ids with lines at emit time, then taking
+    # the same [-max_lines:] slice, is what makes "validated but never
+    # shown" citations impossible — without re-parsing payload text.
+    kept_ids = {i for i in line_ids[-max_lines:] if i is not None}
+    return ("\n".join(lines[-max_lines:]),
+            {"misses": misses, "telemetry_gaps": gaps,
+             "wins": wins, "detections": detections,
+             "shown_ids": sorted(kept_ids)})
 
 
 def session_context_note(context: dict | None) -> str:

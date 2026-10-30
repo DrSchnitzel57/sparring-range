@@ -349,15 +349,18 @@ AAR_NARRATIVE_SYSTEM = (
     "Cite only events you were given (as #<event_id>). Be blunt and specific.")
 
 
-def _is_operator_chat(job) -> bool:
-    """F7: a coach-chat job's audience is captured immutably in its
-    payload at enqueue. Operator coach conversations (which may cite
-    sealed evidence) belong to the OPERATOR audience — members can
-    neither enumerate, open nor stream them, sealed or not."""
+def _chat_hidden_from_member(job) -> bool:
+    """F7 audience isolation, POSITIVE authorization (plan 22 review): a
+    coach-chat job belongs to exactly one audience, captured immutably in
+    its payload at enqueue. A member sees a coach-chat job ONLY when that
+    audience is explicitly "member" — an unclassified job (missing or
+    unknown value) fails CLOSED like the 'legacy' message rows of
+    migration 0027, and operator jobs (which may cite sealed evidence)
+    never surface. Operators keep full visibility for recovery."""
     if getattr(job, "kind", None) != "coach-chat":
         return False
     return ((job.payload or {}).get("chat_meta") or
-            {}).get("audience") == "operator"
+            {}).get("audience") != "member"
 
 
 def _jobs_root_ids(db, session_id, *, sealed: bool,
@@ -366,13 +369,17 @@ def _jobs_root_ids(db, session_id, *, sealed: bool,
     from srplatform.db.models import ModelJob
     stmt = select(ModelJob).where(ModelJob.session_id == session_id)
     if member_audience:
-        # F7: even UNSEALED, a member never sees the operator's coach
-        # work. Coach rows predating audience capture had exactly one
-        # audience (member), so only an explicit operator stamp hides.
+        # F7 sharpened (plan 22 review): members are AUTHORIZED, not
+        # merely non-denied — a coach-chat row must carry the explicit
+        # member audience to appear. A MISSING audience compares NULL,
+        # so an unclassified row fails closed here exactly as the detail
+        # and stream surfaces refuse it. (Unlike coach_messages, model
+        # jobs never received a legacy backfill — unknown truly means
+        # unknown.)
         stmt = stmt.where(or_(
             ModelJob.kind != "coach-chat",
-            ModelJob.payload["chat_meta"]["audience"].as_string() !=
-            "operator"))
+            ModelJob.payload["chat_meta"]["audience"].as_string() ==
+            "member"))
     if sealed:
         # Competition visibility is ENFORCED in the API (finding 4 +
         # the standing boundary "enforce in APIs, not just the UI"):
@@ -432,7 +439,7 @@ def model_job_detail(session_id: uuid.UUID, job_id: uuid.UUID,
         raise HTTPException(404, "job not found")
     if sealed and job.kind not in ("hint", "aar-narrative", "coach-chat"):
         raise HTTPException(404, "job not found")
-    if not p.is_operator and _is_operator_chat(job):
+    if not p.is_operator and _chat_hidden_from_member(job):
         raise HTTPException(404, "job not found")   # F7 audience isolation
     body = chain_status_body(db, job_id, errors=False, result_kind=False)
     return strip_sealed(body) if sealed else strip_results(body)
@@ -461,7 +468,7 @@ def model_job_stream(session_id: uuid.UUID, job_id: uuid.UUID,
         if sealed and job.kind not in ("hint", "aar-narrative",
                                        "coach-chat"):
             raise HTTPException(404, "job not found")
-        if not p.is_operator and _is_operator_chat(job):
+        if not p.is_operator and _chat_hidden_from_member(job):
             raise HTTPException(404, "job not found")  # F7 audience isolation
     from srplatform.settings import get_settings
     s0 = get_settings()

@@ -17,6 +17,8 @@ user corrections are acknowledged, not argued with.
 """
 from __future__ import annotations
 
+import pytest
+
 from srplatform.coach.aar import validate_narrative
 from srplatform.coach.chat import build_chat_prompt, validated_citations
 from srplatform.coach.timeline import compress_timeline, session_context_note
@@ -57,6 +59,51 @@ def test_aar_narrative_forged_citation_dropped_real_kept():
         "Solid response at #11. The recon at #99999999 was clever. Keep it up.",
         valid)
     assert "#11" in out and "#99999999" not in out
+
+
+# ------------------------------------------ compressed-away citations ----- #
+def _many(n):
+    return [ev(i, "red", "tool_call", "web01", {"command": f"step {i}"},
+               phase="recon") for i in range(1, n + 1)]
+
+
+def test_trimmed_events_leave_the_chat_allow_list_and_the_prompt():
+    """Plan 22 review: 60 events render as the LAST 40 lines. The FIRST
+    twenty are compressed away — an allow-list that accumulated ids at
+    emit time still counted them citable, so 'Evidence #1' validated even
+    though the model was never shown event #1. The allowed set now comes
+    from the exact final render: #1 is absent from BOTH the prompt and
+    the allow-list; the visible head line (#21) is in both."""
+    events = _many(60)
+    text, idx = compress_timeline(events, max_lines=40)
+    assert len(text.splitlines()) == 40
+    assert idx["shown_ids"] == list(range(21, 61))
+    assert "#1]" not in text and "#20]" not in text and "#21]" in text
+    _sys, user, _c, allowed = build_chat_prompt(events, [], "q?",)
+    assert allowed == list(range(21, 61))
+    assert "#1]" not in user and "#21]" in user
+    # an answer citing the trimmed-away first event is rejected exactly
+    # like a forged one; a visible citation survives
+    assert validated_citations("Evidence #1 explains it", allowed) == []
+    assert validated_citations("Evidence #21 explains it", allowed) == [21]
+
+
+def test_trimmed_events_leave_the_aar_narrative_allow_list():
+    """Same rule on the AAR surface: with 100 events (render keeps 80),
+    the narrative may cite what the report shows, and the compressed-
+    away #1 citation is dropped from the persisted narrative just like a
+    foreign id — the report text carries no #1 citation either."""
+    from srplatform.coach.aar import build_aar
+    events = _many(100)
+    report = build_aar(events, {"techniques": []}, None,
+                       narrative="Early #1 mattered. Late #99 mattered. "
+                                 "Foreign #99999999 did not.")
+    doc = report["markdown"]
+    assert "Early #1 mattered" not in doc       # trimmed away: dropped
+    assert "Late #99 mattered" in doc           # shown: kept
+    assert "#99999999" not in doc
+    approved = report["approved_citation_ids"]
+    assert 1 not in approved and 99 in approved and 20 not in approved
 
 
 # --------------------------------------------------------------- LIVE-10 ---
@@ -122,3 +169,55 @@ def test_operator_coach_jobs_are_invisible_to_member_job_surfaces(client, users)
     oids = [j["job_id"] for j in client.get(
         f"/sessions/{sid}/model-jobs", headers=users["op"]).json()["jobs"]]
     assert jop in oids and jmem in oids
+
+
+@pytest.mark.db
+def test_unclassified_audience_fails_closed_on_every_member_surface(
+        client, users):
+    """Plan 22 review: denial of the EXPLICIT operator audience was
+    positive only in name — a coach-chat job whose stored audience is
+    MISSING or unknown (a row written by no current producer, a partially
+    upgraded queue) enumerated, opened and streamed for a member with
+    200. Members are now AUTHORIZED by the explicit member stamp; every
+    other value fails closed — while operators keep recovery visibility
+    over the same rows."""
+    import uuid as _uuid
+
+    from srplatform.db.models import ModelJob
+    from srplatform.db.session import db as db_ctx
+
+    sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
+                      headers=users["member"]).json()["session_id"]
+    variants = {
+        "missing-meta": {},
+        "missing-audience": {"chat_meta": {"asked_by": "someone"}},
+        "audience-null": {"chat_meta": {"audience": None}},
+        "audience-junk": {"chat_meta": {"audience": "operatorx"}},
+    }
+    ids = {}
+    with db_ctx() as s:
+        for name, payload in variants.items():
+            j = ModelJob(session_id=_uuid.UUID(sid), kind="coach-chat",
+                         priority=50,
+                         payload={"text": f"x-{name}", **payload})
+            s.add(j)
+            s.flush()
+            ids[name] = str(j.job_id)
+        s.commit()
+    listing = client.get(f"/sessions/{sid}/model-jobs",
+                         headers=users["member"]).json()
+    mids = [j["job_id"] for j in listing["jobs"]]
+    for name, jid in ids.items():
+        assert jid not in mids, f"unclassified {name} leaked into the list"
+        assert client.get(f"/sessions/{sid}/model-jobs/{jid}",
+                          headers=users["member"]).status_code == 404, name
+        assert client.get(f"/sessions/{sid}/model-jobs/{jid}/stream",
+                          headers=users["member"]).status_code == 404, name
+        # operator recovery visibility: the row exists and is openable
+        assert client.get(f"/sessions/{sid}/model-jobs/{jid}",
+                          headers=users["op"]).status_code == 200, name
+    oids = [j["job_id"] for j in client.get(
+        f"/sessions/{sid}/model-jobs", headers=users["op"]).json()["jobs"]]
+    assert all(j["job_id"] in oids for j in listing["jobs"])
+    for jid in ids.values():
+        assert jid in oids
