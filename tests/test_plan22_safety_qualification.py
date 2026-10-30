@@ -49,6 +49,11 @@ def _no_db(monkeypatch):
         def __exit__(self, *a):
             return False
 
+        def execute(self, *_a, **_k):
+            # the shared publication boundary takes its advisory lock
+            # through execute(); this stub session accepts it
+            return None
+
         def add(self, _o):
             pass
 

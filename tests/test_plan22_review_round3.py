@@ -117,7 +117,7 @@ def _load_acceptance():
 def test_pw_alias_ownership_exclusive_allocation(tmp_path):
     """A pre-existing path at a candidate name — the exact thing an
     earlier reviewer hit — is SKIPPED UNTOUCHED, never unlinked; cleanup
-    removes only the owned symlink pointing at the owned target."""
+    removes only the owned DEVICE+INODE created by the allocation."""
     acc = _load_acceptance()
 
     target = tmp_path / "run" / "pw-tmp"
@@ -136,10 +136,10 @@ def test_pw_alias_ownership_exclusive_allocation(tmp_path):
                      (sentinel_dir, sentinel_file, sentinel_link)}
 
     good = tmp_path / "short-owned-alias"
-    alias = acc._pw_alias_allocate(target, iter(
+    handle = acc._pw_alias_allocate(target, iter(
         [sentinel_dir, sentinel_file, sentinel_link, good]))
-    assert alias == good
-    assert alias.is_symlink() and Path(os.readlink(str(good))) == \
+    assert handle.path == good
+    assert good.is_symlink() and Path(os.readlink(str(good))) == \
         target.resolve()
     for p, ino in inodes_before.items():
         assert p.is_symlink() if p == sentinel_link else p.exists()
@@ -148,8 +148,8 @@ def test_pw_alias_ownership_exclusive_allocation(tmp_path):
     assert (sentinel_dir / "keep.me").read_text() == "reviewer data"
     assert os.readlink(str(sentinel_link)) == str(elsewhere)
 
-    # normal cleanup removes exactly the owned alias, target intact
-    acc._pw_alias_release(alias, target)
+    # normal cleanup removes exactly the owned inode, target intact
+    assert acc._pw_alias_release(handle) is None
     assert not good.exists() and not good.is_symlink()
     assert target.is_dir()
 
@@ -159,21 +159,25 @@ def test_pw_alias_ownership_exclusive_allocation(tmp_path):
             [sentinel_dir, sentinel_file, sentinel_link]))
     assert sentinel_file.read_text() == "do not delete me"
 
-    # hostile cleanup races: alias replaced by a DIRECTORY, or retargeted
-    alias2 = acc._pw_alias_allocate(target, iter([tmp_path / "a2"]))
-    alias2.unlink()
-    alias2.mkdir()
-    acc._pw_alias_release(alias2, target)
-    assert alias2.is_dir(), "a foreign directory took the name — left alone"
-    alias2.rmdir()
+    # hostile cleanup races: alias replaced by a DIRECTORY, or by ANOTHER
+    # symlink (even one with the same target) — different inode, so it is
+    # LEFT ALONE and reported, never unlinked (round-4 F3).
+    h2 = acc._pw_alias_allocate(target, iter([tmp_path / "a2"]))
+    h2.path.unlink()
+    h2.path.mkdir()
+    note = acc._pw_alias_release(h2)
+    assert note and "DIFFERENT inode" in note
+    assert h2.path.is_dir(), "a foreign directory took the name — left alone"
+    h2.path.rmdir()
 
-    alias3 = acc._pw_alias_allocate(target, iter([tmp_path / "a3"]))
-    alias3.unlink()
-    os.symlink(str(elsewhere), str(alias3))
-    acc._pw_alias_release(alias3, target)
-    assert alias3.is_symlink() and os.readlink(str(alias3)) == str(elsewhere)
-    acc._pw_alias_release(alias3, target)   # ours again -> removable
-    alias3.unlink(missing_ok=True)
+    h3 = acc._pw_alias_allocate(target, iter([tmp_path / "a3"]))
+    h3.path.unlink()
+    os.symlink(str(elsewhere), str(h3.path))
+    note = acc._pw_alias_release(h3)
+    assert note and "DIFFERENT inode" in note
+    assert h3.path.is_symlink() and \
+        os.readlink(str(h3.path)) == str(elsewhere)
+    h3.path.unlink()                       # the foreign owner cleans up
 
 
 def test_pw_alias_is_short_enough_for_chromium(tmp_path):
@@ -181,31 +185,34 @@ def test_pw_alias_is_short_enough_for_chromium(tmp_path):
     socket cap (~107 chars for the socket, so keep the alias < 40)."""
     acc = _load_acceptance()
     target = tmp_path
-    alias = acc._pw_alias_allocate(target)
+    handle = acc._pw_alias_allocate(target)
     try:
-        assert str(alias).startswith("/tmp/srpw-")
-        assert len(str(alias)) < 40
+        assert str(handle.path).startswith("/tmp/srpw-")
+        assert len(str(handle.path)) < 40
     finally:
-        acc._pw_alias_release(alias, target)
-    assert not alias.exists() and not alias.is_symlink()
+        acc._pw_alias_release(handle)
+    assert not handle.path.exists() and not handle.path.is_symlink()
 
 
 # --------------------------------------------------------------- F1 & F2 --- #
 # (real API + PostgreSQL lanes below)
 def _seed(kind, *, ok=True, ident="legacy-identity-17", detail=None,
-          age_h=4000.0, detail_json=None):
+          age_h=4000.0, detail_json=None, returning=False):
     from sqlalchemy import text
 
     from srplatform.db.session import db as db_ctx
     d = detail_json if detail_json is not None else (
         detail if detail is not None else {})
     with db_ctx() as s:
-        s.execute(text(
+        r = s.execute(text(
             "INSERT INTO safety_records (kind, ok, config_identity, detail,"
             " recorded_at) VALUES (:k, :ok, :i, CAST(:d AS jsonb),"
-            " now() - make_interval(hours => :h))"),
+            " now() - make_interval(hours => :h))"
+            " RETURNING record_id"),
             {"k": kind, "ok": ok, "i": ident, "d": json.dumps(d),
              "h": int(age_h)})
+        if returning:
+            return r.fetchone()[0]
 
 
 def _rows(kind):
@@ -285,18 +292,39 @@ def test_classification_after_last_transition_usable_at_real_age(
 
 def test_nested_classification_chain_uses_oldest_original(client, users):
     """A classification whose source was ITSELF classified evaluates age
-    and transition invalidation from the OLDEST original observation."""
-    from srplatform.settings import get_settings
-    from srplatform.safety.datapath import config_identity
+    and transition invalidation from the OLDEST ORIGINAL record, resolved
+    through the immutable id+digest chain (round-4 provenance contract).
+    An unresolvable or forged chain does not reach this comparison — see
+    the round-4 provenance tests."""
+    from srplatform.safety import _detail_digest
     now = time.time()
     observed = now - 6000 * 3600
-    _seed("datapath_proof", ident="legacy-identity-17", age_h=6000,
+    # the ORIGINAL observation (unmarked): its authoritative timestamp is
+    # the effective time, and it is what the chain must resolve to
+    orig_id = _seed("datapath_proof", ident="older-identity-9", age_h=6000,
+                    detail_json={}, returning=True)
+    # an intermediate classification of that original (round-3-era audit),
+    # then a later classification of THAT, both with true digests
+    mid_digest_target = _detail_digest({})
+    cls1_detail = {"qualification_contract": 1,
+                   "one_time_reclassification": True,
+                   "observed_at": observed,
+                   "source_record_id": orig_id,
+                   "original_detail_digest": mid_digest_target,
+                   "reason": "seeded chain step 1", "operator": "seed"}
+    cls1_id = _seed("datapath_proof", ident="legacy-identity-17",
+                    age_h=100, detail_json=cls1_detail, returning=True)
+    _seed("datapath_proof", ident="legacy-identity-17", age_h=50,
           detail_json={"qualification_contract": 1,
                        "one_time_reclassification": True,
                        "observed_at": observed,
-                       "reason": "seeded chain", "operator": "seed"})
-    _seed("release", age_h=5900, detail_json={})   # between obs and audit
+                       "source_record_id": cls1_id,
+                       "original_detail_digest":
+                           _detail_digest(cls1_detail),
+                       "reason": "seeded chain step 2", "operator": "seed"})
+    _seed("release", age_h=5900, detail_json={})   # after obs, before audit
     q, _ = _qual(client, users, "datapath_proof")
+    assert q["provenance"] == "current", q
     assert q["usable"] is False
     assert any("predates the last release" in p for p in q["problems"])
     assert 5990 < q["age_h"] < 6010, q["age_h"]    # chain-walked age
@@ -366,6 +394,20 @@ def test_concurrent_classifications_exactly_one_wins(users):
     assert len(rows) == 2                          # ONE classification only
     assert rows[0][2] == {}                        # original immutable
     assert rows[1][2]["one_time_reclassification"] is True
+
+    # MIRROR consumers (round 4): the durable file ledger received the
+    # WINNER's classification and nothing else — a losing classifier
+    # never republishes its stale pass to the mirrors.
+    from srplatform.safety import get_supervisor
+    sf = Path(get_supervisor().state_file)
+    lines = [json.loads(ln) for ln in
+             (sf.parent / (sf.name + ".records")).read_text().splitlines()]
+    cls_lines = [ln for ln in lines
+                 if ln["kind"] == "baseline_check"
+                 and (ln.get("detail") or {}).get(
+                     "one_time_reclassification") is True]
+    assert len(cls_lines) == 1, cls_lines
+    assert cls_lines[0]["detail"]["source_record_id"] == rows[0][0]
 
 
 def test_persistence_failure_refuses_without_publishing(client, users,

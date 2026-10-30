@@ -31,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import typing
 import uuid
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
@@ -2116,15 +2117,26 @@ LOGIN_USER = "p21-login"
 LOGIN_PW = "Upgrade-Browser-2026!"
 
 
-def _pw_alias_allocate(target: pathlib.Path, candidates=None) -> pathlib.Path:
+class _PwAlias(typing.NamedTuple):
+    """An OWNED short alias: ownership is the exact DEVICE+INODE created
+    by this allocation (captured at creation, not first-observed at
+    cleanup), plus the target it was made for."""
+    path: pathlib.Path
+    dev: int
+    ino: int
+    target: pathlib.Path
+
+
+def _pw_alias_allocate(target: pathlib.Path, candidates=None) -> "_PwAlias":
     """Allocate a SHORT /tmp alias (symlink) to ``target`` by EXCLUSIVE
-    creation (plan 22 review F5). Ownership comes from atomically creating
-    the symlink — never from a name prefix or the PID: a candidate path
-    that already exists (file, directory, foreign symlink, even one a
-    previous reviewer placed there deliberately) is SKIPPED UNTOUCHED,
-    never unlinked or replaced. Names carry a per-attempt random token, so
-    an unlucky collision just moves to the next name. Returns the alias;
-    raise only if every candidate collides. ``candidates`` is a test seam
+    creation (plan 22 review round 3 F5, round 4 F3). Ownership comes from
+    atomically creating the symlink AND remembering its device+inode —
+    never from a name prefix or the PID: a candidate path that already
+    exists (file, directory, foreign symlink, even one a previous reviewer
+    placed there deliberately) is SKIPPED UNTOUCHED, never unlinked or
+    replaced. Names carry a per-attempt random token, so an unlucky
+    collision just moves to the next name. Returns the owned handle; raise
+    only if every candidate collides. ``candidates`` is a test seam
     yielding pathlib.Path names (default: 64 owned short names)."""
     import secrets
 
@@ -2143,23 +2155,28 @@ def _pw_alias_allocate(target: pathlib.Path, candidates=None) -> pathlib.Path:
         except OSError as exc:
             raise RuntimeError(f"cannot create the browser socket alias "
                                f"{alias}: {exc}") from exc
-        return alias
+        st = os.lstat(str(alias))       # the inode WE just created
+        return _PwAlias(pathlib.Path(alias), st.st_dev, st.st_ino, target)
     raise RuntimeError("every short browser-alias name already exists — "
                        "refusing to displace foreign inodes under /tmp")
 
 
-def _pw_alias_release(alias: pathlib.Path, target: pathlib.Path) -> None:
-    """Remove ONLY the alias inode this process created: it must still be
-    a symlink pointing at our own target. Anything else that occupies the
-    path now (replaced directory, foreign retarget) is left untouched —
+def _pw_alias_release(handle: "_PwAlias") -> str | None:
+    """Remove ONLY the exact inode this allocation created — device+inode
+    must match, checked with lstat. Target TEXT proves nothing: a
+    replacement symlink may point at the same target while being a
+    different owner's inode, and deleting THAT is the round-4 defect.
+    A different inode at the path is left UNTOUCHED and reported;
     cleanup ownership is the created inode, never the name."""
     try:
-        if alias.is_symlink() and \
-                pathlib.Path(os.readlink(alias)) == \
-                pathlib.Path(target).resolve():
-            os.unlink(str(alias))
+        st = os.lstat(str(handle.path))
     except OSError:
-        pass
+        return None                     # already gone; nothing of ours left
+    if (st.st_dev, st.st_ino) != (handle.dev, handle.ino):
+        return (f"{handle.path} is now a DIFFERENT inode than this run "
+                "allocated — left untouched")
+    os.unlink(str(handle.path))
+    return None
 
 
 def _upgrade_browser_login(tmp: pathlib.Path, rootA: pathlib.Path,
@@ -2364,8 +2381,8 @@ def _upgrade_browser_login(tmp: pathlib.Path, rootA: pathlib.Path,
         except RuntimeError as exc:
             prereq_fail("short browser socket alias (Chromium unix path)",
                         str(exc))
-        _PW_ENV = {**os.environ, "TMPDIR": str(pw_alias),
-                   "XDG_RUNTIME_DIR": str(pw_alias)}
+        _PW_ENV = {**os.environ, "TMPDIR": str(pw_alias.path),
+                   "XDG_RUNTIME_DIR": str(pw_alias.path)}
 
         pw_session = session
         pw("open", "about:blank", "--browser=chromium", timeout=240)
@@ -2418,7 +2435,7 @@ def _upgrade_browser_login(tmp: pathlib.Path, rootA: pathlib.Path,
             subprocess.run([str(pw_cli), f"-s={pw_session}", "close"],
                            capture_output=True, timeout=30, check=False)
         if pw_alias is not None:
-            _pw_alias_release(pw_alias, (tmp / "pw-tmp").resolve())
+            _pw_alias_release(pw_alias)
         for p in (api, proc_web):
             if p is None:
                 continue

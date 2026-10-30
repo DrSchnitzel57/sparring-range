@@ -43,6 +43,7 @@ import os
 import pathlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -215,13 +216,22 @@ def _ship_image(src: pathlib.Path, dst: pathlib.Path, *,
                 link: bool = False) -> None:
     """Place an image into the bundle (see _add_image). With ``link`` the
     SHIPPED inode is a HARDLINK to the source — bytes identical, no second
-    copy — which requires the source to be a self-contained single-image
-    qcow2 in bundle mode already (verified exactly as _add_image would);
-    release artifacts must not silently depend on a build machine path,
-    and the source seals keep the same bytes either way."""
+    copy — which requires the source to be a REGULAR (non-symlink),
+    self-contained single-image qcow2 already in bundle mode (verified
+    exactly as _add_image would): a symlinked "source" would ship a
+    symlink artifact pointing OUTSIDE the bundle, and the release must
+    never depend on a build-machine path. Nothing here writes to the
+    shared source inode (no chmod/chown/truncate) — the seal stays
+    exactly as sealed."""
     if not link:
         _add_image(src, dst)
         return
+    lst = os.lstat(str(src))
+    if stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode):
+        raise BundleError(
+            f"--link-images requires a regular non-symlink source image; "
+            f"{src} is a {'symlink' if stat.S_ISLNK(lst.st_mode) else 'non-regular file'}"
+            " — linking it would ship a pointer outside the bundle")
     info = _image_info(src)
     if info.get("backing-filename"):
         raise BundleError(
@@ -232,7 +242,7 @@ def _ship_image(src: pathlib.Path, dst: pathlib.Path, *,
     if len(images) != 1:
         raise BundleError(f"{src} has a backing chain of {len(images)} "
                           "images; a released image must stand alone")
-    mode = src.stat().st_mode & 0o777
+    mode = lst.st_mode & 0o777
     if mode != 0o644:
         raise BundleError(
             f"--link-images shares the source inode (mode {mode:04o}); "
@@ -244,12 +254,58 @@ def _ship_image(src: pathlib.Path, dst: pathlib.Path, *,
 def build(output: pathlib.Path, *, base_image: pathlib.Path,
           role_images: dict[str, pathlib.Path], app_dir: pathlib.Path = REPO,
           guest_agent_available: bool = True,
-          link_images: bool = False) -> dict:
-    output = pathlib.Path(output)
-    if output.exists():
-        shutil.rmtree(output)
-    output.mkdir(parents=True)
+          link_images: bool = False, force: bool = False) -> dict:
+    """Build the release bundle ATOMICALLY (plan 22 review round 4 F4).
 
+    Every input is validated BEFORE any mutation, so a missing image or a
+    bad flag never destroys an existing release; an existing output is
+    REFUSED by default — replacing a release artifact is a deliberate act
+    (``force=True`` / ``--force``), never a side effect of rerunning the
+    builder. The build happens in a staging directory beside the target
+    and is activated by rename only after it fully succeeded; any failure
+    leaves the existing destination byte- and inode-identical."""
+    import secrets
+
+    output = pathlib.Path(output)
+    app_dir = pathlib.Path(app_dir)
+    base_image = pathlib.Path(base_image)
+
+    # ---- preflight: every input validated before ANY mutation ----
+    if not app_dir.is_dir():
+        raise BundleError(f"application directory missing: {app_dir}")
+    if not base_image.is_file():
+        raise BundleError(f"base image missing: {base_image}")
+    for role, path in sorted(role_images.items()):
+        if not pathlib.Path(path).is_file():
+            raise BundleError(f"role image missing: {role}: {path}")
+    if not guest_agent_available:
+        raise BundleError("the guest agent is not available in the base image")
+    if output.exists() and not force:
+        raise BundleError(
+            f"refusing to replace existing bundle output {output} — a "
+            "release artifact is only replaced deliberately (pass --force "
+            "when replacement is genuinely intended)")
+
+    staged = output.parent / f".{output.name}.staging-" \
+        f"{os.getpid()}-{secrets.token_hex(4)}"
+    staged.mkdir(parents=True)
+    try:
+        manifest = _build_into(staged, base_image=base_image,
+                               role_images=role_images, app_dir=app_dir,
+                               link_images=link_images)
+        if output.exists():          # only reachable with force=True
+            shutil.rmtree(output)
+        os.rename(staged, output)
+    except BaseException:
+        shutil.rmtree(staged, ignore_errors=True)
+        raise
+    return manifest
+
+
+def _build_into(output: pathlib.Path, *, base_image: pathlib.Path,
+                role_images: dict[str, pathlib.Path],
+                app_dir: pathlib.Path, link_images: bool) -> dict:
+    """Populate a fresh staging directory (called by build() only)."""
     files: dict[str, dict] = {}
 
     def add(src: pathlib.Path, rel: str) -> None:
@@ -276,8 +332,7 @@ def build(output: pathlib.Path, *, base_image: pathlib.Path,
         images["appliance-base"] = {"path": rel, "sha256": files[rel]["sha256"],
                                     "bytes": files[rel]["bytes"]}
     for role, path in sorted(role_images.items()):
-        if not path.is_file():
-            raise BundleError(f"role image missing: {path}")
+        path = pathlib.Path(path)
         rel = f"images/{path.name}"
         dst = output / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -287,8 +342,6 @@ def build(output: pathlib.Path, *, base_image: pathlib.Path,
         files[rel] = {"sha256": _sha256(dst), "bytes": dst.stat().st_size}
         images[role] = {"path": rel, "sha256": files[rel]["sha256"],
                         "bytes": files[rel]["bytes"]}
-    if not guest_agent_available:
-        raise BundleError("the guest agent is not available in the base image")
 
     manifest_revision = _revision()
     manifest = {
@@ -337,9 +390,47 @@ def verify(bundle: pathlib.Path) -> dict:
         raise BundleError(f"unsupported bundle version "
                           f"{manifest.get('bundle_version')!r}")
     problems: list[str] = []
+
+    # STRUCTURAL SELF-CONTAINMENT (plan 22 review round 4 F5): never trust
+    # bytes reached THROUGH a symlink. Every path below the bundle root —
+    # listed files, images, and their intermediate directories — must be
+    # real non-symlink inodes whose realpath stays inside the bundle; an
+    # external pointer (or an internal one posing as the release) is
+    # refused before its digest is ever compared. A symlinked DIRECTORY
+    # is refused too: it could hide or smuggle content on the build host.
+    root_real = os.path.realpath(bundle)
+
+    def _trustworthy(rel: str) -> bool:
+        p = bundle
+        for part in pathlib.PurePosixPath(rel).parts:
+            p = p / part
+            if os.path.islink(p):
+                problems.append(f"symlink component refused: {rel}")
+                return False
+        try:
+            st = os.lstat(p)
+        except OSError:
+            return False           # missing: the per-file loop reports it
+        if not stat.S_ISREG(st.st_mode):
+            problems.append(f"not a regular file: {rel}")
+            return False
+        if os.path.realpath(p) != os.path.realpath(bundle) and \
+                not os.path.realpath(p).startswith(root_real + os.sep):
+            problems.append(f"path escapes the bundle: {rel}")
+            return False
+        return True
+
+    for dirpath, dirnames, _filenames in os.walk(bundle):
+        for name in list(dirnames):
+            if os.path.islink(os.path.join(dirpath, name)):
+                rel = os.path.relpath(os.path.join(dirpath, name), bundle)
+                problems.append(f"symlink directory refused: {rel}")
+                dirnames.remove(name)   # do not descend through it
     files = manifest.get("files") or {}
     for rel, expect in sorted(files.items()):
         path = bundle / rel
+        if not _trustworthy(rel):
+            continue
         if not path.is_file():
             problems.append(f"missing: {rel}")
             continue
@@ -388,6 +479,8 @@ def verify(bundle: pathlib.Path) -> dict:
     # outside the bundle cannot be installed on the operator's machine.
     for rel, meta in sorted((manifest.get("images") or {}).items()):
         path = bundle / meta["path"]
+        if not _trustworthy(meta["path"]):
+            continue
         if not path.is_file():
             problems.append(f"missing image: {meta['path']}")
             continue
@@ -540,8 +633,14 @@ def _parser() -> argparse.ArgumentParser:
                     metavar="ROLE=PATH")
     pb.add_argument("--link-images", action="store_true",
                     help="ship the qcow2 files as hardlinks to the (already "
-                         "self-contained, 0644) source images instead of a "
-                         "second full copy; bytes and seals are unchanged")
+                         "self-contained, regular, 0644) source images "
+                         "instead of a second full copy; bytes and seals "
+                         "are unchanged")
+    pb.add_argument("--force", action="store_true",
+                    help="replace OUTPUT if it already exists (default: "
+                         "refuse — a release artifact is only replaced "
+                         "deliberately; inputs are validated either way "
+                         "before ANY mutation)")
 
     pv = sub.add_parser("verify")
     pv.add_argument("bundle")
@@ -590,7 +689,8 @@ def main(argv: list[str] | None = None) -> int:
             manifest = build(pathlib.Path(args.output),
                              base_image=pathlib.Path(args.base_image),
                              role_images=role_images,
-                             link_images=args.link_images)
+                             link_images=args.link_images,
+                             force=args.force)
             from infra.images.specs import GUEST_BUDGETS
             carried = set(manifest["images"])
             missing = [role for role in sorted(GUEST_BUDGETS)

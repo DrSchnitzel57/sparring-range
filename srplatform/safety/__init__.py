@@ -67,6 +67,71 @@ class SafetyStoreUnavailable(RuntimeError):
     """The AUTHORITATIVE append-only safety-record store cannot be used.
     Fencing-sensitive writes (reclassification) refuse rather than publish
     an unfenced fallback; observation-time resolution refuses to guess."""
+
+
+class SafetyProvenanceError(ValueError):
+    """A recognized classification's provenance cannot be VERIFIED (the
+    source row is absent, a digest disagrees, the chain is cyclic or
+    unresolvable, or a claimed time is not a finite, plausible,
+    non-future instant). Such a record is INCOMPATIBLE evidence — never a
+    new passed observation, and never defaulted to "now". It subclasses
+    ValueError: publication refuses with it, readers mark it unusable."""
+
+
+# THE shared publication boundary (plan 22 review round 4, owner contract):
+# every safety_records writer — ordinary observation appends AND operator
+# classifications — takes this same advisory transaction lock inside its
+# one read-validate-append transaction, so a classifier and an observation
+# can never interleave outside it. The table's grants are deliberately
+# SELECT/INSERT-only (append-only doctrine), so an advisory lock, not a
+# row FOR UPDATE, provides the serialization.
+_SAFETY_PUBLISH_LOCK_SQL = (
+    "SELECT pg_advisory_xact_lock(hashtext('sr.safety_records.cas.v1'))")
+_SAFETY_NEWEST_SQL = (
+    "SELECT record_id, ok, detail, config_identity,"
+    " extract(epoch from recorded_at) AS at"
+    " FROM safety_records WHERE kind = :k"
+    " ORDER BY record_id DESC LIMIT 1")
+_SAFETY_BY_ID_SQL = (
+    "SELECT detail, extract(epoch from recorded_at) FROM safety_records"
+    " WHERE record_id = :r")
+
+# provenance time sanity: no pre-2001 epochs, small clock tolerance,
+# nothing from the future — a future "observation" is a defect, never a
+# head start on validity.
+_PROVENANCE_MIN_EPOCH = 1_000_000_000.0
+_PROVENANCE_FUTURE_TOLERANCE_S = 300.0
+_PROVENANCE_MAX_HOPS = 64
+_PROVENANCE_AGREEMENT_S = 1.0
+
+
+def _detail_digest(detail) -> str:
+    return hashlib.sha256(json.dumps(detail, sort_keys=True,
+                                     default=str).encode()).hexdigest()[:16]
+
+
+def _valid_observation_time(value, now: float | None = None) -> float | None:
+    """A finite, plausible, NON-FUTURE epoch as a float — or None. Bools,
+    NaN, Infinity, strings, missing values, pre-2001 and future stamps all
+    fail; nothing here coerces a bad value into a passed observation."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(ts) or ts < _PROVENANCE_MIN_EPOCH:
+        return None
+    if ts > (time.time() if now is None else now) \
+            + _PROVENANCE_FUTURE_TOLERANCE_S:
+        return None
+    return ts
+
+
+def _is_recognized_classification(det) -> bool:
+    return (isinstance(det, dict)
+            and det.get("qualification_contract") == QUALIFICATION_CONTRACT
+            and det.get("one_time_reclassification") is True)
 # Bounded freshness for the real runner health probe (SSHRunner.health through
 # the transport the dispatcher itself uses): one probe per TTL window, never a
 # connection storm behind the safety-page poll.
@@ -305,25 +370,156 @@ class Supervisor:
         return {"ok": not file_err, "file_error": file_err, "mirror_error": mirror_err}
 
     # --------------------------------------------------------------- records ---
-    def _effective_observed_at(self, detail, recorded_at) -> float:
-        """THE SYSTEM CONTRACT (plan 22 review round 3): a reclassification
-        is an operator COMPATIBILITY DECISION, not a fresh observation — the
-        effective observation time stays the ORIGINAL test's. A published
-        classification therefore carries ``observed_at`` (the source's own
-        effective time, resolved through any nested classification chain at
-        publish time); age, engage/release invalidation and every consumer
-        read it, never the audit row's wall-clock timestamp."""
-        det = detail if isinstance(detail, dict) else {}
-        eff = det.get("observed_at")
-        if eff is None and det.get("one_time_reclassification"):
-            # round-2 shape fallback: the source's recorded_at was kept
-            eff = det.get("reclassified_record_at")
+    def _record_by_id(self, rid: int):
+        """Authoritative row lookup for provenance resolution (reader side):
+        returns ``(detail, recorded_at)`` or None. None NEVER means
+        "trustworthy" — an unresolvable source is incompatible."""
         try:
-            return float(eff) if eff is not None else float(recorded_at)
-        except (TypeError, ValueError):
-            raise SafetyStoreUnavailable(
-                "a reclassification record carries an unreadable observed_at "
-                "— refusing to guess its observation time") from None
+            from sqlalchemy import text
+
+            from srplatform.db.session import db
+            with db() as s:
+                row = s.execute(text(_SAFETY_BY_ID_SQL),
+                                {"r": int(rid)}).first()
+            if row is None:
+                return None
+            return (row[0] if isinstance(row[0], dict) else {},
+                    float(row[1]))
+        except Exception:  # noqa: BLE001 — unreachable store = unverifiable
+            return None
+
+    def _resolve_provenance(self, detail, recorded_at, fetch,
+                            *, now: float | None = None) -> float:
+        """THE OBSERVATION-PROVENANCE CONTRACT (plan 22 review round 4).
+
+        An UNMARKED original observation derives its effective observation
+        time from its AUTHORITATIVE RECORD TIMESTAMP — an arbitrary
+        ``detail.observed_at`` injected into an ordinary record has no
+        authority and is ignored (a stored field cannot retroactively move
+        when the test ran).
+
+        A recognized classification (this build's contract marker plus
+        ``one_time_reclassification``) carries a derived time ONLY when
+        its immutable source id + source digest resolve, hop by hop, to
+        the original record; the terminal ORIGINAL row's authoritative
+        timestamp is the effective time, and the carried value must agree
+        with that resolution. Missing, non-finite, future, cyclic or
+        digest-inconsistent provenance raises SafetyProvenanceError —
+        incompatible evidence, never a fresh passed observation. Age
+        advisories for genuinely compatible evidence stay as they were;
+        no daily re-commissioning is reintroduced."""
+        now = time.time() if now is None else now
+        det = detail if isinstance(detail, dict) else {}
+        if not _is_recognized_classification(det):
+            ts = _valid_observation_time(recorded_at, now)
+            if ts is None:
+                raise SafetyProvenanceError(
+                    "record timestamp is not a finite, plausible, "
+                    "non-future observation time")
+            return ts
+        carried = _valid_observation_time(det.get("observed_at"), now)
+        if carried is None:
+            raise SafetyProvenanceError(
+                "classification observed_at is missing, non-finite or from "
+                "the future — no defensible observation time")
+        src_id = det.get("source_record_id")
+        want_digest = det.get("original_detail_digest")
+        if not isinstance(src_id, int) or isinstance(src_id, bool) \
+                or not isinstance(want_digest, str) or not want_digest:
+            raise SafetyProvenanceError(
+                "classification does not carry an immutable source record "
+                "id + detail digest — its derived time cannot resolve")
+        visited: set[int] = set()
+        while True:
+            if src_id in visited:
+                raise SafetyProvenanceError(
+                    "classification provenance chain is cyclic")
+            visited.add(src_id)
+            if len(visited) > _PROVENANCE_MAX_HOPS:
+                raise SafetyProvenanceError(
+                    "classification provenance chain is unboundedly deep")
+            row = fetch(src_id)
+            if row is None:
+                raise SafetyProvenanceError(
+                    f"classification names source record {src_id}, which "
+                    "the authoritative store cannot resolve")
+            src_detail, src_at = row
+            if _detail_digest(src_detail) != want_digest:
+                raise SafetyProvenanceError(
+                    f"source record {src_id} does not match the "
+                    "classification's immutable detail digest — the "
+                    "provenance is forged or stale")
+            if _is_recognized_classification(src_detail):
+                nxt = src_detail.get("source_record_id")
+                nd = src_detail.get("original_detail_digest")
+                if not isinstance(nxt, int) or isinstance(nxt, bool) \
+                        or not isinstance(nd, str) or not nd:
+                    raise SafetyProvenanceError(
+                        f"nested classification {src_id} carries no "
+                        "resolvable source chain")
+                src_id, want_digest = nxt, nd
+                continue
+            terminal = _valid_observation_time(src_at, now)
+            if terminal is None:
+                raise SafetyProvenanceError(
+                    f"original record {src_id} carries no plausible "
+                    "observation time")
+            if abs(terminal - carried) > _PROVENANCE_AGREEMENT_S:
+                raise SafetyProvenanceError(
+                    f"classification carries observed_at {carried!r} but "
+                    f"its source chain resolves to {terminal!r} — "
+                    "inconsistent provenance")
+            return terminal
+
+    def _authoritative_publish(self, kind: str, ok: bool, identity: str,
+                               detail: dict, *,
+                               validate=None) -> bool:
+        """ONE shared read-validate-append boundary for safety_records
+        (plan 22 review round 4, owner contract). Every writer — ordinary
+        baseline/proof/killswitch/engage/release observations AND operator
+        classifications — appends through this transaction, and every one
+        of them FIRST acquires the same advisory transaction lock. A
+        classifier therefore cannot validate against a source snapshot
+        while a fresh observation commits in between: the observation
+        queues on the lock and becomes the newest row the next reader
+        sees. ``validate(row, session)`` runs AFTER the source read,
+        inside the lock, must be pure local computation plus reads on the
+        SAME connection (no network waits, ever), and returns the final
+        detail dict. Returns True when the append COMMITTED, False when
+        the authoritative store is missing or failed (callers decide:
+        observations fall back to the durable file ledger with the failure
+        retained; classifications refuse — an unfenced append cannot
+        honor the CAS)."""
+        from sqlalchemy.exc import SQLAlchemyError
+
+        from srplatform.db.session import db
+        try:
+            from sqlalchemy import text
+
+            from srplatform.db.models import SafetyRecord
+            with db() as s:
+                s.execute(text(_SAFETY_PUBLISH_LOCK_SQL))
+                if validate is not None:
+                    row = s.execute(text(_SAFETY_NEWEST_SQL),
+                                    {"k": kind}).first()
+                    hook = getattr(self, "_test_after_source_read", None)
+                    if hook is not None:
+                        hook()
+                    final = validate(row, s)
+                    if isinstance(final, dict):
+                        detail = final
+                s.add(SafetyRecord(kind=kind, ok=ok, config_identity=identity,
+                                    detail=detail))
+                # COMMIT happens as the session context exits — the
+                # advisory lock is held until this very point, so exactly
+                # one append can follow each validated source read.
+            return True
+        except (ValueError, SafetyStoreUnavailable):
+            raise                      # truthful refusals propagate as-is
+        except SQLAlchemyError:
+            return False
+        except Exception:  # noqa: BLE001 — no store configured, or down
+            return False
 
     def reclassify_qualification(self, kind: str, *, reason: str,
                                  actor: str,
@@ -334,31 +530,27 @@ class Supervisor:
         verified the record's provenance states so, and this is appended as
         an AUDIT event bound to today's configuration.
 
-        It mints NO fresh observation and launders NOTHING (review round 3,
-        owner contract): the appended record keeps the SOURCE's effective
-        observation time (``observed_at``, nested chains resolved), so age
-        and engage/release invalidation behave exactly as the original test
-        would — a source recorded before the last engage/release STAYS
-        blocked no matter when the decision was made. The decision's own
-        time is stored separately (``classification_decided_at``), the
-        source row is kept byte-identical (id + detail digest recorded),
-        and a failed/already-contracted/unknown-kind source is refused.
-        Age-only expiry is NOT reintroduced: this is a compatibility
-        decision, made once per record.
+        It mints NO fresh observation and launders NOTHING: the appended
+        record carries the SOURCE's effective observation time, resolved
+        through the immutable source chain under the OBSERVATION-PROVENANCE
+        CONTRACT (`_resolve_provenance`) — an unmarked original's time is
+        its authoritative record timestamp, never an injected detail
+        field — so age and engage/release invalidation behave exactly as
+        the original test would. The decision's own time is stored
+        separately (``classification_decided_at``), the source row stays
+        byte-identical (id + detail digest recorded), and a
+        failed/already-contracted/unresolvable-provenance source is
+        refused. Age-only expiry is NOT reintroduced.
 
-        PUBLICATION IS AN ATOMIC CAS (review F2): every classifier first
-        takes the SAME database advisory transaction lock, then reads the
-        newest record of the kind, validates, and appends — all inside
-        ONE database transaction. (The table's grants are deliberately
-        SELECT/INSERT-only, so serialization uses an advisory lock, not a
-        row FOR UPDATE.) Concurrent classifiers racing on the same source
-        serialize, and only ONE can win; every loser re-reads after the
-        winner's commit and gets the truthful conflict, never an implicit
-        "latest wins". If the authoritative store (the append-only
-        safety_records table) is unavailable the classification FAILS —
-        there is no unfenced file-only publish, because an unfenceable
-        append cannot honor the CAS.
-        """
+        PUBLICATION goes through the SAME shared serialization boundary
+        every safety writer uses (`_authoritative_publish`): advisory
+        lock, newest-row read, validation, append, commit — one database
+        transaction, no network waits inside. Concurrent classifiers AND
+        interleaved observations serialize; only one append can follow a
+        validated source, losers get the truthful conflict. If the
+        authoritative store is unavailable the classification FAILS (no
+        unfenced file-only publish exists); mirrors are written only
+        after the commit, never independently."""
         if kind not in QUALIFICATION_KINDS:
             raise ValueError(f"{kind} is not a qualification kind")
         if not str(reason or "").strip():
@@ -372,88 +564,69 @@ class Supervisor:
                 raise ValueError("expect_recorded_at must be the source "
                                  "record's recorded_at value") from None
         identity = config_identity(self.settings)
-        from sqlalchemy.exc import SQLAlchemyError
+        resolved: dict = {}
 
-        from srplatform.db.session import db
-        try:
-            with db() as s:
+        def _validate(row, s) -> dict:
+            if row is None:
+                raise ValueError(f"no {kind} record exists to classify")
+            src_id = int(row[0])
+            src_ok = bool(row[1])
+            src_detail = row[2] if isinstance(row[2], dict) else {}
+            src_identity = row[3]
+            src_at = float(row[4])
+            if want is not None and abs(src_at - want) > 1e-6:
+                raise ValueError(
+                    f"the newest {kind} record is no longer the one "
+                    f"being classified (recorded_at {src_at!r} != "
+                    f"{want!r}) — re-examine the current record before "
+                    "classifying")
+            if src_detail.get("qualification_contract") is not None:
+                raise ValueError(
+                    f"the newest {kind} record already carries a "
+                    "qualification contract — re-collect the evidence "
+                    "instead of reclassifying")
+            if not src_ok:
+                raise ValueError(f"the newest {kind} record FAILED — a "
+                                 "failed check cannot be classified "
+                                 "into passing")
+
+            def _fetch(rid: int, _s=s):
                 from sqlalchemy import text
-                from srplatform.db.models import SafetyRecord
-                # CAS boundary: serialize every classifier on the SAME
-                # advisory transaction lock (the table grants are
-                # deliberately SELECT/INSERT-only — append-only doctrine,
-                # so no row FOR UPDATE), then re-check the newest-record
-                # identity, validate, and append inside ONE transaction.
-                # Competing classifiers queue here; the loser re-reads
-                # after the winner's COMMIT and gets the truthful refusal.
-                s.execute(text(
-                    "SELECT pg_advisory_xact_lock("
-                    "hashtext('sr.safety_records.cas.v1'))"))
-                row = s.execute(text(
-                    "SELECT record_id, ok, detail, config_identity,"
-                    " extract(epoch from recorded_at) AS at"
-                    " FROM safety_records WHERE kind = :k"
-                    " ORDER BY record_id DESC LIMIT 1"),
-                    {"k": kind}).first()
-                if row is None:
-                    raise ValueError(f"no {kind} record exists to classify")
-                src_id = int(row[0])
-                src_ok = bool(row[1])
-                src_detail = row[2] if isinstance(row[2], dict) else {}
-                src_identity = row[3]
-                src_at = float(row[4])
-                if want is not None and abs(src_at - want) > 1e-6:
-                    raise ValueError(
-                        f"the newest {kind} record is no longer the one "
-                        f"being classified (recorded_at {src_at!r} != "
-                        f"{want!r}) — re-examine the current record before "
-                        "classifying")
-                if src_detail.get("qualification_contract") is not None:
-                    raise ValueError(
-                        f"the newest {kind} record already carries a "
-                        "qualification contract — re-collect the evidence "
-                        "instead of reclassifying")
-                if not src_ok:
-                    raise ValueError(f"the newest {kind} record FAILED — a "
-                                     "failed check cannot be classified "
-                                     "into passing")
-                effective = self._effective_observed_at(src_detail, src_at)
-                decided = time.time()
-                detail = {"qualification_contract": QUALIFICATION_CONTRACT,
-                          "one_time_reclassification": True,
-                          "observed_at": effective,
-                          "classification_decided_at": decided,
-                          "source_record_id": src_id,
-                          "reclassified_record_at": src_at,
-                          "record_identity_was": src_identity,
-                          "bound_identity": identity,
-                          "original_detail_digest": hashlib.sha256(
-                              json.dumps(src_detail, sort_keys=True,
-                                         default=str).encode()
-                              ).hexdigest()[:16],
-                          "reason": str(reason)[:500], "operator": actor}
-                s.add(SafetyRecord(kind=kind, ok=True,
-                                   config_identity=identity, detail=detail))
-                # COMMIT happens as the session context exits — the row
-                # lock that serializes competing classifiers is held until
-                # this very point, so exactly one append can follow the
-                # validated source.
-        except ValueError:
-            raise
-        except SafetyStoreUnavailable:
-            raise
-        except SQLAlchemyError as exc:
+                r = _s.execute(text(_SAFETY_BY_ID_SQL),
+                               {"r": int(rid)}).first()
+                if r is None:
+                    return None
+                return (r[0] if isinstance(r[0], dict) else {},
+                        float(r[1]))
+
+            effective = self._resolve_provenance(src_detail, src_at, _fetch)
+            decided = time.time()
+            detail = {"qualification_contract": QUALIFICATION_CONTRACT,
+                      "one_time_reclassification": True,
+                      "observed_at": effective,
+                      "classification_decided_at": decided,
+                      "source_record_id": src_id,
+                      "reclassified_record_at": src_at,
+                      "record_identity_was": src_identity,
+                      "bound_identity": identity,
+                      "original_detail_digest": _detail_digest(src_detail),
+                      "reason": str(reason)[:500], "operator": actor}
+            resolved["effective"] = effective
+            resolved["src_id"] = src_id
+            resolved["detail"] = detail
+            return detail
+
+        published = self._authoritative_publish(kind, True, identity, {},
+                                                validate=_validate)
+        if not published:
             raise SafetyStoreUnavailable(
                 "the authoritative safety-record store is unavailable — "
                 "a classification without it would be an unfenced append "
-                f"(reclassification refused): {str(exc)[:200]}") from None
-        except Exception as exc:  # noqa: BLE001 — no store, no publish
-            raise SafetyStoreUnavailable(
-                "the authoritative safety-record store is unavailable — "
-                "reclassification refused "
-                f"({type(exc).__name__}: {str(exc)[:160]})") from None
-        # durable audit mirrors AFTER the authoritative append (never a
-        # substitute for it); failures stay visible like record()'s do
+                "(reclassification refused)")
+        # durable audit mirrors AFTER the committed authoritative append
+        # (never a substitute for it, never written for a loser); file
+        # mirror failures stay visible exactly like record()'s are
+        detail = resolved["detail"]
         if self._mirror_dh is not None:
             self._mirror_dh.append({"kind": kind, "ok": True,
                                     "config_identity": identity,
@@ -465,14 +638,26 @@ class Supervisor:
             self._record_failures = list(
                 getattr(self, "_record_failures", [])) + [ferr]
         return {"ok": True, "kind": kind, "bound_identity": identity,
-                "observed_at": effective, "source_record_id": src_id}
+                "observed_at": resolved["effective"],
+                "source_record_id": resolved["src_id"]}
 
     def record(self, kind: str, ok: bool, detail: dict | None = None) -> None:
         """Append a safety record (baseline_check|datapath_proof|killswitch_test|
         engage|release). Records are never rewritten; validity is derived from
         the newest ones. Persistence failures are RETAINED for start_gate
         (audit N07: a record that could not be persisted must deny starts,
-        not silently vanish)."""
+        not silently vanish).
+
+        ROUND 4 CONTRACT: the append goes through the SAME shared
+        serialization boundary as classifications (`_authoritative_publish`),
+        so a fresh observation can never slip between a classifier's source
+        read and its append — whichever commits first is simply the newest
+        row, and the newest row is what readers honor. Mirrors are written
+        only AFTER the authoritative attempt, consistently with it: when a
+        store is configured and commits, the mirror follows the commit;
+        when the store failed, the durable file record still lands (the
+        N07 outage ledger) with the failure retained — an observation is
+        never silently dropped, and nothing republishes a stale pass."""
         identity = config_identity(self.settings)
         if kind in QUALIFICATION_KINDS:
             # new qualifications carry the contract marker; older accepted
@@ -480,18 +665,16 @@ class Supervisor:
             # you recorded is the record that stays — append-only)
             detail = {**(detail or {}),
                       "qualification_contract": QUALIFICATION_CONTRACT}
+        self._record_failures = list(getattr(self, "_record_failures", []))
+        published = self._authoritative_publish(kind, ok, identity,
+                                                detail or {})
+        if not published:
+            self._record_failures.append(
+                f"db record '{kind}': authoritative safety-record store "
+                "unavailable — recorded to the durable file ledger only")
         if self._mirror_dh is not None:
             self._mirror_dh.append({"kind": kind, "ok": ok, "config_identity": identity,
                                     "detail": detail or {}, "recorded_at": time.time()})
-        self._record_failures = list(getattr(self, "_record_failures", []))
-        try:
-            from srplatform.db.models import SafetyRecord
-            from srplatform.db.session import db
-            with db() as s:
-                s.add(SafetyRecord(kind=kind, ok=ok, config_identity=identity,
-                                   detail=detail or {}))
-        except Exception as e:  # noqa: BLE001 — observable, never swallowed
-            self._record_failures.append(f"db record '{kind}': {e}")
         ferr = self._append_file_record(kind, ok, identity, detail)
         if ferr:
             self._record_failures.append(ferr)
@@ -508,10 +691,17 @@ class Supervisor:
             return f"file record '{kind}' write failed: {e}"
 
     def _latest_records(self) -> dict:
-        """Newest record per kind by TIMESTAMP, MERGING the DB and the file
-        mirror (audit N07: preferring the DB whenever any row exists let an
+        """Newest record per kind, MERGING the DB and the file mirror
+        (audit N07: preferring the DB whenever any row exists let an
         engage/release recorded only to the file during a DB outage be
-        forgotten once the DB became reachable again)."""
+        forgotten once the DB became reachable again).
+
+        Round 4: WITHIN the authoritative store the newest record is the
+        one with the HIGHEST APPEND SEQUENCE (record_id), not the newest
+        wall-clock stamp — a later-committed failure must never be hidden
+        by a timestamp quirk (clock skew, backdated inserts). Cross-store
+        merging (authoritative rows vs the outage file/mirror, which
+        carry no sequence) keeps the N07 timestamp semantics."""
         out: dict[str, dict] = {}
 
         def consider(rec: dict) -> None:
@@ -519,7 +709,16 @@ class Supervisor:
             if not kind:
                 return
             cur = out.get(kind)
-            if cur is None or float(rec.get("recorded_at", 0)) >= float(cur.get("recorded_at", 0)):
+            if cur is None:
+                out[kind] = rec
+                return
+            cur_seq, rec_seq = cur.get("seq"), rec.get("seq")
+            if cur_seq is not None and rec_seq is not None:
+                if rec_seq >= cur_seq:
+                    out[kind] = rec
+                return
+            if float(rec.get("recorded_at", 0)) >= float(
+                    cur.get("recorded_at", 0)):
                 out[kind] = rec
 
         def db_records() -> list[dict]:
@@ -532,7 +731,7 @@ class Supervisor:
                         SafetyRecord.record_id)).scalars().all()
                     return [{"kind": r.kind, "ok": r.ok,
                              "config_identity": r.config_identity,
-                             "detail": r.detail,
+                             "detail": r.detail, "seq": r.record_id,
                              "recorded_at": r.recorded_at.timestamp() if r.recorded_at else 0}
                             for r in rows]
             except Exception:
@@ -631,13 +830,23 @@ class Supervisor:
                 "configuration")
         raw_ts = float(rec.get("recorded_at", 0))
         det = rec.get("detail") if isinstance(rec.get("detail"), dict) else {}
-        # Round-3 system contract: QUALIFICATION AGE AND TRANSITION
-        # INVALIDATION RUN ON THE EFFECTIVE OBSERVATION TIME — the
-        # original test's, carried through a compatibility classification
-        # (``observed_at``) — never on the audit decision's wall clock,
-        # or reclassifying would launder an old/blocked observation into
-        # a fresh one. Ordinary records: raw timestamp, exactly as before.
-        rec_ts = self._effective_observed_at(det, raw_ts)
+        # Round-4 system contract: QUALIFICATION AGE AND TRANSITION
+        # INVALIDATION run on the EFFECTIVE OBSERVATION TIME, established
+        # by the OBSERVATION-PROVENANCE CONTRACT (_resolve_provenance): an
+        # ordinary record's own authoritative timestamp; a recognized
+        # classification's time only through its verified immutable source
+        # chain — never an arbitrary detail field, never the audit
+        # decision's wall clock. Unverifiable provenance is INCOMPATIBLE:
+        # it does not pass, and it does not default to "now".
+        try:
+            rec_ts = self._resolve_provenance(det, raw_ts, self._record_by_id)
+        except SafetyProvenanceError as exc:
+            out["provenance"] = "incompatible"
+            out["problems"] = [
+                f"{kind} record carries no verifiable observation "
+                f"provenance ({exc}) — incompatible evidence, never a new "
+                "passed observation"]
+            return out
         if kind not in ("engage", "release"):
             for gate in ("engage", "release"):
                 g = recs.get(gate)
@@ -647,7 +856,7 @@ class Supervisor:
                         "evidence invalidated, re-run the check")
         out["recorded_at"] = rec_ts
         out["observed_at"] = rec_ts
-        if det.get("one_time_reclassification"):
+        if _is_recognized_classification(det):
             # the UI must distinguish the observation date from the day
             # an operator made the compatibility decision (audit time)
             out["classified_at"] = raw_ts
