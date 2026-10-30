@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import pathlib
 import shutil
 import subprocess
 from typing import Protocol
@@ -35,11 +36,32 @@ EMERGENCY_TABLE = "sr_emergency"
 BASELINE_TABLE = "sr_range_baseline"
 
 
+def _file_fingerprint(path: str) -> str:
+    """Public identity of a trust/credential FILE (content digest, never
+    content): rotating a key or re-pinning a host changes the digest and
+    therefore invalidates the evidence bound to it. A missing file is a
+    distinct identity from an empty one."""
+    if not path:
+        return "unset"
+    p = pathlib.Path(path)
+    try:
+        return hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+    except OSError:
+        return "absent"
+
+
 def config_identity(s: Settings) -> str:
     """Identity of the network/config the safety evidence is bound to (F02).
     Changing bridge/VLAN/CIDR/management/TOPOLOGY/API destination invalidates
     prior proofs (audit N07: bridge ports and the API destination/port change
-    the rendered rules, so they are part of the identity)."""
+    the rendered rules, so they are part of the identity).
+
+    Plan 22 review: the RUNNER side of the same safety story must be bound
+    too — a re-pointed runner destination, a rotated runner key, a changed
+    host-trust file or a different datapath contract all change what the
+    commissioning evidence actually covers, so each is part of the identity.
+    Only PUBLIC identity goes in: file contents never do, digests only.
+    """
     from srplatform.safety.firewall import _api_host, _api_port, bridge_ports
     material = json.dumps({
         "range_bridge": s.range_bridge, "range_vlan": s.range_vlan,
@@ -47,6 +69,11 @@ def config_identity(s: Settings) -> str:
         "bastion_address": s.bastion_address, "proxmox_node": s.proxmox_node,
         "range_bridge_ports": sorted(bridge_ports(s)),
         "api_host": _api_host(s), "api_port": _api_port(s),
+        "runner_transport": s.runner_transport,
+        "runner_target": str(s.runner_ssh_target or ""),
+        "runner_key": _file_fingerprint(str(s.runner_ssh_key_path or "")),
+        "runner_trust": _file_fingerprint(str(s.runner_ssh_known_hosts or "")),
+        "datapath_contract": s.datapath_controller,
     }, sort_keys=True)
     return hashlib.sha256(material.encode()).hexdigest()[:16]
 

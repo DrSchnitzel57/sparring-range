@@ -22,6 +22,7 @@ Properties the old module violated, now enforced:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -57,6 +58,10 @@ def _now() -> datetime:
 QUALIFICATION_KINDS = ("baseline_check", "datapath_proof", "killswitch_test")
 ADMISSION_KIND = "admission_probe"
 QUALIFICATION_CONTRACT = 1
+# Bounded freshness for the real runner health probe (SSHRunner.health through
+# the transport the dispatcher itself uses): one probe per TTL window, never a
+# connection storm behind the safety-page poll.
+RUNNER_PROBE_TTL_S = 15.0
 
 ISOLATION_MARKERS = (
     "100% packet loss", "100.0% packet loss", "unreachable", "fail", "failures",
@@ -69,6 +74,41 @@ REACHABILITY_MARKERS = (
     r"(?<!\d)0(\.0)?% packet loss", r"bytes from", r"default via",
     r"answers:", r"status: resolved", r"connected to", r"established",
 )
+
+
+def _legacy_scope_attested(kind: str, detail: dict) -> tuple[bool, str]:
+    """Did an unmarked (pre-contract) record's detail PROVE its scope?
+
+    The shapes below are what the accepted operator endpoints have always
+    been REQUIRED to write for each kind (audit R04/N07 schemas). A record
+    carrying that content describes what it observed and can be classified
+    "legacy-compatible"; anything else — empty, missing the bound
+    observations, or hand-written prose — proves nothing about what config
+    it covered and must NOT default into compatibility (plan 22 review).
+    """
+    if kind == "datapath_proof":
+        probes = detail.get("probes")
+        if not isinstance(probes, dict) or not probes:
+            return False, "no probe observations recorded"
+        if not detail.get("vm"):
+            return False, "probe host not recorded"
+        ok, reasons = probes_attest_isolation(probes)
+        return (True, "") if ok else (False, "; ".join(reasons)[:200])
+    if kind == "killswitch_test":
+        if "commands_stopped" not in detail or "datapath_isolated" not in detail:
+            return False, "cessation/isolation observations not recorded"
+        if not (detail.get("commands_stopped") and detail.get("datapath_isolated")):
+            return False, ("a stop test that did not observe both cessation "
+                           "and isolation never qualified anything")
+        return True, ""
+    if kind == "baseline_check":
+        live = detail.get("live")
+        if not isinstance(live, dict):
+            return False, "no live verification status recorded"
+        if not detail.get("source"):
+            return False, "no attestation source recorded"
+        return True, ""
+    return False, f"unknown qualification kind {kind!r}"
 
 
 def probes_attest_isolation(probes: dict) -> tuple[bool, list[str]]:
@@ -89,6 +129,24 @@ def probes_attest_isolation(probes: dict) -> tuple[bool, list[str]]:
             reasons.append(f"probe '{name}' observation {str(value)[:80]!r} does not clearly "
                            "attest failed egress (quote the tool output, e.g. '100% packet loss')")
     return (not reasons), reasons
+
+
+def _runner_health_probe(settings) -> tuple[bool, str]:
+    """REAL bounded health of the isolated runner RIGHT NOW (plan 22 review):
+    one supervised health round through ``get_runner(settings).health()`` —
+    the exact transport, pinned host trust, BatchMode identity and
+    runner-side supervisor the dispatcher itself will use for the next
+    command. Configured strings and file existence are NOT a usable runner;
+    this opens the connection. Fixed-shape (no model-selected destinations,
+    no shell of its own beyond the transport's, no root, bounded by the
+    transport's own timeouts)."""
+    from srplatform.red_agent.runner import RunnerUnavailable, get_runner
+    try:
+        return get_runner(settings).health()
+    except RunnerUnavailable as exc:      # not configured / trust file absent
+        return False, str(exc)
+    except Exception as exc:              # noqa: BLE001 — unknown is not healthy
+        return False, f"runner health probe could not run: {str(exc)[:200]}"
 
 
 class Supervisor:
@@ -216,6 +274,48 @@ class Supervisor:
         return {"ok": not file_err, "file_error": file_err, "mirror_error": mirror_err}
 
     # --------------------------------------------------------------- records ---
+    def reclassify_qualification(self, kind: str, *, reason: str,
+                                 actor: str) -> dict:
+        """ONE-TIME operator classification of pre-contract evidence (plan 22
+        review): a legacy record whose detail cannot prove its scope is not
+        silently honored and not silently thrown away — an operator who has
+        verified the record's provenance states so, and this is appended as
+        a NEW current-contract record bound to today's configuration.
+
+        This mints no fresh observation: the appended record says exactly
+        what happened (the operator classified the <date> record; original
+        content quoted by digest), keeps the original append-only line
+        untouched, and names the actor. Age-only manual retests stay
+        removed — this is the explicit compatibility decision, made once
+        per record, not a daily ritual."""
+        if kind not in QUALIFICATION_KINDS:
+            raise ValueError(f"{kind} is not a qualification kind")
+        if not str(reason or "").strip():
+            raise ValueError("a reclassification requires the reason the "
+                             "operator verified this record's provenance")
+        rec = self._latest_records().get(kind)
+        if not rec:
+            raise ValueError(f"no {kind} record exists to classify")
+        if (rec.get("detail") or {}).get("qualification_contract") is not None:
+            raise ValueError(
+                f"the newest {kind} record already carries a qualification "
+                "contract — re-collect the evidence instead of reclassifying")
+        if not rec.get("ok"):
+            raise ValueError(f"the newest {kind} record FAILED — a failed "
+                             "check cannot be classified into passing")
+        identity = config_identity(self.settings)
+        detail = {"qualification_contract": QUALIFICATION_CONTRACT,
+                  "one_time_reclassification": True,
+                  "reclassified_record_at": float(rec.get("recorded_at", 0)),
+                  "record_identity_was": rec.get("config_identity"),
+                  "bound_identity": identity,
+                  "original_detail_digest": hashlib.sha256(json.dumps(
+                      rec.get("detail") or {}, sort_keys=True,
+                      default=str).encode()).hexdigest()[:16],
+                  "reason": str(reason)[:500], "operator": actor}
+        self.record(kind, True, detail)
+        return {"ok": True, "kind": kind, "bound_identity": identity}
+
     def record(self, kind: str, ok: bool, detail: dict | None = None) -> None:
         """Append a safety record (baseline_check|datapath_proof|killswitch_test|
         engage|release). Records are never rewritten; validity is derived from
@@ -337,7 +437,30 @@ class Supervisor:
             return out
         marker = (detail or {}).get("qualification_contract")
         if marker is None:
-            out["provenance"] = "legacy-compatible"
+            # Plan 22 review: an unmarked QUALIFICATION record is "legacy"
+            # only if its detail actually PROVES its scope. The
+            # kind-specific shape a record was required to carry is
+            # re-validated here; an empty or unclassifiable detail proves
+            # nothing and is NOT made compatible by default (fail closed,
+            # with an explicit one-time operator classification as the
+            # recovery path). Lifecycle markers (engage/release/…) carry
+            # no qualification scope — there is nothing to attest.
+            if kind not in QUALIFICATION_KINDS:
+                out["provenance"] = "legacy-compatible"
+            else:
+                scope_ok, scope_why = _legacy_scope_attested(kind, detail or {})
+                if scope_ok:
+                    out["provenance"] = "legacy-compatible"
+                else:
+                    out["provenance"] = "legacy-unclassified"
+                    out["problems"] = [
+                        f"{kind} record predates qualification contracts and "
+                        f"its detail does not attest its scope ({scope_why}) — "
+                        "an operator must either re-collect the evidence or "
+                        "classify the existing record ONCE for the current "
+                        "configuration: `rangectl safety reclassify "
+                        f"{kind} --reason \"...\"`"]
+                    return out
         elif marker != QUALIFICATION_CONTRACT:
             out["provenance"] = "incompatible"
             out["problems"] = [
@@ -387,41 +510,110 @@ class Supervisor:
         return False, "; ".join(v["problems"]) or "unusable"
 
     # ------------------------------------------------------- admission health ---
+    def _runner_check(self) -> dict:
+        """Config gate PLUS a real, bounded health probe through the
+        EXISTING runner authority.
+
+        Checking configured strings and file existence is NOT a verified
+        usable runner (plan 22 review): the probe runs the platform's own
+        ``get_runner(settings).health()`` — one supervised round-trip (supervisor
+        start + containment status) through the exact pinned identity the
+        dispatcher uses, proving transport, host trust, key acceptance and
+        the cessation control channel, not just a TCP handshake. Results
+        are memoized for a short TTL so the safety page and the Begin
+        poll cannot hammer it.
+        """
+        s = self.settings
+        ok_cfg, why_cfg = self.runner_available()
+        if s.runner_transport != "ssh":
+            return {"check": "runner", "ok": ok_cfg, "detail": why_cfg}
+        if not ok_cfg:
+            return {"check": "runner", "ok": False, "detail": why_cfg}
+        key = (s.runner_ssh_target, s.runner_ssh_key_path,
+               s.runner_ssh_known_hosts)
+        cache = getattr(self, "_runner_probe_cache", None)
+        if cache and cache["key"] == key and time.monotonic() < cache["until"]:
+            ok, why = cache["res"]
+        else:
+            ok, why = _runner_health_probe(s)
+            self._runner_probe_cache = {
+                "key": key, "res": (ok, why),
+                "until": time.monotonic() + RUNNER_PROBE_TTL_S}
+        return {"check": "runner", "ok": ok, "detail": why}
+
+    def _broker_check(self) -> dict:
+        """The VM-cessation authority answers RIGHT NOW (or it does not).
+        An unconfigured authority is only non-applicable where the
+        configuration carries no VMs to stop (the noop-fixture exemption
+        the qualification applies); anywhere else its absence fails
+        closed."""
+        if self.broker is None:
+            if self.settings.sr_env != "production":
+                return {"check": "broker_authority", "ok": True,
+                        "applicable": False,
+                        "detail": "broker authority NOT configured "
+                                  "(non-production configuration) — no VM "
+                                  "cessation authority to probe"}
+            return {"check": "broker_authority", "ok": False,
+                    "detail": "broker authority NOT configured — current "
+                              "VM cessation cannot be proven"}
+        try:
+            st = self.broker.latch_status()
+        except Exception as exc:  # noqa: BLE001 — unknown is not healthy
+            return {"check": "broker_authority", "ok": False,
+                    "detail": f"broker authority unreachable: {str(exc)[:160]}"}
+        if isinstance(st, dict) and st.get("latched"):
+            return {"check": "broker_authority", "ok": False,
+                    "detail": f"broker reports emergency engagement ACTIVE "
+                              f"({str(st.get('reason') or 'no reason recorded')[:120]}) "
+                              "— starts stay refused"}
+        return {"check": "broker_authority", "ok": True,
+                "detail": "broker authority answers; no engagement active"}
+
     def admission_probes(self) -> dict:
         """Bounded, NON-DESTRUCTIVE, authoritative health of RIGHT NOW
-        (plan 22 LIVE-07): only fixed typed checks through authorities the
-        controller already holds — no host shell, no model-selected
-        destinations, no killswitch exercise. A failed or unknown probe
-        fails closed; a not-applicable mechanism is reported, not faked."""
-        checks: list[dict] = []
-        ok_runner, why = self.runner_available()
-        checks.append({"check": "runner", "ok": ok_runner, "detail": why})
+        (plan 22 LIVE-07, sharpened by review): fixed typed checks through
+        authorities the platform already holds — the runner's own SSH
+        identity, the broker client, the datapath controller. No host
+        shell, no model-selected destinations, no killswitch exercise.
+
+        Three honest outcomes are distinguished: FAILED (blocks), UNKNOWN
+        (blocks — unknown health is not health), and a live check the
+        datapath DECLARED UNSUPPORTED (never counted as a passed probe and
+        never disguised as "not applicable because production": isolation
+        in that mode is carried by the config-bound commissioning
+        qualification, and the page says exactly that)."""
+        checks: list[dict] = [self._runner_check(), self._broker_check()]
         mechanism = getattr(self.datapath, "mechanism", None)
         if mechanism == "nft":
             from srplatform.safety.firewall import validate_port_coverage
             cov_ok, cov_why = validate_port_coverage(self.settings)
             checks.append({"check": "bridge_port_coverage", "ok": cov_ok,
                            "detail": cov_why})
-        try:
-            base = self.datapath.baseline_status()
-            # A noop datapath outside production carries no isolation to
-            # probe — the SAME exemption the commissioning qualification
-            # applies. "Not applicable" is reported, never counted as a
-            # failed observation.
-            applicable = (self._evidence_required()
-                          and base.get("ok") is not None)
-            checks.append({"check": "datapath_structure",
-                           "ok": bool(base.get("ok")) if applicable else True,
-                           "applicable": applicable,
-                           "detail": (
-                               str(base.get("detail", base))[:300]
-                               if applicable else
-                               "no isolation structure to probe (noop "
-                               "datapath outside production)")})
-        except Exception as exc:  # noqa: BLE001 — unknown is not healthy
-            checks.append({"check": "datapath_structure", "ok": False,
-                           "detail": f"controller error: {exc}"[:300]})
-        return {"ok": all(c["ok"] for c in checks), "checks": checks,
+        if mechanism == "noop" and not self._evidence_required():
+            checks.append({"check": "isolation_live", "ok": True,
+                           "applicable": False,
+                           "detail": "noop datapath outside production — "
+                                     "no isolation exists to probe"})
+        else:
+            try:
+                base = self.datapath.baseline_status()
+                if base.get("ok") is None:
+                    checks.append({
+                        "check": "isolation_live", "ok": None,
+                        "declared_unsupported": True,
+                        "detail": str(base.get("detail", base))[:300]})
+                else:
+                    checks.append({"check": "isolation_live",
+                                   "ok": bool(base.get("ok")),
+                                   "detail": str(base.get("detail", base))[:300]})
+            except Exception as exc:  # noqa: BLE001 — unknown is not healthy
+                checks.append({"check": "isolation_live", "ok": False,
+                               "detail": f"controller error: {exc}"[:300]})
+        health = all(c["ok"] is not False
+                     and not (c["ok"] is None and not c.get("declared_unsupported"))
+                     for c in checks)
+        return {"ok": health, "checks": checks,
                 "config_identity": config_identity(self.settings),
                 "at": time.time()}
 
@@ -451,17 +643,26 @@ class Supervisor:
             reasons.append("safety record persistence failed since startup: "
                            + "; ".join(self._record_failures[-3:])
                            + " — re-run the checks with working storage")
+        advisories: list[str] = []
         for c in probes["checks"]:
-            if not c["ok"]:
+            if c["ok"] is False or (c["ok"] is None
+                                    and not c.get("declared_unsupported")):
                 label = {"runner": "runner unavailable",
                          # the accepted pre-22 gate worded this blocker as
                          # "live bridge topology" — keep operator-recognized
                          # wording for the identical check
                          "bridge_port_coverage":
-                             "live bridge topology"}.get(
+                             "live bridge topology",
+                         "isolation_live": "live isolation check",
+                         "broker_authority": "broker authority"}.get(
                     c["check"], c["check"])
                 reasons.append(f"{label}: {c['detail']}")
-        advisories: list[str] = []
+            elif c["ok"] is None and c.get("declared_unsupported"):
+                advisories.append(
+                    "live isolation check DECLARED UNSUPPORTED by this "
+                    "datapath — Begin is carried by the config-bound "
+                    "commissioning qualification, never by a simulated "
+                    "live probe")
         if self._evidence_required():
             for q in quals:
                 if not q["usable"]:

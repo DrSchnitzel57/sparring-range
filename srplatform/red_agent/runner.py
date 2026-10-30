@@ -445,11 +445,39 @@ class SshRunner(Runner):
         # Bounded channel (plan 18, live find): keepalives turn a wedged
         # guest (TCP established, daemon stuck) into a loud ssh exit 255
         # in ~15 s instead of an eternal silent hang.
+        #
+        # Target may carry an explicit port in bracket form —
+        # `user@[host]:2222` (the acceptance fixtures run sshd on
+        # unprivileged ports; so can a real deployment). Splitting it into
+        # `-p` keeps the hostname argument unambiguous for the OpenSSH
+        # client; plain targets keep the exact argv they always had.
+        # IdentitiesOnly pins authentication to the CONFIGURED identity:
+        # an unrelated agent key must never authenticate (or mask a rotated
+        # key) against the isolated runner.
+        target, port = self._split_target(s.runner_ssh_target)
+        port_opt = ["-p", port] if port else []
         return ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+                "-o", "IdentitiesOnly=yes",
                 "-o", f"UserKnownHostsFile={s.runner_ssh_known_hosts}",
                 "-o", "ConnectTimeout=10", *SSH_ALIVE_OPTS,
-                "-i", s.runner_ssh_key_path,
-                "--", s.runner_ssh_target]
+                "-i", s.runner_ssh_key_path, *port_opt,
+                "--", target]
+
+    @staticmethod
+    def _split_target(target: str) -> tuple[str, str | None]:
+        """`user@[h]:p` -> ('user@h', 'p'); anything else -> (target, None).
+        The brackets are a PORT delimiter (the OpenSSH client refuses a
+        bracketed IPv4 otherwise); the pinned-name lookup in known_hosts
+        still uses the canonical `[host]:port` form, which the pin file
+        must carry for non-default ports."""
+        import re
+        m = re.match(r"^(.*?)\[([^\]]+)\]:(\d+)$", target or "")
+        if m:
+            host = m.group(2)
+            if ":" in host:      # IPv6 literal: the brackets ARE required
+                host = f"[{host}]"
+            return f"{m.group(1)}{host}", m.group(3)
+        return target, None
 
     # --- runner-side supervisor control channel -------------------------------
     def _supervisor_bin(self) -> str:
@@ -641,8 +669,13 @@ class SshRunner(Runner):
         if r.exit_code == 0 and r.cancel_state != "unknown":
             return True, f"runner reachable at {self.s.runner_ssh_target} (supervised)"
         if r.cancel_state == "unknown":
+            # Include the transport's own words (merged stderr): an operator
+            # reading the safety page must see WHY (host key, auth, refused),
+            # not only that the verdict is unknown.
+            diag = " ".join(x for x in ((r.error or "").strip(),
+                                        (r.output or "").strip()) if x)
             return False, ("runner health FAILED: cessation verdict UNKNOWN — "
-                           f"{(r.error or r.output or '')[:200]}")
+                           + diag[:400])
         return False, f"runner health failed (exit {r.exit_code}): {r.output[:200] or r.error}"
 
 
