@@ -94,7 +94,11 @@ gates independently. Any requirement not met stays open, regardless of plan tick
   nine counterexamples plus the upgraded-browser-login AC-5 gap repaired with
   root fixes and re-proven on final revision `df72a85` (all seven acceptance
   criteria, receipts in `FINDINGS_CHECKLIST.md`; new bundle
-  `sparring-range-appliance-22b`). The box stays unchecked until independent
+  `sparring-range-appliance-22b`). Review round 2 (FIX) closed the same day:
+  four residual gaps (malformed-broker-reply release, path-keyed runner memo,
+  /readyz-vs-Begin runner fact, missing reclassify command) root-fixed and
+  re-proven at `c9b3e4f` with bundle `-22c`; rerun/carried lane table in
+  `FINDINGS_CHECKLIST.md`. The box stays unchecked until independent
   re-review accepts.
   User authorized plan creation followed directly by Qwen Flash Next high
   implementation and autonomous independent review on the existing branch.

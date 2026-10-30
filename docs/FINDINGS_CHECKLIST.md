@@ -1,5 +1,102 @@
 # Current findings and validation evidence
 
+## Plan-22 review-round-2 receipts — 2026-10-30 (branch `practice-upgrades-18-21`, final revision `c9b3e4f`)
+
+Independent re-review of candidate `5c9509f` returned **VERDICT: FIX**: the
+nine round-1 counterexamples now PASS independently; four residual
+safety/recovery gaps remained. All four were fixed at the root contract in
+`2056e97` (the browser-harness robustness in `c9b3e4f`), each with a proof
+at the real producer/consumer boundary in `tests/test_plan22_review_round2.py`:
+
+- **F1 (HIGH) malformed broker reply released Begin** — the old check only
+  tested truthy `latched`, so `null`/`{}`/`[]`/`{"latched": None}` over the
+  REAL typed client read as "no engagement active". `_broker_check` now
+  validates the broker's latch CONTRACT (`{latched: strict bool, reason,
+  latched_at}` — `ledger.get_latch`'s shape) before reading anything: a
+  non-object, a missing field, or a non-strict-bool `latched` BLOCKS with
+  "reply UNTRUSTED" wording; unreachable still blocks; only the exact shape
+  passes, phrased as contract-answered. Proofs: real `BrokerService` +
+  typed client both ways (unlatched passes, engaged blocks naming the
+  reason), the full malformed matrix, and raw replies on a REAL unix socket
+  through the real `HttpTransport`/`BrokerClient` (null result, empty
+  result, non-bool, truncated JSON, no-result payload, HTTP 503, and a
+  timeout on BOTH read attempts — the typed client's one READ retry is
+  honored). Broker UID policy untouched.
+- **F2 (MEDIUM) runner memo keyed by file paths** — an in-place re-pin of
+  known_hosts at the same path replayed the cached pass for the TTL while
+  the direct probe refused. The memo key is now the trust IDENTITY
+  (`transport, target, sha256(key contents), sha256(trust contents)` —
+  `config_identity`'s `_file_fingerprint`, missing/empty/unreadable are
+  distinct identities, no secret content in the key). Proof rides the REAL
+  asyncssh wire: warm a genuine success (memoized — a second check opens no
+  connection), replace the pin CONTENT in place with a foreign key, the
+  very next check re-probes and refuses; deleting the key then refuses on
+  the deterministic config fact without probing.
+- **F3 (MEDIUM) /readyz contradicted the Begin classifier** —
+  `runner_available()` is now the single DETERMINISTIC config-readiness
+  fact (transport named, private key present, host-trust file present with
+  at least one non-comment pin), and `/readyz` reports exactly it with a
+  `"fact"` field naming itself as config-readiness and pointing health at
+  `/safety/qualification`; no live probe is added, so fresh install/upgrade
+  readiness still requires no attacker or guest. Proof on the REAL API:
+  missing key and EMPTY trust answer `runner.ok FALSE` on BOTH surfaces
+  with byte-identical details and Begin refused; the healthy positive
+  passes /readyz as "configured", never "reachable". (The classifier test
+  `test_production_static_isolation_is_declared_unsupported_not_inapplicable`
+  was corrected to keep BOTH layers: usable config reaches the failing
+  probe, broken config refuses at the shared fact — its fail-open intent
+  is preserved, no assertion weakened.)
+- **F4 (MEDIUM) the recovery command did not exist** — the blocker names
+  `rangectl safety reclassify KIND --reason "..."`, and that command is
+  now REAL: `POST /safety/reclassify-qualification` (operator-only; kind
+  allowlist 422; no record 404; failed/newest-contracted/moved-source 409)
+  behind the typer command, and `reclassify_qualification` accepts
+  `expect_recorded_at` so the classification is bound to the EXACT source
+  record the operator examined — a concurrently replaced newest record is
+  refused, never silently classified. The appended record states what
+  happened (one-time classification, operator, reason, original detail
+  digest, source recorded_at, current bound identity); the original
+  append-only line is untouched. Proof is the full end-to-end: real CLI
+  subprocess → authenticated uvicorn server → the same database → the
+  surfaces read the kind as current usable evidence; role/kind/absent/
+  failed/moved/double-classify all refuse with real statuses and write
+  nothing. Ordinary sessions still carry no 24-hour manual ritual.
+
+The independent review's harness finding was real and is fixed truthfully:
+its FIRST upgrade-gate attempt failed in 49.8 s because Chromium's unix
+socket path exceeded the ~107-char cap under the long disk TMPDIR (it then
+passed via a short owned alias). `pw()` in the upgrade gate now always runs
+the pinned playwright-cli under a short `/tmp/sr-pw-<pid>` ALIAS into the
+run's own disk-backed directory (removed in the harness `finally`) — the
+data stays on disk, only the socket prefix is short. The 514 s PASS at
+`df72a85` stands as evidence of the login itself; this round's upgrade run
+passed on the hardened harness without any alias gymnastics by the runner.
+
+Round-2 verification (real exit statuses, foreground, this tree; lanes not
+listed carry the round-1 receipts above because F1–F4 touch none of their
+inputs — no agent/model-admin, containment fixture, install sequence, web
+bundle or browser-facing behavior changed, and the web UI consumes neither
+`/readyz` nor runner details):
+
+| Lane | Rerun/carry | Result |
+|---|---|---|
+| fast (exact AGENTS command) | RERAN | exit 0 — **727 passed, 0 failed, 0 skipped**, 509 deselected, 13 warnings, 104.57 s |
+| selection | RERAN | PASS 211.1 s (new proofs classified into layers) |
+| practice | RERAN | PASS 19.0 s — 11 + 28 passed, 0 skipped, incl. the F2 real-wire pin-swap |
+| db | RERAN | PASS 731.6 s — **338 passed, 0 failed, 0 skipped** (335 + the 3 new API/CLI/DB proofs); disposable fixture created and removed |
+| authority | RERAN | PASS 26.5 s — 35 passed (safety core changed) |
+| upgrade | RERAN (once) | PASS 513.2 s — full preserving upgrade incl. the REAL browser login on the hardened harness |
+| bundle | RERAN | PASS 432.0 s — NEW `.cache/bundle/sparring-range-appliance-22c` (MANIFEST sha256 `f49867125ad0bcd4bb69b352715f7cf6f2ba267fafa3045dd8d9b1949f0def80`, revision `c9b3e4ff7fd0`, 392 files, 4 images, EXISTING images reused); runtime binding to this checkout (248 files); operator manifest renders; shipped image boots (throwaway overlay, TCG, marker `2026-10-30T11:45:44Z`); digest tamper refused |
+| agent, containment, install, frontend, browser | CARRIED (`5c9509f`) | 123 / 41 / sequences complete / 0 high+critical / 7 of 7 — unaffected inputs, stated as carried, not re-claimed |
+
+Artifacts byte-intact: sealed release MANIFEST `0cfa12f1f48c…`
+(rev `59fb5442fede`), `-22` MANIFEST `8083dd4a9578…`, `-22b` MANIFEST
+`da639671daa4ea…`. Cleanup verified: zero `sr-*` containers, gate run dirs
+and `/tmp/sr-pw-*` aliases removed, `/tmp/sr-broker-ledger-*` orphans swept
+(owned by the fixture convention). Roadmap 22 stays unchecked: no installed
+appliance, provider, systemd, nested-KVM or live-operator acceptance is
+claimed by any row above.
+
 ## Plan-22 review-round-1 receipts — 2026-10-30 (branch `practice-upgrades-18-21`, final revision `df72a85`)
 
 Independent review of candidate `9776884` returned **VERDICT: FIX** (nine
