@@ -427,6 +427,10 @@ export default function ReplayPanel({ sid }) {
   // pause the real player with the master clock; before the cast epoch the
   // player holds frame zero — the session clock runs, the cast does not
   const inCastNow = now >= castRel - 0.05;
+  // plan 22 review: while the clock predates the recording, the held
+  // frame zero is CONTENT FROM THE FUTURE — suppress the terminal and
+  // say so instead of showing it (controls stay usable).
+  const preCast = !!cast && !framesErr && !inCastNow;
   useEffect(() => {
     const p = playerRef.current;
     if (!p) return;
@@ -576,7 +580,28 @@ export default function ReplayPanel({ sid }) {
             {!cast && !framesErr && <p className="dim">no defender recording exists for this session —
               recordings appear when someone defends through the bastion.</p>}
             {cast && !frames && !framesErr && <p className="dim">loading cast frames…</p>}
-            <div ref={rootRef} style={{ minHeight: cast ? 100 : 0 }} />
+            {/* Plan 22 review: BEFORE the cast's coverage the player holds
+                frame zero — and frame zero IS the first recorded screen,
+                so merely seeking there showed the future. The terminal is
+                suppressed until the session clock reaches the recording,
+                with an explicit honest state; the controls keep working
+                and the player keeps its held position underneath. */}
+            <div style={{ position: "relative" }}>
+              <div ref={rootRef}
+                   data-cast-visible={String(!!cast && !preCast)}
+                   style={{ minHeight: cast ? 100 : 0,
+                            visibility: preCast ? "hidden" : "visible" }} />
+              {preCast && (
+                <div role="status" data-precast-note
+                     className="dim"
+                     style={{ position: "absolute", inset: 0, display: "flex",
+                              alignItems: "center", justifyContent: "center",
+                              textAlign: "center" }}>
+                  no recording yet — this session predates the first defender
+                  recording (starts at +{Math.round(castRel)}s); seek or play
+                  the clock forward to watch it
+                </div>)}
+            </div>
           </div>
         </div>
       </div>

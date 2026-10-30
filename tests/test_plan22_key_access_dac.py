@@ -322,6 +322,18 @@ def _enrollment_helper(stage: pathlib.Path) -> None:
     listing = os.waitstatus_to_exitcode(status) == 3
     print(f"BASTION-TRAVERSAL-ONLY-ON-STATE-{('OK' if listing else 'ERR')}")
 
+    # hand the tree back to the invoking user (namespace root CAN chown):
+    # mapped-uid-owned 0700/0751 directories are otherwise undeletable by
+    # pytest's tmp cleanup, leaving garbage under /tmp
+    for d, dirs, files in os.walk(stage):
+        for name in files:
+            os.chown(os.path.join(d, name), 0, 0)
+    for d, dirs, files in os.walk(stage):
+        for name in dirs:
+            p = os.path.join(d, name)
+            os.chmod(p, 0o755)
+            os.chown(p, 0, 0)
+
 
 if os.environ.get("SR_DAC_HELPER") == "1":
     _helper_main(pathlib.Path(sys.argv[1]))
