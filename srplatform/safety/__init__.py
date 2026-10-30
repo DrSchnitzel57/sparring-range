@@ -404,11 +404,20 @@ class Supervisor:
                            "detail": cov_why})
         try:
             base = self.datapath.baseline_status()
-            applicable = base.get("ok") is not None
+            # A noop datapath outside production carries no isolation to
+            # probe — the SAME exemption the commissioning qualification
+            # applies. "Not applicable" is reported, never counted as a
+            # failed observation.
+            applicable = (self._evidence_required()
+                          and base.get("ok") is not None)
             checks.append({"check": "datapath_structure",
                            "ok": bool(base.get("ok")) if applicable else True,
                            "applicable": applicable,
-                           "detail": str(base.get("detail", base))[:300]})
+                           "detail": (
+                               str(base.get("detail", base))[:300]
+                               if applicable else
+                               "no isolation structure to probe (noop "
+                               "datapath outside production)")})
         except Exception as exc:  # noqa: BLE001 — unknown is not healthy
             checks.append({"check": "datapath_structure", "ok": False,
                            "detail": f"controller error: {exc}"[:300]})
@@ -444,7 +453,12 @@ class Supervisor:
                            + " — re-run the checks with working storage")
         for c in probes["checks"]:
             if not c["ok"]:
-                label = {"runner": "runner unavailable"}.get(
+                label = {"runner": "runner unavailable",
+                         # the accepted pre-22 gate worded this blocker as
+                         # "live bridge topology" — keep operator-recognized
+                         # wording for the identical check
+                         "bridge_port_coverage":
+                             "live bridge topology"}.get(
                     c["check"], c["check"])
                 reasons.append(f"{label}: {c['detail']}")
         advisories: list[str] = []
