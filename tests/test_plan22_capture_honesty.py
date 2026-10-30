@@ -5,11 +5,14 @@ F8 (with the 409 change on the conflict answer): duplicate suppression is
 exact-equality on (seq, kind, text, read_ts, dropped_bytes); a divergent
 re-delivery is a 409-classified conflict, never a silent 200.
 
-F9: a worker-claimed pipe-read instant is a CLAIM. Absurd epochs
-(read_ts=1) are DROPPED while the bytes are still stored (the row honestly
-degrades to persist time); plausible claims survive; and the member-facing
-output projection labels which of the two replay is looking at, because a
-timing that only the worker vouches for is advisory, not verified.
+F9 (plan 22 review sharpened it): a worker-claimed pipe-read instant is a
+CLAIM adjudicated against the OPERATION's server-trusted lifetime ± 300 s
+skew — not a 400-day wall window. Out-of-interval claims (read_ts=1, 180
+days ago on a fresh op) are refused while the bytes are still stored (the
+row honestly degrades to persist time, the claim is kept verbatim, and
+the surface says so); in-lifetime claims survive; and the member-facing
+output projection labels which placement replay is looking at, because a
+timing only the worker vouches for is advisory, not verified.
 
 F6 server half: the replay surface carries ONE canonical session-clock
 anchor (the session's first event, unfiltered) so client-side filters can
@@ -31,13 +34,16 @@ def test_absurd_worker_read_ts_is_dropped_but_bytes_survive(client, users):
     assert r.status_code == 201 and r.json()["status"] == "stored"
     rows = _rows(rid, "AND seq = 0")
     assert rows[0][1] == "real bytes"          # completeness preserved
-    assert rows[0][3] is None                  # the bogus claim was dropped
+    assert rows[0][3] is None                  # the bogus claim was refused
+    assert rows[0][4] == 1.0                   # …kept verbatim, un-laundered
+    assert rows[0][5] == "rejected-out-of-interval"
 
     now = time.time()
     r2 = _append(client, rid, token, op, seq=1, text="kept", read_ts=now)
     assert r2.json()["status"] == "stored"
     rows = _rows(rid, "AND seq = 1")
-    assert abs(rows[0][3] - now) < 0.001       # plausible claim survives
+    assert abs(rows[0][3] - now) < 0.001       # in-lifetime claim accepted
+    assert rows[0][5] == "accepted"
 
 
 def test_output_projection_labels_timing_provenance(client, users):

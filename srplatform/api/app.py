@@ -1976,10 +1976,11 @@ _CAPTURE_MAX_CLAIMED_DROPPED = 1_000_000_000
 _CAPTURE_MARKER_TEXT = ("server capture quota reached — further chunks "
                         "were not stored")
 _CAPTURE_MARKER_BYTES = len(_CAPTURE_MARKER_TEXT.encode("utf-8"))
-# F9: plausibility window for worker-claimed pipe-read instants. The age
-# bound is generous (lab fixtures legitimately carry recent-but-not-now
-# stamps); the point is refusing absurd epochs, not second-level trust.
-_CAPTURE_READ_TS_MAX_AGE_S = 400 * 24 * 3600
+# F9, sharpened by plan 22 review (item 8): a worker-claimed pipe-read
+# instant is adjudicated against the OPERATION's server-trusted lifetime
+# (registration → end), not a 400-day window around server time. The one
+# allowance is clock skew between worker and server clocks — documented,
+# bounded, and the reason the interval is inclusive at both ends.
 _CAPTURE_READ_TS_MAX_SKEW_S = 300
 
 
@@ -1989,6 +1990,36 @@ class OperationOutputIn(BaseModel):
     text: str | None = None
     dropped_bytes: int | None = Field(default=None, ge=0)
     read_ts: float | None = Field(default=None, ge=0, lt=1e12)
+
+
+def _read_ts_verdict(claim: float | None, op_created, op_ended,
+                     run_ended) -> tuple[float | None, str]:
+    """Adjudicate a worker timing claim against the operation's own
+    server-trusted interval (plan 22 review, item 8).
+
+    A pipe read can only have happened while the operation was alive:
+    from its registration (the earliest instant the server knows the
+    operation existed — chunks never attach to unregistered ops) until it
+    ended (operation end; else run end; else still running ⇒ now), plus a
+    documented ±300 s clock-skew allowance at each bound. Returns
+    ``(accepted_value_or_None, status)`` — a rejected claim is NOT
+    laundered: it is stored verbatim in ``read_ts_claim`` with status
+    ``rejected-out-of-interval`` so the surface can say so, and a retry
+    of the SAME claim stays idempotent.
+    """
+    if claim is None:
+        return None, "absent"
+    skew = _CAPTURE_READ_TS_MAX_SKEW_S
+    lower = op_created.timestamp() - skew
+    if op_ended is not None:
+        upper = op_ended.timestamp() + skew
+    elif run_ended is not None:
+        upper = run_ended.timestamp() + skew
+    else:
+        upper = _now().timestamp() + skew
+    if lower <= claim <= upper:
+        return claim, "accepted"
+    return None, "rejected-out-of-interval"
 
 
 def _capture_quota_response(db, run_id, session_id, op_id, dropped):
@@ -2013,7 +2044,8 @@ def _capture_quota_response(db, run_id, session_id, op_id, dropped):
             run_id=run_id, session_id=session_id, op_id=op_id,
             seq=int(next_seq) + 1, kind="truncated",
             text=_CAPTURE_MARKER_TEXT,
-            dropped_bytes=dropped))
+            dropped_bytes=dropped,
+            read_ts_status="absent"))    # a marker carries no claim
     db.commit()
     return JSONResponse({"ok": True, "status": "quota"}, status_code=200)
 
@@ -2053,8 +2085,11 @@ def append_operation_output(run_id: uuid.UUID, op_id: str,
       by a partial unique index, and worker-claimed drop totals are
       clamped, not trusted;
     * ``read_ts`` (the worker's observed pipe-read instant) is stored
-      separately from the row's persist time (finding 10) — replay
-      timing never silently degrades to persist time unlabelled;
+      separately from the row's persist time (finding 10) — and only if
+      it falls inside the operation's server-trusted lifetime ± the
+      documented skew allowance (plan 22 review item 8); a rejected
+      claim is kept verbatim in ``read_ts_claim`` with its status, and
+      replay labels the provenance either way;
     * chunks attach only to an operation the worker registered BEFORE
       dispatch — orphans (forged op ids) are refused.
     """
@@ -2064,27 +2099,30 @@ def append_operation_output(run_id: uuid.UUID, op_id: str,
     run = _require_worker(db, run_id, x_worker_token)
     if body.kind not in ("output", "gap", "truncated"):
         raise HTTPException(422, "kind must be output, gap or truncated")
-    # F9: a worker-claimed read instant is only kept if PLAUSIBLE inside a
-    # window around server time (read_ts=1 is a broken clock, not evidence).
-    # The BYTES are still stored — completeness outranks a bad timestamp —
-    # but the out-of-window claim is dropped, the row honestly degrades to
-    # persist-time, and replay labels the provenance either way.
-    if body.read_ts is not None:
-        now_s = _now().timestamp()
-        if not (now_s - _CAPTURE_READ_TS_MAX_AGE_S <= body.read_ts
-                <= now_s + _CAPTURE_READ_TS_MAX_SKEW_S):
-            body.read_ts = None
     if body.text is not None and body.text == "" and body.kind == "output":
         raise HTTPException(422, "output chunks must carry text")
     if body.text is not None and \
             len(body.text.encode("utf-8", "replace")) > _CAPTURE_MAX_TEXT_BYTES:
         raise HTTPException(422, "chunk text exceeds the server bound")
     registered = db.execute(
-        select(RunOperation.id).where(RunOperation.run_id == run_id,
-                                      RunOperation.op_id == op_id)
+        select(RunOperation.created_at, RunOperation.ended_at,
+               Run.ended_at)
+        .join(Run, Run.run_id == RunOperation.run_id)
+        .where(RunOperation.run_id == run_id,
+               RunOperation.op_id == op_id)
         .limit(1)).first()
     if registered is None:
         raise HTTPException(404, "operation not registered for this run")
+
+    # F9, per the plan-22 counterexample (180-days-ago on a fresh op):
+    # the claim is adjudicated against THIS operation's lifetime, not a
+    # wall window around server time. The BYTES are still stored —
+    # completeness outranks a bad timestamp — but an out-of-interval
+    # claim never places the chunk; it is kept verbatim, with its status,
+    # for the honest surface and for claim-exact idempotence.
+    raw_claim = body.read_ts
+    body.read_ts, claim_status = _read_ts_verdict(
+        raw_claim, registered[0], registered[1], registered[2])
 
     dropped = body.dropped_bytes
     if dropped is not None and dropped > _CAPTURE_MAX_CLAIMED_DROPPED:
@@ -2097,20 +2135,24 @@ def append_operation_output(run_id: uuid.UUID, op_id: str,
 
     existing = db.execute(
         select(OperationOutput.kind, OperationOutput.text,
-               OperationOutput.read_ts, OperationOutput.dropped_bytes)
+               OperationOutput.read_ts_claim, OperationOutput.dropped_bytes)
         .where(OperationOutput.run_id == run_id,
                OperationOutput.op_id == op_id,
                OperationOutput.seq == body.seq)
         .limit(1)).first()
     if existing is not None:
         db.commit()
-        # F8: idempotence means EQUAL, not merely same-text. A re-delivery
-        # must carry the same kind, text AND claimed timing/drop metadata;
-        # anything else at a known seq is a genuine conflict and answers
-        # 409 — the caller's stream diverged, and silent 200s would let a
-        # lying or buggy worker rewrite history one retry at a time.
+        # F8 + plan 22 item 8: idempotence means EQUAL, not merely
+        # same-text — and the timing comparison is against the RAW claim
+        # the worker sent, never the server-normalized column. Two
+        # different rejected claims (both normalized to NULL) are a
+        # genuine conflict, and a retry of one REJECTED claim stays an
+        # honest duplicate instead of being forced to "match" the first
+        # rejected value it never sent. Anything else at a known seq is
+        # a conflict and answers 409 — silent 200s would let a lying or
+        # buggy worker rewrite history one retry at a time.
         if (existing[0] == body.kind and existing[1] == body.text
-                and existing[2] == body.read_ts
+                and existing[2] == raw_claim
                 and existing[3] == dropped):
             return JSONResponse({"ok": True, "status": "duplicate"},
                                 status_code=200)
@@ -2169,7 +2211,8 @@ def append_operation_output(run_id: uuid.UUID, op_id: str,
             pg_insert(OperationOutput)
             .values(run_id=run_id, session_id=run.session_id, op_id=op_id,
                     seq=body.seq, kind=body.kind, text=body.text,
-                    dropped_bytes=dropped, read_ts=body.read_ts)
+                    dropped_bytes=dropped, read_ts=body.read_ts,
+                    read_ts_claim=raw_claim, read_ts_status=claim_status)
             .on_conflict_do_nothing(
                 index_elements=["run_id", "op_id", "seq"]))
     except IntegrityError:

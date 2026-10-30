@@ -430,23 +430,36 @@ def operation_output(session_id: uuid.UUID, op_id: str,
         conds.append("seq > :after")
         params["after"] = after_seq
     rows = db.execute(sa_text(
-        f"SELECT seq, ts, kind, text, dropped_bytes, read_ts "
-        f"FROM operation_outputs "
+        f"SELECT seq, ts, kind, text, dropped_bytes, read_ts, "
+        f"read_ts_status FROM operation_outputs "
         f"WHERE {' AND '.join(conds)} ORDER BY seq LIMIT :lim"),
         params).fetchall()
     has_more = len(rows) > limit
     rows = rows[:limit]
-    # F9: timing honesty at the surface. read_ts is WORKER-CLAIMED pipe
-    # read time (bounded to a plausibility window at ingest, never
-    # server-verified); persist time is a coarser server-side fallback.
-    # Replay may order by either, but must say which one it is showing.
+    # F9 + plan 22 item 8: timing honesty at the surface. A chunk's
+    # read_ts is present ONLY when the worker's claim fell inside the
+    # operation's server-trusted interval; a rejected claim still rides
+    # along as `read_ts_status` so the client can say WHY that chunk is
+    # placed at persist time instead of silently looking like a plain
+    # fallback. Rows predating the interval contract say `legacy-*`.
+    statuses = {r.read_ts_status for r in rows}
+    if "accepted" in statuses:
+        provenance = ("worker-claimed pipe-read time, bounded to the "
+                      "operation's server-trusted interval (advisory)")
+    elif any(r.read_ts for r in rows) or "legacy-window-accepted" in statuses:
+        provenance = ("worker-claimed pipe-read time (advisory; accepted "
+                      "before the per-operation interval contract)")
+    elif "rejected-out-of-interval" in statuses:
+        provenance = ("server persist time — a worker timing claim was "
+                      "REJECTED (outside the operation's server-trusted "
+                      "interval)")
+    else:
+        provenance = "server persist time (fallback)"
     return {"op_id": op_id,
-            "timing_provenance": ("worker-claimed pipe-read time "
-                                  "(advisory)" if any(r.read_ts
-                                                      for r in rows)
-                                  else "server persist time (fallback)"),
+            "timing_provenance": provenance,
             "chunks": [{"seq": r.seq, "ts": r.ts.isoformat(),
                         "read_ts": r.read_ts,
+                        "read_ts_status": r.read_ts_status,
                         "kind": r.kind, "text": r.text,
                         "dropped_bytes": r.dropped_bytes} for r in rows],
             "has_more": has_more,

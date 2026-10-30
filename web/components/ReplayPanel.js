@@ -542,8 +542,10 @@ export default function ReplayPanel({ sid }) {
           {(chunkRows || []).length > 0 &&
             <p className="dim" data-testid="timing-provenance" style={{ fontSize: ".82rem" }}>
               attacker timing: {(chunkRows || []).some(c => c.read_ts != null)
-                ? "WORKER-CLAIMED pipe-read time (advisory: window-bounded at ingest, not server-verified)"
-                : "server persist time (fallback — coarser than the capture)"}
+                ? "WORKER-CLAIMED pipe-read time (advisory: bounded to the operation's server-trusted lifetime ± 300 s clock skew)"
+                : (chunkRows || []).some(c => c.read_ts_status === "rejected-out-of-interval")
+                  ? "server persist time — a worker timing claim was REJECTED (outside the operation's server-trusted lifetime)"
+                  : "server persist time (fallback — coarser than the capture)"}
             </p>}
           {(opsNext !== null || ops.some(o => o.has_output)) &&
             <p className="dim" style={{ fontSize: ".82rem" }}>output loads as the clock reaches each command (bounded pages; nothing bulk-downloaded).</p>}

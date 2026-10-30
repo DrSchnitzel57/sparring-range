@@ -62,7 +62,8 @@ def _append(client, rid, token, op, **body):
 def _rows(rid, where="", args=None):
     with db_ctx() as s:
         return s.execute(text(
-            "SELECT kind, text, dropped_bytes, read_ts FROM operation_outputs"
+            "SELECT kind, text, dropped_bytes, read_ts, read_ts_claim, "
+            "read_ts_status FROM operation_outputs"
             " WHERE run_id = :r " + where + " ORDER BY seq"),
             {"r": rid, **(args or {})}).fetchall()
 
@@ -302,13 +303,127 @@ def test_read_ts_stored_apart_from_persist_time(client, users):
     sid = _running_session(client, users)
     rid, token = _run_with_token(sid)
     op = _register(client, rid, token)
+    import time as _t
+    now = _t.time()
     assert _append(client, rid, token, op, seq=0, text="early",
-                   read_ts=1_777_000_111.25).json()["status"] == "stored"
+                   read_ts=now - 1.25).json()["status"] == "stored"
     assert _append(client, rid, token, op, seq=1, text="no ts").json()[
         "status"] == "stored"
     rows = _rows(rid)
-    assert abs(rows[0][3] - 1_777_000_111.25) < 0.001
-    assert rows[1][3] is None
+    assert abs(rows[0][3] - (now - 1.25)) < 0.001
+    assert rows[0][5] == "accepted"
+    assert rows[1][3] is None and rows[1][4] is None
+    assert rows[1][5] == "absent"
+
+
+# ------------------------------------------------- item 8: per-operation --- #
+# The review counterexample: a claim from 180 days ago on a FRESH op was
+# accepted by the old 400-day wall window. Under the per-operation
+# interval it is refused — kept verbatim for honesty, never used for
+# placement — while claims inside the operation's lifetime (± the
+# documented 300 s skew) are accepted.
+def test_stale_and_future_claims_are_rejected_but_kept(client, users):
+    import time as _t
+
+    sid = _running_session(client, users)
+    rid, token = _run_with_token(sid)
+    op = _register(client, rid, token)
+    now = _t.time()
+    DAY = 86400.0
+
+    # the counterexample: 180 days ago — inside the OLD 400-day window,
+    # outside the operation's lifetime
+    r = _append(client, rid, token, op, seq=0, text="ancient",
+                read_ts=now - 180 * DAY)
+    assert r.json()["status"] == "stored"      # bytes are never refused
+    # a future claim beyond the skew allowance
+    _append(client, rid, token, op, seq=1, text="future",
+            read_ts=now + 400)
+    # absurd epoch (the old docstring's own example)
+    _append(client, rid, token, op, seq=2, text="epoch-one", read_ts=1.0)
+    rows = _rows(rid)
+    assert [(r[3], r[5]) for r in rows] == [
+        (None, "rejected-out-of-interval")] * 3
+    assert rows[0][4] == now - 180 * DAY        # claim kept VERBATIM
+    assert rows[1][4] == now + 400 and rows[2][4] == 1.0
+
+    # the honest surface: placement is persist time, and it SAYS the
+    # claim was rejected rather than hiding it
+    r = client.get(f"/sessions/{sid}/operations/{op}/output",
+                   headers=users["member"])
+    body = r.json()
+    assert "REJECTED" in body["timing_provenance"]
+    assert [c["read_ts_status"] for c in body["chunks"]] == [
+        "rejected-out-of-interval"] * 3
+    assert all(c["read_ts"] is None for c in body["chunks"])
+
+
+def test_interval_boundaries_follow_the_operation_lifetime(client, users):
+    """Boundaries are INCLUSIVE at registration-300 and at end+300; after
+    the operation ends the run end (not "now") bounds the window."""
+    import time as _t
+
+    sid = _running_session(client, users)
+    rid, token = _run_with_token(sid)
+    op = _register(client, rid, token)
+    now = _t.time()
+
+    # registration is seconds ago: 299 s before it is inside, 301 s is not
+    _append(client, rid, token, op, seq=0, text="in", read_ts=now - 299)
+    _append(client, rid, token, op, seq=1, text="out", read_ts=now - 301)
+    # and a near-future worker clock inside the skew is accepted
+    _append(client, rid, token, op, seq=2, text="skew", read_ts=now + 299)
+    rows = _rows(rid)
+    assert [r[5] for r in rows] == [
+        "accepted", "rejected-out-of-interval", "accepted"]
+
+    # end the operation: a claim near the END is still accepted, a claim
+    # beyond end+skew is not — the window CLOSES, it does not ride "now"
+    done = client.post(f"/internal/runs/{rid}/operations/{op}/done",
+                       json={"state": "completed"},
+                       headers={"X-Worker-Token": token})
+    assert done.status_code == 200
+    with db_ctx() as s:
+        ended = s.execute(text(
+            "SELECT ended_at FROM run_operations WHERE run_id = :r"),
+            {"r": rid}).scalar_one()
+    e = ended.timestamp()
+    _append(client, rid, token, op, seq=3, text="just-after",
+            read_ts=e + 200)
+    _append(client, rid, token, op, seq=4, text="much-later",
+            read_ts=e + 400)
+    rows = _rows(rid, "AND seq >= 3")
+    assert [r[5] for r in rows] == [
+        "accepted", "rejected-out-of-interval"]
+
+
+def test_idempotence_compares_the_raw_claim(client, users):
+    """Plan 22 item 8: a REJECTED claim's retry answers duplicate (the
+    worker sent what we have), but a DIFFERENT rejected claim at the same
+    seq is a conflict — two different rejected claims normalizing to the
+    same NULL used to smuggle a silent duplicate. Accepted-side clash
+    semantics are unchanged."""
+    import time as _t
+
+    sid = _running_session(client, users)
+    rid, token = _run_with_token(sid)
+    op = _register(client, rid, token)
+    now = _t.time()
+    DAY = 86400.0
+    stale = now - 180 * DAY
+
+    r = _append(client, rid, token, op, seq=0, text="t", read_ts=stale)
+    assert r.json()["status"] == "stored"
+    same = _append(client, rid, token, op, seq=0, text="t", read_ts=stale)
+    assert same.status_code == 200 and same.json()["status"] == "duplicate"
+    other = _append(client, rid, token, op, seq=0, text="t",
+                    read_ts=stale - 5)
+    assert other.status_code == 409 and other.json()["status"] == "conflict"
+    absent = _append(client, rid, token, op, seq=0, text="t")
+    assert absent.status_code == 409, "a dropped claim is still a change"
+    # and nothing moved
+    rows = _rows(rid)
+    assert len(rows) == 1 and rows[0][4] == stale
 
 
 def test_capture_survives_ordinary_completion(client, users):

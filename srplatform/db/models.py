@@ -780,7 +780,19 @@ class OperationOutput(Base):
         Float, nullable=True,
         comment="wall-clock seconds (time.time) at pipe-read time; NULL = "
                 "not observed — never silently equal to persist time "
-                "(review finding 10)")
+                "(review finding 10). Only a claim INSIDE the operation's "
+                "server-trusted interval is ever stored here (plan 22)")
+    read_ts_claim: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="the worker's RAW timing claim, kept even when rejected — "
+                "idempotence compares the claim, never the normalized "
+                "column, so retries never rewrite timing history")
+    read_ts_status: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+        comment="accepted | rejected-out-of-interval | absent for rows "
+                "written after migration 0028; legacy rows are "
+                "legacy-window-accepted | legacy-unknown (the weak "
+                "400-day window cannot be re-adjudicated retroactively)")
 
     __table_args__ = (
         Index("uq_operation_outputs_op_seq", "run_id", "op_id", "seq",
