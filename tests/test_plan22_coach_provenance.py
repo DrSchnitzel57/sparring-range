@@ -117,13 +117,36 @@ def test_member_and_agent_lines_keep_distinct_provenance():
 
 
 def test_context_note_states_the_only_truth_about_red_activity():
-    ready = session_context_note({"session_status": "ready"})
+    """Review item 9: the note CLASSIFIES the run state. The completed
+    run is the counterexample — the old active-only capture called an
+    already-finished attack "no red run has started"."""
+    ready = session_context_note({"session_status": "ready",
+                                  "red_run_state": "never"})
     assert "NO red run has started" in ready
     assert "not attacker reconnaissance" in ready
+    # a missing classifier (synthetic/legacy context) fails to "never"
+    assert "NO red run has started" in session_context_note(
+        {"session_status": "ready"})
+
     running = session_context_note({"session_status": "running",
-                                    "red_run_state": "running",
+                                    "red_run_state": "active",
+                                    "run_status": "running",
                                     "phase": "recon"})
-    assert "red run state: running" in running and "phase recon" in running
+    assert "IN PROGRESS" in running and "recon" in running
+    assert "NO red run has started" not in running
+
+    done = session_context_note({"session_status": "complete",
+                                 "red_run_state": "completed",
+                                 "run_status": "completed"})
+    assert "COMPLETED" in done and "attacker activity" in done
+    assert "NO red run has started" not in done
+
+    broken = session_context_note({"session_status": "complete",
+                                   "red_run_state": "interrupted",
+                                   "run_status": "failed",
+                                   "run_outcome": "worker_failure"})
+    assert "INTERRUPTED" in broken and "worker_failure" in broken
+    assert "NO red run has started" not in broken
     assert session_context_note(None) == ""
 
 
@@ -221,3 +244,70 @@ def test_unclassified_audience_fails_closed_on_every_member_surface(
     assert all(j["job_id"] in oids for j in listing["jobs"])
     for jid in ids.values():
         assert jid in oids
+
+
+@pytest.mark.db
+def test_enqueued_coach_prompt_classifies_run_state(client, users):
+    """Review item 9, through the REAL route: the prompt captured into
+    the durable coach-chat job is built from the CLASSIFIED run state at
+    enqueue — never / active / completed / interrupted. The counter-
+    example was a chat asked after the attack finished, whose prompt
+    claimed "NO red run has started" while its own evidence window was
+    full of RED entries."""
+    import uuid as _uuid
+
+    from sqlalchemy import text
+
+    from srplatform.db.models import ModelJob
+    from srplatform.db.session import db as db_ctx
+    from tests.test_plan19_model_admin import _make_profile
+
+    sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
+                      headers=users["member"]).json()["session_id"]
+    _make_profile(client, users, "coachstate", "http://x/v1")
+    assert client.put("/admin/model/roles", headers=users["op"],
+                      json={"role": "coach",
+                            "profile_name": "coachstate"}).status_code == 200
+
+    def _prompt() -> str:
+        r = client.post(f"/sessions/{sid}/coach/messages",
+                        headers=users["member"],
+                        json={"text": "what just happened?"})
+        assert r.status_code == 201 and r.json()["status"] == "queued", r.text
+        jid = _uuid.UUID(r.json()["job_id"])
+        with db_ctx() as s:
+            payload = s.get(ModelJob, jid).payload
+        assert payload["chat_meta"]["audience"] == "member"
+        return payload["user"]
+
+    def _set_run(status, outcome=None, ended=True):
+        with db_ctx() as s:
+            s.execute(text("DELETE FROM runs WHERE session_id = :s"),
+                      {"s": sid})
+            s.execute(text(
+                "INSERT INTO runs (run_id, session_id, scenario_id,"
+                " status, outcome, started_at, ended_at) VALUES"
+                " (gen_random_uuid(), :s, 'web-foothold-01', :st, :o,"
+                " now() - interval '3 minutes',"
+                " CASE WHEN CAST(:e AS boolean)"
+                " THEN now() - interval '60 seconds'"
+                " ELSE NULL END)"),
+                {"s": sid, "st": status, "o": outcome,
+                 "e": "t" if ended else "f"})
+
+    assert "NO red run has started" in _prompt()
+    _set_run("running", ended=False)
+    p = _prompt()
+    assert "IN PROGRESS" in p and "NO red run has started" not in p
+    _set_run("completed")
+    p = _prompt()
+    assert "COMPLETED" in p and "attacker activity" in p
+    assert "NO red run has started" not in p
+    _set_run("failed", outcome="worker_failure")
+    p = _prompt()
+    assert "INTERRUPTED" in p and "worker_failure" in p
+    assert "NO red run has started" not in p
+    # a stopping run may still be working — it is ACTIVE, not finished
+    _set_run("stopping", ended=False)
+    p = _prompt()
+    assert "IN PROGRESS" in p

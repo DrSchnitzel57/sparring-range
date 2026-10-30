@@ -143,21 +143,34 @@ def compress_timeline(events: list[dict], max_lines: int = 80) -> tuple[str, dic
 
 
 def session_context_note(context: dict | None) -> str:
-    """One header line for coaching prompts (plan 22 LIVE-10): phase/run
-    state as OBSERVED by the platform, plus what each actor class means.
-    A READY session with no red run has never had attacker activity —
-    operator identity/sudo/connectivity checks and background telemetry
-    are setup noise, not reconnaissance. Attribution beyond these classes
-    stays unknown; host telemetry alone proves neither identity nor
-    intent."""
+    """One header line for coaching prompts (plan 22 LIVE-10, sharpened
+    by review item 9): the red run's state as a CLASSIFIER — never /
+    active / completed / interrupted — not merely "is a run ACTIVE
+    right now". A session whose run already completed DID have attacker
+    activity; telling the coach "no red run has started" there invites
+    it to explain away real RED evidence. A READY session with no run at
+    all still has zero agent operations — setup/telemetry noise is not
+    recon. Attribution beyond these classes stays unknown; host
+    telemetry alone proves neither identity nor intent."""
     if not context:
         return ""
     status = context.get("session_status") or "?"
-    if run := (context.get("red_run_state") or None):
-        phase = context.get("phase")
-        run_line = (f"red run state: {run}"
-                    + (f" (phase {phase})" if phase else ""))
-    else:
+    state = context.get("red_run_state") or "never"
+    phase = context.get("phase")
+    ph = f" (last observed phase {phase})" if phase else ""
+    if state == "active":
+        run_line = (f"a red run is IN PROGRESS{ph} — RED entries are the "
+                    "agent's current work")
+    elif state == "completed":
+        run_line = ("a red run COMPLETED — RED entries in the evidence ARE "
+                    f"attacker activity{ph}; the run is over")
+    elif state == "interrupted":
+        outcome = context.get("run_outcome") or "ended"
+        run_line = ("a red run was INTERRUPTED"
+                    f" ({outcome}){ph} — RED entries up to the interruption "
+                    "are attacker activity; anything after it is not the "
+                    "agent")
+    else:  # never
         run_line = ("NO red run has started — anything before the first RED "
                     "entry is setup, defender work or background telemetry, "
                     "not attacker reconnaissance")

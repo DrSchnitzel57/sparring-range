@@ -570,6 +570,39 @@ def _agent_phase(db, session_id) -> str | None:
     return st.current_phase if st else None
 
 
+def _red_run_context(db, session_id) -> dict:
+    """The red run's state TRUTHFULLY classified at coach enqueue (plan 22
+    review item 9). Consulting only the ACTIVE run made a chat asked after
+    the run finished claim "NO red run has started" — while the very
+    evidence window shown to the coach was full of RED entries. Classified
+    from the run rows themselves:
+
+      active       a run is in an active state (``stopping`` and
+                   ``cancel-unknown`` count — it may still be working)
+      completed    the latest run ended normally
+      interrupted  the latest run ended failed/cancelled (outcome rides
+                   along so the coach can say how)
+      never        this session has no run at all
+    """
+    from srplatform.api import runs as runs_svc
+    from srplatform.db.models import Run
+    active = runs_svc.active_run_for_session(db, session_id)
+    if active is not None:
+        return {"red_run_state": "active", "run_status": active.status,
+                "phase": getattr(active, "current_phase", None)}
+    latest = db.execute(
+        select(Run).where(Run.session_id == session_id)
+        .order_by(Run.started_at.desc().nullslast(),
+                  Run.run_id.desc()).limit(1)
+    ).scalars().first()
+    if latest is None:
+        return {"red_run_state": "never"}
+    if latest.status == "completed":
+        return {"red_run_state": "completed", "run_status": latest.status}
+    return {"red_run_state": "interrupted", "run_status": latest.status,
+            "run_outcome": latest.outcome or latest.status}
+
+
 @router.post("/sessions/{session_id}/coach/messages", status_code=201)
 def coach_chat_post(session_id: uuid.UUID, body: ChatIn,
                     p: Principal = Depends(any_member)):
@@ -598,14 +631,13 @@ def coach_chat_post(session_id: uuid.UUID, body: ChatIn,
         events = [filter_event(db, sess, p, e)
                   for e in _events_of(db, session_id)]
         history = chat.recent_messages(db, session_id, audience=audience)
-        # LIVE-10: capture phase/run state AT ENQUEUE — the coach must know
-        # whether any red run has started at all (a READY session has seen
-        # zero agent operations; setup/telemetry noise is not recon).
-        from srplatform.api import runs as runs_svc
-        active = runs_svc.active_run_for_session(db, session_id)
-        context = {"session_status": sess.status,
-                   "red_run_state": active.status if active else None,
-                   "phase": getattr(active, "current_phase", None)
+        # LIVE-10 + review item 9: capture the run state AT ENQUEUE as a
+        # CLASSIFIER — a session whose run already completed did have
+        # attacker activity; only a session with NO run at all has seen
+        # none (setup/telemetry noise is not recon).
+        run_ctx = _red_run_context(db, session_id)
+        context = {"session_status": sess.status, **run_ctx,
+                   "phase": run_ctx.get("phase")
                    or _agent_phase(db, session_id)}
     system, user, cutoff, allowed = chat.build_chat_prompt(
         events, history, body.text, audience, context=context)
