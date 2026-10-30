@@ -2645,7 +2645,7 @@ def safety_reclassify_qualification(body: ReclassifyIn,
     line untouched, actor + digests persisted). A fresh live observation
     is recorded with its own endpoint and its own proof; nothing here
     accepts a bare reason string in place of a record."""
-    from srplatform.safety import QUALIFICATION_KINDS
+    from srplatform.safety import QUALIFICATION_KINDS, SafetyStoreUnavailable
     if body.kind not in QUALIFICATION_KINDS:
         raise HTTPException(422, f"{body.kind} is not a qualification kind "
                                  f"(allowed: {', '.join(sorted(QUALIFICATION_KINDS))})")
@@ -2653,6 +2653,10 @@ def safety_reclassify_qualification(body: ReclassifyIn,
         return get_supervisor().reclassify_qualification(
             body.kind, reason=body.reason, actor=p.username,
             expect_recorded_at=body.expect_recorded_at)
+    except SafetyStoreUnavailable as exc:
+        # truthful refusal: without the authoritative append-only store a
+        # classification cannot be fenced, so NOTHING was published
+        raise HTTPException(503, str(exc)) from None
     except ValueError as exc:
         msg = str(exc)
         if "no " in msg and "record exists" in msg:

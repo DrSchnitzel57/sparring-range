@@ -2116,6 +2116,52 @@ LOGIN_USER = "p21-login"
 LOGIN_PW = "Upgrade-Browser-2026!"
 
 
+def _pw_alias_allocate(target: pathlib.Path, candidates=None) -> pathlib.Path:
+    """Allocate a SHORT /tmp alias (symlink) to ``target`` by EXCLUSIVE
+    creation (plan 22 review F5). Ownership comes from atomically creating
+    the symlink — never from a name prefix or the PID: a candidate path
+    that already exists (file, directory, foreign symlink, even one a
+    previous reviewer placed there deliberately) is SKIPPED UNTOUCHED,
+    never unlinked or replaced. Names carry a per-attempt random token, so
+    an unlucky collision just moves to the next name. Returns the alias;
+    raise only if every candidate collides. ``candidates`` is a test seam
+    yielding pathlib.Path names (default: 64 owned short names)."""
+    import secrets
+
+    target = pathlib.Path(target).resolve()
+    if candidates is None:
+        def _gen():
+            for _ in range(64):
+                yield pathlib.Path(
+                    f"/tmp/srpw-{os.getpid()}-{secrets.token_hex(4)}")
+        candidates = _gen()
+    for alias in candidates:
+        try:
+            os.symlink(str(target), str(alias))
+        except FileExistsError:
+            continue                    # NOT ours — never disturb it
+        except OSError as exc:
+            raise RuntimeError(f"cannot create the browser socket alias "
+                               f"{alias}: {exc}") from exc
+        return alias
+    raise RuntimeError("every short browser-alias name already exists — "
+                       "refusing to displace foreign inodes under /tmp")
+
+
+def _pw_alias_release(alias: pathlib.Path, target: pathlib.Path) -> None:
+    """Remove ONLY the alias inode this process created: it must still be
+    a symlink pointing at our own target. Anything else that occupies the
+    path now (replaced directory, foreign retarget) is left untouched —
+    cleanup ownership is the created inode, never the name."""
+    try:
+        if alias.is_symlink() and \
+                pathlib.Path(os.readlink(alias)) == \
+                pathlib.Path(target).resolve():
+            os.unlink(str(alias))
+    except OSError:
+        pass
+
+
 def _upgrade_browser_login(tmp: pathlib.Path, rootA: pathlib.Path,
                            receipt: dict, owner_url: str,
                            pubport: int) -> str:
@@ -2304,17 +2350,20 @@ def _upgrade_browser_login(tmp: pathlib.Path, rootA: pathlib.Path,
         # disk path is legitimate but breaks the FIRST socket bind (observed
         # in independent review: the initial 49.8 s attempt failed exactly
         # this way, then passed under a short alias). Give the browser a
-        # SHORT owned alias into this run's own disk-backed directory —
-        # data still lands on disk (tmp), only the socket prefix is short.
+        # SHORT alias into this run's own disk-backed directory — data
+        # still lands on disk (tmp), only the socket prefix is short.
+        # Review F5: the alias must be OWNED by EXCLUSIVE creation — an
+        # existing path at a candidate name (anything: file, directory,
+        # someone else's symlink) is NEVER unlinked, only skipped; cleanup
+        # removes only the exact symlink inode we created pointing at our
+        # own target. See _pw_alias_allocate / _pw_alias_release.
         pw_home = tmp / "pw-tmp"
         pw_home.mkdir(exist_ok=True)
-        pw_alias = pathlib.Path(f"/tmp/sr-pw-{os.getpid()}")
         try:
-            pw_alias.unlink(missing_ok=True)
-            os.symlink(pw_home, pw_alias)
-        except OSError as exc:
+            pw_alias = _pw_alias_allocate(pw_home)
+        except RuntimeError as exc:
             prereq_fail("short browser socket alias (Chromium unix path)",
-                        f"cannot create {pw_alias}: {exc}")
+                        str(exc))
         _PW_ENV = {**os.environ, "TMPDIR": str(pw_alias),
                    "XDG_RUNTIME_DIR": str(pw_alias)}
 
@@ -2369,10 +2418,7 @@ def _upgrade_browser_login(tmp: pathlib.Path, rootA: pathlib.Path,
             subprocess.run([str(pw_cli), f"-s={pw_session}", "close"],
                            capture_output=True, timeout=30, check=False)
         if pw_alias is not None:
-            try:
-                pw_alias.unlink(missing_ok=True)
-            except OSError:
-                pass
+            _pw_alias_release(pw_alias, (tmp / "pw-tmp").resolve())
         for p in (api, proc_web):
             if p is None:
                 continue

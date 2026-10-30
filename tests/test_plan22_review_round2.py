@@ -293,6 +293,9 @@ def _ssh_settings(tmp_path, *, key_ok: bool, trust_text: str | None):
     key = tmp_path / "runner_key"
     if key_ok:
         key.write_text("dummy-private-key\n")
+        # review F3: OpenSSH (and now the shared readiness fact) refuses
+        # group/other-accessible keys — a usable config carries 0600
+        key.chmod(0o600)
     kh = tmp_path / "known_hosts"
     if trust_text is not None:
         kh.write_text(trust_text)

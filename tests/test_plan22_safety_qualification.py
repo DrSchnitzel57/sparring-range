@@ -166,32 +166,30 @@ def test_empty_legacy_detail_is_not_compatible_by_default(tmp_path, monkeypatch,
     q = next(q for q in sup.qualification_report()["qualifications"]
              if q["kind"] == "datapath_proof")
     assert q["provenance"] == "legacy-unclassified"
-    # a FAILED legacy record can never be classified into passing
+    # ROUND-3 CONTRACT: reclassification is published through the
+    # authoritative append-only store ONLY. With no such store (this fast
+    # lane absorbs the DB leg), it FAILS TRUTHFULLY — an unfenced file-only
+    # classification could not honor the CAS and is refused, publishing
+    # nothing. The full source semantics (FAILED / already-contracted /
+    # absent / moved / effective-observation-time) are proven against the
+    # real store in tests/test_plan22_review_round2.py and
+    # tests/test_plan22_review_round3.py.
+    from srplatform.safety import SafetyStoreUnavailable
     recs["killswitch_test"] = dict(recs["killswitch_test"], ok=False, detail={})
     sup._records_reader = lambda: list(recs.values())
-    with pytest.raises(ValueError, match="FAILED"):
+    before = len(sup._mirror_dh)
+    with pytest.raises(SafetyStoreUnavailable):
         sup.reclassify_qualification("killswitch_test", reason="verified",
                                      actor="op")
-
-    # the operator classifies ONE record after verifying its provenance:
-    out = sup.reclassify_qualification(
-        "baseline_check", reason="signed commissioning report ref R-17",
-        actor="admin")
-    assert out["ok"]
-    q = next(q for q in sup.qualification_report()["qualifications"]
-             if q["kind"] == "baseline_check")
-    assert q["provenance"] == "current" and q["usable"]
-    # the classification mints no fresh observation and keeps the original
-    mirror = sup._mirror_dh
-    new = [r for r in mirror if r["kind"] == "baseline_check"][-1]
-    assert new["detail"]["one_time_reclassification"] is True
-    assert new["detail"]["reason"] == "signed commissioning report ref R-17"
-    assert new["detail"]["operator"] == "admin"
-    assert recs["baseline_check"]["detail"] == {}   # original untouched
-    # reclassifying a current record is refused — evidence must be re-collected
-    with pytest.raises(ValueError, match="contract"):
-        sup.reclassify_qualification("baseline_check", reason="again",
-                                     actor="admin")
+    with pytest.raises(SafetyStoreUnavailable):
+        sup.reclassify_qualification(
+            "baseline_check", reason="signed commissioning report ref R-17",
+            actor="admin")
+    assert len(sup._mirror_dh) == before       # nothing published unfenced
+    # argument-level refusals still need no store at all:
+    with pytest.raises(ValueError, match="kind"):
+        sup.reclassify_qualification("engage", reason="not a kind",
+                                     actor="op")
     # and a classification without a reason is not an attestation
     with pytest.raises(ValueError, match="reason"):
         sup.reclassify_qualification("killswitch_test", reason="  ",
@@ -284,6 +282,7 @@ def test_production_static_isolation_is_declared_unsupported_not_inapplicable(
                  runner_ssh_known_hosts=str(tmp_path / "trust"),
                  safety_state_file=str(tmp_path / "s.json"))
     (tmp_path / "runner-key").write_text("dummy-private\n")
+    (tmp_path / "runner-key").chmod(0o600)       # OpenSSH-usable material
     (tmp_path / "trust").write_text("[192.0.2.9]:22 ssh-ed25519 AAAA\n")
     probe_calls = []
     monkeypatch.setattr(safety_mod, "_runner_health_probe",

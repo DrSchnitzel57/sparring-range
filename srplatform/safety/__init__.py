@@ -24,13 +24,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import stat
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from srplatform.safety.datapath import (
-    DatapathController, _file_fingerprint, config_identity, get_datapath)
+    DatapathController, config_identity, get_datapath)
 from srplatform.safety.runregistry import run_registry
 from srplatform.settings import Settings, get_settings
 
@@ -59,6 +61,12 @@ def _now() -> datetime:
 QUALIFICATION_KINDS = ("baseline_check", "datapath_proof", "killswitch_test")
 ADMISSION_KIND = "admission_probe"
 QUALIFICATION_CONTRACT = 1
+
+
+class SafetyStoreUnavailable(RuntimeError):
+    """The AUTHORITATIVE append-only safety-record store cannot be used.
+    Fencing-sensitive writes (reclassification) refuse rather than publish
+    an unfenced fallback; observation-time resolution refuses to guess."""
 # Bounded freshness for the real runner health probe (SSHRunner.health through
 # the transport the dispatcher itself uses): one probe per TTL window, never a
 # connection storm behind the safety-page poll.
@@ -130,6 +138,28 @@ def probes_attest_isolation(probes: dict) -> tuple[bool, list[str]]:
             reasons.append(f"probe '{name}' observation {str(value)[:80]!r} does not clearly "
                            "attest failed egress (quote the tool output, e.g. '100% packet loss')")
     return (not reasons), reasons
+
+
+def _runner_file_identity(path: str) -> str:
+    """Trust/security identity of a runner credential/trust file for the
+    health memo (review F3): CONTENT DIGEST + MODE + OWNER, never content.
+    OpenSSH enforces the MODE (it refuses group/other-accessible private
+    keys), so a chmod that changes usability must invalidate a cached
+    health verdict exactly like a byte change; unreadable and absent are
+    distinct identities. Modes/uid only — no secret material."""
+    if not path:
+        return "unset"
+    p = Path(path)
+    try:
+        st = p.stat()
+        mode = stat.S_IMODE(st.st_mode)
+    except OSError:
+        return "absent"
+    try:
+        digest = hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+    except OSError:
+        digest = "unreadable"
+    return f"{digest}:m{mode:o}:u{st.st_uid}"
 
 
 def _runner_health_probe(settings) -> tuple[bool, str]:
@@ -275,6 +305,26 @@ class Supervisor:
         return {"ok": not file_err, "file_error": file_err, "mirror_error": mirror_err}
 
     # --------------------------------------------------------------- records ---
+    def _effective_observed_at(self, detail, recorded_at) -> float:
+        """THE SYSTEM CONTRACT (plan 22 review round 3): a reclassification
+        is an operator COMPATIBILITY DECISION, not a fresh observation — the
+        effective observation time stays the ORIGINAL test's. A published
+        classification therefore carries ``observed_at`` (the source's own
+        effective time, resolved through any nested classification chain at
+        publish time); age, engage/release invalidation and every consumer
+        read it, never the audit row's wall-clock timestamp."""
+        det = detail if isinstance(detail, dict) else {}
+        eff = det.get("observed_at")
+        if eff is None and det.get("one_time_reclassification"):
+            # round-2 shape fallback: the source's recorded_at was kept
+            eff = det.get("reclassified_record_at")
+        try:
+            return float(eff) if eff is not None else float(recorded_at)
+        except (TypeError, ValueError):
+            raise SafetyStoreUnavailable(
+                "a reclassification record carries an unreadable observed_at "
+                "— refusing to guess its observation time") from None
+
     def reclassify_qualification(self, kind: str, *, reason: str,
                                  actor: str,
                                  expect_recorded_at: float | None = None) -> dict:
@@ -282,64 +332,140 @@ class Supervisor:
         review): a legacy record whose detail cannot prove its scope is not
         silently honored and not silently thrown away — an operator who has
         verified the record's provenance states so, and this is appended as
-        a NEW current-contract record bound to today's configuration.
+        an AUDIT event bound to today's configuration.
 
-        This mints no fresh observation: the appended record says exactly
-        what happened (the operator classified the <date> record; original
-        content quoted by digest), keeps the original append-only line
-        untouched, and names the actor. Age-only manual retests stay
-        removed — this is the explicit compatibility decision, made once
-        per record, not a daily ritual.
+        It mints NO fresh observation and launders NOTHING (review round 3,
+        owner contract): the appended record keeps the SOURCE's effective
+        observation time (``observed_at``, nested chains resolved), so age
+        and engage/release invalidation behave exactly as the original test
+        would — a source recorded before the last engage/release STAYS
+        blocked no matter when the decision was made. The decision's own
+        time is stored separately (``classification_decided_at``), the
+        source row is kept byte-identical (id + detail digest recorded),
+        and a failed/already-contracted/unknown-kind source is refused.
+        Age-only expiry is NOT reintroduced: this is a compatibility
+        decision, made once per record.
 
-        Review F4: the classification is bound to the EXACT record the
-        operator examined. When ``expect_recorded_at`` is supplied (the
-        CLI/API path always passes what the surface displayed), a record
-        that moved since — a newer or different newest record — is refused
-        rather than silently classified, so a concurrent re-commission or
-        a stale panel can never have the WRONG source laundered. The kind
-        allowlist, the failed/newest-contract refusals and the reason
-        requirement stand; nothing here accepts a bare reason against an
-        unproven field: the source record must exist, must be a passing
-        check, must predate the contract, and its identity is recorded."""
+        PUBLICATION IS AN ATOMIC CAS (review F2): every classifier first
+        takes the SAME database advisory transaction lock, then reads the
+        newest record of the kind, validates, and appends — all inside
+        ONE database transaction. (The table's grants are deliberately
+        SELECT/INSERT-only, so serialization uses an advisory lock, not a
+        row FOR UPDATE.) Concurrent classifiers racing on the same source
+        serialize, and only ONE can win; every loser re-reads after the
+        winner's commit and gets the truthful conflict, never an implicit
+        "latest wins". If the authoritative store (the append-only
+        safety_records table) is unavailable the classification FAILS —
+        there is no unfenced file-only publish, because an unfenceable
+        append cannot honor the CAS.
+        """
         if kind not in QUALIFICATION_KINDS:
             raise ValueError(f"{kind} is not a qualification kind")
         if not str(reason or "").strip():
             raise ValueError("a reclassification requires the reason the "
                              "operator verified this record's provenance")
-        rec = self._latest_records().get(kind)
-        if not rec:
-            raise ValueError(f"no {kind} record exists to classify")
+        want: float | None = None
         if expect_recorded_at is not None:
             try:
                 want = float(expect_recorded_at)
             except (TypeError, ValueError):
                 raise ValueError("expect_recorded_at must be the source "
                                  "record's recorded_at value") from None
-            if abs(float(rec.get("recorded_at") or 0.0) - want) > 1e-6:
-                raise ValueError(
-                    f"the newest {kind} record is no longer the one being "
-                    f"classified (recorded_at {rec.get('recorded_at')!r} != "
-                    f"{want!r}) — re-examine the current record before "
-                    "classifying")
-        if (rec.get("detail") or {}).get("qualification_contract") is not None:
-            raise ValueError(
-                f"the newest {kind} record already carries a qualification "
-                "contract — re-collect the evidence instead of reclassifying")
-        if not rec.get("ok"):
-            raise ValueError(f"the newest {kind} record FAILED — a failed "
-                             "check cannot be classified into passing")
         identity = config_identity(self.settings)
-        detail = {"qualification_contract": QUALIFICATION_CONTRACT,
-                  "one_time_reclassification": True,
-                  "reclassified_record_at": float(rec.get("recorded_at", 0)),
-                  "record_identity_was": rec.get("config_identity"),
-                  "bound_identity": identity,
-                  "original_detail_digest": hashlib.sha256(json.dumps(
-                      rec.get("detail") or {}, sort_keys=True,
-                      default=str).encode()).hexdigest()[:16],
-                  "reason": str(reason)[:500], "operator": actor}
-        self.record(kind, True, detail)
-        return {"ok": True, "kind": kind, "bound_identity": identity}
+        from sqlalchemy.exc import SQLAlchemyError
+
+        from srplatform.db.session import db
+        try:
+            with db() as s:
+                from sqlalchemy import text
+                from srplatform.db.models import SafetyRecord
+                # CAS boundary: serialize every classifier on the SAME
+                # advisory transaction lock (the table grants are
+                # deliberately SELECT/INSERT-only — append-only doctrine,
+                # so no row FOR UPDATE), then re-check the newest-record
+                # identity, validate, and append inside ONE transaction.
+                # Competing classifiers queue here; the loser re-reads
+                # after the winner's COMMIT and gets the truthful refusal.
+                s.execute(text(
+                    "SELECT pg_advisory_xact_lock("
+                    "hashtext('sr.safety_records.cas.v1'))"))
+                row = s.execute(text(
+                    "SELECT record_id, ok, detail, config_identity,"
+                    " extract(epoch from recorded_at) AS at"
+                    " FROM safety_records WHERE kind = :k"
+                    " ORDER BY record_id DESC LIMIT 1"),
+                    {"k": kind}).first()
+                if row is None:
+                    raise ValueError(f"no {kind} record exists to classify")
+                src_id = int(row[0])
+                src_ok = bool(row[1])
+                src_detail = row[2] if isinstance(row[2], dict) else {}
+                src_identity = row[3]
+                src_at = float(row[4])
+                if want is not None and abs(src_at - want) > 1e-6:
+                    raise ValueError(
+                        f"the newest {kind} record is no longer the one "
+                        f"being classified (recorded_at {src_at!r} != "
+                        f"{want!r}) — re-examine the current record before "
+                        "classifying")
+                if src_detail.get("qualification_contract") is not None:
+                    raise ValueError(
+                        f"the newest {kind} record already carries a "
+                        "qualification contract — re-collect the evidence "
+                        "instead of reclassifying")
+                if not src_ok:
+                    raise ValueError(f"the newest {kind} record FAILED — a "
+                                     "failed check cannot be classified "
+                                     "into passing")
+                effective = self._effective_observed_at(src_detail, src_at)
+                decided = time.time()
+                detail = {"qualification_contract": QUALIFICATION_CONTRACT,
+                          "one_time_reclassification": True,
+                          "observed_at": effective,
+                          "classification_decided_at": decided,
+                          "source_record_id": src_id,
+                          "reclassified_record_at": src_at,
+                          "record_identity_was": src_identity,
+                          "bound_identity": identity,
+                          "original_detail_digest": hashlib.sha256(
+                              json.dumps(src_detail, sort_keys=True,
+                                         default=str).encode()
+                              ).hexdigest()[:16],
+                          "reason": str(reason)[:500], "operator": actor}
+                s.add(SafetyRecord(kind=kind, ok=True,
+                                   config_identity=identity, detail=detail))
+                # COMMIT happens as the session context exits — the row
+                # lock that serializes competing classifiers is held until
+                # this very point, so exactly one append can follow the
+                # validated source.
+        except ValueError:
+            raise
+        except SafetyStoreUnavailable:
+            raise
+        except SQLAlchemyError as exc:
+            raise SafetyStoreUnavailable(
+                "the authoritative safety-record store is unavailable — "
+                "a classification without it would be an unfenced append "
+                f"(reclassification refused): {str(exc)[:200]}") from None
+        except Exception as exc:  # noqa: BLE001 — no store, no publish
+            raise SafetyStoreUnavailable(
+                "the authoritative safety-record store is unavailable — "
+                "reclassification refused "
+                f"({type(exc).__name__}: {str(exc)[:160]})") from None
+        # durable audit mirrors AFTER the authoritative append (never a
+        # substitute for it); failures stay visible like record()'s do
+        if self._mirror_dh is not None:
+            self._mirror_dh.append({"kind": kind, "ok": True,
+                                    "config_identity": identity,
+                                    "detail": detail,
+                                    "recorded_at": detail[
+                                        "classification_decided_at"]})
+        ferr = self._append_file_record(kind, True, identity, detail)
+        if ferr:
+            self._record_failures = list(
+                getattr(self, "_record_failures", [])) + [ferr]
+        return {"ok": True, "kind": kind, "bound_identity": identity,
+                "observed_at": effective, "source_record_id": src_id}
 
     def record(self, kind: str, ok: bool, detail: dict | None = None) -> None:
         """Append a safety record (baseline_check|datapath_proof|killswitch_test|
@@ -503,7 +629,15 @@ class Supervisor:
                 f"{kind} record predates a configuration/network change "
                 "(identity mismatch) — re-collect for the current "
                 "configuration")
-        rec_ts = float(rec.get("recorded_at", 0))
+        raw_ts = float(rec.get("recorded_at", 0))
+        det = rec.get("detail") if isinstance(rec.get("detail"), dict) else {}
+        # Round-3 system contract: QUALIFICATION AGE AND TRANSITION
+        # INVALIDATION RUN ON THE EFFECTIVE OBSERVATION TIME — the
+        # original test's, carried through a compatibility classification
+        # (``observed_at``) — never on the audit decision's wall clock,
+        # or reclassifying would launder an old/blocked observation into
+        # a fresh one. Ordinary records: raw timestamp, exactly as before.
+        rec_ts = self._effective_observed_at(det, raw_ts)
         if kind not in ("engage", "release"):
             for gate in ("engage", "release"):
                 g = recs.get(gate)
@@ -512,6 +646,11 @@ class Supervisor:
                         f"{kind} record predates the last {gate} — "
                         "evidence invalidated, re-run the check")
         out["recorded_at"] = rec_ts
+        out["observed_at"] = rec_ts
+        if det.get("one_time_reclassification"):
+            # the UI must distinguish the observation date from the day
+            # an operator made the compatibility decision (audit time)
+            out["classified_at"] = raw_ts
         if rec_ts:
             age_h = (time.time() - rec_ts) / 3600
             out["age_h"] = round(age_h, 1)
@@ -563,8 +702,8 @@ class Supervisor:
         # (key contents never enter the key; a missing file is its own
         # distinct identity, as are empty vs unreadable).
         key = (s.runner_transport, str(s.runner_ssh_target or ""),
-               _file_fingerprint(str(s.runner_ssh_key_path or "")),
-               _file_fingerprint(str(s.runner_ssh_known_hosts or "")))
+               _runner_file_identity(str(s.runner_ssh_key_path or "")),
+               _runner_file_identity(str(s.runner_ssh_known_hosts or "")))
         cache = getattr(self, "_runner_probe_cache", None)
         if cache and cache["key"] == key and time.monotonic() < cache["until"]:
             ok, why = cache["res"]
@@ -623,6 +762,27 @@ class Supervisor:
                     "detail": f"broker reply UNTRUSTED: latched must be the "
                               f"strict boolean the contract defines, got "
                               f"{type(st['latched']).__name__} — starts "
+                              "stay refused"}
+        # Review F4: the metadata fields carry their own types in the real
+        # ledger contract (get_latch returns reason as TEXT|NULL and
+        # latched_at as a numeric epoch|NULL). Malformed metadata is a
+        # malformed answer — a dict/number reason or a string/NaN/Inf
+        # timestamp means this authority does not speak the contract, and
+        # its "not latched" cannot be trusted. Legitimate NULLs pass.
+        if not (st["reason"] is None or isinstance(st["reason"], str)):
+            return {"check": "broker_authority", "ok": False,
+                    "detail": f"broker reply UNTRUSTED: reason must be text "
+                              f"or null per the latch contract, got "
+                              f"{type(st['reason']).__name__} — starts stay "
+                              "refused"}
+        lat = st["latched_at"]
+        if not (lat is None
+                or (isinstance(lat, (int, float))
+                    and not isinstance(lat, bool) and math.isfinite(lat))):
+            return {"check": "broker_authority", "ok": False,
+                    "detail": f"broker reply UNTRUSTED: latched_at must be a "
+                              f"finite numeric epoch or null per the latch "
+                              f"contract, got {type(lat).__name__} — starts "
                               "stay refused"}
         if st["latched"]:
             return {"check": "broker_authority", "ok": False,
@@ -899,6 +1059,24 @@ class Supervisor:
                                "host to trust; the runner cannot be reached")
             if not Path(s.runner_ssh_key_path).is_file():
                 return False, f"runner private key missing: {s.runner_ssh_key_path}"
+            # Review F3: readiness is ALSO the transport's own security
+            # gate — OpenSSH refuses a private key that group/other can
+            # access, so such a key is NOT a usable configuration no
+            # matter what a cached probe once said. Refuse before any
+            # cache/probe path; never suggest widening permissions.
+            try:
+                kmode = stat.S_IMODE(Path(s.runner_ssh_key_path).stat().st_mode)
+            except OSError:
+                return False, (f"runner private key cannot be inspected: "
+                               f"{s.runner_ssh_key_path}")
+            if kmode & 0o077:
+                return False, (f"runner private key permissions are "
+                               f"group/other-accessible ({kmode:04o}) — "
+                               "OpenSSH refuses it; tighten to 0600 "
+                               "(never loosen the transport)")
+            if not os.access(s.runner_ssh_key_path, os.R_OK):
+                return False, (f"runner private key is unreadable by the "
+                               f"API service user: {s.runner_ssh_key_path}")
             return True, "ssh runner configured (key + non-empty host trust present)"
         if t == "local-dev":
             if s.sr_env == "production":
