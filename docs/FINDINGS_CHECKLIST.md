@@ -1,5 +1,55 @@
 # Current findings and validation evidence
 
+## Plan-22 review-round-1 receipts — 2026-10-30 (branch `practice-upgrades-18-21`, final revision `df72a85`)
+
+Independent review of candidate `9776884` returned **VERDICT: FIX** (nine
+counterexamples + the AC-5 upgraded-browser-login gap). All nine were repaired
+at the root and each is committed with its proof: `cbb6550` items 1+2 (runner
+admission probes the REAL supervisor authority with TTL memoization; broker
+latch authority; three-state isolation — declared-unsupported is ADVISORY,
+never pass; qualifications bound to config identity with recorded one-time
+reclassification), `a831ef8` items 3+4 (ONE rendered enrollment location read
+by both services; cross-process flock), `e6c16a4` items 5+6 (citations from the
+exact final render window; positive audience authorization), `8ff1b0c` item 7
+(pre-cast terminal SUPPRESSED with named start offset, browser-proven including
+the reverse-seek counterexample), `f9718dd` item 8 (`read_ts` adjudicated
+against the OPERATION's server-trusted interval — migration 0028 keeps raw
+claims, idempotence compares claims, the surface names rejections), `fef55d9`
+item 9 (coach context CLASSIFIES never/active/completed/interrupted — the
+completed-run denial is gone). AC-5 closed in `df72a85`: the upgrade gate's
+manifest carries a loopback public URL, and after the real preserving upgrade
+the gate starts the upgraded payload's own venv API against the upgraded DB,
+stands up the installed nginx's one `/api`-strip rule at the baked URL, serves
+the provisioned web build and drives a REAL playwright form login for a member
+seeded with a real scrypt hash; the stored token must answer 200 on
+`/api/sessions` through the public door. Readiness stub and head assertions now
+DERIVE the schema head; head pins followed migration 0028 (`e8ba4b8`).
+
+All seven acceptance criteria were then re-proven on THIS final tree
+(`df72a85`, frontend before browser; real exit statuses, no pipe masking):
+
+| Gate | Result | Receipt |
+|---|---|---|
+| fast (exact AGENTS command) | exit 0 | **723 passed, 0 failed, 0 skipped**, 505 deselected, 13 warnings, 98.11 s |
+| selection | PASS 199.7 s | every test classified; required-mode failure probes pass |
+| practice | PASS 11.0 s | **10 + 28 passed, 0 skipped**, 1225 deselected (LIVE regressions + unchanged/aged vs changed/failed/unknown admission) |
+| db | PASS 688.1 s | **335 passed, 0 failed, 0 skipped**; disposable `sr-acc-pg-0bbb955e` created and removed |
+| agent | PASS 153.9 s | 123 passed, 0 failed/skipped |
+| authority | PASS 26.3 s | 35 passed |
+| containment | PASS 25.6 s | 41 passed, no privilege weakening |
+| install | PASS 8.2 s | real sequences clean=18 files, rerun=0 changed, upgrade=1 changed, drift detected+repaired; managed-service half operator-only |
+| upgrade | PASS 497.9 s, exit 0 | payload revision `df72a85a11cf`; **real browser login against the upgraded appliance** — form login as `p21-login` on the provisioned bundle (baked `http://127.0.0.1:PORT/api`) via the nginx-equivalent `/api` strip, token works on `/api/sessions`; readiness contract at the DERIVED head; 39 PASS lines incl. fence/interruption/restore sequences |
+| frontend | PASS 8.2 s | `npm ci` + `next build`; audit zero high/critical (1 moderate, applicability documented) |
+| browser | PASS 372.8 s | **7 passed, 0 skipped** — plan-22 honesty surfaces incl. the new pre-cast suppression test (two casts, reverse-seek re-suppression, selected-epoch follow) |
+| bundle | PASS 249.1 s | NEW bundle `.cache/bundle/sparring-range-appliance-22b` (MANIFEST sha256 `da639671daa4ea1b139311792c0b6ac69cedcfd17475e9e46ba6268c93c9c450`, revision `df72a85a11cf`, 391 files, 4 images); runtime binding to this checkout; operator manifest renders/validates; shipped image boots through a throwaway overlay (TCG, marker `2026-10-30T09:12:47Z`); digest tamper refused |
+
+Sealed `59fb…` release byte-intact (`MANIFEST.json` sha256
+`0cfa12f1f48cb24e…2052dd3`); previous candidate `-22` untouched (sha256
+`8083dd4a9578b2d0…ff6cd2`, revision `97768844d5cf`); the new bundle reuses the
+four verified images — no cold role build. Resource preflight before the heavy
+lanes (disk/RAM), per-run owned fixtures only; post-run cleanup verified: zero
+`sr-*` containers, zero `sr-broker-ledger-*` orphans, DAC fixture self-cleans.
+
 ## Plan-22 implementation receipts — 2026-10-30 (branch `practice-upgrades-18-21`, revision `9776884`)
 
 All gates below ran on the FINAL committed tree `9776884` (the earlier
