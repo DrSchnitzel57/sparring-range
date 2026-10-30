@@ -1,5 +1,116 @@
 # Current findings and validation evidence
 
+## Plan-22 review-round-4 receipts — 2026-10-30 (branch `practice-upgrades-18-21`, fix `71c0200`)
+
+Independent focused review of candidate `034ac0b` returned **VERDICT: FIX**:
+the ordinary counterexamples passed, but five exact boundary defects
+remained under two OWNER CONTRACT DECISIONS — (1) every safety publisher
+that affects the selected qualification shares ONE authoritative
+serialization/publication boundary (a classifier-only lock is
+insufficient); mirrors follow committed authority; no proven publication
+means fail closed; (2) an unmarked original observation's effective time
+is its authoritative record timestamp, and a classification carries a
+derived time only when its contract and immutable id/digest chain resolve
+to that original. All five were root-fixed at `71c0200` with real
+API/PG/HTTP and tiny-fixture proofs in
+`tests/test_plan22_review_round4.py`:
+
+- **F1 (HIGH) concurrent source-failure race** — ordinary writers never
+  took the classifier's advisory lock, so a real HTTP FAILED baseline
+  committed between the classifier's source SELECT and its append, and
+  the classification laundered it (200, usable TRUE). `record()` and
+  `reclassify_qualification()` now share ONE
+  `_authoritative_publish` boundary: advisory lock → newest-by-`record_id`
+  read → validate → append → commit, one transaction, no network waits
+  inside; readers select the newest row by APPEND SEQUENCE within the
+  store, so wall-clock quirks cannot hide a later-committed failure;
+  mirrors write only after a successful (or, for the N07 outage ledger,
+  explicitly recorded) publication, and the classifier's mirror follows
+  its commit. Proof (real uvicorn + real threads + a deterministic hook
+  at the source-read seam): FAILED queued on the lock → committed order
+  [legacy, classification, FAILED] → qualification usable FALSE
+  ("latest baseline_check FAILED"), file-ledger mirror shows exactly one
+  classification + one honest failure; the other ordering and a moved
+  source both yield truthful 409s; the six-barrier single-winner test
+  now also asserts the mirror consumer saw exactly the winner.
+- **F2 (HIGH) future unbound `observed_at` laundering** — an UNMARKED
+  legacy source carrying an injected future `detail.observed_at`
+  classified into a `-24 h` usable observation. The provenance resolver
+  now ignores detail fields on any unmarked (or marked-ordinary) record —
+  its authoritative timestamp is the observation time — and a recognized
+  classification resolves hop-by-hop through `source_record_id` +
+  `original_detail_digest` to the ORIGINAL row, requiring agreement with
+  the carried time; missing/non-finite/bool/string/future/pre-2001
+  values, wrong ids, digest mismatches and cycles raise
+  `SafetyProvenanceError` → HTTP 409 at publication, provenance
+  `incompatible` in reports — never a passed observation, never a
+  `now` fallback, no daily re-commissioning, age advisories unchanged.
+  Proven on API+DB (4000 h + injected future + release → 200 but blocked
+  at age 4000; forged id/digest, future/missing carried → incompatible;
+  marked-ordinary injection ignored) plus a fast-lane resolver matrix
+  including a cyclic chain; the 4000 h, 100 h and 6000 h
+  (now fully resolvable chain) positives stand.
+- **F3 (MEDIUM) alias cleanup deleted a replacement inode** — ownership
+  is now the allocation-time DEVICE+INODE (captured via `lstat` at
+  creation in `_PwAlias`), checked with `lstat` at release; a replacement
+  symlink with the SAME target but a different inode survives and is
+  REPORTED, the owned inode stays removable, and own success cleanup is
+  unchanged. Deterministic rename-aside + same-target-replacement test;
+  the upgrade gate's REAL Chromium login passed through the new handle.
+- **F4 (MEDIUM) failed build destroyed the existing output** — `build()`
+  now validates every input (images present, guest-agent flag) and the
+  OUTPUT policy BEFORE any mutation: an existing destination is refused
+  unless `force=True`/`--force`, and the build happens in a sibling
+  staging directory activated by rename only on success — any failure
+  leaves the destination byte- and inode-identical with no staging
+  debris. Callers reviewed: the bundle gate builds only when no release
+  exists, and the disposable tamper fixture builds into a fresh path —
+  NEITHER needs force (none was added to them); force was exercised for
+  real by the `-22e` rebuild and by a failed-symlink-source rebuild that
+  left the previous bundle verifying.
+- **F5 (MEDIUM) `--link-images` permitted symlink artifacts** — linked
+  sources must now be REGULAR NON-SYMLINK images (checked by `lstat`
+  before linking; nothing chmods/truncates the shared source inode), and
+  `verify()` independently refuses — BEFORE trusting any bytes — symlink
+  components, non-regular files, realpath escapes, and symlinked
+  directories anywhere below the bundle root. Tiny-fixture proofs:
+  symlinked source refused (nothing created), external and internal
+  digest-matching symlinks refused, moved-and-symlinked `deploy/` tree
+  refused, ordinary tamper still refused, and a genuine regular
+  hardlinked build verifies with `nlink == 2`, identical bytes/mode and
+  an untouched source mtime.
+
+Round-4 verification (real exit statuses, foreground; lanes not listed
+carry the round-3/2/1 receipts with explicit base — none of their inputs
+changed: the model-administration/agent lanes, containment fixtures,
+install sequences and the web bundle + browser gate consume nothing
+touched here except report FIELDS that are byte-compatible and proven by
+the DB lane; the browser gate was last rerun at `034ac0b`):
+
+| Lane | Rerun/carry | Result |
+|---|---|---|
+| fast (exact AGENTS command) | RERAN | exit 0 — **737 passed, 0 failed, 0 skipped**, 522 deselected, 13 warnings, 118.7 s (includes the 7 new fast round-4 proofs) |
+| selection | RERAN | PASS 234.2 s |
+| practice | RERAN | PASS 13.2 s — 12 + 28 passed, 0 skipped |
+| db (focused: round-2+3+4 files) | RERAN 3× | **15 passed, 0 failed** every run (interleaved race, 409 orderings, provenance matrix, six-barrier + mirror assertion, persistence 503/recovery, nested chain) |
+| db (FULL gate — `record()` is the central changed writer) | RERAN | PASS 722.0 s — complete db layer green, owned DB resources verified cleaned |
+| authority | RERAN | PASS 26.7 s — 35 passed |
+| upgrade | RERAN (disk-guarded) | PASS 513.1 s — full preserving upgrade + REAL browser login through the new device+inode alias handle; guard never fired |
+| bundle | RERAN | PASS 279.3 s — NEW `.cache/bundle/sparring-range-appliance-22e` (MANIFEST sha256 `71eb837e81ec475a48956ebc5ed609e75ee9cca67f0f6422627527688b874948`, revision `71c0200c079d`, 394 files, 4 images hardlinked via `--link-images --force`, zero image duplication); verify + 248-file runtime binding + manifest render + image boot (overlay, TCG, marker `2026-10-30T14:22:54Z`) + tamper refusal, all under the hardened symlink-aware verifier |
+| agent, containment, install, frontend, browser | CARRIED (scoped, `5c9509f`/`7ed7e0b`/`034ac0b`) | 123 / 41 / sequences / 0 high+critical / 7 of 7 — unchanged inputs |
+
+Disk and artifact discipline: 6 GiB free at start (≥ 2 GiB reserve),
+ended 5 GiB with the reserve never breached; no image copy existed
+anywhere this round (hardlinks only). All FIVE older bundles' MANIFEST
+seals verified byte-identical (`0cfa12f1f48c…`, `8083dd4a9578…`,
+`da639671daa4ea…`, `f49867125ad0…`, `35e4e9635a86…`); the shared source
+images changed only by HARDLINK COUNT (2→3 from `-22e` linking them) —
+inode, mode, size and mtime identical, no write touched them. Only this
+session's fresh fixtures were removed; zero `sr-*` containers left;
+pre-existing `sr-libvirt-*`/`sr-guest-cache` untouched. Roadmap 22 stays
+unchecked — no installed appliance, provider, systemd or nested-KVM
+acceptance is claimed.
+
 ## Plan-22 review-round-3 receipts — 2026-10-30 (branch `practice-upgrades-18-21`, final revision `e01ea4e` + builder `3e7956d`)
 
 Independent focused review of candidate `7ed7e0b` returned **VERDICT: FIX**:

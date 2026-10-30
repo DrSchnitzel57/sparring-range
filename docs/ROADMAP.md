@@ -108,7 +108,16 @@ gates independently. Any requirement not met stays open, regardless of plan tick
   API/PG/SSH/unix-wire/alias-collision proofs and bundle `-22d` verified
   while all older seals stayed byte-identical; round-3 lane table in
   `FINDINGS_CHECKLIST.md`. The box stays unchecked until that
-  independent re-review accepts.
+  independent re-review accepts. Review round 4 (FIX) closed the same
+  day under the owner publication/provenance contracts: five boundary
+  defects (classifier-vs-observation interleaving, future unbound
+  observed_at laundering, alias cleanup deleting a replacement inode,
+  build destroying its output before validation, --link-images accepting
+  symlink artifacts) root-fixed at `71c0200` with real HTTP/PG race,
+  provenance-matrix and tiny-fixture proofs, full db gate green, and
+  bundle `-22e` built by the new staging builder while all older seals
+  stayed byte-identical; round-4 lane table in `FINDINGS_CHECKLIST.md`.
+  The box stays unchecked until that independent re-review accepts.
   User authorized plan creation followed directly by Qwen Flash Next high
   implementation and autonomous independent review on the existing branch.
   No push, merge, automatic deployment or repeated unchanged live commissioning.
