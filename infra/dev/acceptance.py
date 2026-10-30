@@ -509,40 +509,6 @@ def check_agent() -> None:
 
 
 def check_practice() -> None:
-    """Plan 22 installed-practice repairs on REAL fixtures (required mode).
-
-    These are the tests that reproduce the installed findings with actual
-    enforcement rather than mocks: real kernel DAC decisions across distinct
-    UIDs in unprivileged user namespaces (LIVE-01 credential access), and
-    the later plan-22 practice-lane regressions. A skip is never
-    acceptance: SR_REQUIRE_PRACTICE converts skips to failures, and an
-    environment without unprivileged user namespaces + subuid mappings FAILS
-    this gate with the exact missing prerequisite — it never passes empty.
-    """
-    import subprocess
-    probe = subprocess.run(
-        ["unshare", "--user", "--map-users=0:10000:2",
-         "--map-groups=0:10000:2", "true"],
-        capture_output=True, text=True, timeout=30)
-    if probe.returncode != 0:
-        prereq_fail(
-            "practice prerequisites (unprivileged user namespaces + "
-            "subuid/subgid mappings)",
-            f"unshare probe exit {probe.returncode}: "
-            f"{(probe.stderr or probe.stdout)[:200]}")
-    env = {"SR_REQUIRE_PRACTICE": "1"}
-    r, counts = pytest_run(["-m", "practice"], env=env, timeout=1200)
-    require_selection(counts, "practice")
-    if r.returncode != 0:
-        fail("installed-practice repair layer (real DAC/namespaces)",
-             f"exit {r.returncode}, counts {counts}:\n{r.stdout[-6000:]}")
-    ok("practice layer passes in required mode",
-       f"{counts.get('passed', 0)} passed, {counts.get('failed', 0)} failed, "
-       f"{counts.get('skipped', 0)} skipped, "
-       f"{counts.get('deselected', 0)} deselected")
-
-
-def check_practice() -> None:
     """Plan 22 installed-practice repair batch (required mode).
 
     Reproduces the installed findings against REAL enforcement instead of
@@ -551,7 +517,9 @@ def check_practice() -> None:
     them. A required layer never passes on skips: SR_REQUIRE_PRACTICE is
     set, any skipped test fails, and an environment without the namespace
     prerequisites FAILS the gate with the exact missing piece rather than
-    vacuously passing.
+    vacuously passing. AC-2 additionally runs the plan-22 regression matrix
+    (admission unchanged/aged vs changed/failed/unknown, enrollment merge,
+    role policy, canonical citations) inside the same required-mode gate.
     """
     import os
     import shutil
@@ -587,9 +555,28 @@ def check_practice() -> None:
                  f"exit {r.returncode}, counts {counts}:\n{r.stdout[-6000:]}")
         if counts.get("skipped", 0):
             fail("practice layer never accepts skips", str(counts))
+        # AC-2: the gate must ALSO run, in required mode, the LIVE-regression
+        # and admission-matrix cases (unchanged/aged versus changed/failed/
+        # unknown, enrollment merge + hot reload, role policy, canonical
+        # citations). They belong to the fast lane (no infra) and carry no
+        # practice marker, so they are named explicitly here; db rows in the
+        # same files stay out, and any skip is a failure.
+        r2, counts2 = pytest_run(
+            ["-m", "not db and not browser and not live",
+             "tests/test_plan22_safety_qualification.py",
+             "tests/test_plan22_bastion_enrollment.py",
+             "tests/test_plan22_coach_provenance.py"],
+            env=env, timeout=1200)
+        require_selection(counts2, "practice regression matrix")
+        if r2.returncode != 0 or counts2.get("skipped", 0):
+            fail("installed-practice regression matrix",
+                 f"exit {r2.returncode}, counts {counts2}:\n"
+                 f"{r2.stdout[-6000:]}")
         ok("practice layer passes in required mode",
-           f"{counts.get('passed', 0)} passed, 0 skipped, "
-           f"{counts.get('deselected', 0)} deselected")
+           f"{counts.get('passed', 0)} + {counts2.get('passed', 0)} passed "
+           f"(layer + regression matrix), 0 skipped, "
+           f"{counts.get('deselected', 0) + counts2.get('deselected', 0)} "
+           "deselected")
     finally:
         if fx is not None:
             problems = fx.cleanup()
