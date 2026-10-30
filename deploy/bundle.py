@@ -211,9 +211,40 @@ def _add_image(src: pathlib.Path, dst: pathlib.Path) -> None:
                           "images; a released image must stand alone")
 
 
+def _ship_image(src: pathlib.Path, dst: pathlib.Path, *,
+                link: bool = False) -> None:
+    """Place an image into the bundle (see _add_image). With ``link`` the
+    SHIPPED inode is a HARDLINK to the source — bytes identical, no second
+    copy — which requires the source to be a self-contained single-image
+    qcow2 in bundle mode already (verified exactly as _add_image would);
+    release artifacts must not silently depend on a build machine path,
+    and the source seals keep the same bytes either way."""
+    if not link:
+        _add_image(src, dst)
+        return
+    info = _image_info(src)
+    if info.get("backing-filename"):
+        raise BundleError(
+            f"--link-images requires a self-contained source image, but "
+            f"{src} has backing file {info['backing-filename']!r}")
+    chain = _qemu_img("info", "--backing-chain", str(src))
+    images = [ln for ln in chain.splitlines() if ln.startswith("image:")]
+    if len(images) != 1:
+        raise BundleError(f"{src} has a backing chain of {len(images)} "
+                          "images; a released image must stand alone")
+    mode = src.stat().st_mode & 0o777
+    if mode != 0o644:
+        raise BundleError(
+            f"--link-images shares the source inode (mode {mode:04o}); "
+            f"{src} must already carry the bundle mode 0644 so linking "
+            "cannot mutate a sealed artifact")
+    os.link(src, dst)
+
+
 def build(output: pathlib.Path, *, base_image: pathlib.Path,
           role_images: dict[str, pathlib.Path], app_dir: pathlib.Path = REPO,
-          guest_agent_available: bool = True) -> dict:
+          guest_agent_available: bool = True,
+          link_images: bool = False) -> dict:
     output = pathlib.Path(output)
     if output.exists():
         shutil.rmtree(output)
@@ -238,8 +269,9 @@ def build(output: pathlib.Path, *, base_image: pathlib.Path,
         rel = f"images/{base_image.name}"
         dst = output / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
-        _add_image(base_image, dst)
-        os.chmod(dst, 0o644)
+        _ship_image(base_image, dst, link=link_images)
+        if not link_images:
+            os.chmod(dst, 0o644)
         files[rel] = {"sha256": _sha256(dst), "bytes": dst.stat().st_size}
         images["appliance-base"] = {"path": rel, "sha256": files[rel]["sha256"],
                                     "bytes": files[rel]["bytes"]}
@@ -249,8 +281,9 @@ def build(output: pathlib.Path, *, base_image: pathlib.Path,
         rel = f"images/{path.name}"
         dst = output / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
-        _add_image(path, dst)
-        os.chmod(dst, 0o644)
+        _ship_image(path, dst, link=link_images)
+        if not link_images:
+            os.chmod(dst, 0o644)
         files[rel] = {"sha256": _sha256(dst), "bytes": dst.stat().st_size}
         images[role] = {"path": rel, "sha256": files[rel]["sha256"],
                         "bytes": files[rel]["bytes"]}
@@ -505,6 +538,10 @@ def _parser() -> argparse.ArgumentParser:
     pb.add_argument("--base-image", required=True)
     pb.add_argument("--role-image", action="append", default=[],
                     metavar="ROLE=PATH")
+    pb.add_argument("--link-images", action="store_true",
+                    help="ship the qcow2 files as hardlinks to the (already "
+                         "self-contained, 0644) source images instead of a "
+                         "second full copy; bytes and seals are unchanged")
 
     pv = sub.add_parser("verify")
     pv.add_argument("bundle")
@@ -552,7 +589,8 @@ def main(argv: list[str] | None = None) -> int:
                 role_images[role] = pathlib.Path(path)
             manifest = build(pathlib.Path(args.output),
                              base_image=pathlib.Path(args.base_image),
-                             role_images=role_images)
+                             role_images=role_images,
+                             link_images=args.link_images)
             from infra.images.specs import GUEST_BUDGETS
             carried = set(manifest["images"])
             missing = [role for role in sorted(GUEST_BUDGETS)
