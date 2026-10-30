@@ -1,5 +1,50 @@
 # Current findings and validation evidence
 
+## Plan-22 implementation receipts — 2026-10-30 (branch `practice-upgrades-18-21`, revision `9776884`)
+
+All gates below ran on the FINAL committed tree `9776884` (the earlier
+`4ef295f`-era lane results were superseded when the LIVE-07 classifier and the
+session Overview props changed afterwards). Commands are the AGENTS fast
+command and `env PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B
+infra/dev/acceptance.py <gate>`; each exit status is the real process status
+(pipes are logged separately). Logs: `/tmp/opencode/ac-final.log`,
+`ac-fast-final2.log`, `ac-browser3.log`, `ac-bundle2.log`.
+
+| Gate | Result | Receipt |
+|---|---|---|
+| fast (exact AGENTS command) | exit 0 | **714 passed, 0 failed, 0 skipped**, 490 deselected, 6 warnings, 94.90 s |
+| selection | PASS 188.4 s | 1204 tests = 714 fast + 490 integration, all classified; required-mode failure probes pass |
+| practice | PASS 8.7 s | 1 real-DAC layer + 19 LIVE-regression/admission matrix, **0 skipped** |
+| db | PASS 680.1 s | **330 passed, 0 skipped**, 874 deselected; disposable `sr-acc-pg-3f79551c` created and removed; zero `srtest_*`/`sr_*` leftovers |
+| agent | PASS 152.7 s | 123 passed, 0 failed/skipped |
+| authority | PASS 26.1 s | 35 passed, 0 skipped |
+| containment | PASS 25.1 s | 41 passed, 0 skipped; no run-owned cgroups leaked |
+| install | PASS 8.1 s | real sequences clean=18 files, rerun=0 changed, upgrade=1 changed, drift detected+repaired; managed-service half explicitly operator-only |
+| upgrade | PASS 441.8 s | payload bundle revision `97768844d5cf`; LIVE-02 journal view, LIVE-04 verified-baseline re-version, LIVE-05 manifest-baked frontend URL all PASS; fence/interruption/restore sequences truthful |
+| frontend | PASS 7.4 s | `npm ci` + `next build`; audit zero high/critical (1 moderate, applicability documented) |
+| browser | PASS 279.1 s | **6 passed, 0 skipped** — includes the plan-22 honesty test (Begin blockers verbatim from a real killswitch engage, enrollment panel/warning, timing provenance) and the stage-5 member loop that caught the Overview crash |
+| bundle | PASS 223.9 s | new bundle `.cache/bundle/sparring-range-appliance-22` (MANIFEST sha256 `8083dd4a9578b2d0614d089b1c12809b520704905950dc501ffa1511d4ff6cd2`, 389 files, 4 images); bidirectional runtime binding 247 files vs checkout; operator manifest renders and validates; shipped image boots through a throwaway overlay (TCG, marker `2026-10-30T04:17:48Z`); digest tamper refused |
+
+The sealed `59fb…` release stays byte-intact (`MANIFEST.json` sha256
+`0cfa12f1f48cb24e…2052dd3`, revision `59fb5442fede8814…`); its four verified
+images were reused for the new bundle — no image rebuild. Reuse is legitimate:
+the gate boots a SHIPPED image from the new bundle and re-verifies every digest.
+
+Gate reruns on this branch also caught two real integration defects, both
+repaired with regression coverage rather than probe weakening: the admission
+probes fabricated a failing `datapath_structure` observation for noop
+datapaths outside production (23 DB-layer regressions; fixed to report
+not-applicable under the same exemption the qualification applies —
+production noop still fails closed), and the session Overview referenced
+`qualBlockers`/`keyEnroll` without props, crashing the whole session page
+client-side (browser lane only; commit `9776884`).
+
+Scope honesty: every receipt above is fixture/sandbox evidence on this host
+(browser = pinned chromium on a run-owned build; images boot under TCG).
+Installed-appliance behavior, real provider coaching, real isolation/stop,
+nested-KVM and the member SSH journey remain the operator's manual gates.
+Nothing here re-opens the 2026-10-23 commissioning receipts.
+
 ## Supervised installed-upgrade findings — 2026-10-29 (plan 22 authorized)
 
 User authorized consolidated repair and autonomous Qwen-high implementation /

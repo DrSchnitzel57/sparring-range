@@ -1,10 +1,10 @@
 # 22 — Installed practice repair batch
 
 ## Steps
-- [ ] Fixture installed findings and retained review defects.
-- [ ] Repair upgrade, diagnostics and SSH onboarding.
-- [ ] Deliver evidence-based safety admission/recovery UX.
-- [ ] Repair coach, citations and replay/output defects.
+- [x] Fixture installed findings and retained review defects.
+- [x] Repair upgrade, diagnostics and SSH onboarding.
+- [x] Deliver evidence-based safety admission/recovery UX.
+- [x] Repair coach, citations and replay/output defects.
 - [ ] Prove integrated practice/upgrade, package and independently review.
 - [ ] Update findings, tick roadmap 22 on its gates and update architecture if changed.
 
