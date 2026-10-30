@@ -198,6 +198,7 @@ export default function LiveSession() {
       <div role="tabpanel" id={`panel-${tab}`} hidden={false}>
         {tab === "overview" && <Overview id={id} sess={sess} live={live} conns={conns}
           injects={injects} busy={busy} opNote={opNote}
+          qualBlockers={qualBlockers} keyEnroll={keyEnroll}
           beginMatch={beginMatch} startRed={startRed} stopRed={stopRed}
           endSession={endSession} redeploy={redeploy} submitInject={submitInject}
           injectDraft={injectDraft} setInjectDraft={setInjectDraft} setTab={setTab} />}
@@ -211,6 +212,7 @@ export default function LiveSession() {
 }
 
 function Overview({ id, sess, live, conns, injects, busy, opNote,
+                    qualBlockers, keyEnroll,
                     beginMatch, startRed, stopRed, endSession, redeploy,
                     submitInject, injectDraft, setInjectDraft, setTab }) {
   const match = sess.match;

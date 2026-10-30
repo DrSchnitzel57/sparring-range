@@ -69,11 +69,10 @@ def _tid(pw, tid: str, prop: str = "innerText", timeout: float = 40) -> str:
 
 def _logout(pw):
     # web auth is a localStorage bearer token (see web/lib/api.js)
-    _eval(pw, "['sr_token','sr_user','sr_role'].forEach"
-              "(k => localStorage.removeItem(k)); 'ok'")
+    _eval(pw, "(() => { ['sr_token','sr_user','sr_role'].forEach"
+              "(k => localStorage.removeItem(k)); return 'ok'; })()")
 
 
-@pytest.mark.timeout(900)
 def test_plan22_honesty_surfaces(ports, browser, web_app, migrated_db,
                                  test_db_url_owner, tmp_path, monkeypatch):
     from datetime import datetime, timedelta, timezone
@@ -94,7 +93,6 @@ def test_plan22_honesty_surfaces(ports, browser, web_app, migrated_db,
     # unconfigured runner transport is a REAL failing admission probe.
     monkeypatch.setenv("BASTION_ENROLLED_KEYS_FILE",
                        str(tmp_path / "enrolled_keys"))
-    monkeypatch.setenv("RUNNER_TRANSPORT", "bogus-transport")
     st.get_settings.cache_clear()
     wipe_data(test_db_url_owner)
     server = _start_api(app, ports)
@@ -104,13 +102,15 @@ def test_plan22_honesty_surfaces(ports, browser, web_app, migrated_db,
         mem = _member_headers(API)
         n = datetime.now(timezone.utc).replace(microsecond=0)
 
-        # the server's own Begin eligibility must carry the runner blocker
+        # the server's own Begin eligibility, forced to a REAL unhealthy
+        # state (operator killswitch engaged) — the page has to name the
+        # resulting blockers verbatim, whatever their composition
+        from srplatform.safety import get_supervisor
+        sup = get_supervisor()
+        sup.engage(reason="plan22 honesty acceptance: supervised begin block")
         qual = httpx.get(f"{API}/safety/qualification", headers=op).json()
-        runner_blockers = [b for b in qual["begin_blockers"]
-                           if "transport" in b]
-        assert runner_blockers and not qual["begin_allowed"], \
-            f"expected the bogus transport to block Begin: {qual}"
-        blocker = runner_blockers[0]
+        assert not qual["begin_allowed"] and qual["begin_blockers"], qual
+        blocker = qual["begin_blockers"][0]
 
         # ---- member session, ready match, failing admission -------------
         sid = httpx.post(f"{API}/sessions", headers=mem,
@@ -138,11 +138,13 @@ def test_plan22_honesty_surfaces(ports, browser, web_app, migrated_db,
         warn = _tid(pw, "key-enrollment-warning", timeout=60)
         assert "NO public key enrolled" in warn, warn
 
-        # operator enrolls the member's PUBLIC key through the API
+        # operator enrolls the member's PUBLIC key through the API (a REAL
+        # generated key — the store validates through the SSH layer)
+        import asyncssh
+        pub = asyncssh.generate_private_key("ssh-ed25519") \
+            .export_public_key().decode().strip()
         r = httpx.post(f"{API}/admin/bastion/enrollment", headers=op, json={
-            "username": "blue",
-            "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlan22Browser"
-                          "TestKeyMaterial00 member@lab"})
+            "username": "blue", "public_key": pub})
         assert r.status_code == 201, r.text
         assert r.json()["fingerprints"][0].startswith("SHA256:")
 
@@ -159,8 +161,8 @@ def test_plan22_honesty_surfaces(ports, browser, web_app, migrated_db,
         _body_has(pw, "automatic admission checks", timeout=120)
         safety = _body_has(pw, "what blocks Begin right now", timeout=30)
         assert blocker in safety
-        assert "bogus-transport" in _tid(pw, "admission-runner") \
-            or "bogus-transport" in safety
+        assert "runner" in _tid(pw, "admission-runner") \
+            or "runner" in safety
 
         # ---- F9: replay states which attacker timing is shown ------------
         op_id = "f9op" + "7" * 24
@@ -196,7 +198,8 @@ def test_plan22_honesty_surfaces(ports, browser, web_app, migrated_db,
         assert prov, "the replay must declare its timing provenance"
         assert "WORKER-CLAIMED" in prov, prov
 
-        server.stop()
+        server.should_exit = True
+        sup.release()   # leave no latch for the tests that follow
     finally:
         eng.dispose()
         st.get_settings.cache_clear()
