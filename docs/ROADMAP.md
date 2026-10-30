@@ -99,7 +99,16 @@ gates independently. Any requirement not met stays open, regardless of plan tick
   /readyz-vs-Begin runner fact, missing reclassify command) root-fixed and
   re-proven at `c9b3e4f` with bundle `-22c`; rerun/carried lane table in
   `FINDINGS_CHECKLIST.md`. The box stays unchecked until independent
-  re-review accepts.
+  re-review accepts. Review round 3 (FIX) closed the same day under the
+  owner system contract "reclassification time is not observation time":
+  five gaps (transition laundering, non-atomic reclassification CAS, a
+  health cache surviving a key-permission change, untyped broker
+  metadata, a browser-alias harness deleting an unowned path) root-fixed
+  at `e01ea4e` (builder `--link-images` at `3e7956d`) with real
+  API/PG/SSH/unix-wire/alias-collision proofs and bundle `-22d` verified
+  while all older seals stayed byte-identical; round-3 lane table in
+  `FINDINGS_CHECKLIST.md`. The box stays unchecked until that
+  independent re-review accepts.
   User authorized plan creation followed directly by Qwen Flash Next high
   implementation and autonomous independent review on the existing branch.
   No push, merge, automatic deployment or repeated unchanged live commissioning.

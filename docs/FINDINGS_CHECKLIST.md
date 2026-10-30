@@ -1,5 +1,118 @@
 # Current findings and validation evidence
 
+## Plan-22 review-round-3 receipts — 2026-10-30 (branch `practice-upgrades-18-21`, final revision `e01ea4e` + builder `3e7956d`)
+
+Independent focused review of candidate `7ed7e0b` returned **VERDICT: FIX**:
+the four round-2 fixes improved but left five concrete gaps, under the
+OWNER SYSTEM CONTRACT: **reclassification time is not observation time** —
+the compatibility decision may append an AUDIT event now, while the
+effective observation time, scope and provenance REMAIN the original
+test's; publication shares one authoritative serialized
+read-validate-append/CAS boundary; no unfenced fallback publish; no DB
+transaction across network waits. All five were fixed at the root in
+`e01ea4e` (builder option in `3e7956d`) with real-boundary proofs in
+`tests/test_plan22_review_round3.py`:
+
+- **F1 (HIGH) transition laundering** — classification previously appended
+  a PASSED record with TODAY's timestamp, laundering a 4000 h legacy into
+  age 0.0 usable. Now every qualification evaluates AGE and engage/release
+  invalidation from the EFFECTIVE OBSERVATION TIME: ordinary records use
+  their own timestamp (unchanged); a classification carries
+  `observed_at` (the source's own effective time — nested chains resolved
+  at publish time) and invalidation runs on it, while
+  `classification_decided_at` keeps the audit's decision time separately.
+  Report entries expose `observed_at` + `classified_at` so the UI can
+  explain the two dates. Proof (API+DB): 4000 h legacy + later release →
+  reclassify 200, but `usable=False`, blocker "predates the last release",
+  `age_h≈4000`, source row byte-identical (`{}`), `source_record_id` and
+  original digest recorded, decision time > observation time; a valid
+  original after the last transition classifies and stays usable AT ITS
+  REAL AGE (advisory only — no daily expiry reintroduced); a nested
+  classification chain evaluates from the oldest original (6000 h, blocked
+  by a release between). 
+- **F2 (MEDIUM) CAS not atomic** — `expect_recorded_at` was checked before
+  an unprotected append, so two real HTTP requests could both win.
+  Publication is now one database transaction that first takes the shared
+  `pg_advisory_xact_lock` (the table grants are deliberately
+  SELECT/INSERT-only — append-only doctrine — so serialization uses an
+  advisory lock, not row `FOR UPDATE`), reads the newest record of the
+  kind AFTER acquiring it, validates, and appends — then commits. Six REAL
+  barrier-released HTTP classifiers: exactly ONE 200, five truthful 409s
+  ("already carries a contract"/"no longer the one"), exactly one new row,
+  original immutable. Persistence failure is a truthful 503 ("the
+  authoritative safety-record store is unavailable…") with ZERO rows
+  published (asserted while the store is back), and a retry after
+  recovery succeeds; a FAILED record appended after an accepted
+  classification still blocks — the CAS never overrides reality. The
+  fast-lane reclassification unit tests were corrected to the new
+  contract (no authoritative store → honest refusal, nothing unfenced
+  published); argument-level refusals still need no store.
+- **F3 (MEDIUM) cache-key security conditions** — a warm REAL-SSH success
+  with a 0600 key then survived `chmod 0644` (bytes unchanged) in the
+  cached verdict while OpenSSH itself now refuses the key. The shared
+  config fact now ALSO checks the private key's MODE (group/other access
+  → refuse "OpenSSH refuses it; tighten to 0600", never loosen) and
+  owner readability, BEFORE any cache or probe; the health memo key is
+  content digest + mode + owner, so any security-attribute change
+  invalidates a cached positive exactly like a byte change (in-place key
+  replacement re-probes and refuses; a trust-file edit forces a fresh
+  probe). Proven on the real asyncssh wire: warm 0600 success → chmod 0644
+  refuses with ZERO new probes → unreadable (0200) refuses → restoring
+  0600 recovers → trust edit re-probes healthy → foreign key swapped in
+  place refuses; no key material in any detail. `/readyz` and
+  `/safety/qualification` keep byte-identical detail (one fact, and it
+  is now also honest about 0644).
+- **F4 (MEDIUM) broker metadata types** — presence was validated but not
+  `reason`/`latched_at`. The real `ledger.get_latch` contract is
+  `reason: TEXT|NULL`, `latched_at: numeric epoch|NULL`; the classifier
+  now refuses `reason` that is not text/None and `latched_at` that is not
+  a finite number/None (dict, list, number reason, string/bool/NaN/
+  Infinity timestamps all BLOCK "reply UNTRUSTED"), while every
+  legitimate representation — including NULL metadata while unlatched —
+  passes. Proven through the stub matrix and over the REAL unix socket +
+  `HttpTransport`/`BrokerClient`, plus the real broker positive and the
+  engaged negative (engaged still blocks as ACTIVE, not UNTRUSTED).
+- **F5 (MEDIUM) harness deleted an unowned alias** — round 2 unlinked the
+  candidate path before creating its own. Allocation is now EXCLUSIVE
+  creation only (`os.symlink`, `FileExistsError` → skip, per-attempt random
+  token): a pre-existing sentinel at the candidate name — directory,
+  regular file, or foreign symlink — is verified UNTOUCHED (same inode,
+  same content, same target) and the next name is used; cleanup removes
+  only the exact owned symlink still pointing at the owned target (a
+  replaced directory or retargeted link is left alone). Deterministic
+  collision and hostile-cleanup tests included; the alias stays < 40
+  chars, and the upgrade gate's REAL browser login passed through the new
+  allocation code path.
+
+Round-3 verification (real exit statuses, foreground; lanes not listed
+carry the round-2/round-1 receipts because none of their inputs changed —
+model administration, containment fixtures, install sequences, web bundle
+and the browser gate consume nothing touched here, and the builder change
+is exercised only by the bundle build):
+
+| Lane | Rerun/carry | Result |
+|---|---|---|
+| fast (exact AGENTS command) | RERAN | exit 0 — **730 passed, 0 failed, 0 skipped**, 516 deselected, 13 warnings, 105.7 s |
+| selection | RERAN | PASS 214.3 s (round-3 proofs classified) |
+| practice | RERAN | PASS 12.5 s — 12 + 28 passed, 0 skipped (incl. the new F3 mode-change wire test) |
+| db (focused: round-2 + round-3 files) | RERAN 5× | **9 passed, 0 failed** every run, incl. the 6-barrier concurrency test (stable across repeats); full 338-test db lane carries round 2 (the reclassify writer contract changed — the three changed API tests were among the focused 9) |
+| authority | RERAN | PASS 27.2 s — 35 passed (broker classifier tightened) |
+| upgrade | RERAN (once, disk-guarded) | PASS 514.1 s — full preserving upgrade incl. the REAL browser login on the exclusive-allocation alias; guard never fired, 5.1 GiB free throughout |
+| bundle | RERAN | PASS 284.6 s — NEW `.cache/bundle/sparring-range-appliance-22d` (MANIFEST sha256 `35e4e9635a86b767219f7b0b84ade79e721d93d58ba006e74126b831ce4dfac9`, revision `3e7956d2264b`, 393 files, 4 images shipped as **hardlinks** to the existing self-contained 0644 images via the new `--link-images` flag — no second copy, 32 s build, disk unchanged); verify + 248-file runtime binding + manifest render + image boot (overlay, TCG, marker `2026-10-30T13:07:14Z`) + tamper refusal |
+| agent, containment, install, frontend, browser | CARRIED (scoped, `5c9509f`/`7ed7e0b`) | 123 / 41 / sequences / 0 high+critical / 7 of 7 — unchanged inputs, stated as carried |
+
+Disk and artifact discipline (round-3 rule): started 5.1 GiB free with a
+2 GiB reserve; no 4.5 GiB copy existed anywhere in this round (the builder
+now hardlinks under `--link-images`); the upgrade run was disk-guarded;
+ended 5.1 GiB free. All four older bundles' MANIFEST seals verified
+byte-identical before and after (`0cfa12f1f48c…`, `8083dd4a9578…`,
+`da639671daa4ea…`, `f49867125ad0…`), the `-22c` image inventory
+(inode/links/mode/mtime) unchanged, and only this session's own fresh
+fixture directories were removed (by explicit prefix + owner + mtime,
+never a blind sweep); the pre-existing `sr-libvirt-*`/`sr-guest-cache`
+stubs were left untouched. Roadmap 22 stays unchecked — no installed
+appliance, provider, systemd or nested-KVM acceptance is claimed.
+
 ## Plan-22 review-round-2 receipts — 2026-10-30 (branch `practice-upgrades-18-21`, final revision `c9b3e4f`)
 
 Independent re-review of candidate `5c9509f` returned **VERDICT: FIX**: the
