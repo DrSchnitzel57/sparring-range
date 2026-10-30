@@ -2112,6 +2112,258 @@ def check_bundle() -> None:
 # upgrade (21): the preserving in-place upgrade, end to end                   #
 # -------------------------------------------------------------------------- #
 
+LOGIN_USER = "p21-login"
+LOGIN_PW = "Upgrade-Browser-2026!"
+
+
+def _upgrade_browser_login(tmp: pathlib.Path, rootA: pathlib.Path,
+                           receipt: dict, owner_url: str,
+                           pubport: int) -> str:
+    """Plan-22 AC-5 (review round 1): after the REAL upgrade a REAL browser
+    logs in against the upgraded code, end to end.
+
+    Reconstructs the installed shape with three REAL parts and ONE fixed
+    shim, nothing else:
+
+    * the API runs from the UPGRADED PAYLOAD'S OWN venv against the
+      upgraded database — the same code and interpreter the activated
+      service unit runs, started here as ``uvicorn``;
+    * a fixed ``/api``-stripping proxy answers at the manifest's public
+      URL, where the provisioned web bundle's BAKED address points. The
+      installed appliance's nginx applies this one same rewrite; the
+      proxy stands in for it (a fixed prefix strip, not a second
+      router), which is why the browser gate's prefix-free API base and
+      this gate's ``/api``-baked bundle can both be true;
+    * ``next start`` serves the web build the upgrade provisioned inside
+      the activated payload;
+    * the PINED playwright-cli (same web/ pin as the browser gate)
+      drives the real form login and waits for the authenticated
+      surface.
+
+    The page is served from its own loopback port while the baked API
+    address is the proxy port — a cross-origin artifact of a gate
+    without nginx; the API allowlist therefore names the PAGE origin,
+    the minimal honest stand-in for the single-origin installed front
+    door. A missing prerequisite fails the gate: this is the promotion
+    gate, there is no skip.
+    """
+    import http.client
+    import http.server
+    import threading
+
+    def free_port() -> int:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    payload = rootA / "opt/sparring-range"
+    venv_py = pathlib.Path(receipt["venv"]) / "bin" / "python"
+    web_dir = payload / "web"
+    web_receipt = receipt.get("web") or {}
+    node_binary = web_receipt.get("binary") or shutil.which("node") or ""
+    if not venv_py.is_file():
+        fail("upgraded venv exists for the browser login", str(venv_py))
+    if not (web_dir / "node_modules" / ".bin" / "next").is_file():
+        fail("upgraded payload carries the provisioned web build",
+             str(web_dir))
+    if not node_binary or not pathlib.Path(node_binary).is_file():
+        fail("provisioned node runtime is runnable for next start",
+             repr(node_binary))
+    pw_cli = REPO / "web" / "node_modules" / ".bin" / "playwright-cli"
+    if not pw_cli.is_file():
+        found = shutil.which("playwright-cli")
+        pw_cli = pathlib.Path(found) if found else pathlib.Path("")
+    if not pw_cli.is_file():
+        prereq_fail("real browser login after the upgrade",
+                    "pinned playwright-cli missing — run `npm ci` in web/")
+
+    api_port, web_port = free_port(), free_port()
+    api_log = (tmp / "login-api.log").open("w")
+    web_log = (tmp / "login-web.log").open("w")
+    api = proc_web = None
+    proxy_srv = pw_session = None
+    try:
+        api = subprocess.Popen(
+            [str(venv_py), "-m", "uvicorn", "srplatform.api.app:app",
+             "--host", "127.0.0.1", "--port", str(api_port),
+             "--log-level", "warning"],
+            cwd=str(payload),
+            env={"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": str(tmp),
+                 "SR_ENV": "dev",
+                 "POSTGRES_URL": owner_url,
+                 "POSTGRES_URL_OWNER": owner_url,
+                 "SAFETY_STATE_FILE": str(tmp / "login-safety.json"),
+                 "RECORDINGS_DIR": str(tmp / "login-rec"),
+                 "API_ALLOWED_ORIGINS": f"http://127.0.0.1:{web_port}",
+                 "PYTHONDONTWRITEBYTECODE": "1"},
+            stdout=api_log, stderr=subprocess.STDOUT)
+
+        class _StripApi(http.server.BaseHTTPRequestHandler):
+            """The installed nginx rule, verbatim: location /api/ {
+            proxy_pass http://127.0.0.1:<api>/; } — strip the prefix,
+            forward everything else unchanged."""
+
+            def _do(self, verb: str):
+                path = self.path
+                if path.startswith("/api"):
+                    path = path[len("/api"):] or "/"
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                    body = self.rfile.read(n) if n else b""
+                    hdrs = {k: v for k, v in self.headers.items()
+                            if k.lower() not in ("host", "content-length")}
+                    up = http.client.HTTPConnection("127.0.0.1", api_port,
+                                                    timeout=20)
+                    up.request(verb, path, body=body or None, headers=hdrs)
+                    res = up.getresponse()
+                    data = res.read()
+                    self.send_response(res.status)
+                    for k, v in res.getheaders():
+                        if k.lower() not in ("transfer-encoding",
+                                             "connection"):
+                            self.send_header(k, v)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    up.close()
+                except Exception as exc:  # noqa: BLE001 — 502, then assert
+                    self.send_response(502)
+                    self.end_headers()
+                    self.wfile.write(str(exc).encode())
+
+            def do_GET(self):
+                self._do("GET")
+
+            def do_POST(self):
+                self._do("POST")
+
+            def do_OPTIONS(self):
+                self._do("OPTIONS")
+
+            def log_message(self, *args):  # silence
+                pass
+
+        proxy_srv = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", pubport), _StripApi)
+        threading.Thread(target=proxy_srv.serve_forever,
+                         daemon=True).start()
+
+        proc_web = subprocess.Popen(
+            [str(web_dir / "node_modules" / ".bin" / "next"), "start",
+             "-H", "127.0.0.1", "-p", str(web_port)],
+            cwd=str(web_dir),
+            env={"PATH": (pathlib.Path(node_binary).parent.as_posix()
+                          + ":/usr/local/bin:/usr/bin:/bin"),
+                 "HOME": str(tmp)},
+            stdout=web_log, stderr=subprocess.STDOUT)
+
+        def _wait(url: str, note: str, log) -> None:
+            import urllib.request
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                for p in (api, proc_web):
+                    if p is not None and p.poll() is not None:
+                        log.flush()
+                        fail(note, f"process died early:\n"
+                                   f"{log_path(log).read_text()[-800:]}")
+                try:
+                    with urllib.request.urlopen(url, timeout=3) as r:
+                        if r.status == 200:
+                            return
+                except Exception:  # noqa: BLE001 — still booting
+                    pass
+                time.sleep(0.5)
+            fail(note, f"\n{log_path(log).read_text()[-800:]}")
+
+        def log_path(log):
+            return (tmp / "login-api.log" if log is api_log
+                    else tmp / "login-web.log")
+
+        # the public URL the bundle baked answers through the proxy
+        _wait(f"http://127.0.0.1:{pubport}/healthz",
+              "upgraded API answers at the baked public URL (/api strip)",
+              api_log)
+        _wait(f"http://127.0.0.1:{web_port}/",
+              "upgraded web build serves the login page", web_log)
+
+        session = f"sr-upg-{os.getpid()}"
+
+        def pw(*args, timeout=120):
+            r = subprocess.run([str(pw_cli), f"-s={session}", *args],
+                               capture_output=True, text=True,
+                               timeout=timeout, cwd=str(REPO))
+            if r.returncode != 0:
+                raise AssertionError(
+                    f"playwright-cli {' '.join(str(a) for a in args)} -> "
+                    f"{r.returncode}\n{r.stdout[-500:]}\n{r.stderr[-500:]}")
+            return r
+
+        pw_session = session
+        pw("open", "about:blank", "--browser=chromium", timeout=240)
+        pw("goto", f"http://127.0.0.1:{web_port}/")
+        pw("fill", 'input[placeholder="username"]', LOGIN_USER)
+        pw("fill", 'input[placeholder="password"]', LOGIN_PW)
+        pw("click", 'button[type="submit"]')
+        # success = the form navigated to the authenticated dashboard AND
+        # the identity stored by the app is the upgraded DB's own user.
+        deadline = time.time() + 45
+        body = who = ""
+        while time.time() < deadline:
+            body = pw("--raw", "eval", "document.body.innerText").stdout
+            who = pw("--raw", "eval",
+                     "localStorage.getItem('sr_user') || ''").stdout
+            if "dashboard" in body and LOGIN_USER in who:
+                break
+            time.sleep(0.5)
+        else:
+            api_log.flush()
+            fail("browser login reached the authenticated surface",
+                 f"page never showed the dashboard for {LOGIN_USER!r}; "
+                 f"sr_user={who!r}; body:\n{body[:1200]}\napi tail:\n"
+                 f"{tmp.joinpath('login-api.log').read_text()[-600:]}")
+        if "Failed to fetch" in body:
+            fail("browser login reached the authenticated surface",
+                 "page shows a failed sign-in")
+        # The token the form flow stored must work on the proxied PUBLIC
+        # door too — proving the browser truly spoke to the upgraded API
+        # (not a stale localhost default).
+        token = pw("--raw", "eval",
+                   "localStorage.getItem('sr_token') || ''").stdout
+        token = token.strip().strip('"')
+        if not token or token == "null":
+            fail("login stored the API token", "localStorage empty")
+        import urllib.request
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{pubport}/api/sessions",
+            headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            if r.status != 200:
+                fail("token accepted through the public /api door",
+                     f"HTTP {r.status}")
+        return (f"form login as {LOGIN_USER} on the provisioned bundle "
+                f"(baked {web_receipt.get('next_public_api_url')}) via "
+                f"the nginx-equivalent /api strip; token works on "
+                f"/api/sessions")
+    finally:
+        if pw_session:
+            subprocess.run([str(pw_cli), f"-s={pw_session}", "close"],
+                           capture_output=True, timeout=30, check=False)
+        for p in (api, proc_web):
+            if p is None:
+                continue
+            p.terminate()
+            try:
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait(timeout=5)
+        if proxy_srv is not None:
+            proxy_srv.shutdown()
+            proxy_srv.server_close()
+        for log in (api_log, web_log):
+            log.close()
+
+
 def check_upgrade() -> None:
     """The REAL preserving upgrade through the REAL CLI, in sandboxes.
 
@@ -2309,6 +2561,12 @@ def check_upgrade() -> None:
         # anything here.
         import http.server
         import threading
+        # the payload's expected schema head, DERIVED not hardcoded: a
+        # new migration must never silently turn the readiness stub and
+        # the head assertions into false negatives.
+        head_rev = max(p.name.split("_")[0] for p in
+                       (REPO / "srplatform" / "db" / "migrations" /
+                        "versions").glob("[0-9][0-9][0-9][0-9]_*.py"))
         ready_flag = tmp / "readyz-not-ready"       # 200 ready:false
         badhead_flag = tmp / "readyz-wrong-head"    # 200 ready:true 0019
 
@@ -2319,7 +2577,7 @@ def check_upgrade() -> None:
                     if ready_flag.exists():
                         body = json.dumps({
                             "ready": False, "migration_version": "0019",
-                            "issues": ["schema 0019 behind head 0027"],
+                            "issues": [f"schema 0019 behind head {head_rev}"],
                             "controller": {"ok": True, "detail": ""},
                             "runner": {"ok": True, "detail": ""},
                             "recordings_writable": True,
@@ -2330,7 +2588,7 @@ def check_upgrade() -> None:
                             "issues": []}).encode()
                     else:
                         body = json.dumps({
-                            "ready": True, "migration_version": "0027",
+                            "ready": True, "migration_version": head_rev,
                             "issues": []}).encode()
                     ctype = "application/json"
                 elif self.path == "/":
@@ -2433,6 +2691,7 @@ def check_upgrade() -> None:
                 fail("sandbox fresh install", (r.stdout + r.stderr)[-500:])
 
         def seed(url_x: str, tag: str, *, coach: bool = True) -> None:
+            from srplatform.api.auth import hash_password
             eng = sa_create(url_x)
             with eng.begin() as c:
                 c.execute(sa_text(
@@ -2440,6 +2699,14 @@ def check_upgrade() -> None:
                     "role) VALUES (gen_random_uuid(), :u, "
                     "'scrypt$witness$keep', 'operator')"),
                     {"u": f"p21-witness-{tag}"})
+                # AC-5: a member whose hash REAL code can verify — the
+                # witness hash proves only that upgrades preserve bytes,
+                # it can never authenticate. The post-upgrade browser
+                # login signs in as this user.
+                c.execute(sa_text(
+                    "INSERT INTO users (user_id, username, password_hash, "
+                    "role) VALUES (gen_random_uuid(), :u, :h, 'member')"),
+                    {"u": LOGIN_USER, "h": hash_password(LOGIN_PW)})
                 sid = c.execute(sa_text(
                     "INSERT INTO sessions (session_id, scenario_id, status) "
                     "VALUES (gen_random_uuid(), 'web-foothold-01', "
@@ -2485,6 +2752,17 @@ def check_upgrade() -> None:
         manifest_path = iseq.build_manifest(tmp / "appliance-input")
         man_raw = json.loads(manifest_path.read_text())
         man_raw["urls"]["internal"] = f"http://127.0.0.1:{ready_port}"
+        # AC-5/LIVE-05 (review round 1): the gate must prove a REAL
+        # browser login after the upgrade, so the manifest carries a
+        # loopback PUBLIC url (the schema allows http; a real appliance
+        # uses its LAN address). The web bundle bakes it at provision,
+        # and after the upgrade a fixed /api-stripping proxy answers on
+        # this very port — the installed nginx's one rule — so the
+        # browser's baked address reaches the upgraded API.
+        with socket.socket() as _s:
+            _s.bind(("127.0.0.1", 0))
+            pubport = _s.getsockname()[1]
+        man_raw["urls"]["public"] = f"http://127.0.0.1:{pubport}"
         manifest_path.write_text(json.dumps(man_raw))
         rootA = tmp / "rootA"
         apply_sandbox(rootA, manifest_path)
@@ -2539,7 +2817,7 @@ def check_upgrade() -> None:
                  f"status={outA.get('status')} missing={missing}")
         heads = {row[0] for row in
                  db_q(url, "SELECT version_num FROM alembic_version")}
-        if heads != {"0027"}:
+        if heads != {head_rev}:
             fail("preserving upgrade reached head", f"heads {heads}")
         # round-3 finding 1: the ENGINE bootstrapped the 0021 prerequisite
         # itself — role created through the installer channel, API-only
@@ -2609,12 +2887,18 @@ def check_upgrade() -> None:
         # posted login to localhost:8000 and every sign-in "Failed to
         # fetch" despite a healthy appliance. The receipt is the proof.
         web_receipt = receipt.get("web") or {}
-        if web_receipt.get("next_public_api_url") != "https://sr.example.edu/api":
+        if web_receipt.get("next_public_api_url") != f"http://127.0.0.1:{pubport}/api":
             fail("upgrade frontend baked the manifest's public API URL",
                  f"receipt next_public_api_url="
                  f"{web_receipt.get('next_public_api_url')!r}")
         ok("upgrade provisioned the frontend with the public API URL",
            str(web_receipt.get("next_public_api_url")))
+        # ---- AC-5 / LIVE-05 (review round 1): the baked URL must not
+        # merely be present — a real browser must sign in through it
+        # against the upgraded code. Fails the gate on any missing piece.
+        login_note = _upgrade_browser_login(tmp, rootA, receipt, url,
+                                            pubport)
+        ok("real browser login against the upgraded appliance", login_note)
         # F5: the CHECKED restart ran against the service double — every
         # unit restarted and then verified active; stamp only after that
         ctl_lines = ctl_log_a.read_text().splitlines() if \
@@ -2922,7 +3206,7 @@ def check_upgrade() -> None:
                  "no-ops away)", json.dumps(outB)[:400])
         heads_b = {row[0] for row in
                    db_q(url2, "SELECT version_num FROM alembic_version")}
-        if heads_b != {"0027"}:
+        if heads_b != {head_rev}:
             fail("resumed upgrade reached head exactly once", str(heads_b))
         if drifted.read_text().startswith("# foreign drift"):
             fail("activation replaced the drifted runtime file")
