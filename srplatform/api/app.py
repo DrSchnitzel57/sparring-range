@@ -237,6 +237,12 @@ def readyz():
     except Exception as e:  # noqa: BLE001
         issues.append(f"db: {e}")
     s = _gs()
+    # Review F3: the runner fact here is CONFIG READINESS only (transport
+    # named, key present, non-empty host trust) — never current runner HEALTH.
+    # A live runner probe at /readyz would couple installation readiness to a
+    # reachable attacker runner, which bootstrap cannot require. Label the
+    # fact so no consumer reads runner.ok as "runner healthy / may Begin";
+    # current health lives in the admission probes at /safety/qualification.
     runner_ok, runner_why = get_supervisor().runner_available()
     rec_dir = s.recordings_dir
     rec_ok = os.access(rec_dir, os.W_OK) if os.path.isdir(rec_dir) else False
@@ -259,7 +265,10 @@ def readyz():
     return {"ready": v is not None and not issues,
             "migration_version": v, "issues": issues,
             "controller": {"ok": controller, "detail": controller_detail},
-            "runner": {"ok": runner_ok, "detail": runner_why},
+            "runner": {"ok": runner_ok, "detail": runner_why,
+                       "fact": "config-readiness (deterministic; no live "
+                               "probe) — current runner health: "
+                               "/safety/qualification"},
             "recordings_writable": rec_ok,
             "safety": get_supervisor().verify()}
 
@@ -2613,6 +2622,42 @@ def safety_killswitch_test(body: KillswitchTestIn, p: Principal = Depends(operat
     return {"ok": ok,
             "note": "recorded" if ok else "recorded as FAILED — starts stay denied "
                     "until a complete test passes"}
+
+
+class ReclassifyIn(BaseModel):
+    kind: str = Field(min_length=1, max_length=64)
+    reason: str = Field(min_length=3, max_length=500)
+    expect_recorded_at: float | None = None
+
+
+@app.post("/safety/reclassify-qualification")
+def safety_reclassify_qualification(body: ReclassifyIn,
+                                    p: Principal = Depends(operator)):
+    """SUPPORTED one-time operator classification of a pre-contract
+    qualification record (plan 22 review F4) — the endpoint behind the
+    recovery instruction the safety surfaces print, so the documented
+    command must never be a dead end.
+
+    Not a recommission: this records the operator's explicit compatibility
+    decision over the EXACT source record they examined (kind allowlist,
+    operator-only, source recorded_at binding against concurrent moves,
+    failed/newest-already-contracted records refused, original append-only
+    line untouched, actor + digests persisted). A fresh live observation
+    is recorded with its own endpoint and its own proof; nothing here
+    accepts a bare reason string in place of a record."""
+    from srplatform.safety import QUALIFICATION_KINDS
+    if body.kind not in QUALIFICATION_KINDS:
+        raise HTTPException(422, f"{body.kind} is not a qualification kind "
+                                 f"(allowed: {', '.join(sorted(QUALIFICATION_KINDS))})")
+    try:
+        return get_supervisor().reclassify_qualification(
+            body.kind, reason=body.reason, actor=p.username,
+            expect_recorded_at=body.expect_recorded_at)
+    except ValueError as exc:
+        msg = str(exc)
+        if "no " in msg and "record exists" in msg:
+            raise HTTPException(404, msg) from None
+        raise HTTPException(409, msg) from None
 
 
 # --- agent_state (worker-scoped working memory) ---------------------------------

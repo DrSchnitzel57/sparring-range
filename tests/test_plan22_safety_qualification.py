@@ -280,31 +280,57 @@ def test_production_static_isolation_is_declared_unsupported_not_inapplicable(
         config_identity
     s = Settings(sr_env="production", runner_transport="ssh",
                  runner_ssh_target="runner@192.0.2.9",
-                 runner_ssh_key_path=str(tmp_path / "no-key"),
-                 runner_ssh_known_hosts=str(tmp_path / "empty-trust"),
+                 runner_ssh_key_path=str(tmp_path / "runner-key"),
+                 runner_ssh_known_hosts=str(tmp_path / "trust"),
                  safety_state_file=str(tmp_path / "s.json"))
-    (tmp_path / "empty-trust").write_text("")   # exists but pins NOTHING
+    (tmp_path / "runner-key").write_text("dummy-private\n")
+    (tmp_path / "trust").write_text("[192.0.2.9]:22 ssh-ed25519 AAAA\n")
+    probe_calls = []
     monkeypatch.setattr(safety_mod, "_runner_health_probe",
-                        lambda _s: (False, "runner refused the configured "
-                                           "identity: Permission denied"))
+                        lambda _s: (probe_calls.append(1) or
+                                    (False, "runner refused the configured "
+                                            "identity: Permission denied")))
     ident = config_identity(s)
     recs = {k: _aged(k, identity=ident) for k in ALL_KINDS}
     sup = Supervisor(datapath=StaticIsolationDatapath(), settings=s,
                      state_file=str(tmp_path / "s.json"))
     sup._mirror_dh = []
     sup._records_reader = lambda: list(recs.values())
-    sup._db_read_state = lambda: ({"latched": False, "latched_at": None,
-                                   "reason": None}, None)
+    sup._db_read_state = (lambda: ({"latched": False, "latched_at": None,
+                                    "reason": None}, None))
     sup._record_failures = []
     probes = sup.admission_probes()
     iso = next(c for c in probes["checks"] if c["check"] == "isolation_live")
     assert iso["ok"] is None and iso.get("declared_unsupported") is True
     run = next(c for c in probes["checks"] if c["check"] == "runner")
     assert run["ok"] is False
+    assert probe_calls, "usable config must reach the REAL probe"
     assert not probes["ok"]                      # failing health, not "fine"
     ok, reasons = sup.start_gate()
     assert not ok
     assert any("runner refused the configured identity" in r for r in reasons)
+    # review F3: the SHARED deterministic layer — with a missing key or an
+    # EMPTY trust file the surfaces refuse on the config fact BEFORE any
+    # probe could run (identical detail on every consumer, /readyz too)
+    s2 = Settings(sr_env="production", runner_transport="ssh",
+                  runner_ssh_target="runner@192.0.2.9",
+                  runner_ssh_key_path=str(tmp_path / "no-key"),
+                  runner_ssh_known_hosts=str(tmp_path / "trust"),
+                  safety_state_file=str(tmp_path / "s2.json"))
+    sup2 = sup.__class__(datapath=StaticIsolationDatapath(), settings=s2,
+                         state_file=str(tmp_path / "s2.json"))
+    rc = sup2._runner_check()
+    assert rc["ok"] is False and "private key missing" in rc["detail"]
+    cfg, why = sup2.runner_available()
+    assert (cfg, why) == (rc["ok"], rc["detail"])  # one fact, one truth
+    s2.runner_ssh_key_path = str(tmp_path / "runner-key")
+    (tmp_path / "empty-trust").write_text("")    # exists but pins NOTHING
+    s2.runner_ssh_known_hosts = str(tmp_path / "empty-trust")
+    sup3 = sup.__class__(datapath=StaticIsolationDatapath(), settings=s2,
+                         state_file=str(tmp_path / "s3.json"))
+    rc3 = sup3._runner_check()
+    assert rc3["ok"] is False and "EMPTY" in rc3["detail"]
+    assert sup3.runner_available() == (False, rc3["detail"])
     joined = " ".join(reasons + sup.qualification_report()["advisories"])
     # the exact wording the review called out as the fail-open:
     assert "inapplicable" not in joined.lower()

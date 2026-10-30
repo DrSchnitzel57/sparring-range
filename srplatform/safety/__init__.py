@@ -29,7 +29,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from srplatform.safety.datapath import DatapathController, config_identity, get_datapath
+from srplatform.safety.datapath import (
+    DatapathController, _file_fingerprint, config_identity, get_datapath)
 from srplatform.safety.runregistry import run_registry
 from srplatform.settings import Settings, get_settings
 
@@ -275,7 +276,8 @@ class Supervisor:
 
     # --------------------------------------------------------------- records ---
     def reclassify_qualification(self, kind: str, *, reason: str,
-                                 actor: str) -> dict:
+                                 actor: str,
+                                 expect_recorded_at: float | None = None) -> dict:
         """ONE-TIME operator classification of pre-contract evidence (plan 22
         review): a legacy record whose detail cannot prove its scope is not
         silently honored and not silently thrown away — an operator who has
@@ -287,7 +289,18 @@ class Supervisor:
         content quoted by digest), keeps the original append-only line
         untouched, and names the actor. Age-only manual retests stay
         removed — this is the explicit compatibility decision, made once
-        per record, not a daily ritual."""
+        per record, not a daily ritual.
+
+        Review F4: the classification is bound to the EXACT record the
+        operator examined. When ``expect_recorded_at`` is supplied (the
+        CLI/API path always passes what the surface displayed), a record
+        that moved since — a newer or different newest record — is refused
+        rather than silently classified, so a concurrent re-commission or
+        a stale panel can never have the WRONG source laundered. The kind
+        allowlist, the failed/newest-contract refusals and the reason
+        requirement stand; nothing here accepts a bare reason against an
+        unproven field: the source record must exist, must be a passing
+        check, must predate the contract, and its identity is recorded."""
         if kind not in QUALIFICATION_KINDS:
             raise ValueError(f"{kind} is not a qualification kind")
         if not str(reason or "").strip():
@@ -296,6 +309,18 @@ class Supervisor:
         rec = self._latest_records().get(kind)
         if not rec:
             raise ValueError(f"no {kind} record exists to classify")
+        if expect_recorded_at is not None:
+            try:
+                want = float(expect_recorded_at)
+            except (TypeError, ValueError):
+                raise ValueError("expect_recorded_at must be the source "
+                                 "record's recorded_at value") from None
+            if abs(float(rec.get("recorded_at") or 0.0) - want) > 1e-6:
+                raise ValueError(
+                    f"the newest {kind} record is no longer the one being "
+                    f"classified (recorded_at {rec.get('recorded_at')!r} != "
+                    f"{want!r}) — re-examine the current record before "
+                    "classifying")
         if (rec.get("detail") or {}).get("qualification_contract") is not None:
             raise ValueError(
                 f"the newest {kind} record already carries a qualification "
@@ -529,8 +554,17 @@ class Supervisor:
             return {"check": "runner", "ok": ok_cfg, "detail": why_cfg}
         if not ok_cfg:
             return {"check": "runner", "ok": False, "detail": why_cfg}
-        key = (s.runner_ssh_target, s.runner_ssh_key_path,
-               s.runner_ssh_known_hosts)
+        # Review F2: the memo key must be the TRANSPORT TRUST IDENTITY, not
+        # the file NAMES. Re-pinning a foreign host key or rotating the key
+        # IN PLACE keeps the paths identical while the authority behind
+        # them changes completely — a path-keyed cache then replays the old
+        # success for the TTL even though the direct probe would (correctly)
+        # refuse the foreign pin. Fingerprints are content digests
+        # (key contents never enter the key; a missing file is its own
+        # distinct identity, as are empty vs unreadable).
+        key = (s.runner_transport, str(s.runner_ssh_target or ""),
+               _file_fingerprint(str(s.runner_ssh_key_path or "")),
+               _file_fingerprint(str(s.runner_ssh_known_hosts or "")))
         cache = getattr(self, "_runner_probe_cache", None)
         if cache and cache["key"] == key and time.monotonic() < cache["until"]:
             ok, why = cache["res"]
@@ -545,8 +579,17 @@ class Supervisor:
         """The VM-cessation authority answers RIGHT NOW (or it does not).
         An unconfigured authority is only non-applicable where the
         configuration carries no VMs to stop (the noop-fixture exemption
-        the qualification applies); anywhere else its absence fails
-        closed."""
+        the qualification applies); anywhere else its absence fails closed.
+
+        Review F1 (HIGH): answering is not the same as ANSWERING THE
+        CONTRACT. The broker's latch record is exactly
+        ``{latched: strict bool, reason, latched_at}`` (ledger.get_latch);
+        anything else — a missing key, a null/zero/string "latched", a bare
+        list or None, a wrong authority speaking another protocol — is
+        UNKNOWN and must block, never launder itself into "no engagement
+        active". The check validates the typed shape first and only then
+        reads the boolean; NO falsy value is ever treated as release, and
+        no exception escapes as a trace."""
         if self.broker is None:
             if self.settings.sr_env != "production":
                 return {"check": "broker_authority", "ok": True,
@@ -562,13 +605,33 @@ class Supervisor:
         except Exception as exc:  # noqa: BLE001 — unknown is not healthy
             return {"check": "broker_authority", "ok": False,
                     "detail": f"broker authority unreachable: {str(exc)[:160]}"}
-        if isinstance(st, dict) and st.get("latched"):
+        if not isinstance(st, dict):
+            return {"check": "broker_authority", "ok": False,
+                    "detail": f"broker reply UNTRUSTED: expected the latch "
+                              f"record object, got {type(st).__name__} — "
+                              "starts stay refused until it answers the "
+                              "contract"}
+        missing = [f for f in ("latched", "reason", "latched_at")
+                   if f not in st]
+        if missing:
+            return {"check": "broker_authority", "ok": False,
+                    "detail": f"broker reply UNTRUSTED: latch record missing "
+                              f"field(s) {', '.join(missing)} — starts stay "
+                              "refused until it answers the contract"}
+        if not isinstance(st["latched"], bool):
+            return {"check": "broker_authority", "ok": False,
+                    "detail": f"broker reply UNTRUSTED: latched must be the "
+                              f"strict boolean the contract defines, got "
+                              f"{type(st['latched']).__name__} — starts "
+                              "stay refused"}
+        if st["latched"]:
             return {"check": "broker_authority", "ok": False,
                     "detail": f"broker reports emergency engagement ACTIVE "
                               f"({str(st.get('reason') or 'no reason recorded')[:120]}) "
                               "— starts stay refused"}
         return {"check": "broker_authority", "ok": True,
-                "detail": "broker authority answers; no engagement active"}
+                "detail": "broker authority answers the latch contract; "
+                          "no engagement active"}
 
     def admission_probes(self) -> dict:
         """Bounded, NON-DESTRUCTIVE, authoritative health of RIGHT NOW
@@ -804,14 +867,39 @@ class Supervisor:
 
     # ------------------------------------------------------------------ gate ---
     def runner_available(self) -> tuple[bool, str]:
+        """DETERMINISTIC config-readiness of the runner (NOT its live health):
+        the transport is named and every input the transport will NEED is
+        actually present and usable. Review F3: this is what /readyz reports,
+        so it must never be a misleading positive. A configured-but-absent
+        private key or an EMPTY host-trust file cannot authenticate a runner
+        — the live probe and the Begin classifier both refuse them — so
+        config readiness says NO too, and the two surfaces agree. This does
+        not probe the network (readiness stays side-effect-free); the actual
+        health is the SEPARATE admission probe, so installation readiness is
+        still satisfied without an attacker or guest being active."""
         s = self.settings
         t = s.runner_transport
         if t == "ssh":
             if not (s.runner_ssh_target and s.runner_ssh_key_path and s.runner_ssh_known_hosts):
                 return False, "isolated runner not fully configured (target/key/known_hosts)"
-            if not Path(s.runner_ssh_known_hosts).exists():
+            if not Path(s.runner_ssh_known_hosts).is_file():
                 return False, f"runner host-key file missing: {s.runner_ssh_known_hosts}"
-            return True, "ssh runner configured"
+            try:
+                trust_lines = [
+                    ln for ln in Path(s.runner_ssh_known_hosts)
+                    .read_text(errors="replace").splitlines()
+                    if ln.strip() and not ln.strip().startswith("#")]
+            except OSError:
+                trust_lines = []
+            if not trust_lines:
+                # an empty trust file authenticates NO host: every pinning
+                # connection is refused, so this is not a ready runner
+                return False, (f"runner host-key file is EMPTY "
+                               f"({s.runner_ssh_known_hosts}) — no pinned "
+                               "host to trust; the runner cannot be reached")
+            if not Path(s.runner_ssh_key_path).is_file():
+                return False, f"runner private key missing: {s.runner_ssh_key_path}"
+            return True, "ssh runner configured (key + non-empty host trust present)"
         if t == "local-dev":
             if s.sr_env == "production":
                 return False, "local-dev runner forbidden in production"
