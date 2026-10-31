@@ -1,5 +1,130 @@
 # Current findings and validation evidence
 
+## Plan-22 review-round-5 receipts — 2026-10-31 (branch `practice-upgrades-18-21`, fix `2c9cad4`)
+
+Independent focused review of `dc5fb27`/source `71c0200` returned
+**VERDICT: FIX**: the ordinary counterexamples passed, but four exact
+boundary defects remained under two EXTENDED owner contracts — (1) DB-
+published safety records are ordered by their authoritative append
+identity across EVERY mirror, a delayed file copy can never become a
+newer observation, and retained outage-only evidence is EXPLICITLY
+UNRECONCILED (never authorizes, never overrides an authoritative FAILED,
+never lost); (2) provenance references resolve the FULL authoritative
+source record (kind, strict outcome, scope), not detail+time. All four
+were root-fixed at `2c9cad4` with real HTTP/PG and tiny-fixture proofs in
+`tests/test_plan22_review_round5.py`:
+
+- **F1 (HIGH) delayed mirror hid a DB failure** — the classification's
+  DB commit was authoritative, but its file mirror (written after the
+  commit) carried no sequence, so the timestamp-ordered merge let that
+  delayed copy become the newest observation (usable TRUE despite the
+  committed FAILED baseline). Now: `_authoritative_publish` returns the
+  committed `record_id` and EVERY mirror envelope (`_mirror_dh` and the
+  durable file ledger) carries it as `seq`; `_latest_records` orders by
+  sequence within the store, an unreconciled line NEVER supersedes an
+  authoritative one, a same-sequence tie keeps the authoritative row's
+  envelope, and a mirror line that POSITIVELY matches an authoritative
+  record (kind + outcome + config identity + detail digest) is that
+  record's copy and inherits its sequence — replayed/delayed duplicates
+  reconcile instead of becoming evidence. Lines that remain sequence-less
+  while an authoritative sequence exists are retained as EXPLICITLY
+  UNRECONCILED: they never authorize, never override, never disappear,
+  an unreconciled FAILED blocks conservatively, and an unreconciled
+  engage/release transition honors the gate rule. The legacy
+  file-only/no-store lane keeps its historical timestamp semantics
+  (N07), and the outage persistence failure stays retained. Proof:
+  deterministic real-uvicorn post-commit/pre-mirror barriers in BOTH
+  orderings (classification parked → FAILED commits AND mirrors →
+  release: rows [legacy, classification, FAILED], ledger really shows the
+  classification LAST, yet the selected record is the authoritative
+  FAILED one, usable FALSE; FAILED parked pre-mirror → classification
+  refuses 409 against committed authority with its mirror not yet
+  written — no DB transaction spans the network wait), normal-read +
+  reconciled-duplicate + fabricated-pass-unreconciled + delayed-other-
+  kind probes, and a fast-lane DB-unavailable→recovered lane proving an
+  unreconciled pass cannot authorize once authority returns while the
+  failure is never lost. The round-4 source-read SQL lock race,
+  six-classifier single winner and store-503 positives stay green.
+- **F2 (MEDIUM) cross-kind/failed chains accepted** — the persisted-chain
+  reader resolved detail+time only, so a persisted baseline_check
+  classification naming a FAILED datapath_proof record with the CORRECT
+  digest and time read as a CURRENT USABLE pass. The resolver now
+  resolves the FULL authoritative row at every hop: same qualification
+  kind, strict `ok is True`, `record_identity_was` == the source row's
+  config identity, `bound_identity` == the carrying row's identity,
+  digest match, marker sanity (unknown contract, flag-without-marker and
+  binding-less persisted rows are malformed — INCOMPATIBLE, never a
+  usable current pass, never a now-fallback). Proven through the real
+  API/DB on persisted forged chains (cross-kind FAILED with correct
+  digest/time, failed same-kind, wrong scope, unknown marker,
+  binding-less row → incompatible with truthful problems) plus the
+  fast-lane resolver matrix (bool/NaN/future carried values, foreign
+  self-binding, cyclic chain); the valid nested chain and immutable
+  original stay the positive (seeded chains carry the true bindings).
+- **F3 (HIGH) missing bundle content verified OK** — `_trustworthy`
+  returned False WITHOUT recording a problem on a missing path, and the
+  caller's `continue` then skipped the missing-file check, so a bundle
+  with a deleted listed file or even the shipped base image verified
+  ok. Every refusal in `_trustworthy` now records its problem
+  (missing / cannot-stat / symlink component / non-regular / escape),
+  and the per-image caller keeps its `missing image:` wording; the
+  upgrade payload guard remains as the separate second layer. Proven on
+  a tiny real-qcow2 bundle for each class: deleted listed file, broken
+  symbolic link in its place, deleted shipped image, the entire images
+  directory, a deleted nested parent directory — each refused — plus a
+  fresh intact positive control.
+- **F4 (MEDIUM) activation destructive and non-exclusive** — after
+  staging the builder unconditionally `rmtree`'d any existing
+  destination (a foreign destination appearing after the preflight was
+  destroyed; a failing forced activation left no previous release).
+  Activation is now a `renameat2(RENAME_NOREPLACE)` primitive (fails
+  closed if unsupported — no destructive fallback): without force, a
+  destination appearing in the preflight→activation window is refused
+  atomically with the foreign bytes AND inode intact; with force, the
+  previous release is moved to a tokenized backup FIRST, the staged
+  build is activated, the backup is restored verbatim if activation
+  fails, and only a SUCCESSFUL replacement removes the superseded
+  release. Callers unchanged (the gates build only when no release
+  exists; no silent force anywhere). Proven with the deterministic
+  activation barrier (foreign sentinel + inode unchanged, no debris) and
+  injected activation-rename fault under force (previous valid bundle
+  verifies, revision intact, no staging/backup debris).
+
+Round-5 verification (real exit statuses, foreground, serialized; lanes
+not listed carry the round-4/3/2/1 receipts with explicit base — the
+model-administration/agent lanes, containment fixtures, install
+sequences, the preserving-upgrade + REAL browser login and the web
+bundle/browser consume nothing whose contract changed: the report shape
+is field-compatible and the new provenance value only appears with
+unreconciled evidence, proven by the rerun DB lanes; the browser/login
+lanes were last rerun at `71c0200`/`034ac0b`):
+
+| Lane | Rerun/carry | Result |
+|---|---|---|
+| fast (exact AGENTS command) | RERAN | exit 0 — **741 passed, 0 failed, 0 skipped**, 529 deselected, 13 warnings, 136.0 s (includes the 4 new fast round-5 proofs and the updated round-4 resolver matrix) |
+| selection | RERAN | PASS 253.0 s |
+| practice | RERAN | PASS 12.8 s — 12 + 28 passed, 0 skipped |
+| db (focused: round-2+3+4+5 files) | RERAN 3× | **22 passed, 0 failed** every run (~20 s) — both real-HTTP mirror barriers, reconciled/forged copies, persisted forged-chain probes, six-barrier winner, provenance matrices |
+| db (FULL gate — shared reader/merge changed) | RERAN | PASS 735.8 s — complete db layer green, owned DB resources verified cleaned |
+| authority | RERAN | PASS 27.8 s — 35 passed |
+| bundle | RERAN | PASS 383.1 s — NEW `.cache/bundle/sparring-range-appliance-22f` (MANIFEST sha256 `0aeecdaa5948abe12044e5b65a1b5109b621c9d7891e2d502157e0722f87d6d2`, revision `2c9cad4fd2d3` = this fix commit, 395 files, 4 images hardlinked via `--link-images`, zero image duplication, no force needed); verify + 248-file runtime binding + manifest render + image boot (overlay, TCG, marker `2026-10-31T19:41:47Z`) + tamper refusal, all under the positively-accounting verifier |
+| upgrade (incl REAL browser login), install, agent, containment, frontend, browser | CARRIED (scoped, `71c0200`/`034ac0b`) | 513.1 s PASS / sequences / 123 / 41 / 0 high+critical / 7 of 7 — inputs unchanged (report shape field-compatible; those lanes exercised at the round-4 base) |
+
+Disk and artifact discipline: 19 GiB free at start (after the
+user-authorized parent cleanup of the three obsolete candidates — that
+deletion is the PARENT's action, acknowledged, not a seal failure), 19
+GiB at end; no image copy existed this round (hardlinks only, the
+shared inodes' nlink 3→4 is the only change — inode, mode and mtime
+identical); the 2 GiB reserve never breached. The three protected
+seals (original `0cfa12f1f48c…`, `-22d` `35e4e9635a86…`, `-22e`
+`71eb837e81ec…`) verified byte-identical before and after. My stale
+round-4 disk-guard loop was killed and confirmed absent; disposable PG
+clusters self-cleaned; only this session's fresh `/tmp` fixtures were
+removed (prefix + owner + mtime); zero `sr-*` containers left; foreign
+`sr-libvirt-*`/`sr-guest-cache` untouched. Roadmap 22 stays unchecked —
+no installed appliance, provider, systemd or nested-KVM acceptance is
+claimed.
+
 ## Plan-22 review-round-4 receipts — 2026-10-30 (branch `practice-upgrades-18-21`, fix `71c0200`)
 
 Independent focused review of candidate `034ac0b` returned **VERDICT: FIX**:

@@ -118,6 +118,16 @@ gates independently. Any requirement not met stays open, regardless of plan tick
   bundle `-22e` built by the new staging builder while all older seals
   stayed byte-identical; round-4 lane table in `FINDINGS_CHECKLIST.md`.
   The box stays unchecked until that independent re-review accepts.
+  Review round 5 (FIX) closed the same day under the extended owner
+  contracts: four boundary defects (a delayed mirror copy hiding a
+  committed DB failure, cross-kind/failed persisted provenance chains,
+  missing bundle content verifying OK, and a destructive non-exclusive
+  activation) root-fixed at `2c9cad4` with deterministic real-HTTP
+  mirror-barrier, persisted-forgery and tiny-fixture proofs, the full
+  db gate green, and bundle `-22f` built with regular hardlinks while
+  the three protected seals stayed byte-identical; round-5 lane table
+  in `FINDINGS_CHECKLIST.md`. The box stays unchecked until that
+  independent re-review accepts.
   User authorized plan creation followed directly by Qwen Flash Next high
   implementation and autonomous independent review on the existing branch.
   No push, merge, automatic deployment or repeated unchanged live commissioning.
