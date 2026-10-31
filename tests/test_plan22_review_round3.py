@@ -304,13 +304,17 @@ def test_nested_classification_chain_uses_oldest_original(client, users):
     orig_id = _seed("datapath_proof", ident="older-identity-9", age_h=6000,
                     detail_json={}, returning=True)
     # an intermediate classification of that original (round-3-era audit),
-    # then a later classification of THAT, both with true digests
+    # then a later classification of THAT, all with true digests AND the
+    # scope bindings the round-5 provenance contract requires: every hop
+    # records the SOURCE row's config identity and binds itself to its own
     mid_digest_target = _detail_digest({})
     cls1_detail = {"qualification_contract": 1,
                    "one_time_reclassification": True,
                    "observed_at": observed,
                    "source_record_id": orig_id,
                    "original_detail_digest": mid_digest_target,
+                   "record_identity_was": "older-identity-9",
+                   "bound_identity": "legacy-identity-17",
                    "reason": "seeded chain step 1", "operator": "seed"}
     cls1_id = _seed("datapath_proof", ident="legacy-identity-17",
                     age_h=100, detail_json=cls1_detail, returning=True)
@@ -321,6 +325,8 @@ def test_nested_classification_chain_uses_oldest_original(client, users):
                        "source_record_id": cls1_id,
                        "original_detail_digest":
                            _detail_digest(cls1_detail),
+                       "record_identity_was": "legacy-identity-17",
+                       "bound_identity": "legacy-identity-17",
                        "reason": "seeded chain step 2", "operator": "seed"})
     _seed("release", age_h=5900, detail_json={})   # after obs, before audit
     q, _ = _qual(client, users, "datapath_proof")

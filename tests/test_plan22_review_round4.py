@@ -248,10 +248,13 @@ def test_marked_ordinary_record_injected_time_also_ignored(client, users):
 
 
 def _seed_classification(kind, *, src_id, digest, observed_at, age_h=10,
-                         drop_observed=False):
+                         drop_observed=False, src_identity="legacy-identity-17",
+                         own_identity="legacy-identity-17"):
     det = {"qualification_contract": 1, "one_time_reclassification": True,
            "source_record_id": src_id,
            "original_detail_digest": digest,
+           "record_identity_was": src_identity,
+           "bound_identity": own_identity,
            "reason": "forged seed", "operator": "seed"}
     if not drop_observed:
         det["observed_at"] = observed_at
@@ -306,23 +309,42 @@ def test_forged_or_broken_provenance_is_incompatible(client, users):
 
 def test_resolver_rejects_paths_without_authority(tmp_path):
     """Fast-lane resolution matrix (no DB): every non-finite, non-
-    plausible or chain-broken provenance raises SafetyProvenanceError —
-    a stored field alone never establishes when a test ran."""
+    plausible or chain-broken provenance — INCLUDING cross-kind, failed
+    sources, wrong scope and unknown markers (round 5) — raises
+    SafetyProvenanceError. A stored field alone never establishes when a
+    test ran or what it proved."""
     from srplatform.safety import (SafetyProvenanceError,
                                    _detail_digest,
                                    _is_recognized_classification)
     from tests.test_plan22_review_round3 import _Raw, _f1_sup
     sup = _f1_sup(tmp_path, _Raw())
     now = time.time()
+    SRC_ID, SRC_IDENTITY = 1, "cid-src"
 
     def cls_detail(**kw):
         d = {"qualification_contract": 1, "one_time_reclassification": True,
-             "source_record_id": 1, "original_detail_digest":
-                 _detail_digest({}), "observed_at": now - 3600}
+             "source_record_id": SRC_ID, "original_detail_digest":
+                 _detail_digest({}), "observed_at": now - 3600,
+             "record_identity_was": SRC_IDENTITY,
+             "bound_identity": "cid-self"}
         d.update(kw)
         return d
 
-    ok_fetch = lambda rid: ({}, now - 3600) if rid == 1 else None  # noqa
+    SELF = {"record_id": 42, "config_identity": "cid-self"}
+
+    def _row(**kw):
+        r = {"record_id": SRC_ID, "kind": "baseline_check", "ok": True,
+             "detail": {}, "config_identity": SRC_IDENTITY,
+             "recorded_at": now - 3600}
+        r.update(kw)
+        return r
+
+    ok_fetch = lambda rid: _row() if rid == SRC_ID else None  # noqa
+
+    def resolve(det, fetch=ok_fetch, **kw):
+        return sup._resolve_provenance(det, now, fetch,
+                                       kind="baseline_check",
+                                       self_row=SELF, now=now, **kw)
 
     for bad, why in (
         ({"observed_at": float("nan")}, "nan"),
@@ -334,11 +356,15 @@ def test_resolver_rejects_paths_without_authority(tmp_path):
         ({"observed_at": now - 3600, "source_record_id": None}, "no id"),
         ({"observed_at": now - 3600,
           "original_detail_digest": 7}, "digest type"),
+        ({"observed_at": now - 3600,
+          "record_identity_was": None}, "no scope binding"),
+        ({"observed_at": now - 3600,
+          "bound_identity": "cid-other"}, "foreign self-binding"),
     ):
         det = cls_detail()
         det.update(bad)
         with pytest.raises(SafetyProvenanceError):
-            sup._resolve_provenance(det, now, ok_fetch, now=now)
+            resolve(det)
 
     # unmarked original: an injected observed_at has NO authority — the
     # record timestamp rules, even if the field says "now"
@@ -346,28 +372,53 @@ def test_resolver_rejects_paths_without_authority(tmp_path):
                                    lambda rid: None,
                                    now=now) == pytest.approx(
                                        now - 5000 * 3600)
+
+    # F2 (round 5): the chain reference must resolve to a PASSED record of
+    # the SAME kind with the SAME scope — digest/time agreement alone
+    # proves nothing.
+    with pytest.raises(SafetyProvenanceError, match="same qualification"):
+        resolve(cls_detail(), lambda rid: _row(kind="datapath_proof")
+                if rid == SRC_ID else None)
+    with pytest.raises(SafetyProvenanceError, match="did not PASS"):
+        resolve(cls_detail(), lambda rid: _row(ok=False)
+                if rid == SRC_ID else None)
+    with pytest.raises(SafetyProvenanceError, match="scope"):
+        resolve(cls_detail(), lambda rid: _row(config_identity="cid-evil")
+                if rid == SRC_ID else None)
+    with pytest.raises(SafetyProvenanceError, match="digest"):
+        resolve(cls_detail(original_detail_digest="0" * 16))
+    # an unknown future/legacy contract marker in the SOURCE is unknown —
+    # never a trusted hop or terminal
+    evil = {"qualification_contract": 99}
+    with pytest.raises(SafetyProvenanceError, match="unknown"):
+        resolve(cls_detail(original_detail_digest=_detail_digest(evil)),
+                lambda rid: _row(detail=evil) if rid == SRC_ID else None)
+    # a malformed hop: classification flag without a marker
+    evil2 = {"one_time_reclassification": True}
+    with pytest.raises(SafetyProvenanceError, match="malformed"):
+        resolve(cls_detail(original_detail_digest=_detail_digest(evil2)),
+                lambda rid: _row(detail=evil2) if rid == SRC_ID else None)
+
     # cyclic chain: a classification whose source chain points back at a
     # record already visited (a self-pointer is the minimal cycle)
-    rec1 = cls_detail(source_record_id=1)
-    cyc = {1: (rec1, now - 3600)}
+    rec1 = cls_detail(source_record_id=SRC_ID, bound_identity=SRC_IDENTITY)
+    rec1["original_detail_digest"] = _detail_digest({})
+    cyc = {SRC_ID: _row(detail=rec1)}
 
     def cyc_fetch(rid):
-        entry = cyc.get(rid)
-        return (entry[0], entry[1]) if entry else None
+        return cyc.get(rid)
 
-    det = cls_detail(source_record_id=1,
+    det = cls_detail(source_record_id=SRC_ID,
                      original_detail_digest=_detail_digest(rec1))
     with pytest.raises(SafetyProvenanceError, match="cyclic"):
-        sup._resolve_provenance(det, now, cyc_fetch, now=now)
+        resolve(det, cyc_fetch)
 
     # disagreement between the carried time and the resolved original
     with pytest.raises(SafetyProvenanceError, match="inconsistent"):
-        sup._resolve_provenance(cls_detail(observed_at=now - 999 * 3600),
-                                now, ok_fetch, now=now)
+        resolve(cls_detail(observed_at=now - 999 * 3600))
 
     # a genuinely resolvable one-hop chain passes and yields the ORIGINAL
-    assert sup._resolve_provenance(cls_detail(), now, ok_fetch,
-                                   now=now) == pytest.approx(now - 3600)
+    assert resolve(cls_detail()) == pytest.approx(now - 3600)
     assert _is_recognized_classification(cls_detail())
 
 

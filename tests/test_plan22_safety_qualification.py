@@ -54,6 +54,13 @@ def _no_db(monkeypatch):
             # through execute(); this stub session accepts it
             return None
 
+        def flush(self):
+            # the publication boundary flushes to learn the append
+            # sequence; this stub commits but has no sequence to report
+            # (the legacy file-ledger semantics the round-5 contract
+            # preserves for environments with no authoritative store)
+            return None
+
         def add(self, _o):
             pass
 

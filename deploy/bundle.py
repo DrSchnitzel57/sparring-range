@@ -251,19 +251,112 @@ def _ship_image(src: pathlib.Path, dst: pathlib.Path, *,
     os.link(src, dst)
 
 
+_RENAME_NOREPLACE = 0x1  # Linux renameat2 flag
+_AT_FDCWD = -100
+
+# Test seams ONLY (round-5 F4 proofs): a hook that runs in the exact
+# window between the last preflight and the atomic activation, and a hook
+# that makes the activation rename itself fail. Production leaves both
+# None; neither weakens the primitive, they only exercise it.
+_test_before_activation = None
+_test_fail_activation = None
+
+
+def _renameat2_noreplace(src: pathlib.Path, dst: pathlib.Path) -> None:
+    """ATOMICALLY rename src -> dst, refusing (FileExistsError) if ANY-
+    THING exists at dst at that very instant (Linux renameat2 with
+    RENAME_NOREPLACE). There is no check-then-delete window and the
+    destination's inode is never touched by this call. If the primitive
+    is unsupported, FAIL CLOSED — a destructive fallback is exactly what
+    this contract forbids."""
+    import ctypes
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        sys_renameat2 = libc.renameat2
+    except (AttributeError, OSError):
+        raise BundleError(
+            "atomic bundle activation is unsupported on this platform "
+            "(renameat2 unavailable) — refusing a destructive fallback") \
+            from None
+    res = int(sys_renameat2(_AT_FDCWD, os.fsencode(str(src)),
+                            _AT_FDCWD, os.fsencode(str(dst)),
+                            _RENAME_NOREPLACE))
+    if res != 0:
+        errno = ctypes.get_errno()
+        if errno == 17:                       # EEXIST
+            raise FileExistsError(errno, os.strerror(errno), str(dst))
+        if errno == 38:                       # ENOSYS
+            raise BundleError(
+                "atomic bundle activation is unsupported here (renameat2 "
+                "ENOSYS) — refusing a destructive fallback")
+        raise OSError(errno, os.strerror(errno), str(dst))
+
+
+def _activate_bundle(staged: pathlib.Path, output: pathlib.Path, *,
+                     force: bool) -> None:
+    """Activate a fully built staging directory onto the output path with
+    NO check-then-delete window (plan 22 review round 5 F4).
+
+    Without force: a destination that appears after the preflight makes
+    the atomic activation REFUSE — the foreign bytes and inode stay
+    untouched. With force: the existing release is FIRST moved aside
+    atomically to a tokenized backup, the staged build is activated, and
+    ONLY THEN the superseded release is removed; if activation fails the
+    backup is renamed straight back, so a failed forced rebuild never
+    destroys the previous release."""
+    if _test_before_activation is not None:
+        _test_before_activation(output)
+    backup: pathlib.Path | None = None
+    try:
+        if force and output.exists():
+            import secrets
+
+            backup = output.parent / (
+                f".{output.name}.superseded-{os.getpid()}-"
+                f"{secrets.token_hex(4)}")
+            try:
+                _renameat2_noreplace(output, backup)
+            except (FileExistsError, BundleError) as exc:
+                backup = None
+                raise BundleError(
+                    f"cannot move the existing bundle aside for "
+                    f"replacement ({exc}) — nothing was deleted") from None
+        try:
+            if _test_fail_activation is not None:
+                # fires where the activation rename itself would run, so
+                # the rollback path is exercised for real
+                _test_fail_activation()
+            _renameat2_noreplace(staged, output)
+        except FileExistsError:
+            raise BundleError(
+                f"refusing to activate the bundle over {output}: something "
+                "appeared at the destination after the preflight — its "
+                "bytes were NOT touched; pass --force only when replacing "
+                "it is genuinely intended") from None
+    except BaseException:
+        if backup is not None:
+            os.rename(backup, output)       # the previous release survives
+        raise
+    if backup is not None:
+        shutil.rmtree(backup, ignore_errors=True)
+
+
 def build(output: pathlib.Path, *, base_image: pathlib.Path,
           role_images: dict[str, pathlib.Path], app_dir: pathlib.Path = REPO,
           guest_agent_available: bool = True,
           link_images: bool = False, force: bool = False) -> dict:
-    """Build the release bundle ATOMICALLY (plan 22 review round 4 F4).
+    """Build the release bundle ATOMICALLY (plan 22 review rounds 4-5 F4).
 
     Every input is validated BEFORE any mutation, so a missing image or a
     bad flag never destroys an existing release; an existing output is
     REFUSED by default — replacing a release artifact is a deliberate act
     (``force=True`` / ``--force``), never a side effect of rerunning the
     builder. The build happens in a staging directory beside the target
-    and is activated by rename only after it fully succeeded; any failure
-    leaves the existing destination byte- and inode-identical."""
+    and activation is an exclusive atomic rename: a destination that
+    appears between preflight and activation is refused with its bytes
+    and inode intact, and a forced replacement rolls the previous
+    release back if the activation itself fails."""
     import secrets
 
     output = pathlib.Path(output)
@@ -293,9 +386,7 @@ def build(output: pathlib.Path, *, base_image: pathlib.Path,
         manifest = _build_into(staged, base_image=base_image,
                                role_images=role_images, app_dir=app_dir,
                                link_images=link_images)
-        if output.exists():          # only reachable with force=True
-            shutil.rmtree(output)
-        os.rename(staged, output)
+        _activate_bundle(staged, output, force=force)
     except BaseException:
         shutil.rmtree(staged, ignore_errors=True)
         raise
@@ -400,7 +491,11 @@ def verify(bundle: pathlib.Path) -> dict:
     # is refused too: it could hide or smuggle content on the build host.
     root_real = os.path.realpath(bundle)
 
-    def _trustworthy(rel: str) -> bool:
+    def _trustworthy(rel: str, *, missing_msg: str | None = None) -> bool:
+        """EVERY refusal below RECORDS the problem — a mandatory inventory
+        entry that cannot be trusted is a failure, never a silent skip
+        (plan 22 review round 5 F3: returning False without accounting
+        let a COMPLETELY MISSING listed file or image verify ok)."""
         p = bundle
         for part in pathlib.PurePosixPath(rel).parts:
             p = p / part
@@ -409,13 +504,17 @@ def verify(bundle: pathlib.Path) -> dict:
                 return False
         try:
             st = os.lstat(p)
-        except OSError:
-            return False           # missing: the per-file loop reports it
+        except FileNotFoundError:
+            problems.append(missing_msg or f"missing: {rel}")
+            return False
+        except OSError as exc:
+            problems.append(f"cannot stat {rel}: {exc}")
+            return False
         if not stat.S_ISREG(st.st_mode):
             problems.append(f"not a regular file: {rel}")
             return False
-        if os.path.realpath(p) != os.path.realpath(bundle) and \
-                not os.path.realpath(p).startswith(root_real + os.sep):
+        rp = os.path.realpath(p)
+        if rp != root_real and not rp.startswith(root_real + os.sep):
             problems.append(f"path escapes the bundle: {rel}")
             return False
         return True
@@ -430,9 +529,6 @@ def verify(bundle: pathlib.Path) -> dict:
     for rel, expect in sorted(files.items()):
         path = bundle / rel
         if not _trustworthy(rel):
-            continue
-        if not path.is_file():
-            problems.append(f"missing: {rel}")
             continue
         if path.stat().st_size != expect.get("bytes"):
             problems.append(f"size drift: {rel}")
@@ -479,10 +575,8 @@ def verify(bundle: pathlib.Path) -> dict:
     # outside the bundle cannot be installed on the operator's machine.
     for rel, meta in sorted((manifest.get("images") or {}).items()):
         path = bundle / meta["path"]
-        if not _trustworthy(meta["path"]):
-            continue
-        if not path.is_file():
-            problems.append(f"missing image: {meta['path']}")
+        if not _trustworthy(meta["path"],
+                            missing_msg=f"missing image: {meta['path']}"):
             continue
         if shutil.which("qemu-img") is None:
             continue

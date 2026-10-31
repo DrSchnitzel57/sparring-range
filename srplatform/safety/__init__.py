@@ -93,8 +93,9 @@ _SAFETY_NEWEST_SQL = (
     " FROM safety_records WHERE kind = :k"
     " ORDER BY record_id DESC LIMIT 1")
 _SAFETY_BY_ID_SQL = (
-    "SELECT detail, extract(epoch from recorded_at) FROM safety_records"
-    " WHERE record_id = :r")
+    "SELECT record_id, kind, ok, detail, config_identity,"
+    " extract(epoch from recorded_at) AS at"
+    " FROM safety_records WHERE record_id = :r")
 
 # provenance time sanity: no pre-2001 epochs, small clock tolerance,
 # nothing from the future — a future "observation" is a defect, never a
@@ -371,8 +372,9 @@ class Supervisor:
 
     # --------------------------------------------------------------- records ---
     def _record_by_id(self, rid: int):
-        """Authoritative row lookup for provenance resolution (reader side):
-        returns ``(detail, recorded_at)`` or None. None NEVER means
+        """Authoritative FULL-ROW lookup for provenance resolution (reader
+        side): returns the complete record (record_id, kind, strict ok,
+        detail, config_identity, recorded_at) or None. None NEVER means
         "trustworthy" — an unresolvable source is incompatible."""
         try:
             from sqlalchemy import text
@@ -383,14 +385,18 @@ class Supervisor:
                                 {"r": int(rid)}).first()
             if row is None:
                 return None
-            return (row[0] if isinstance(row[0], dict) else {},
-                    float(row[1]))
+            return {"record_id": int(row[0]), "kind": row[1],
+                    "ok": row[2] is True,
+                    "detail": row[3] if isinstance(row[3], dict) else {},
+                    "config_identity": row[4], "recorded_at": float(row[5])}
         except Exception:  # noqa: BLE001 — unreachable store = unverifiable
             return None
 
     def _resolve_provenance(self, detail, recorded_at, fetch,
-                            *, now: float | None = None) -> float:
-        """THE OBSERVATION-PROVENANCE CONTRACT (plan 22 review round 4).
+                            *, kind: str | None = None,
+                            self_row: dict | None = None,
+                            now: float | None = None) -> float:
+        """THE OBSERVATION-PROVENANCE CONTRACT (plan 22 rounds 4-5).
 
         An UNMARKED original observation derives its effective observation
         time from its AUTHORITATIVE RECORD TIMESTAMP — an arbitrary
@@ -398,16 +404,21 @@ class Supervisor:
         authority and is ignored (a stored field cannot retroactively move
         when the test ran).
 
-        A recognized classification (this build's contract marker plus
-        ``one_time_reclassification``) carries a derived time ONLY when
-        its immutable source id + source digest resolve, hop by hop, to
-        the original record; the terminal ORIGINAL row's authoritative
-        timestamp is the effective time, and the carried value must agree
-        with that resolution. Missing, non-finite, future, cyclic or
-        digest-inconsistent provenance raises SafetyProvenanceError —
-        incompatible evidence, never a fresh passed observation. Age
-        advisories for genuinely compatible evidence stay as they were;
-        no daily re-commissioning is reintroduced."""
+        A recognized classification resolves hop by hop through
+        ``source_record_id`` + ``original_detail_digest`` to the ORIGINAL
+        record, and EVERY link must satisfy the FULL authoritative record
+        contract (round 5): the source row exists, is of the SAME
+        qualification kind, PASSED (strict ``ok is True``), matches the
+        carried detail digest, and is scope-bound — the classification's
+        ``record_identity_was`` equals its SOURCE row's config identity
+        and its ``bound_identity`` equals the config identity of the row
+        carrying it. Unknown markers, malformed persisted rows (a
+        classification flag without a marker, a missing scope binding),
+        cross-kind or failed sources, cycles, and carried times that
+        disagree with the terminal resolution raise SafetyProvenanceError
+        — INCOMPATIBLE evidence, never a usable current pass, never a
+        "now" fallback. Age advisories for genuinely compatible evidence
+        stay as they were; no daily re-commissioning is reintroduced."""
         now = time.time() if now is None else now
         det = detail if isinstance(detail, dict) else {}
         if not _is_recognized_classification(det):
@@ -429,7 +440,22 @@ class Supervisor:
             raise SafetyProvenanceError(
                 "classification does not carry an immutable source record "
                 "id + detail digest — its derived time cannot resolve")
+        expected_kind = kind
+        own_identity = (self_row or {}).get("config_identity")
+        riw = det.get("record_identity_was")
+        if not isinstance(riw, str) or not riw:
+            raise SafetyProvenanceError(
+                "classification carries no record_identity_was source-scope "
+                "binding — malformed persisted provenance")
+        if own_identity is not None and det.get("bound_identity") != own_identity:
+            raise SafetyProvenanceError(
+                "classification's bound_identity does not match the config "
+                "identity of the record carrying it — scope-inconsistent "
+                "chain")
         visited: set[int] = set()
+        self_id = (self_row or {}).get("record_id")
+        if isinstance(self_id, int):
+            visited.add(self_id)
         while True:
             if src_id in visited:
                 raise SafetyProvenanceError(
@@ -443,23 +469,68 @@ class Supervisor:
                 raise SafetyProvenanceError(
                     f"classification names source record {src_id}, which "
                     "the authoritative store cannot resolve")
-            src_detail, src_at = row
+            if expected_kind is not None and row.get("kind") != expected_kind:
+                raise SafetyProvenanceError(
+                    f"source record {src_id} is kind {row.get('kind')!r}, "
+                    f"not {expected_kind!r} — a classification may only "
+                    "reference the same qualification kind")
+            if row.get("ok") is not True:
+                raise SafetyProvenanceError(
+                    f"source record {src_id} did not PASS — a failed "
+                    "record can never be classified into passing")
+            src_detail = row.get("detail")
+            src_detail = (src_detail if isinstance(src_detail, dict)
+                          else {})
             if _detail_digest(src_detail) != want_digest:
                 raise SafetyProvenanceError(
                     f"source record {src_id} does not match the "
                     "classification's immutable detail digest — the "
                     "provenance is forged or stale")
-            if _is_recognized_classification(src_detail):
+            src_identity = row.get("config_identity")
+            if riw != src_identity:
+                raise SafetyProvenanceError(
+                    f"classification's record_identity_was {riw!r} is not "
+                    f"source record {src_id}'s config identity — the chain "
+                    "crosses a configuration/scope boundary")
+            src_marker = src_detail.get("qualification_contract")
+            src_onetime = src_detail.get("one_time_reclassification")
+            if src_marker is None and src_onetime is not None:
+                raise SafetyProvenanceError(
+                    f"source record {src_id} carries a classification "
+                    "flag without a contract marker — malformed "
+                    "persisted provenance")
+            if src_marker is not None \
+                    and src_marker != QUALIFICATION_CONTRACT:
+                raise SafetyProvenanceError(
+                    f"source record {src_id} carries unknown "
+                    f"qualification contract {src_marker!r} — this build "
+                    "cannot verify its chain")
+            if src_marker == QUALIFICATION_CONTRACT and src_onetime is True:
                 nxt = src_detail.get("source_record_id")
                 nd = src_detail.get("original_detail_digest")
+                n_riw = src_detail.get("record_identity_was")
                 if not isinstance(nxt, int) or isinstance(nxt, bool) \
                         or not isinstance(nd, str) or not nd:
                     raise SafetyProvenanceError(
                         f"nested classification {src_id} carries no "
                         "resolvable source chain")
-                src_id, want_digest = nxt, nd
+                if not isinstance(n_riw, str) or not n_riw:
+                    raise SafetyProvenanceError(
+                        f"nested classification {src_id} carries no "
+                        "source-scope binding — malformed chain")
+                if src_detail.get("bound_identity") != src_identity:
+                    raise SafetyProvenanceError(
+                        f"nested classification {src_id} is not bound to "
+                        "its own row's config identity — scope-forged "
+                        "chain")
+                src_id, want_digest, riw = nxt, nd, n_riw
                 continue
-            terminal = _valid_observation_time(src_at, now)
+            if src_marker == QUALIFICATION_CONTRACT and src_onetime not in (
+                    None, False):
+                raise SafetyProvenanceError(
+                    f"source record {src_id} carries a malformed "
+                    "one_time_reclassification flag — unknown marker")
+            terminal = _valid_observation_time(row.get("recorded_at"), now)
             if terminal is None:
                 raise SafetyProvenanceError(
                     f"original record {src_id} carries no plausible "
@@ -473,23 +544,29 @@ class Supervisor:
 
     def _authoritative_publish(self, kind: str, ok: bool, identity: str,
                                detail: dict, *,
-                               validate=None) -> bool:
+                               validate=None) -> tuple[bool, int | None]:
         """ONE shared read-validate-append boundary for safety_records
-        (plan 22 review round 4, owner contract). Every writer — ordinary
-        baseline/proof/killswitch/engage/release observations AND operator
-        classifications — appends through this transaction, and every one
-        of them FIRST acquires the same advisory transaction lock. A
-        classifier therefore cannot validate against a source snapshot
-        while a fresh observation commits in between: the observation
-        queues on the lock and becomes the newest row the next reader
-        sees. ``validate(row, session)`` runs AFTER the source read,
-        inside the lock, must be pure local computation plus reads on the
-        SAME connection (no network waits, ever), and returns the final
-        detail dict. Returns True when the append COMMITTED, False when
-        the authoritative store is missing or failed (callers decide:
-        observations fall back to the durable file ledger with the failure
-        retained; classifications refuse — an unfenced append cannot
-        honor the CAS)."""
+        (plan 22 review rounds 4-5, owner contract). Every writer —
+        ordinary baseline/proof/killswitch/engage/release observations AND
+        operator classifications — appends through this transaction, and
+        every one of them FIRST acquires the same advisory transaction
+        lock. A classifier therefore cannot validate against a source
+        snapshot while a fresh observation commits in between: the
+        observation queues on the lock and becomes the newest row the next
+        reader sees. ``validate(row, session)`` runs AFTER the source
+        read, inside the lock, must be pure local computation plus reads
+        on the SAME connection (no network waits, ever), and returns the
+        final detail dict. Returns ``(published, seq)``: whether the
+        append COMMITTED, and the COMMITTED authoritative APPEND SEQUENCE
+        (record_id) — the identity every mirror envelope must carry so
+        delayed copies order by the authoritative sequence, never by
+        their own write clock. seq is None when the committed store
+        exposes no sequence (legacy stub lanes; a real store always
+        assigns one); published is False when the store is missing or
+        failed (callers decide: observations fall back to the durable
+        file ledger EXPLICITLY UNRECONCILED with the failure retained;
+        classifications refuse — an unfenced append cannot honor the
+        CAS)."""
         from sqlalchemy.exc import SQLAlchemyError
 
         from srplatform.db.session import db
@@ -508,18 +585,21 @@ class Supervisor:
                     final = validate(row, s)
                     if isinstance(final, dict):
                         detail = final
-                s.add(SafetyRecord(kind=kind, ok=ok, config_identity=identity,
-                                    detail=detail))
+                obj = SafetyRecord(kind=kind, ok=ok,
+                                   config_identity=identity, detail=detail)
+                s.add(obj)
+                s.flush()
+                seq = int(getattr(obj, "record_id", 0) or 0) or None
                 # COMMIT happens as the session context exits — the
                 # advisory lock is held until this very point, so exactly
                 # one append can follow each validated source read.
-            return True
+            return True, seq
         except (ValueError, SafetyStoreUnavailable):
             raise                      # truthful refusals propagate as-is
         except SQLAlchemyError:
-            return False
+            return False, None
         except Exception:  # noqa: BLE001 — no store configured, or down
-            return False
+            return False, None
 
     def reclassify_qualification(self, kind: str, *, reason: str,
                                  actor: str,
@@ -596,10 +676,16 @@ class Supervisor:
                                {"r": int(rid)}).first()
                 if r is None:
                     return None
-                return (r[0] if isinstance(r[0], dict) else {},
-                        float(r[1]))
+                return {"record_id": int(r[0]), "kind": r[1],
+                        "ok": r[2] is True,
+                        "detail": r[3] if isinstance(r[3], dict) else {},
+                        "config_identity": r[4],
+                        "recorded_at": float(r[5])}
 
-            effective = self._resolve_provenance(src_detail, src_at, _fetch)
+            effective = self._resolve_provenance(
+                src_detail, src_at, _fetch, kind=kind,
+                self_row={"record_id": src_id,
+                          "config_identity": src_identity})
             decided = time.time()
             detail = {"qualification_contract": QUALIFICATION_CONTRACT,
                       "one_time_reclassification": True,
@@ -616,13 +702,22 @@ class Supervisor:
             resolved["detail"] = detail
             return detail
 
-        published = self._authoritative_publish(kind, True, identity, {},
-                                                validate=_validate)
+        published, seq = self._authoritative_publish(kind, True, identity,
+                                                     {},
+                                                     validate=_validate)
         if not published:
             raise SafetyStoreUnavailable(
                 "the authoritative safety-record store is unavailable — "
                 "a classification without it would be an unfenced append "
                 "(reclassification refused)")
+        # ROUND 5 CONTRACT: mirrors of a committed record carry the
+        # AUTHORITATIVE SEQUENCE (the envelope below), so a delayed copy
+        # orders by its commit identity — never by the clock on the wall
+        # of whatever process copies it late. The test barrier sits exactly
+        # in the post-commit / pre-mirror window (review F1).
+        barrier = getattr(self, "_test_after_commit_before_mirror", None)
+        if barrier is not None:
+            barrier(kind)
         # durable audit mirrors AFTER the committed authoritative append
         # (never a substitute for it, never written for a loser); file
         # mirror failures stay visible exactly like record()'s are
@@ -630,10 +725,11 @@ class Supervisor:
         if self._mirror_dh is not None:
             self._mirror_dh.append({"kind": kind, "ok": True,
                                     "config_identity": identity,
-                                    "detail": detail,
+                                    "detail": detail, "seq": seq,
                                     "recorded_at": detail[
                                         "classification_decided_at"]})
-        ferr = self._append_file_record(kind, True, identity, detail)
+        ferr = self._append_file_record(kind, True, identity, detail,
+                                        seq=seq)
         if ferr:
             self._record_failures = list(
                 getattr(self, "_record_failures", [])) + [ferr]
@@ -666,60 +762,81 @@ class Supervisor:
             detail = {**(detail or {}),
                       "qualification_contract": QUALIFICATION_CONTRACT}
         self._record_failures = list(getattr(self, "_record_failures", []))
-        published = self._authoritative_publish(kind, ok, identity,
-                                                detail or {})
+        published, seq = self._authoritative_publish(kind, ok, identity,
+                                                     detail or {})
         if not published:
             self._record_failures.append(
                 f"db record '{kind}': authoritative safety-record store "
                 "unavailable — recorded to the durable file ledger only")
+        # ROUND 5: the mirror envelope carries the authoritative sequence
+        # when publication committed (None = EXPLICITLY UNRECONCILED
+        # outage-only record, conservative-only for readers). The test
+        # barrier marks the post-commit / pre-mirror window.
+        barrier = getattr(self, "_test_after_commit_before_mirror", None)
+        if barrier is not None:
+            barrier(kind)
         if self._mirror_dh is not None:
             self._mirror_dh.append({"kind": kind, "ok": ok, "config_identity": identity,
-                                    "detail": detail or {}, "recorded_at": time.time()})
-        ferr = self._append_file_record(kind, ok, identity, detail)
+                                    "detail": detail or {}, "seq": seq,
+                                    "recorded_at": time.time()})
+        ferr = self._append_file_record(kind, ok, identity, detail, seq=seq)
         if ferr:
             self._record_failures.append(ferr)
 
-    def _append_file_record(self, kind, ok, identity, detail) -> str | None:
+    def _append_file_record(self, kind, ok, identity, detail,
+                            seq: int | None = None) -> str | None:
         try:
             p = self.state_file.parent / (self.state_file.name + ".records")
             p.parent.mkdir(parents=True, exist_ok=True)
             with p.open("a") as f:
-                f.write(json.dumps({"kind": kind, "ok": ok, "config_identity": identity,
-                                    "detail": detail or {}, "recorded_at": time.time()}) + "\n")
+                f.write(json.dumps({"kind": kind, "ok": ok,
+                                    "config_identity": identity,
+                                    "detail": detail or {}, "seq": seq,
+                                    "recorded_at": time.time()}) + "\n")
             return None
         except OSError as e:
             return f"file record '{kind}' write failed: {e}"
 
     def _latest_records(self) -> dict:
         """Newest record per kind, MERGING the DB and the file mirror
-        (audit N07: preferring the DB whenever any row exists let an
-        engage/release recorded only to the file during a DB outage be
-        forgotten once the DB became reachable again).
+        under the ROUND 5 ORDERING CONTRACT:
 
-        Round 4: WITHIN the authoritative store the newest record is the
-        one with the HIGHEST APPEND SEQUENCE (record_id), not the newest
-        wall-clock stamp — a later-committed failure must never be hidden
-        by a timestamp quirk (clock skew, backdated inserts). Cross-store
-        merging (authoritative rows vs the outage file/mirror, which
-        carry no sequence) keeps the N07 timestamp semantics."""
+        * DB-published observations and classifications are ordered by
+          their AUTHORITATIVE APPEND SEQUENCE (record_id), carried in
+          every mirror envelope as ``seq`` — a delayed file copy can
+          NEVER become a newer observation by its write clock.
+        * A record whose envelope carries no sequence while the
+          environment demonstrably HAS an authoritative store is
+          EXPLICITLY UNRECONCILED (a genuine outage-only observation or
+          audit line): it is retained and honored CONSERVATIVELY — it can
+          never authorize admission as a pass and never overrides a
+          known authoritative FAILED state — but it never disappears and
+          its failures are not lost.
+        * With no authoritative sequence seen anywhere (legacy dev/file
+          installs predating this contract) the ledger falls back to the
+          historical timestamp append order — N07 semantics preserved.
+
+        Readers receive the unreconciled lines under the reserved
+        ``__unreconciled__`` key; selection itself never mixes it in.
+        A mirror line that POSITIVELY MATCHES an authoritative record
+        (kind + outcome + config identity + detail digest — never a
+        timestamp guess) IS that record's copy: it inherits the
+        authoritative sequence, so replayed or delayed duplicates can
+        neither reorder history nor masquerade as outage evidence."""
         out: dict[str, dict] = {}
+        pending: list[dict] = []
+        authority = {"seen": False}
 
-        def consider(rec: dict) -> None:
-            kind = rec.get("kind")
-            if not kind:
-                return
-            cur = out.get(kind)
-            if cur is None:
-                out[kind] = rec
-                return
-            cur_seq, rec_seq = cur.get("seq"), rec.get("seq")
-            if cur_seq is not None and rec_seq is not None:
-                if rec_seq >= cur_seq:
-                    out[kind] = rec
-                return
-            if float(rec.get("recorded_at", 0)) >= float(
-                    cur.get("recorded_at", 0)):
-                out[kind] = rec
+        def content_key(rec: dict):
+            det = rec.get("detail")
+            try:
+                digest = hashlib.sha256(json.dumps(
+                    det if det is not None else {}, sort_keys=True,
+                    default=str).encode()).hexdigest()[:16]
+            except (TypeError, ValueError):
+                return None
+            return (rec.get("kind"), bool(rec.get("ok")),
+                    rec.get("config_identity"), digest)
 
         def db_records() -> list[dict]:
             try:
@@ -736,15 +853,64 @@ class Supervisor:
                             for r in rows]
             except Exception:
                 return []  # file mirror below still contributes
+
+        authoritative: list[dict] = []
         if self._records_reader is not None:
             try:
-                for r in self._records_reader():
-                    consider(r)
+                authoritative = [dict(r) for r in self._records_reader()]
             except Exception:
                 pass
         else:
-            for r in db_records():
-                consider(r)
+            authoritative = db_records()
+        # POSITIVE reconciliation map: content → authoritative sequence.
+        seq_by_content: dict = {}
+        for r in authoritative:
+            if r.get("seq") is not None:
+                key = content_key(r)
+                if key is not None:
+                    prev = seq_by_content.get(key)
+                    if prev is None or int(r["seq"]) >= prev:
+                        seq_by_content[key] = int(r["seq"])
+
+        def consider(rec: dict) -> None:
+            kind = rec.get("kind")
+            if not kind:
+                return
+            rec = dict(rec)
+            if rec.get("seq") is None:
+                key = content_key(rec)
+                if key is not None and key in seq_by_content:
+                    rec["seq"] = seq_by_content[key]  # that record's copy
+            rec_seq = rec.get("seq")
+            if rec_seq is not None:
+                authority["seen"] = True
+            else:
+                pending.append(rec)
+            cur = out.get(kind)
+            if cur is None:
+                out[kind] = rec
+                return
+            cur_seq = cur.get("seq")
+            if cur_seq is not None and rec_seq is not None:
+                # Same sequence = the SAME authoritative event mirrored:
+                # the row first seen (the authoritative one) keeps its
+                # envelope — a mirror copy's write clock never becomes
+                # the record's observation time.
+                if rec_seq > cur_seq:
+                    out[kind] = rec
+                return
+            if rec_seq is not None:       # authoritative beats unreconciled
+                out[kind] = rec
+                return
+            if cur_seq is not None:       # a delayed copy never supersedes
+                return
+            # both unreconciled: append-order timestamps (legacy fallback)
+            if float(rec.get("recorded_at", 0)) >= float(
+                    cur.get("recorded_at", 0)):
+                out[kind] = rec
+
+        for r in authoritative:
+            consider(r)
         if self._mirror_dh is not None:
             for r in self._mirror_dh:
                 consider(r)
@@ -754,6 +920,17 @@ class Supervisor:
                 consider(json.loads(line))
         except (OSError, json.JSONDecodeError):
             pass
+        # EXPLICIT unreconciled classification (round 5, owner contract):
+        # only once an authoritative sequence was demonstrably seen does a
+        # sequence-less record become "unreconciled" — an outage-only
+        # mirror/copy that may NEVER authorize a pass on its own clock.
+        # Where no authority has ever been seen (legacy file-only installs)
+        # the historical timestamp semantics simply continue.
+        if authority["seen"]:
+            for rec in out.values():
+                if rec.get("seq") is None:
+                    rec["unreconciled"] = True
+            out["__unreconciled__"] = pending
         return out
 
     def _qualification(self, kind: str,
@@ -776,6 +953,26 @@ class Supervisor:
         rec = recs.get(kind)
         if not rec:
             out["problems"] = [f"no {kind} record"]
+            return out
+        if rec.get("unreconciled"):
+            # Round 5, owner contract: the newest selected line for this
+            # kind exists only in a mirror WITHOUT an authoritative
+            # sequence while the authoritative store is demonstrably in
+            # use. It is retained and honored CONSERVATIVELY — never a
+            # pass that authorizes admission, never a lost failure — and
+            # it reconciles only by a fresh authoritative record (re-run
+            # the check with working storage), never by a timestamp.
+            problems = [
+                f"{kind} evidence is UNRECONCILED: it has no authoritative "
+                "append sequence (a delayed mirror copy or an outage-only "
+                "observation), so it cannot be ordered against committed "
+                "records and cannot authorize admission — re-run the "
+                "check with working storage"]
+            if not rec.get("ok"):
+                problems.insert(0, f"latest {kind} FAILED (unreconciled "
+                                   "record) — the failure stands")
+            out["provenance"] = "unreconciled"
+            out["problems"] = problems
             return out
         detail = rec.get("detail")
         if detail is not None and not isinstance(detail, dict):
@@ -839,7 +1036,10 @@ class Supervisor:
         # decision's wall clock. Unverifiable provenance is INCOMPATIBLE:
         # it does not pass, and it does not default to "now".
         try:
-            rec_ts = self._resolve_provenance(det, raw_ts, self._record_by_id)
+            rec_ts = self._resolve_provenance(
+                det, raw_ts, self._record_by_id, kind=kind,
+                self_row={"record_id": rec.get("seq"),
+                          "config_identity": rec.get("config_identity")})
         except SafetyProvenanceError as exc:
             out["provenance"] = "incompatible"
             out["problems"] = [
@@ -854,6 +1054,27 @@ class Supervisor:
                     out.setdefault("problems", []).append(
                         f"{kind} record predates the last {gate} — "
                         "evidence invalidated, re-run the check")
+        # CONSERVATIVE pending-row handling (round 5): an unreconciled
+        # same-kind FAILED is never lost — it cannot be proven older than
+        # the authoritative newest-pass, so it blocks until reconciled.
+        # An unreconciled engage/release transition is honored under the
+        # same gate rule as a selected one. Mirror copies that match an
+        # authoritative record inherit its true sequence, so only
+        # genuinely order-unprovable rows can block here.
+        for p in recs.get("__unreconciled__") or ():
+            pk = p.get("kind")
+            if pk == kind and not p.get("ok"):
+                out.setdefault("problems", []).append(
+                    f"an unreconciled FAILED {kind} record exists whose "
+                    "order against the current evidence cannot be proven "
+                    "— re-run the check with working storage")
+            elif kind not in ("engage", "release") and pk in (
+                    "engage", "release") and float(
+                        p.get("recorded_at", 0)) >= rec_ts:
+                out.setdefault("problems", []).append(
+                    f"an unreconciled {pk} transition cannot be ordered "
+                    "before this evidence — re-run the check with "
+                    "working storage")
         out["recorded_at"] = rec_ts
         out["observed_at"] = rec_ts
         if _is_recognized_classification(det):
