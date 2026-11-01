@@ -980,14 +980,16 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
     if spec.get("environment"):
         # ENVIRONMENT SCENARIOS (Underpressure plan): provisioning follows
         # the blueprint — segment bridges, role-specific multi-NIC attach and
-        # per-generation identity — through the versioned broker lane. Flat
-        # single-bridge cloning REFUSES such a scenario rather than silently
-        # misprovisioning one address of one NIC and calling it deployed.
-        raise ScenarioError(
-            [f"scenario '{scenario_id}' binds environment "
-             f"{spec['environment']!r}: environment provisioning (segment "
-             f"bridges + multi-NIC blueprint clones) is not in this lane yet; "
-             f"no side effects were attempted"])
+        # per-generation identity — through the versioned broker lane. The
+        # flat single-bridge lane REFUSES to misprovision one address of one
+        # NIC and call it deployed; the blueprint lane owns the whole shape:
+        # catalog preflight (every profile resolves BEFORE any clone), budget
+        # validation (blueprint totals vs this appliance, at load), and per
+        # guest one whole-vector set_config the broker refuses pre-effect if
+        # its segment lane cannot honor it (fail-closed, intent retained).
+        from srplatform.scenario_engine.env_deploy import deploy_environment
+        return deploy_environment(db, session_id, scenario_id, spec, broker,
+                                  resume=resume)
     node = s.deploy_node
     # Paired 03+04, step 4: explicit clone mode (no silent fallback) +
     # aggregate budget reservation BEFORE any side effect. Unknown retains

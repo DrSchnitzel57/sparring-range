@@ -317,17 +317,24 @@ def test_broken_environment_is_reported_not_skipped(tmp_path):
     assert repo_copy["_valid"] is True
 
 
-# ------------------------------------------------------------- deploy guard --
-class _NoBroker:
+# ------------------------------------------------------------- deploy routing --
+class _EmptyCatalogBroker:
+    def template_catalog(self):
+        return []
+
     def __getattr__(self, name):
-        raise AssertionError(f"broker must not be touched: {name}")
+        raise AssertionError(f"no side effect may precede catalog preflight: {name}")
 
 
-def test_deploy_refuses_environment_scenario_without_side_effects():
+def test_deploy_routes_environment_scenario_to_the_blueprint_lane():
+    """The orchestrator no longer REFUSES environment scenarios — it hands
+    them to deploy_environment, whose first act is the catalog preflight.
+    An empty broker catalog must fail there with zero side effects and
+    zero DB use (db=None proves it)."""
     from srplatform.scenario_engine.orchestrator import deploy
-    with pytest.raises(ScenarioError, match="environment provisioning"):
+    with pytest.raises(ScenarioError, match="no template catalog"):
         deploy(db=None, session_id=None, scenario_id="underpressure-range-01",
-               broker=_NoBroker())
+               broker=_EmptyCatalogBroker())
 
 
 # ------------------------------------------------------------- windows paths --

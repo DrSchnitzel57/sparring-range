@@ -91,14 +91,15 @@ def _bp_and_catalog():
     return bp, catalog
 
 
-def _session_row(eng):
+def _session_row(eng, scenario_id=None):
     from sqlalchemy.orm import Session as SASession
     from srplatform.db.models import Session as SessionRow, User
     with SASession(eng) as db:
         owner = User(username=f"env-{uuid.uuid4().hex[:8]}")
         db.add(owner)
         db.flush()
-        s = SessionRow(scenario_id=f"{ENV_ID}-{uuid.uuid4().hex[:4]}",
+        s = SessionRow(scenario_id=scenario_id or
+                       f"{ENV_ID}-{uuid.uuid4().hex[:4]}",
                        user_id=owner.user_id)
         db.add(s)
         db.commit()
@@ -243,3 +244,26 @@ def test_ready_deployment_is_idempotent(eng):
     assert again["idempotent"] is True
     assert again["deployment_id"] == first["deployment_id"]
     assert len(broker.calls) == calls  # zero side effects on the second pass
+
+
+def test_orchestrator_deploy_end_to_end(eng):
+    """The shipped scenario `underpressure-range-01` through the REAL
+    orchestrator entry point: snapshot-spec resolution, environment routing,
+    full blueprint deploy, and the idempotent ready return — no component
+    between them is stubbed except the broker."""
+    from sqlalchemy.orm import Session as SASession
+    from srplatform.scenario_engine.orchestrator import deploy as orch_deploy
+    _bp, catalog = _bp_and_catalog()
+    sid = _session_row(eng, scenario_id="underpressure-range-01")
+    broker = StubBroker(catalog)
+    with SASession(eng) as db:
+        out = orch_deploy(db, sid, "underpressure-range-01", broker)
+    assert len(out["hosts"]) == 12
+    dep = _deployment(eng, sid)
+    assert dep.status == "ready"
+    assert all(r["environment_guest"] and r["applied_nics"]
+               for r in dep.resources)
+    with SASession(eng) as db:
+        again = orch_deploy(db, sid, "underpressure-range-01", broker)
+    assert again["idempotent"] is True and not [
+        c for c in broker.calls if c[0] == "clone"][12:]
