@@ -104,13 +104,13 @@ def _revision() -> str:
 
 
 # The directories and top-level files a release bundle carries.
-APP_DIRS = ("docs", "deploy", "scenarios", "srplatform", "rangectl", "infra",
-            "tests", "web", "audit", "verifiers", "telemetry")
+APP_DIRS = ("docs", "deploy", "scenarios", "environments", "srplatform",
+            "rangectl", "infra", "tests", "web", "verifiers", "telemetry")
 APP_FILES = ("pyproject.toml", "requirements.lock", "alembic.ini", "README.md",
              "AGENTS.md")
 # The parts of the bundle that are RUNTIME: what the appliance executes.
 RUNTIME_DIRS = ("srplatform", "deploy", "infra", "verifiers", "telemetry",
-                "audit", "rangectl", "scenarios", "web")
+                "rangectl", "scenarios", "environments", "web")
 RUNTIME_FILES = ("pyproject.toml", "requirements.lock", "alembic.ini")
 
 

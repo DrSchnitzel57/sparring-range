@@ -119,8 +119,7 @@ def test_range_bridge_only_carries_the_range_network(tmp_path):
                                     verify_model_key=False)
 
 
-# --------------------------------------------------- manifest catalog authority --
-def test_manifest_catalog_is_the_profile_authority(tmp_path):
+# --------------------------------------------------- manifest catalog authority --def test_manifest_catalog_is_the_profile_authority(tmp_path):
     raw = _manifest(tmp_path, verify_files=True)
     raw["images"]["attacker"]["profile"] = "kali-rolling"
     m = ApplianceManifest.from_dict(raw, verify_images=True,
@@ -137,3 +136,38 @@ def test_manifest_catalog_is_the_profile_authority(tmp_path):
     with pytest.raises(Exception, match="duplicate image profile"):
         ApplianceManifest.from_dict(dup, verify_images=True,
                                     verify_model_key=False)
+
+
+# ------------------------------------------- shipped example + bundle payload --
+def test_shipped_appliance_example_validates_with_the_lane(tmp_path):
+    """The one example operators start from must itself carry a legal
+    segment lane — schema-valid and policy-deriving. Only the placeholder
+    key/model files and image bytes are substituted (they materialize at
+    install time); every structure the operator keeps is checked as
+    shipped."""
+    import json
+    import pathlib
+    raw = json.loads((pathlib.Path(__file__).resolve().parents[1]
+                      / "deploy" / "appliance.manifest.example.json")
+                     .read_text())
+    key = tmp_path / "id_ed25519.pub"
+    key.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP0123456789"
+                   "0123456789012345678901234567890123 operator@example\n")
+    (tmp_path / "model.key").write_text("placeholder\n")
+    raw["access_keys"] = {role: str(key) for role in raw["access_keys"]}
+    raw["model"]["api_key_file"] = str(tmp_path / "model.key")
+    for image in raw["images"].values():
+        image["path"] = str(tmp_path / pathlib.Path(image["path"]).name)
+    m = ApplianceManifest.from_dict(raw, verify_images=False,
+                                    verify_model_key=False)
+    pol = AppliancePolicy.from_manifest(m)  # includes validate_manifest
+    assert [s.name for s in pol.segments] == ["range", "team", "transit"]
+    assert pol.max_nics == 3
+
+
+def test_bundle_ships_environments_and_no_dead_dirs():
+    from deploy.bundle import APP_DIRS, RUNTIME_DIRS, is_runtime
+    assert "environments" in APP_DIRS and "environments" in RUNTIME_DIRS
+    assert is_runtime("environments/underpressure-range/blueprint.yaml")
+    # the archived audit/ dir was removed; a dead payload name only drifts
+    assert "audit" not in APP_DIRS and "audit" not in RUNTIME_DIRS

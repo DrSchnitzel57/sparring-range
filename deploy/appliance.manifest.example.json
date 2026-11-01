@@ -1,0 +1,94 @@
+{
+  "access_keys": {
+    "bastion": "/etc/sparring-range/keys/bastion.pub",
+    "mgmt": "/etc/sparring-range/keys/mgmt.pub",
+    "runner": "/etc/sparring-range/keys/runner.pub"
+  },
+  "appliance": {
+    "hostname": "sr-appliance",
+    "timezone": "UTC"
+  },
+  "backup": {
+    "destination": "",
+    "enabled": false
+  },
+  "broker": {
+    "ledger": "/var/lib/sparring-range/state/ledger.sqlite3",
+    "socket": "/run/sparring-range/broker.sock",
+    "state_dir": "/var/lib/sparring-range/state"
+  },
+  "budgets": {
+    "max_disk_gb": 44,
+    "max_guests": 12,
+    "max_memory_mb": 50176,
+    "max_vcpus": 26,
+    "min_free_gb": 60
+  },
+  "images": {
+    "attacker": {
+      "disk_gb": 12,
+      "memory_mb": 2048,
+      "path": "/var/lib/sparring-range/images/attacker.qcow2",
+      "profile": "kali-rolling",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000001",
+      "size_bytes": 1,
+      "template_id": 9005,
+      "vcpus": 2
+    },
+    "mojang-web-db": {
+      "disk_gb": 10,
+      "memory_mb": 2048,
+      "path": "/var/lib/sparring-range/images/mojang-web-db.qcow2",
+      "profile": "ubuntu2204-mail",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000002",
+      "size_bytes": 1,
+      "template_id": 9012,
+      "vcpus": 2
+    },
+    "mojang-web-local": {
+      "disk_gb": 12,
+      "memory_mb": 2048,
+      "path": "/var/lib/sparring-range/images/mojang-web-local.qcow2",
+      "profile": "debian12-web",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000003",
+      "size_bytes": 1,
+      "template_id": 9011,
+      "vcpus": 2
+    }
+  },
+  "installation_id": "11111111-2222-4333-8444-555555555555",
+  "model": {
+    "alias": "sr-range-model",
+    "api_key_file": "/etc/sparring-range/secrets/model.key",
+    "base_url": "https://model.internal.example/v1"
+  },
+  "network": {
+    "bastion_address": "10.66.0.2",
+    "controller_range_ip": "10.66.0.1",
+    "ingest_address": "10.66.0.1",
+    "ingest_port": 8443,
+    "lan_address": "10.10.10.50",
+    "lan_cidr": "10.10.10.0/24",
+    "management_cidr": "10.0.0.0/24",
+    "max_nics": 3,
+    "range_bridge": "srlab0",
+    "range_cidr": "10.66.0.0/24",
+    "range_gateway": "10.66.0.1",
+    "segments": [
+      {"bridge": "srlab0", "cidr": "10.66.0.0/24", "name": "range"},
+      {"bridge": "sr-team", "cidr": "172.17.0.0/24", "name": "team"},
+      {"bridge": "sr-transit", "cidr": "172.16.0.0/24", "name": "transit"}
+    ]
+  },
+  "paths": {
+    "images": "/var/lib/sparring-range/images",
+    "recordings": "/var/lib/sparring-range/recordings",
+    "secrets": "/etc/sparring-range/secrets"
+  },
+  "schema_version": 1,
+  "urls": {
+    "ingest": "https://10.66.0.2:8443",
+    "internal": "http://127.0.0.1:8000",
+    "public": "https://range.example.edu"
+  }
+}

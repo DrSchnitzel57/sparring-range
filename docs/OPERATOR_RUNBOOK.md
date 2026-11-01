@@ -74,6 +74,11 @@ instead of colliding with it.
 .venv/bin/python deploy/appliance.py doctor   --manifest /etc/sparring-range/appliance-manifest.json
 ```
 
+Start from `deploy/appliance.manifest.example.json` (schema-checked in CI).
+For an Underpressure install declare `network.segments` plus `max_nics`;
+one segment MUST be the range network itself (`range`/`range_bridge`/
+`range_cidr`) so flat-lane guests stay inside the approved address lane.
+
 `apply` needs root and creates the service identities (`srbroker`, `sringest`,
 `srworker`, plus `srrange`/`srbastion`), the fixed systemd units, the derived
 broker policy and the control-plane environment. It never regenerates an
