@@ -119,7 +119,10 @@ def test_range_bridge_only_carries_the_range_network(tmp_path):
                                     verify_model_key=False)
 
 
-# --------------------------------------------------- manifest catalog authority --def test_manifest_catalog_is_the_profile_authority(tmp_path):
+# --------------------------------------------------- manifest catalog authority --
+
+
+def test_manifest_catalog_is_the_profile_authority(tmp_path):
     raw = _manifest(tmp_path, verify_files=True)
     raw["images"]["attacker"]["profile"] = "kali-rolling"
     m = ApplianceManifest.from_dict(raw, verify_images=True,
