@@ -1,5 +1,51 @@
 # Current findings and validation evidence
 
+## Work frozen at user request — 2026-11-01
+
+The user requested integration and push **as-is**, with no further repair/review
+loop. This is an unfinished development checkpoint, not release acceptance.
+
+- Latest source: `c398eab870c855ade8d0ba4a647aac6c5723ac44`. It claims fixes
+  for mirror-sequence validation, durable outage reconciliation (including
+  API/CLI recovery), and no-replace forced-build rollback. **No completed
+  independent review or final test receipt exists for this latest commit.**
+- Last completed independent review: **VERDICT: FIX** at `da735cc`, source
+  `2c9cad4`. Three demonstrated defects remained: a nonexistent mirror sequence
+  could override authoritative failure; an outage-only failure remained blocked
+  after the prescribed fresh successful check; forced rollback replaced a newly
+  appeared foreign empty directory. These require independent re-verification
+  against `c398eab`; implementation claims do not close them.
+- That older source independently passed the infrastructure-free pytest command
+  documented below: **741 passed, 529 deselected, 13 warnings**, exit 0,
+  136.36 s; practice passed **12 + 28**, zero skipped, 14.5 s. Focused disposable
+  DB checks passed **23**, 20 deselected, 28.98 s. These are historical results,
+  not fresh results for the frozen HEAD or its integration with `master`.
+- Last independently inspected candidate: local cache
+  `.cache/bundle/sparring-range-appliance-22f`, revision `2c9cad4`, MANIFEST
+  SHA256 `0aeecdaa5948abe12044e5b65a1b5109b621c9d7891e2d502157e0722f87d6d2`.
+  Its 395 listed files, four images and 248 runtime files were inspected;
+  full verification exited 0 in 43.05 s. It is **not bound to the latest fixes**
+  and was not accepted as a release. Cached artifacts/images are not Git payload.
+- Installed appliance remains on the operator-upgraded release
+  `59fb5442fede8814c879d29c61fb88748cabc5b2`, schema `0027`; plan-22 source
+  has not been installed. Reported operator workarounds were model-key access
+  permissions, rebuilding the frontend with its public API URL, and enrolling
+  the current account's public key. No appliance action accompanies this freeze.
+- Milestones 18/19 had prior software acceptance; milestone 21 had local
+  upgrade/artifact acceptance for supervised installed testing. Plan 22 remains
+  unaccepted. Installed provider/systemd/isolation/nested-KVM/member-journey
+  qualification and sustained useful/adversarial AI behavior are not established
+  by the local fixture results. Preserve earlier scoped commissioning receipts.
+- Only the user-approved obsolete `-22`, `-22b`, `-22c` bundles were removed;
+  approximately 19 GiB remained free. Original and newer candidates were retained.
+  The implementation endpoint failed with connection refused when asked to
+  acknowledge the freeze; no restart was requested. No test/build worker was
+  visible in the user-process inventory during checkpointing.
+
+Resume by independently checking the three findings against the frozen source,
+refreshing affected acceptance evidence and building a source-bound candidate.
+Do not deploy merely because this checkpoint is on the default branch.
+
 ## Plan-22 review-round-5 receipts — 2026-10-31 (branch `practice-upgrades-18-21`, fix `2c9cad4`)
 
 Independent focused review of `dc5fb27`/source `71c0200` returned
