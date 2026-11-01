@@ -76,6 +76,56 @@ about targets, what worked, what failed, what is in flight, current phase.
 Plain text, no JSON."""
 
 
+def render_environment_context(scenario: dict) -> str | None:
+    """Authorized-scope inventory text for an ENVIRONMENT scenario.
+
+    Built from the private attack view only: entry position, target
+    guests, service context and the tactic guide. Never scorer
+    expectations, credentials, defender telemetry or platform
+    management material. Returns None (caller falls back / aborts)
+    when the environment cannot be loaded — a broken contract must
+    not degrade into a blind loop.
+    """
+    from srplatform import environment_specs as envspecs
+    env_id = scenario.get("environment")
+    if not env_id:
+        return None
+    try:
+        env = envspecs.load_environment(env_id)
+    except envspecs.EnvironmentError:
+        return None
+    view = env.attack_view()
+    scope = view["scope"]
+    bp = env.blueprint
+    lines = [f"# Environment {view['pins']['environment']} "
+             f"(blueprint v{view['pins']['blueprint_version']}, "
+             f"attack guide v{view['pins']['attack_version']})",
+             f"Domain: {view['domain']}",
+             f"Entry: {scope['entry_guest']} via {scope['entry_via']}"
+             + (f" (segments: {', '.join(scope.get('allowed_segments') or [])})"
+                if scope.get("allowed_segments") else ""),
+             "Authorized targets:"]
+    for name in scope["target_guests"]:
+        g = bp.guest(name)
+        addrs = []
+        for iface in g.interfaces:
+            if iface.ipv4.address:
+                addrs.append(f"{iface.ipv4.address}/{iface.segment}")
+        lines.append(f"- {name} [{', '.join(addrs) or 'dhcp'}] "
+                     f"os={g.os.value} services={', '.join(s.value for s in g.services) or '-'}")
+    lines.append("Public paths (via the edge NAT):")
+    for e in bp.edges:
+        if e.kind.value == "nat":
+            lines.append(f"- {e.detail}")
+    lines.append("Service context:")
+    lines += [f"- {c}" for c in view["service_context"]]
+    lines.append("Tactic guide (advisory; scope and rules are enforced "
+                 "platform-side, not by you choosing them):")
+    for t in view["tactics"]:
+        lines.append(f"- {t['tactic']}: {' '.join(t['guidance'].split())}")
+    return "\n".join(lines)
+
+
 class RedAgentKilled(Exception):
     pass
 
@@ -185,6 +235,10 @@ class RedAgentLoop:
         return self.scenario.get("red", {}).get("objectives", [])
 
     def _topology_text(self) -> str:
+        if self.scenario.get("environment"):
+            text = render_environment_context(self.scenario)
+            if text is not None:
+                return text
         hosts = (self.scenario.get("topology") or {}).get("hosts") or []
         lines = [f"- {h.get('name')}: ip {h.get('ip')} services {h.get('services', [])}"
                  for h in hosts]

@@ -60,6 +60,10 @@ class Session(Base):
     outcome: Mapped[str | None] = mapped_column(Text)
     finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     players: Mapped[dict | None] = mapped_column(JSONB)  # reserved for future team mode
+    # Underpressure plan: exercise sessions may bind to a durable LAB that
+    # outlives them. NULL for every pre-existing/flat scenario session —
+    # old rows are never reinterpreted.
+    lab_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("labs.lab_id"))
 
 
 class Event(Base):
@@ -801,3 +805,109 @@ class OperationOutput(Base):
         Index("uq_operation_outputs_truncated_once", "run_id", "op_id",
               unique=True, postgresql_where=sa_text("kind = 'truncated'")),
     )
+
+
+# ---------------------------------------------------------------- plan: labs --
+class Lab(Base):
+    """The DURABLE environment aggregate (Underpressure plan step 3).
+
+    A lab owns the replica guests (per-guest generations and the retained
+    reservation) and OUTLIVES exercise sessions: closing browsers, ordinary
+    inactivity, optional timer expiry and completing an exercise never
+    erase disks — only an explicit, dependency-approved reset or delete
+    does. A stopped (powered-off) lab still retains its ownership/storage
+    reservation; only verified absence releases it. One active environment
+    is promised at a time; nothing here reinterprets old session IDs.
+    """
+
+    __tablename__ = "labs"
+
+    lab_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    environment_id: Mapped[str] = mapped_column(Text, nullable=False)
+    # Frozen environment document versions (blueprint/fidelity/checks/attack)
+    pins: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    # captain: operator-provisioned owner who manages membership/resets
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.user_id"))
+    # provisioning | active | degraded | stopped | deleted
+    # (failed resets stay `degraded` with durable inventory, never falsely ready)
+    state: Mapped[str] = mapped_column(Text, nullable=False, default="provisioning")
+    # on | off — power state is DISTINCT from reset and from delete
+    power: Mapped[str] = mapped_column(Text, nullable=False, default="on")
+    # aggregate reservation retained while the lab exists (memory/disk/VM count)
+    reservation: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    # explicit delete only, and only after guest absence is verified
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class LabGuest(Base):
+    """One guest of a lab with its OWNED generation. Every destructive reset
+    bumps the generation and rotates that guest's keys/capabilities; stale
+    console/SSH/verifier/model state bound to an older generation must be
+    refused, and old evidence can never establish new-generation success."""
+
+    __tablename__ = "lab_guests"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    lab_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("labs.lab_id"), nullable=False)
+    guest: Mapped[str] = mapped_column(Text, nullable=False)  # blueprint guest name
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # pending | creating | ready | failed | degraded
+    state: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    # broker-owned resource identity ({vmid, name, macs, ...}) recorded as
+    # intent BEFORE effects and confirmed by read-back afterwards
+    resource: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("lab_id", "guest", name="uq_lab_guests_lab_guest"),
+    )
+
+
+class LabMember(Base):
+    """Team membership with immutable join/leave evidence. Captain invites
+    operator-provisioned accounts; removal terminates active access (the
+    API layer revokes live capabilities) — membership rows are never
+    hard-deleted, only timestamped out."""
+
+    __tablename__ = "lab_members"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    lab_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("labs.lab_id"), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.user_id"), nullable=False)
+    # captain | member (the lab owner is always captain; never global operator)
+    role: Mapped[str] = mapped_column(Text, nullable=False, default="member")
+    added_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.user_id"))
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("lab_id", "user_id", name="uq_lab_members_lab_user"),
+    )
+
+
+class LabResetPlan(Base):
+    """Versioned, previewed destructive-reset record. Individual resets MUST
+    first compute a dependency plan (what rebuilds, what is preserved, what
+    cannot be safely decoupled) and carry explicit captain approval before
+    any rebuild side effect. Status history is operational, not evidence;
+    immutable actor/attempts are appended to events by the API layer."""
+
+    __tablename__ = "lab_reset_plans"
+
+    plan_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    lab_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("labs.lab_id"), nullable=False)
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.user_id"))
+    # {selected: [guest names], full: bool}
+    request: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # planner output (RESET_PLAN_VERSION-bound; includes impact + advisories)
+    plan: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # proposed | approved | executing | executed | failed | cancelled
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="proposed")
+    approved_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.user_id"))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

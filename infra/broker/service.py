@@ -24,6 +24,7 @@ and stops before serving any request.
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 import uuid
@@ -427,6 +428,15 @@ class BrokerService:
             self.policy.check_net0(cfg["net0"])
         if "ipconfig0" in cfg:
             self.policy.check_ipconfig(cfg["ipconfig0"])
+        for key in cfg:
+            m = re.fullmatch(r"(net|ipconfig)([1-9])", key)
+            if not m:
+                continue
+            idx = int(m.group(2))
+            if m.group(1) == "net":
+                self.policy.check_nic_index(idx, cfg[key])
+            else:
+                self.policy.check_ipconfig_index(idx, cfg[key])
         if "tags" in cfg:
             self.policy.check_tags(cfg["tags"])
         if "name" in cfg:

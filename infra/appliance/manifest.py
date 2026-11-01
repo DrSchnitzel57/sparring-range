@@ -180,6 +180,17 @@ class ImageSpec:
 
 
 @dataclass(frozen=True)
+class SegmentBridge:
+    """One operator-created lab segment (segment-lane installs). The bridge
+    is created by the appliance installation; scenarios/models can never
+    name bridges — they name segments, and the broker resolves through this
+    operator-owned table only."""
+    name: str
+    cidr: ipaddress.IPv4Network
+    bridge: str
+
+
+@dataclass(frozen=True)
 class Network:
     lan_cidr: ipaddress.IPv4Network
     range_cidr: ipaddress.IPv4Network
@@ -191,6 +202,9 @@ class Network:
     ingest_port: int
     management_cidr: ipaddress.IPv4Network
     lan_address: ipaddress.IPv4Address | None = None
+    # Segment lane (Underpressure): approved bridges for multi-NIC guests.
+    segments: tuple[SegmentBridge, ...] = ()
+    max_nics: int = 1
 
 
 @dataclass(frozen=True)
@@ -270,7 +284,8 @@ class ApplianceManifest:
         _closed(net_raw, {
             "lan_cidr", "lan_address", "range_cidr", "range_bridge",
             "range_gateway", "controller_range_ip", "bastion_address",
-            "ingest_address", "ingest_port", "management_cidr"}, "network")
+            "ingest_address", "ingest_port", "management_cidr",
+            "segments", "max_nics"}, "network")
         try:
             lan = ipaddress.ip_network(_str(net_raw, "lan_cidr", "network"),
                                        strict=True)
@@ -308,6 +323,57 @@ class ApplianceManifest:
         if rng.is_loopback or lan.is_loopback or mgmt.is_loopback:
             raise _bad("loopback is not a valid appliance network")
         port = _int(net_raw, "ingest_port", "network", low=1, high=65535)
+
+        # Segment lane (Underpressure multi-NIC installs): operator-created
+        # bridges for approved lab segments. Unknown bridges/CIDRs are load
+        # failures; the broker re-validates independently at boot.
+        seg_raw_list = net_raw.get("segments", [])
+        segments: tuple[SegmentBridge, ...] = ()
+        if not isinstance(seg_raw_list, list):
+            raise _bad("network.segments must be a list")
+        seen_seg_names: set[str] = set()
+        seen_seg_bridges: set[str] = set()
+        seen_seg_nets: list[tuple[str, ipaddress.IPv4Network]] = []
+        for i, item in enumerate(seg_raw_list):
+            where = f"network.segments[{i}]"
+            if not isinstance(item, dict):
+                raise _bad(f"{where} must be an object")
+            _closed(item, {"name", "cidr", "bridge"}, where)
+            sname = _str(item, "name", where)
+            if not re.fullmatch(r"[a-z][a-z0-9-]{1,31}", sname) or sname in seen_seg_names:
+                raise _bad(f"{where}.name must be a unique safe segment name")
+            seen_seg_names.add(sname)
+            sbridge = _str(item, "bridge", where)
+            if (not _BRIDGE_RE.fullmatch(sbridge) or sbridge == "lo"
+                    or sbridge == bridge or sbridge in seen_seg_bridges):
+                raise _bad(f"{where}.bridge must be a unique safe bridge and "
+                           f"differ from range_bridge")
+            seen_seg_bridges.add(sbridge)
+            try:
+                snet = ipaddress.ip_network(_str(item, "cidr", where), strict=True)
+            except ValueError as exc:
+                raise _bad(f"{where}.cidr invalid: {exc}") from exc
+            if not isinstance(snet, ipaddress.IPv4Network) or snet.prefixlen > 30:
+                raise _bad(f"{where}.cidr must be a strict IPv4 /<=30 network")
+            if snet.is_loopback:
+                raise _bad(f"{where}.cidr may not be loopback")
+            for other, onet in seen_seg_nets:
+                if snet.overlaps(onet):
+                    raise _bad(f"{where} overlaps segment {other}")
+            seen_seg_nets.append((sname, snet))
+            for lane_name, lane in (("range_cidr", rng), ("lan_cidr", lan),
+                                    ("management_cidr", mgmt)):
+                if snet != rng and snet.overlaps(lane):
+                    raise _bad(f"{where} overlaps {lane_name} without being "
+                               f"equal to it")
+            segments += (SegmentBridge(name=sname, cidr=snet, bridge=sbridge),)
+        max_nics = _int(net_raw, "max_nics", "network", low=1, high=8) \
+            if "max_nics" in net_raw else 1
+        if segments:
+            if max_nics > len(segments):
+                raise _bad("network.max_nics cannot exceed len(network.segments)")
+        elif max_nics != 1:
+            raise _bad("network.max_nics > 1 requires network.segments")
 
         urls = _need_obj(raw, "urls")
         _closed(urls, {"public", "internal", "ingest"}, "urls")
@@ -454,7 +520,7 @@ class ApplianceManifest:
                 lan_cidr=lan, range_cidr=rng, range_bridge=bridge,
                 range_gateway=gw, controller_range_ip=ctl, bastion_address=bast,
                 ingest_address=ing, ingest_port=port, management_cidr=mgmt,
-                lan_address=lan_addr),
+                lan_address=lan_addr, segments=segments, max_nics=max_nics),
             budgets=budgets, broker_socket=sock, broker_ledger=ledger,
             state_dir=state, images_dir=images_dir, recordings_dir=recordings,
             secrets_dir=secrets, public_url=public, internal_url=internal,
@@ -562,6 +628,9 @@ class ApplianceManifest:
             "installation_id": self.installation_id,
             "range_cidr": str(self.network.range_cidr),
             "range_bridge": self.network.range_bridge,
+            "segments": [{"name": s.name, "cidr": str(s.cidr), "bridge": s.bridge}
+                         for s in self.network.segments],
+            "max_nics": self.network.max_nics,
             "broker_socket": self.broker_socket,
             "images": {role: {"template_id": i.template_id,
                               "sha256": i.sha256, "disk_gb": i.disk_gb,

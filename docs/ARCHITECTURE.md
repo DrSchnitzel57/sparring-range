@@ -1334,3 +1334,34 @@ retained plan-20 review defects; it does not authorize agents to update the VM.
   action budgets, schema/API changes, health-detector thresholds and deployment
   service/storage configuration will be designed and agreed in their milestone
   plans. They are deliberately not guessed here or presented as existing code.
+
+## Underpressure live AI defense range — 2026-11-01 (implementation in progress)
+
+The approved Underpressure plan recreates the 10 competition machines as ONE
+persistent team lab inside the Ubuntu/KVM appliance, with a separate
+infrastructure attacker (the AI's transport; never the team's Kali), a trusted
+external scoring vantage, and live autonomous offense through the existing
+protected gateway. Implementation is incremental on `master`; flat presets
+keep their exact old contracts until every lane below is proven.
+
+### Decisions and why (implementation slices)
+
+| Decision | Rejected alternative | Why |
+| --- | --- | --- |
+| The durable replica is an ENVIRONMENT DIRECTORY (`environments/<id>/`: blueprint.yaml, fidelity.yaml, checks.yaml, attack.yaml, defender.md) validated by `srplatform/environment_specs` closed typed models; scenarios only REFERENCE it | Repeating hosts/addresses in every scenario YAML | One source of truth freezes what a session deployed (`environment_pins` in the append-only session snapshot); the fidelity ledger stays attached to the same version set |
+| Scenario schema v2: `environment:` + `scoring.availability` (service-check ids) with `topology` refused alongside it; legacy scenarios validate byte-compatibly | A parallel scenario engine for Underpressure | Library listing, verification snapshots, and history all keep working on the same validated path; the orchestrator REFUSES environment deploys with zero side effects until the segment broker lane completes — misprovisioning one NIC is not "deployment" |
+| Availability is a versioned service-check REGISTRY of REAL transactions (catalogue HTTPS content, SMTP+IMAP/POP round trip, Roundcube login, DNS/MX/SRV, directory bind, seeded SQL reads, authenticated Splunk search) bound to the trusted scoring vantage; dependency failures are UNKNOWN evidence, never downtime | "HTTP 200 and a MySQL banner" | The plan's central criterion is real services; the vantage traverses the same public DNAT path attackers do; `depends_on_guests` prevents an infrastructure gap awarding or deducting points |
+| Every reconstructed value carries a fidelity classification (`reported/observed/inferred/synthetic/substituted/excluded/unverified`) in a ledger whose non-excluded paths MUST resolve inside the blueprint | Shipping a "replica" whose unknowns are silently invented | The original screenshots/disks were never inspected; substitutes (OPNsense, Windows 11 Enterprise evaluation, SQL 2022 Developer, 64 GiB budget) must stay labeled |
+| The lab is a NEW aggregate (`labs`, `lab_guests`, `lab_members`, `lab_reset_plans` via forward migration 0029; `sessions.lab_id` nullable); exercise sessions bind to it but a lab outlives them; power-off keeps reservation and disks; delete is explicit | Reusing Session as the lab (timer expiry deleting state) or reinterpreting old session IDs | Timing freedom is a user decision; old sessions and evidence stay untouched; generations per guest make stale console/SSH/verifier/model state provably invalidatable after a reset |
+| Destructive resets go through a versioned PLANNER (`srplatform/lab.py`): dependents cascade INTO the approved plan, DC/member trust and shared-SQL impacts are blockers/advisories (never silent), unknown or mid-provision inventory BLOCKS, and AI+scoring fences always apply first | Snapshot-rollback of a lone DC, or rebuilding "just the box you clicked" | The approved plan forbids advertising arbitrary isolated DC rollback; unapproved work is either explicitly in the destructive preview or nothing happens |
+| Multi-NIC is a CLOSED segment lane: the operator policy enumerates `{name, bridge, cidr}`; brokers (PVE + appliance) accept `net<i>/ipconfig<i>` ONLY for `i < max_nics`, byte-equal segment bridge specs, addresses inside approved segment CIDRs with exact prefix, and `gw=` stays globally refused; manifests cross-validate bridges/CIDRs at load | Letting scenario/model data name bridges, or a generic device escape hatch | Bridges are an installation fact; segments are the vocabulary scenarios share. v1 single-NIC policies keep byte-identical behavior including refusing indexed keys |
+
+### Status boundaries (as implemented, not accepted)
+
+Validated and unit/fixture-proven: the contracts above plus the plan-22
+re-verification (all three findings fixed at the frozen HEAD with their
+regression tests green). NOT yet proven here: multi-interface libvirt domain
+XML/seed plumbing behind the segment policy, real guest builds (media
+gated), the console gateway, lab API/CLI surface, real-packet segment
+isolation, and all installed/live/model gates. The fidelity ledger is part
+of the deliverable, not a disclaimer to hide behind.

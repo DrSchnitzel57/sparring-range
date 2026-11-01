@@ -53,6 +53,40 @@ Resume by independently checking the three findings against the frozen source,
 refreshing affected acceptance evidence and building a source-bound candidate.
 Do not deploy merely because this checkpoint is on the default branch.
 
+## Underpressure implementation slice — 2026-11-01 (branch `underpressure-range`, base `9b31635`)
+
+- **Plan-22 three-finding recheck against HEAD `9b31635`** (the frozen merge
+  of the claimed fixes): all three mechanisms are present in the integrated
+  source — every mirror envelope carries the authoritative `seq` and
+  unreconciled lines never override committed authority
+  (`srplatform/safety/__init__.py`); outage recovery is a NEW committed pass
+  with the audited `POST /safety/reconcile-outage` +
+  `rangectl safety reconcile-outage` (`app.py:2672`, `safety/__init__.py:777`);
+  activation/forced rollback renames use `renameat2(RENAME_NOREPLACE)`
+  (`deploy/bundle.py:254-284`). The round-5 AND round-6 regression suites
+  pass at HEAD (7 passed, 13 deselected, 9.5 s). Infrastructure-free full
+  suite at this base: **744 passed, 0 failed, 535 deselected** (113 s) —
+  refreshed baseline replacing the historical 741. This is source +
+  infrastructure-free-test evidence; independent review of the frozen
+  integration and every installed/live gate REMAIN open (unchanged freeze).
+- **New contract layer (validated, not release-accepted):**
+  `srplatform/environment_specs` + `environments/underpressure-range`
+  (blueprint/fidelity/checks/attack/defender, 12 guests, 8 real-transaction
+  availability checks, labeled practice rubric), scenario schema v2 with
+  environment pins, orchestrator refusal of flat environment deploys,
+  Windows-path verifier args, durable lab aggregate (migration 0029 —
+  forward, additive) with dependency-aware reset planner, and the closed
+  segment/NIC lane in both broker policies (v1 policies unchanged and
+  regression-proven). New tests: 27 environment + 9 lab + 7 NIC-lane;
+  infra-free suite green at the slice head; DB lanes (fresh-migration +
+  round-trip) run against a disposable containerized Postgres; authority
+  lane 35 passed after the policy change.
+- **Still pending (not faked):** multi-interface domain XML/seed backend
+  wiring behind the segment policy, guest image builds (operator media),
+  lab API/CLI + console gateway, red-agent environment binding + attacker
+  tooling payload, packet-level segment isolation on real nft/libvirt, and
+  every installed-appliance / real-model qualification gate.
+
 ## Plan-22 review-round-5 receipts — 2026-10-31 (branch `practice-upgrades-18-21`, fix `2c9cad4`)
 
 Independent focused review of `dc5fb27`/source `71c0200` returned
