@@ -172,19 +172,25 @@ def test_lab_aggregate_roundtrip_and_constraints(migrated_db):
 def test_sessions_predate_labs_and_stay_uninterpreted(migrated_db):
     """A flat-scenario session keeps lab_id NULL forever; creating a lab
     never backfills or reinterprets existing sessions."""
+    import uuid
+
     from sqlalchemy import create_engine, func, select
     from sqlalchemy.orm import Session as SASession
     from srplatform.db.models import Lab, Session as SessionRow
 
+    # unique marker: the DB lane shares one migrated database per session,
+    # so this test must not assume it is the only writer of sessions
+    marker = uuid.uuid4().hex
     eng = create_engine(migrated_db)
     with SASession(eng) as db:
-        for sid in range(3):
-            db.add(SessionRow(scenario_id=f"legacy-{sid}"))
+        for i in range(3):
+            db.add(SessionRow(scenario_id=f"legacy-{marker}-{i}"))
         db.commit()
     with SASession(eng) as db:
-        db.add(Lab(environment_id="underpressure-range", name="late-lab"))
+        db.add(Lab(environment_id="underpressure-range", name=f"late-lab-{marker}"))
         db.commit()
     with SASession(eng) as db:
         bound = db.scalar(select(func.count()).select_from(SessionRow)
-                          .where(SessionRow.lab_id.is_(None)))
+                          .where(SessionRow.scenario_id.like(f"legacy-{marker}-%"),
+                                 SessionRow.lab_id.is_(None)))
         assert bound == 3

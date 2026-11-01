@@ -339,3 +339,19 @@ def test_windows_path_args_contract():
                 "\\\\server\\share\\x", "C:/a`x"):
         with pytest.raises(Exception, match="absolute"):
             ExfilArg(host="h", path=bad)
+
+
+def test_loop_environment_context_is_scope_only():
+    from srplatform.red_agent.loop import render_environment_context
+    scenario = {"environment": "underpressure-range"}
+    text = render_environment_context(scenario)
+    assert text is not None
+    assert "red-entry" in text and "routed-nat" in text
+    assert "DNAT 172.25.31.10" in text          # public path from edges
+    assert "Kerberoastable" in text              # tactic guide present
+    assert "credential:" not in text             # no scorer material
+    assert "seed_expectation" not in text
+    assert "success_text" not in text
+    # broken/unknown environment => None (loop must not go blind)
+    assert render_environment_context({"environment": "nope"}) is None
+    assert render_environment_context({}) is None

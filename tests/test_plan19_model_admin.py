@@ -70,7 +70,14 @@ def _make_profile(client, users, name, base_url, *, key="sk-canary-9"):
 def test_bootstrap_profiles_exist_and_no_read_path_leaks_a_key(client, users, srv):
     body = client.get("/admin/model/profiles", headers=users["op"])
     assert body.status_code == 200, body.text
-    assert client.get("/readyz").json()["migration_version"] == "0028"
+    # head is DERIVED from the migrations tree (the linear-chain pin lives in
+    # test_app_role_grants), so a forward migration never silently breaks the
+    # admin surface; what matters is that /readyz reports the actual head.
+    from tests.test_app_role_grants import _revisions
+    _revs = _revisions()
+    _children = {down for down, _ in _revs.values() if down}
+    (_head,) = [r for r in _revs if r not in _children]
+    assert client.get("/readyz").json()["migration_version"] == _head
     data = body.json()
     names = {p["name"] for p in data["profiles"]}
     assert {"environment-red", "environment-coach"} <= names
