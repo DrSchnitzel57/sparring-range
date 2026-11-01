@@ -76,6 +76,8 @@ def _install_fixture(tmp_path: pathlib.Path):
 
 def test_fresh_install_provisions_the_secret_role_and_api_only_file(tmp_path,
                                                                     monkeypatch):
+    from tests.helpers import require_sql_handoff_prereq
+    require_sql_handoff_prereq()
     monkeypatch.delenv("SR_PG_SECRET_URL", raising=False)
     monkeypatch.delenv("SR_POSTGRES_URL", raising=False)
     monkeypatch.delenv("SR_POSTGRES_URL_OWNER", raising=False)
@@ -123,6 +125,8 @@ def test_fresh_install_provisions_the_secret_role_and_api_only_file(tmp_path,
 
 
 def test_rerun_preserves_the_existing_secret_file(tmp_path, monkeypatch):
+    from tests.helpers import require_sql_handoff_prereq
+    require_sql_handoff_prereq()
     monkeypatch.delenv("SR_PG_SECRET_URL", raising=False)
     monkeypatch.delenv("SR_POSTGRES_URL", raising=False)
     monkeypatch.delenv("SR_POSTGRES_URL_OWNER", raising=False)
@@ -153,6 +157,8 @@ def test_rerun_preserves_the_existing_secret_file(tmp_path, monkeypatch):
 
 
 def test_dry_run_writes_no_secret_file(tmp_path, monkeypatch):
+    from tests.helpers import require_sql_handoff_prereq
+    require_sql_handoff_prereq()
     monkeypatch.delenv("SR_PG_SECRET_URL", raising=False)
     monkeypatch.delenv("SR_POSTGRES_URL", raising=False)
     monkeypatch.delenv("SR_POSTGRES_URL_OWNER", raising=False)

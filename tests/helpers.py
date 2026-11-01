@@ -88,6 +88,29 @@ def alive(pid: int) -> bool:
         return True
 
 
+def require_sql_handoff_prereq() -> None:
+    """Gate for installer tests that drive the REAL secret-provisioning
+    handoff: os.chown to the postgres user + su postgres are root-only.
+    Hosts without a postgres OS user exercise the documented no-handoff
+    branch honestly and run; a privileged box runs the real path. An
+    unprivileged box that HAS the user (CI runners) cannot, so it SKIPs
+    with the reason; required jobs (SR_REQUIRE_SECRETS=1) FAIL instead."""
+    import os
+    import pwd
+
+    import pytest
+    try:
+        pwd.getpwnam("postgres")
+    except KeyError:
+        return  # no handoff branch — the test covers the documented path
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return
+    reason = "secret provisioning needs root to chown/su as postgres"
+    if os.environ.get("SR_REQUIRE_SECRETS") == "1":
+        pytest.fail(f"SR_REQUIRE_SECRETS=1 — {reason}", pytrace=False)
+    pytest.skip(reason)
+
+
 def require_packet_prereq() -> None:
     """Gate for the privileged PACKET layer (real nft + netns packet flows,
     disposable namespaces only). Ordinary hosts SKIP with the exact missing

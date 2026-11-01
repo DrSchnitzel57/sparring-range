@@ -126,14 +126,18 @@ def test_boundary_math_no_identity_can_read_and_a_loose_file_is_caught(
 
 def test_posix_math_uses_exact_access_semantics_for_service_uids(tmp_path):
     """The math, not os.access (which lies about every file as root):
-    0600 owner-root file → unreadable by any other uid/gid, including
-    any group membership; the exact POSIX ordering is applied."""
+    a 0600 file is unreadable by every uid/gid that is not the owner's,
+    including any group membership; the exact POSIX ordering is applied.
+    The probe uids are derived from the file's ACTUAL owner so the same
+    assertions hold unprivileged (dev box) and as root (CI runner) —
+    a literal uid 0 would silently be the owner when running as root."""
     f = tmp_path / "db-secret.env"
     f.write_text("x")
     f.chmod(0o600)
     st = f.stat()
+    foreign_root = 0 if st.st_uid != 0 else 1001  # never the owner
     for uid, gid, groups in ((1001, 1001, {100, 101}),
-                             (0, 100, {0}),          # wrong-uid root-group
+                             (foreign_root, 100, {0}),   # wrong-uid root-group
                              (st.st_gid + 900, 5, {5})):
         assert not svc._posix_readable(st, uid, gid, groups)
     assert svc._posix_readable(st, st.st_uid, st.st_gid, set())
@@ -142,7 +146,9 @@ def test_posix_math_uses_exact_access_semantics_for_service_uids(tmp_path):
     old.write_text("x")
     old.chmod(0o640)
     st_old = old.stat()
-    assert svc._posix_readable(st_old, 999, st_old.st_gid, set()) is True
+    assert svc._posix_readable(
+        st_old, 999 if st_old.st_uid != 999 else 998,
+        st_old.st_gid, set()) is True
 
 
 # --------------------------------------------------------------------------- #

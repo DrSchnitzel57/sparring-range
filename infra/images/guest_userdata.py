@@ -283,8 +283,8 @@ def _verify_checks(role: str) -> str:
         # (bounded) since verify boots start it fresh under slow TCG.
         mysql_checks = """
 wchk MYSQL-READY 45 mysqladmin --silent ping
-wchk MYSQL-COUNT 30 bash -c 'test "$(mysql --protocol=TCP --host=127.0.0.1 --batch --skip-column-names --user=mojang_reader --password="$(cat /etc/mojang-web/reader-pw)" -e "SELECT COUNT(*) FROM purchases" mojang)" = 12'
-wchk MYSQL-ROW 30 bash -c 'mysql --protocol=TCP --host=127.0.0.1 --batch --skip-column-names --user=mojang_reader --password="$(cat /etc/mojang-web/reader-pw)" -e "SELECT purchase_id FROM purchases" mojang | grep -q buy-001'
+wchk MYSQL-COUNT 30 bash -c 'pw=$(cat /etc/mojang-web/reader-pw 2>/dev/null); test -n "$pw" || { echo READER-PW-MISSING-OR-EMPTY >&2; exit 9; }; test "$(mysql --protocol=TCP --host=127.0.0.1 --batch --skip-column-names --user=mojang_reader --password="$pw" -e "SELECT COUNT(*) FROM purchases" mojang)" = 12'
+wchk MYSQL-ROW 30 bash -c 'pw=$(cat /etc/mojang-web/reader-pw 2>/dev/null); test -n "$pw" || { echo READER-PW-MISSING-OR-EMPTY >&2; exit 9; }; mysql --protocol=TCP --host=127.0.0.1 --batch --skip-column-names --user=mojang_reader --password="$pw" -e "SELECT purchase_id FROM purchases" mojang | grep -q buy-001'
 """
     else:
         units = "mojang-web nginx sshd auditd sparring-shipper"
