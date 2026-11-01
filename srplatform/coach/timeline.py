@@ -34,11 +34,28 @@ def compress_timeline(events: list[dict], max_lines: int = 80) -> tuple[str, dic
       telemetry_gaps – hosts whose objectives lack telemetry entirely
       wins       – explicit remediation events
       detections – verifier/detection events (rendered, source time)
+      shown_ids  – CANONICAL citable ids: the events this render actually
+                   shows (plan 20 F5 — never ids a payload merely mentions;
+                   plan 22 review — also never ids the max_lines trim cut)
     """
     events = sorted(events, key=lambda e: (e.get("event_id") or 0))
     lines, misses, gaps, wins, detections = [], [], [], [], []
+    line_ids: list[int | None] = []     # citable id PARALLEL to each line
     responses: list[tuple[datetime, str | None, dict]] = []
     telemetry_hosts: set[str] = set()
+
+    def emit(e: dict, text: str) -> None:
+        """Citations are canonical (plan 20 F5, sharpened by plan 22
+        review): the citable id is bound to the RENDER LINE at emit time
+        (paired, never re-parsed out of the text — a payload containing
+        `#99999999` must not forge a citation), and only lines the FINAL
+        render keeps become citable: events the max_lines TRIM cut leave
+        the allowed set too."""
+        lines.append(text)
+        try:
+            line_ids.append(int(e.get("event_id")))
+        except (TypeError, ValueError):
+            line_ids.append(None)
 
     for e in events:
         ts, kind = _t(e), e.get("action_type", "?")
@@ -46,15 +63,15 @@ def compress_timeline(events: list[dict], max_lines: int = 80) -> tuple[str, dic
         p = e.get("payload") or {}
         stamp = ts.strftime("%H:%M:%S") if ts else "??:??:??"
         if kind == "tool_call" and actor == "red":
-            lines.append(f"[{stamp}#{e.get('event_id')}] RED {e.get('phase') or '?'}: "
-                         f"{p.get('command', '')[:90]}")
+            emit(e, f"[{stamp}#{e.get('event_id')}] RED (agent) "
+                    f"{e.get('phase') or '?'}: {p.get('command', '')[:90]}")
         elif kind == "action_result" and actor == "red":
-            lines.append(f"[{stamp}#{e.get('event_id')}] RED exit={p.get('exit_code')}: "
-                         f"{p.get('output', '')!r:.70}")
+            emit(e, f"[{stamp}#{e.get('event_id')}] RED (agent) "
+                    f"exit={p.get('exit_code')}: {p.get('output', '')!r:.70}")
         elif kind == "verifier":
             label = "PASS" if p.get("passed") else (p.get("status") or "fail")
-            lines.append(f"[{stamp}#{e.get('event_id')}] VERIFY {p.get('objective')}={label}"
-                         + (f" @{host}" if host else ""))
+            emit(e, f"[{stamp}#{e.get('event_id')}] VERIFY {p.get('objective')}={label}"
+                    + (f" @{host}" if host else ""))
             detections.append(e)
         elif kind == "command" and actor == "telemetry":
             # UNATTRIBUTED ACTIVITY (audit Stage 5): auditd shows that A
@@ -62,16 +79,16 @@ def compress_timeline(events: list[dict], max_lines: int = 80) -> tuple[str, dic
             # telemetry (or the attacker's own commands) must never count as
             # a defender response; it is rendered as activity on record only.
             telemetry_hosts.add(host or "?")
-            lines.append(f"[{stamp}#{e.get('event_id')}] AUDITD {host}: "
-                         f"{str(p.get('argv') or p.get('comm'))[:70]} "
-                         f"[unattributed activity — not defender-attributed]")
+            emit(e, f"[{stamp}#{e.get('event_id')}] AUDITD {host}: "
+                    f"{str(p.get('argv') or p.get('comm'))[:70]} "
+                    f"[unattributed activity — not defender-attributed]")
         elif kind == "detection" and actor == "telemetry":
             # detection events are RENDERED explicitly (audit Stage 5)
             telemetry_hosts.add(host or "?")
-            lines.append(f"[{stamp}#{e.get('event_id')}] DETECT {host}: "
-                         f"watch {p.get('audit_key') or '?'} "
-                         f"{str(p.get('argv') or p.get('comm') or '')[:50]} "
-                         f"[watch hit — unattributed until correlated]")
+            emit(e, f"[{stamp}#{e.get('event_id')}] DETECT {host}: "
+                    f"watch {p.get('audit_key') or '?'} "
+                    f"{str(p.get('argv') or p.get('comm') or '')[:50]} "
+                    f"[watch hit — unattributed until correlated]")
         elif kind in CONNECTION_NOISE:
             continue  # connection lifecycle is NOT investigation (F12)
         elif kind == "remediation":
@@ -79,12 +96,21 @@ def compress_timeline(events: list[dict], max_lines: int = 80) -> tuple[str, dic
             wins.append(e)
             # a member's remediation STATEMENT is a CLAIM until the scorecard
             # verifies host state (audit Stage 5)
-            lines.append(f"[{stamp}#{e.get('event_id')}] BLUE REMEDIATION {host or ''}: "
-                         f"{str(p.get('action') or p.get('command') or '')[:70]} "
-                         f"[claim — verified only via scorecard state]")
+            who = actor.split(":", 1)[1] if actor.startswith("blue:") else "defender"
+            emit(e, f"[{stamp}#{e.get('event_id')}] MEMBER {who} REMEDIATION "
+                    f"{host or ''}: "
+                    f"{str(p.get('action') or p.get('command') or '')[:70]} "
+                    f"[claim — verified only via scorecard state]")
         elif actor.startswith("blue:") and kind in RESPONSE_KINDS:
             responses.append((ts, host, e))
-            lines.append(f"[{stamp}#{e.get('event_id')}] BLUE {p.get('command') or kind}")
+            # PROVENANCE (plan 22 LIVE-10): an authenticated member's recorded
+            # bastion activity is neither attacker reconnaissance nor agent
+            # output — name the actor class so coaching cannot misattribute it.
+            who = actor.split(":", 1)[1] or "member"
+            emit(e, f"[{stamp}#{e.get('event_id')}] MEMBER {who}"
+                    + (f" @{host}" if host else "")
+                    + f" via bastion: {p.get('command') or kind} "
+                      f"[authenticated member activity — not the red agent]")
 
     for e in detections:
         p = e.get("payload") or {}
@@ -105,8 +131,55 @@ def compress_timeline(events: list[dict], max_lines: int = 80) -> tuple[str, dic
                                "reason": "no correlated defender action on this host within "
                                          f"{int(RESPONSE_WINDOW.total_seconds()//60)} min"})
 
-    return "\n".join(lines[-max_lines:]), {"misses": misses, "telemetry_gaps": gaps,
-                                           "wins": wins, "detections": detections}
+    # The allowed citation set comes from the EXACT final render window
+    # (plan 22 review): pairing ids with lines at emit time, then taking
+    # the same [-max_lines:] slice, is what makes "validated but never
+    # shown" citations impossible — without re-parsing payload text.
+    kept_ids = {i for i in line_ids[-max_lines:] if i is not None}
+    return ("\n".join(lines[-max_lines:]),
+            {"misses": misses, "telemetry_gaps": gaps,
+             "wins": wins, "detections": detections,
+             "shown_ids": sorted(kept_ids)})
+
+
+def session_context_note(context: dict | None) -> str:
+    """One header line for coaching prompts (plan 22 LIVE-10, sharpened
+    by review item 9): the red run's state as a CLASSIFIER — never /
+    active / completed / interrupted — not merely "is a run ACTIVE
+    right now". A session whose run already completed DID have attacker
+    activity; telling the coach "no red run has started" there invites
+    it to explain away real RED evidence. A READY session with no run at
+    all still has zero agent operations — setup/telemetry noise is not
+    recon. Attribution beyond these classes stays unknown; host
+    telemetry alone proves neither identity nor intent."""
+    if not context:
+        return ""
+    status = context.get("session_status") or "?"
+    state = context.get("red_run_state") or "never"
+    phase = context.get("phase")
+    ph = f" (last observed phase {phase})" if phase else ""
+    if state == "active":
+        run_line = (f"a red run is IN PROGRESS{ph} — RED entries are the "
+                    "agent's current work")
+    elif state == "completed":
+        run_line = ("a red run COMPLETED — RED entries in the evidence ARE "
+                    f"attacker activity{ph}; the run is over")
+    elif state == "interrupted":
+        outcome = context.get("run_outcome") or "ended"
+        run_line = ("a red run was INTERRUPTED"
+                    f" ({outcome}){ph} — RED entries up to the interruption "
+                    "are attacker activity; anything after it is not the "
+                    "agent")
+    else:  # never
+        run_line = ("NO red run has started — anything before the first RED "
+                    "entry is setup, defender work or background telemetry, "
+                    "not attacker reconnaissance")
+    return (f"Session context: status={status}; {run_line}. "
+            "Line classes: RED (agent) = platform red agent only; "
+            "MEMBER <user> = that member's recorded bastion login; "
+            "AUDITD/DETECT = unattributed host telemetry; VERIFY = platform "
+            "verifier. Telemetry alone proves neither identity nor intent — "
+            "keep attribution UNKNOWN when it is unknown.")
 
 
 def format_citation(e: dict) -> str:

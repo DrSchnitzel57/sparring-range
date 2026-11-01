@@ -3,11 +3,11 @@
 > Workflow normalized 2026-10-28: the [native-workflow decision](../../docs/ARCHITECTURE.md#workflow-decision--native-openchamber-2026-10-28) supersedes old procedural rules in this record, not product requirements or acceptance gates. Retained status is not fresh verification.
 
 ## Steps
-- [ ] Build authenticated evidence projections and conversational coaching.
-- [ ] Capture bounded timed attacker output with honest legacy fallback.
-- [ ] Modernize home/history, session navigation and report presentation.
-- [ ] Integrate synchronized review and test authorization/failure cases.
-- [ ] Record evidence, tick 20 on its gates and update architecture if changed.
+- [x] Build authenticated evidence projections and conversational coaching.
+- [x] Capture bounded timed attacker output with honest legacy fallback.
+- [x] Modernize home/history, session navigation and report presentation.
+- [x] Integrate synchronized review and test authorization/failure cases.
+- [x] Record evidence, tick 20 on its gates and update architecture if changed.
 
 ## Goal and context
 Requires 18–19 software, ARCHITECTURE J/K, ROADMAP and FINDINGS_CHECKLIST backlog.

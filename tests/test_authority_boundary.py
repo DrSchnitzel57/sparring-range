@@ -308,13 +308,154 @@ def test_latched_refuses_mutation_allows_cessation(tmp_path):
     with pytest.raises(BrokerLatched):
         client.clone_and_wait(NODE, 9001, 211, NAME + "-2", session_id="s")
     with pytest.raises(BrokerLatched):
-        client.destroy_and_wait(NODE, 210)
-    with pytest.raises(BrokerLatched):
         client.renew_lease("api")  # renewal can never resume a stopped range
     # cessation + reads still proceed
     assert client.vm_status(NODE, 210) == "stopped"
     assert client.inventory()["latch"]["latched"] is True
     assert client.stop_and_confirm(NODE, 210) == "stopped"
+    # Plan 18: an OWNED, identity-matched teardown is cessation-safe and
+    # must complete the teardown instead of stranding the lease (live
+    # practice 2026-10-23: the old blanket 423 left End permanently
+    # unfinished). Starts/clones/renewal above stay refused.
+    assert client.destroy_and_wait(NODE, 210,
+                                   session_id="sess-1") == "destroyed"
+    assert 210 not in http.vms
+    assert service.ledger.get_claim(210)["state"] == "destroyed"
+
+
+def test_latched_destroy_requires_positive_identity(tmp_path):
+    """A VMID recycled to a FOREIGN machine is never destroyed under latch;
+    the obligation is retained, not resolved."""
+    client, service, http = _mk(tmp_path)
+    _clone(client)
+    service.hard_stop_all("test-cessation")
+    # the VM is gone; a foreign machine now lives at the claimed VMID
+    del http.vms[210]
+    http.vms[210] = {"name": "someone-elses-box", "template": None,
+                     "status": "running"}
+    with pytest.raises(BrokerConflict, match="does not positively match"):
+        client.destroy_and_wait(NODE, 210, session_id="sess-1")
+    assert http.vms[210]["name"] == "someone-elses-box", "foreign left intact"
+    kinds = [o["kind"] for o in service.ledger.open_obligations()]
+    assert "vmid-recycled-no-destroy" in kinds
+    assert service.ledger.get_claim(210)["state"] == "unknown"
+    # and the retained foreign obligation blocks release (no silent forget)
+    with pytest.raises(BrokerConflict, match="unresolved obligation"):
+        service.release_latch("operator")
+
+
+def test_latched_destroy_resolves_only_cessation_obligations(tmp_path):
+    """A stop that FAILED under cessation leaves vm-stop-unconfirmed; the
+    confirmed destroy proves it resolved. The foreign one never self-clears."""
+    client, service, http = _mk(tmp_path)
+    _clone(client)
+    client.start_and_wait(NODE, 210, session_id="sess-1")
+    # stop fails: cessation retains an open obligation and an unknown claim
+    http.fail_task_fragments = ("/210/status/stop",)
+    report = service.hard_stop_all("stop-must-fail")
+    http.fail_task_fragments = ()
+    assert report["failed"], report
+    open_before = {o["kind"] for o in service.ledger.open_obligations()}
+    assert "vm-stop-unconfirmed" in open_before
+    # identity still matches positively: the latched destroy is allowed and
+    # the confirmed destroy proves the stop obligation resolved
+    assert client.destroy_and_wait(NODE, 210, session_id="sess-1") == "destroyed"
+    assert service.ledger.open_obligations() == []
+    kinds = [d["kind"] for d in service.ledger.audit_tail(50)]
+    assert "obligation-resolved-by-destroy" in kinds
+    # nothing open -> release is now possible through the operator tool path
+    service.release_latch("operator")
+    assert service.ledger.get_latch()["latched"] is False
+
+
+def test_latched_destroy_of_confirmed_absent_completes_the_claim(tmp_path):
+    client, service, http = _mk(tmp_path)
+    _clone(client)
+    service.hard_stop_all("test-cessation")
+    del http.vms[210]  # resource genuinely gone (e.g. destroyed out of band)
+    assert client.destroy_and_wait(NODE, 210,
+                                   session_id="sess-1") == "already-absent"
+    assert service.ledger.get_claim(210)["state"] == "destroyed"
+    service.release_latch("operator")
+
+
+def test_latched_destroy_refuses_foreign_session_claim(tmp_path):
+    client, service, http = _mk(tmp_path)
+    _clone(client, session_id="sess-1")
+    service.hard_stop_all("test-cessation")
+    with pytest.raises(BrokerConflict, match="different session"):
+        client.destroy_and_wait(NODE, 210, session_id="attacker-session")
+    assert 210 in http.vms
+
+
+# --------------------------------------------------------------------------- #
+# 5b. obligation resolution: the operator tool, with read-back proof           #
+# --------------------------------------------------------------------------- #
+
+def _resolve(service, oid, operator="op@console", note=""):
+    from infra.broker.tools import resolve_obligation_with_readback
+    return resolve_obligation_with_readback(service, service.ledger,
+                                            obligation_id=oid,
+                                            operator=operator, note=note)
+
+
+def _retained_recycled_obligation(tmp_path):
+    """Cessation + recycled VMID: destroy refused, obligation retained."""
+    client, service, http = _mk(tmp_path)
+    _clone(client)
+    service.hard_stop_all("test-cessation")
+    http.vms[210] = {"name": "someone-elses-box", "template": None,
+                     "status": "running"}
+    with pytest.raises(BrokerConflict):
+        client.destroy_and_wait(NODE, 210, session_id="sess-1")
+    ob = [o for o in service.ledger.open_obligations()
+          if o["kind"] == "vmid-recycled-no-destroy"]
+    assert ob
+    return client, service, http, ob[0]["id"]
+
+
+def test_resolve_recycled_obligation_needs_foreign_proof(tmp_path):
+    client, service, http, oid = _retained_recycled_obligation(tmp_path)
+    out = _resolve(service, oid)
+    assert "foreign name" in out["proof"] and out["resolved"] == oid
+    assert not [o for o in service.ledger.open_obligations()
+                if o["kind"] == "vmid-recycled-no-destroy"
+                and o["vmid"] == 210], "retained obligation must be closed"
+    kinds = [d["kind"] for d in service.ledger.audit_tail(50)]
+    assert "operator-resolve-obligation" in kinds
+    # the foreign machine is untouched and release is now possible
+    assert http.vms[210]["name"] == "someone-elses-box"
+    service.release_latch("operator")
+
+
+def test_resolve_refused_while_resource_present_or_uncertain(tmp_path):
+    client, service, http = _mk(tmp_path)
+    _clone(client)
+    client.start_and_wait(NODE, 210)
+    http.fail_task_fragments = ("/210/status/stop",)
+    service.hard_stop_all("stop-must-fail")
+    http.fail_task_fragments = ()
+    ob = [o for o in service.ledger.open_obligations()
+          if o["kind"] == "vm-stop-unconfirmed"][0]
+    # still present → presence never resolves a claim-style obligation
+    with pytest.raises(BrokerConflict, match="still exists"):
+        _resolve(service, ob["id"])
+    assert any(o["id"] == ob["id"] for o in service.ledger.open_obligations())
+    # uncertain read → refused, open, audited
+    http.fail_request_fragments = ("/210/config",)
+    with pytest.raises(BrokerUnavailable, match="uncertain"):
+        _resolve(service, ob["id"])
+    http.fail_request_fragments = ()
+    # confirmed gone → resolves
+    http.vms.pop(210)
+    out = _resolve(service, ob["id"])
+    assert "absent" in out["proof"]
+
+
+def test_resolve_unknown_obligation_id_is_refused(tmp_path):
+    _client, service, _http = _mk(tmp_path)
+    with pytest.raises(BrokerConflict, match="not open"):
+        _resolve(service, 999)
 
 
 # --------------------------------------------------------------------------- #
@@ -491,6 +632,54 @@ def test_hard_stop_spares_recycled_vmid(tmp_path):
     assert report["foreign-retained"] and report["foreign-retained"][0]["vmid"] == 210
     assert http.vms[210]["status"] == "running", "foreign VM must NOT be stopped"
     assert any(o["vmid"] == 210 for o in service.ledger.open_obligations())
+
+
+# --------------------------------------------------------------------------- #
+# 5b. plan 18 review: daemon-exit drain must not orphan live guests           #
+# --------------------------------------------------------------------------- #
+
+def test_shutdown_drain_stops_live_guests_and_latches(tmp_path):
+    """A broker process exit while VMs are claimed runs the SAME latched,
+    read-back-confirmed cessation as the lease watchdog — the range never
+    outlives its broker unwatched, and the operator must release."""
+    client, service, http = _mk(tmp_path)
+    _clone(client)
+    _place(client)
+    client.start_and_wait(NODE, 210)
+    report = service.drain_on_shutdown("broker-daemon-exit")
+    assert report and report["latched"] and report["stopped"] == [210]
+    assert http.vms[210]["status"] == "stopped", "cessation needs read-back"
+    with pytest.raises(BrokerLatched):
+        client.clone_and_wait(NODE, 9001, 211, "sr-web02-x",
+                              session_id="s", generation="g")
+    # all stops confirmed -> no obligations, operator can release normally
+    assert service.ledger.open_obligations() == []
+    assert service.release_latch("operator")["released"]
+
+
+def test_shutdown_drain_of_idle_broker_does_not_latch(tmp_path):
+    """Zero active claims: a clean stop of an idle appliance is ordinary
+    maintenance — it must not latch and poison the next boot."""
+    client, service, http = _mk(tmp_path)
+    assert service.drain_on_shutdown("broker-daemon-exit") is None
+    assert not service.ledger.get_latch()["latched"]
+    # the next session starts cleanly with no operator release
+    _clone(client)
+    assert service.ledger.get_claim(210) is not None
+    assert not service.ledger.get_latch()["latched"]
+
+
+def test_shutdown_drain_never_raises_from_cessation_errors(tmp_path):
+    """Shutdown cleanup continues regardless: a cessation blow-up is
+    reported, not propagated into the daemon's finally path."""
+    client, service, http = _mk(tmp_path)
+    _clone(client)
+
+    def boom(_reason):
+        raise RuntimeError("ledger exploded")
+    service.hard_stop_all = boom
+    report = service.drain_on_shutdown("broker-daemon-exit")
+    assert report and report.get("drain_failed") == "ledger exploded"
 
 
 def test_cross_session_and_unowned_mutation_refused(tmp_path):

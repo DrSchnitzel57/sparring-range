@@ -57,10 +57,13 @@ print("install[1]: manifest valid (schema v%s)" % m.get("schema_version"))
 PYEOF
 
 # canonical service identities (match deploy/systemd units, README and
-# shipped file ownership: srrange/srbastion/srbroker — one per role so a
-# compromised role cannot write another role's state)
+# shipped file ownership: srrange/srbastion/srbroker/sringest — one per
+# role so a compromised role cannot read another role's credentials or
+# state; round-3 finding 6: the INGEST listener is NOT srrange — only
+# the API is, and the API's delivered environment must be out of reach
+# of every other service identity)
 SR_USER=srrange; SR_GROUP=srrange
-SR_ALL_USERS="srrange srbastion srbroker"
+SR_ALL_USERS="srrange srbastion srbroker sringest"
 STATE="$PREFIX/var/lib/sparring-range"
 ETC="$PREFIX/etc/sparring-range"
 TLS="$ETC/tls"
@@ -271,7 +274,7 @@ open(sys.argv[2], "w").write(
     f"SR_API_BASE_URL={m['urls']['ingest']}\n")
 print("ingest-plane env written")
 PYEOF2
-  run chown root:"$SR_GROUP" "$ETC/ingest-listener.env"
+  run chown root:sringest "$ETC/ingest-listener.env"
   run chmod 0640 "$ETC/ingest-listener.env"
   say config "rendered $ETC/ingest-listener.env from the manifest"
 
@@ -283,7 +286,7 @@ PYEOF2
 # listing rights conveying anything sensitive.
 declare -A TLS_KEY_GROUPS=(
   [api-client.key]=srrange
-  [ingest-server.key]=srrange
+  [ingest-server.key]=sringest
   [broker-server.key]=srbroker
 )
 if [ "$DRY" = 1 ]; then

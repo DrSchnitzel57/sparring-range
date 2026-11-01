@@ -26,6 +26,30 @@ from typing import Mapping
 from .errors import ManifestError
 
 SCHEMA_VERSION = 1
+
+
+def validate_identity(ident, *, expect_template: int | None = None) -> bool:
+    """Validate the shape of an ARTIFACT IDENTITY ({role, template_vmid,
+    artifact_sha256}) as it crosses the broker boundary.  Strict types
+    (bool is never an int here), lowercase-hex digest, and an optional
+    expected template so a swapped reply is refused.  The single contract
+    shared by the clone authority and the deploy-side recorder."""
+    if not isinstance(ident, dict):
+        return False
+    role = ident.get("role")
+    sha = ident.get("artifact_sha256")
+    tmpl = ident.get("template_vmid")
+    if not isinstance(role, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}",
+                                                     role):
+        return False
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+        return False
+    if isinstance(tmpl, bool) or not isinstance(tmpl, int) or tmpl <= 0:
+        return False
+    if expect_template is not None and int(tmpl) != int(expect_template):
+        return False
+    return True
+
 _SCHEMA_KEYS = {
     "schema_version", "installation_id", "appliance", "network", "urls",
     "broker", "paths", "images", "access_keys", "member_keys", "model",
@@ -492,6 +516,18 @@ class ApplianceManifest:
             if image.template_id == template_id:
                 return image
         return None
+
+    def artifact_identity(self, template_id: int) -> dict | None:
+        """The deployable-artifact identity the broker confirmed TEMPLATE
+        to be built from (role + image SHA-256), taken from THIS loaded
+        manifest — the same object the clone verifies the image against.
+        Pure lookup: no file IO, so it answers from the state the broker
+        booted with, never from a later on-disk replacement."""
+        spec = self.image_for_template(int(template_id))
+        if spec is None:
+            return None
+        return {"role": spec.role, "template_vmid": int(spec.template_id),
+                "artifact_sha256": spec.sha256}
 
     def image_for_role(self, role: str) -> ImageSpec:
         try:

@@ -82,6 +82,13 @@ def main(argv=None) -> int:
         srv.serve_forever()
     finally:
         service.stop_watchdog()
+        # A daemon exit must not orphan live guests: if any VM is still
+        # claimed, drain it with the latched cessation path before closing
+        # the only libvirt connection. (The netrules unit keeps range
+        # isolation across stops, so the firewall is not the safety net.)
+        drain = service.drain_on_shutdown("broker-daemon-exit")
+        if drain is not None:
+            print(f"broker shutdown drain: {drain}", flush=True)
         backend.close()
         srv.server_close()
     return 0

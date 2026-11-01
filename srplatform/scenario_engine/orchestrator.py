@@ -32,8 +32,9 @@ from srplatform.db.models import (Deployment, Event, LoginToken, OperationClaim,
                                   RangeLease,
                                   ServiceToken,
                                   Session as SessionModel)
+from srplatform import host_roles
 from srplatform.scenario_engine.loader import load_scenario
-from srplatform.settings import get_settings
+from srplatform.settings import bastion_login_target, get_settings
 
 
 class LeaseConflict(RuntimeError):
@@ -250,10 +251,15 @@ def finalize_ready(db: Session, session_id, user_id, result) -> tuple[list, dict
                           target_host=r["ip"], target_port=22,
                           expires_at=_now() + timedelta(
                               hours=s.web_token_ttl_hours)))
-        instructions.append({"host": r["host"], "ip": r["ip"],
-                             "login_token": tok,
-                             "ssh": f"ssh {s.bastion_address} -p "
-                                    f"{s.bastion_listen_port} -l {tok}"})
+        entry = {"host": r["host"], "ip": r["ip"],
+                 "template_vmid": r.get("template_vmid"),
+                 "login_token": tok,
+                 "ssh": f"ssh {bastion_login_target(s)} -p "
+                        f"{s.bastion_listen_port} -l {tok}"}
+        # plan 22 LIVE-09: one role policy decides what is ADVERTISED —
+        # the attacker host has no member SSH login to offer.
+        host_roles.annotate(entry)
+        instructions.append(entry)
     sess.status = "ready"
     db.add(Event(session_id=session_id, ts=_now(), actor="system",
                  action_type="session_ready",
@@ -1056,13 +1062,45 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
                     _enroll_host_telemetry(db, dep, res, resources, session_id,
                                            host["name"], res.get("ip"), s, enrollments)
                 continue  # already owned & completed — resume skips the clone
+            # CRON ARTIFACT IDENTITY (plan 18 reviews): freeze WHICH
+            # artifact bytes this host is cloned from — the identity the
+            # BROKER (the clone authority) confirms for this template,
+            # from the manifest it itself verified the image against —
+            # plus the clean-baseline FROZEN from the pins binding that
+            # identity at this moment, into the deployment resource
+            # before any scoring uses either. Cron-pin trust later reads
+            # only this frozen evidence: swapping the pin file or the
+            # on-disk manifest afterwards can only revoke trust (identity
+            # stops binding), never redefine what was clean for a running
+            # session, and never record bytes the broker did not deploy.
+            # No broker-side identity => nothing recorded => the cron
+            # check honestly stays UNKNOWN.
+            from srplatform import verification_service as _vs
+
+            def _record_artifact(row):
+                if row.get("cron_artifact"):
+                    return False
+                art = _vs.recorded_cron_artifact(
+                    broker.artifact_for_template(int(host["template_vmid"])),
+                    _vs.load_cron_pins())
+                if not art:
+                    return False
+                row["cron_artifact"] = art
+                return True
+
             if res and res.get("vmid"):
                 vmid = int(res["vmid"])          # reuse the pending intent's VMID
+                # an intent created before the identity existed still gets
+                # it recorded THIS deploy run, before the clone executes
+                if _record_artifact(res):
+                    dep.resources = resources
+                    flag_modified(dep, "resources")
             else:
                 vmid = int(broker.next_vmid(node, s.deploy_vmid_base + i,
                                              session_id=session_id))
                 res = {"vmid": vmid, "node": node, "name": name, "host": host["name"],
                        "template_vmid": host["template_vmid"], "state": "pending"}
+                _record_artifact(res)
                 resources.append(res)
                 by_host[host["name"]] = res
                 dep.resources = resources

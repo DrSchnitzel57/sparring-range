@@ -24,6 +24,13 @@ dependencies = [
     # replaces the hand-written wire implementation in mysql_direct.py.
     "PyMySQL>=1.1.2",
     "openai>=1.40",
+    # Milestone 19: pinned conversational-agent framework (plan 19). The
+    # message/tool/usage types and the provider wire come from Pydantic AI
+    # SLIM with the OpenAI provider only — no MCP, no web search, no Logfire
+    # or external tracing (those are separate optional extras and are NOT
+    # installed; the OpenAI client is constructed with max_retries=0 so the
+    # model gateway remains the ONE bounded retry authority).
+    "pydantic-ai-slim[openai]==2.61.0",
     "typer>=0.12",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
@@ -73,5 +80,7 @@ markers = [
     "hypervisor: real libvirt/KVM lifecycle and QGA readiness (appliance foundation)",
     "access: real guest SSH and recorded bastion replay (appliance access)",
     "journey: installed-appliance full practice journey (real guests, browser, labeled model fixture)",
+    "agent: conversational-agent + model-administration layer (scripted local protocol server; DB when pinned)",
+    "practice: plan-22 installed-practice repairs on real DAC/namespace fixtures (unprivileged user namespaces; no root)",
 ]
-addopts = "-m 'not db and not containment and not packet and not authority and not browser and not live and not images and not capture and not hypervisor and not access and not journey'"
+addopts = "-m 'not db and not containment and not packet and not authority and not browser and not live and not images and not capture and not hypervisor and not access and not journey and not agent and not practice'"

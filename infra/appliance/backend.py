@@ -261,6 +261,15 @@ class LibvirtBackend:
         self._verify_image(image)
         return image
 
+    def artifact_for_template(self, template_id: int) -> dict | None:
+        """The artifact identity THIS backend clones TEMPLATE_ID from —
+        from the manifest loaded at daemon start, the same object whose
+        SHA-256 ``_verify_image`` enforces before every clone. The deploy
+        authority freezes this into the deployment resource (review
+        finding: a separately re-read manifest is not proof of deployed
+        bytes). Unknown template: None, i.e. honestly UNKNOWN."""
+        return self.manifest.artifact_identity(int(template_id))
+
     def _verify_image(self, image: ImageSpec) -> None:
         p = pathlib.Path(image.path)
         try:

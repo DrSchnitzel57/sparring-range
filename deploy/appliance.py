@@ -26,7 +26,10 @@ Usage::
     python deploy/appliance.py apply    --manifest M [--prefix PREFIX] [--dry-run]
     python deploy/appliance.py status   --manifest M [--json]
     python deploy/appliance.py doctor   --manifest M [--json]
-    python deploy/appliance.py upgrade  --manifest M [--prefix PREFIX]
+    python deploy/appliance.py upgrade  --manifest M --payload BUNDLE
+        # owner URL via the environment ONLY (default $SR_PG_UPGRADE_URL):
+        # SR_PG_UPGRADE_URL=... appliance.py upgrade --manifest M --payload B
+    python deploy/appliance.py upgrade  --manifest M --restore-config ATTEMPT
     python deploy/appliance.py recovery status --manifest M
     python deploy/appliance.py recovery reconcile --manifest M
 """
@@ -53,7 +56,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from infra.appliance.manifest import ApplianceManifest  # noqa: E402
-from infra.appliance.netrules import render_networkd, render_nftables  # noqa: E402
+from infra.appliance.netrules import (nft_scope_problems, render_networkd,
+                                      render_nftables)  # noqa: E402
 from infra.appliance.policy import AppliancePolicy  # noqa: E402
 
 DEFAULT_PREFIX = pathlib.Path("/opt/sparring-range")
@@ -64,6 +68,11 @@ DEFAULT_RUN = pathlib.Path("/run/sparring-range")
 UNITS = ("sr-appliance-broker.service", "sr-api.service",
          "sr-appliance-ingest.service", "sr-worker-supervisor.service",
          "sr-bastion.service", "sr-web.service")
+# The range firewall loader runs nft for exactly one file-scoped table.  It
+# is NOT one of the business services (it is root by necessity — nft needs
+# CAP_NET_ADMIN), so it stays outside UNITS, which the identity contract
+# audits, but it is installed, enabled and reported alongside them.
+NETRULES_UNIT = "sr-appliance-netrules.service"
 GROUPS = ("srrange", "srbastion", "sr-broker-clients", "sringest", "srworker",
           "srweb", "sr-secrets")
 USERS = {
@@ -93,6 +102,25 @@ SECRET_DIR_GROUP = "sr-secrets"
 # bastion reads, and it is traversable by the bastion's group.
 SSH_DIR_MODE = 0o750
 SSH_DIR_GROUP = "srbastion"
+
+# Account-bound bastion enrollment (plan 22 LIVE-06, sharpened by review):
+# ONE explicit shared location for the API-enrolled PUBLIC keys — the API
+# is the only writer, the bastion only reads. It must NOT live inside the
+# API's 0700 controller directory (the bastion may not traverse it) and
+# must not be a relative path resolved per-service. Parent: srrange owns
+# it (the API creates/replaces the file), group root, 0775 so the bastion
+# identity traverses and reads the 0644 file it holds. PUBLIC keys only —
+# no secret ever enters this location. Both service environments render
+# the same absolute path; drift between writer and reader is the defect
+# this constant exists to prevent.
+ENROLLMENT_DIR_NAME = "enrollment"
+ENROLLMENT_FILE_NAME = "enrolled_keys"
+
+
+def enrolled_keys_file(m: "ApplianceManifest") -> str:
+    """The rendered absolute enrollment path (writer AND reader side)."""
+    return str(pathlib.Path(m.state_dir) / ENROLLMENT_DIR_NAME
+               / ENROLLMENT_FILE_NAME)
 
 
 # --------------------------------------------------------------------------- #
@@ -231,14 +259,28 @@ def render_control_env(m: ApplianceManifest, *, etc: pathlib.Path = DEFAULT_ETC,
         ("SR_INTERNAL_API_URL", m.internal_url),
         ("SR_TELEMETRY_INGEST_URL", m.ingest_url),
         # The ingest server certificate is issued by the API CA, so that is
-        # the trust anchor the guests are enrolled with.
+        # the trust anchor the guests are enrolled with — and the telemetry
+        # client pins it.  The API-plane anchor is nginx's own surface
+        # (https.crt), NOT api-ca: they sign different certificates.
         ("SR_TELEMETRY_CA_FILE", str(etc / "tls/api-ca.crt")),
-        ("SR_API_TLS_CA_FILE", str(etc / "tls/api-ca.crt")),
+        ("SR_API_TLS_CA_FILE", str(etc / "tls/https.crt")),
         ("SR_RECORDINGS_DIR", m.recordings_dir),
         ("SR_SAFETY_STATE_FILE", str(pathlib.Path(m.state_dir) / "controller" / "safety_state.json")),
         ("SR_BASTION_HOST_KEY_PATH", str(etc / "ssh/bastion_ed25519")),
         ("SR_BASTION_AUTHORIZED_KEYS_FILE", str(etc / "ssh/authorized_keys")),
-        ("SR_BASTION_TARGETS_KNOWN_HOSTS", str(etc / "known_hosts/range_hosts")),
+        # The API ENROLLS account-bound public keys here (the only writer);
+        # the bastion reads the very same rendered path. Relative or
+        # controller-internal fallbacks are how writer and reader silently
+        # diverged (plan 22 review) — the render is the contract.
+        ("SR_BASTION_ENROLLED_KEYS_FILE", enrolled_keys_file(m)),
+        # RUNTIME host pins live under the STATE directory, never under
+        # /etc (plan 18): every appliance unit runs with ProtectSystem=strict
+        # — /etc is read-only for the services that must WRITE fresh
+        # generation pins — and the API publishes them while the file
+        # owner's umask can differ from the installer's. The API is the only
+        # writer; the runner/verifier/bastion clients read the same files.
+        ("SR_BASTION_TARGETS_KNOWN_HOSTS",
+         str(pathlib.Path(m.state_dir) / "known_hosts/range_hosts")),
         ("SR_RANGE_BRIDGE", m.network.range_bridge),
         # The appliance's inner range is a plain isolated bridge: no VLAN tag
         # (the broker policy accepts exactly one NIC specification).
@@ -270,9 +312,27 @@ def render_control_env(m: ApplianceManifest, *, etc: pathlib.Path = DEFAULT_ETC,
         # srworker-readable file and never enters the API/model env.
         ("SR_RUNNER_SSH_TARGET", f"attacker@{m.network.range_cidr.network_address + 9}"),
         ("SR_RUNNER_SSH_KEY_PATH", str(etc / "secrets/worker_runner_key")),
-        ("SR_RUNNER_SSH_KNOWN_HOSTS", str(etc / "known_hosts/range_hosts")),
+        ("SR_RUNNER_SSH_KNOWN_HOSTS",
+         str(pathlib.Path(m.state_dir) / "known_hosts/range_hosts")),
         ("SR_VERIFIER_SSH_KEY_PATH", str(etc / "secrets/verifier_key")),
-        ("SR_VERIFIER_SSH_KNOWN_HOSTS", str(etc / "known_hosts/range_hosts")),
+        ("SR_VERIFIER_SSH_KNOWN_HOSTS",
+         str(pathlib.Path(m.state_dir) / "known_hosts/range_hosts")),
+        # The model credential is the API's alone (plan 18): a file
+        # reference, never the value, and never in a shared environment.
+        # The renderer only names the path the operator provisioned; the
+        # installer keeps it root:srrange 0640.
+        ("SR_LLM_API_KEY_FILE", m.model_api_key_file),
+        # Members connect to the bastion over the REACHABLE LAN address
+        # (plan 18): the range-side bastion_address is a planning address
+        # that may name no interface at all. Rendered hints use this.
+        ("SR_BASTION_PUBLIC_ADDRESS",
+         str(m.network.lan_address) if m.network.lan_address else ""),
+        # Trusted cron pins (plan 18): a release artifact bound to the
+        # built-image digest. The path is always named; a missing file is
+        # honest UNKNOWN, never a filename-based guess. The release build
+        # places it via `python3 -m infra.images.cron_baseline capture`.
+        ("SR_CRON_BASELINE_FILE",
+         str(pathlib.Path(m.state_dir) / "cron-baselines.json")),
         # The match scheduler (ready expiry, deadline cleanup, startup
         # reconciliation) is part of a working appliance, not an option.
         ("SR_MATCH_SCHEDULER_ENABLED", "1"),
@@ -328,11 +388,25 @@ def render_bastion_env(m: ApplianceManifest, *,
         ("SR_ENV", "production"),
         ("SR_API_BASE_URL", m.public_url),
         ("SR_API_ROUTE_PREFIX", "/api"),
-        ("SR_API_TLS_CA_FILE", str(etc / "tls/api-ca.crt")),
+        # The trust anchor MUST be what the API surface actually presents:
+        # public_url is served by nginx with the self-signed tls/https.crt,
+        # while api-ca.crt signs only the ingest listener's certificate.
+        # Anchoring the bastion on api-ca made every callback fail the TLS
+        # handshake (plan 18 review); the telemetry anchor stays api-ca.
+        ("SR_API_TLS_CA_FILE", str(etc / "tls/https.crt")),
         ("SR_BASTION_AUTHORIZED_KEYS_FILE", str(etc / "ssh/authorized_keys")),
+        # READ side of the enrollment contract: the SAME absolute path the
+        # API's environment renders, never a per-service relative fallback
+        # (plan 22 review — enrolled keys must reach the live bastion with
+        # no manual file placement and no restart).
+        ("SR_BASTION_ENROLLED_KEYS_FILE", enrolled_keys_file(m)),
         ("SR_BASTION_HOST_KEY_PATH", str(etc / "ssh/bastion_ed25519")),
         ("SR_BASTION_CLIENT_KEY_PATH", str(etc / "ssh/bastion_client_ed25519")),
-        ("SR_BASTION_TARGETS_KNOWN_HOSTS", str(etc / "known_hosts/range_hosts")),
+        # The bastion READS the runtime pins the API publishes; they live
+        # under the state tree (plan 18) because ProtectSystem=strict makes
+        # /etc read-only for the writer.  Same file, one authority.
+        ("SR_BASTION_TARGETS_KNOWN_HOSTS",
+         str(pathlib.Path(m.state_dir) / "known_hosts/range_hosts")),
         ("SR_RECORDINGS_DIR", m.recordings_dir),
         # The bastion's SERVICE token: a secret in the bastion's OWN file
         # (0600, root:srbastion), never in a shared environment. The API
@@ -429,10 +503,13 @@ def render_broker_unit(m: ApplianceManifest, *,
                        prefix: pathlib.Path = DEFAULT_PREFIX) -> str:
     return f"""[Unit]
 Description=sparring-range appliance broker (local libvirt, typed ops)
-After=network-online.target libvirtd.service
+After=network-online.target libvirtd.service {NETRULES_UNIT}
 Wants=network-online.target libvirtd.service
 # The broker is the ONLY process with a libvirt socket and /dev/kvm access.
-Requires=libvirtd.service
+# Fail-closed ordering (plan 18): no guest may exist before the range's
+# own isolation table is loaded; if the loader fails, the broker does not
+# start and the range stays closed.
+Requires=libvirtd.service {NETRULES_UNIT}
 
 [Service]
 Type=exec
@@ -503,11 +580,45 @@ WantedBy=multi-user.target
 """
 
 
-def render_web_unit(lay: Layout) -> str:
+def _appliance_node_binary() -> str:
+    """The SELECTED appliance Node runtime for unit rendering. Thin seam
+    so the renderer keeps its no-service-imports discipline; the plan and
+    its probe live in appliance_services, the single authority shared by
+    the build, the unit ExecStart and the per-UID verification."""
+    from deploy import appliance_services as svc
+    return svc.node_runtime_plan()["binary"]
+
+
+def render_worker_unit(m) -> str:
+    """The worker supervisor unit with its state directory bound to THIS
+    installation (plan 18 review): the unit REQUIRES the directory in its
+    mount namespace, _ensure_dirs provisions exactly this path, and a
+    silently diverging template would reintroduce the missing-directory
+    startup failure. For the default layout this is byte-identical to the
+    template."""
+    text = _unit_from_template("sr-worker-supervisor.service")
+    want = str(pathlib.Path(m.state_dir) / "worker")
+    lines, seen = [], False
+    for ln in text.splitlines():
+        if ln.startswith("ReadWritePaths="):
+            ln = f"ReadWritePaths={want}"
+            seen = True
+        lines.append(ln)
+    if not seen:
+        raise InstallError("sr-worker-supervisor.service lost its "
+                           "ReadWritePaths contract")
+    return "\n".join(lines) + "\n"
+
+
+def render_web_unit(lay: Layout, node_binary: str) -> str:
     """The Next.js frontend, served as its own service identity on loopback.
 
     nginx terminates TLS and routes /api/* to the API; the frontend never
     listens on the LAN and never holds an infrastructure credential.
+    ``node_binary`` is the SELECTED appliance runtime (node_runtime_plan)
+    — the exact binary the build used and per-UID verification probed
+    (second review, finding 5: provisioning Node 22 while this unit exec'd
+    another path shipped an unsupported frontend behind green checks).
     """
     return f"""[Unit]
 Description=sparring-range web frontend (Next.js, loopback only)
@@ -523,7 +634,7 @@ EnvironmentFile=-{lay.etc}/control-plane.env
 Environment=PORT=3000
 Environment=HOSTNAME=127.0.0.1
 Environment=NODE_ENV=production
-ExecStart=/usr/bin/node {lay.prefix}/web/node_modules/next/dist/bin/next start -p 3000 -H 127.0.0.1
+ExecStart={node_binary} {lay.prefix}/web/node_modules/next/dist/bin/next start -p 3000 -H 127.0.0.1
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
@@ -580,6 +691,61 @@ server {{
 """
 
 
+def render_netrules_unit(lay: Layout) -> str:
+    """The boot loader for the appliance's OWN firewall table (plan 18).
+
+    Live find: the operator applied the rules once in the maintenance
+    window and a reboot silently lost them — the range came up unisolated.
+    This unit reloads exactly the one rendered file at boot: it runs
+    `nft -c` (parse/validate) first, then `nft -f` of that single file.  It
+    NEVER runs `flush ruleset`, never touches another table or chain, and
+    never executes operator-authored text at runtime — the file is the
+    installer's own render, validated at render time (see
+    netrules.nft_scope_problems).
+
+    There is deliberately NO ExecStop: stopping this unit while guest VMs
+    are alive would delete the table and silently remove the range's
+    isolation — the exact failure mode this unit exists to prevent.  The
+    table persists past a unit stop; the only way the rules change is a
+    re-`ExecStart`, and `nft -f` of a file that declares the table replaces
+    the whole table atomically in one batch, so a reload is never a
+    delete-then-add window.  Removal of the table is an explicit operator
+    action in the maintenance window, never a side effect of `systemctl
+    stop` or a package upgrade.
+
+    It is deliberately root: nft needs CAP_NET_ADMIN; no service identity
+    of the range may hold it."""
+    nft = lay.nftables_dir / "sr-appliance.nft"
+    return f"""[Unit]
+Description=sparring-range range firewall (loads ONLY its own inet table)
+Documentation=file://{nft}
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Validate before loading: a corrupt render must fail this unit (and with
+# it the broker, which Requires it), never boot into a half-loaded range.
+ExecStartPre=/usr/sbin/nft -c -f {nft}
+# Table-scoped by construction: the file adds/deletes ONLY inet
+# sr_appliance, and `nft -f` applies it as ONE atomic batch — a reload
+# replaces the table in a single kernel transaction. There is no
+# flush-ruleset path and no stop-time teardown in this installation:
+# isolation outlives unit stop, so a stop can never open a window.
+ExecStart=/usr/sbin/nft -f {nft}
+TimeoutStartSec=30
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
 def render_files(m: ApplianceManifest, *,
                  prefix: pathlib.Path = DEFAULT_PREFIX,
                  etc: pathlib.Path = DEFAULT_ETC,
@@ -610,13 +776,14 @@ def render_files(m: ApplianceManifest, *,
                      render_networkd(m).split("\n\n", 1)[1], 0o644),
         RenderedFile(lay.nftables_dir / "sr-appliance.nft",
                      render_nftables(m), 0o644),
+        RenderedFile(lay.units_dir / NETRULES_UNIT,
+                     render_netrules_unit(lay), 0o644),
         RenderedFile(lay.units_dir / "sr-appliance-broker.service",
                      render_broker_unit(m, etc=lay.etc, prefix=lay.prefix), 0o644),
         RenderedFile(lay.units_dir / "sr-appliance-ingest.service",
                      render_ingest_unit(m, etc=lay.etc, prefix=lay.prefix), 0o644),
         RenderedFile(lay.units_dir / "sr-worker-supervisor.service",
-                     _unit_from_template("sr-worker-supervisor.service"),
-                     0o644),
+                     render_worker_unit(m), 0o644),
         RenderedFile(lay.units_dir / "sr-api.service",
                      _unit_from_template("sr-api.service"), 0o644),
         RenderedFile(lay.units_dir / "sr-bastion.service",
@@ -626,7 +793,7 @@ def render_files(m: ApplianceManifest, *,
                          extra="Environment=SR_PROCESS_ROLE=bastion"),
                      0o644),
         RenderedFile(lay.units_dir / "sr-web.service",
-                     render_web_unit(lay), 0o644),
+                     render_web_unit(lay, _appliance_node_binary()), 0o644),
         RenderedFile(lay.nginx_dir / "sparring-range.conf",
                      render_nginx_site(m, lay), 0o644),
     ]
@@ -644,9 +811,16 @@ def render_files(m: ApplianceManifest, *,
         "— real appliances only",
         "provision the TLS material and onboard the member keys — real "
         "appliances only",
-        "daemon-reload; enable --now " + " ".join(UNITS),
-        "apply fixed networkd bridge and nftables rules once; never at runtime",
+        "daemon-reload; enable --now " + " ".join([*UNITS, NETRULES_UNIT]),
+        "apply fixed networkd bridge and nftables rules once; the rules are "
+        "reloaded at every boot by " + NETRULES_UNIT + " (own table only)",
     ]
+    # Fail closed at RENDER time: a ruleset that could touch anything but
+    # its own table must never reach disk, let alone the loader service.
+    scope_problems = nft_scope_problems(render_nftables(m))
+    if scope_problems:
+        raise InstallError("rendered firewall violates its own-table scope: "
+                           + "; ".join(scope_problems))
     return Plan(files=files, actions=actions, units=list(UNITS))
 
 
@@ -680,7 +854,25 @@ class Runner:
               flush=True)
         if self.dry_run:
             return subprocess.CompletedProcess(list(cmd), 0, "", "")
-        environ = {**os.environ, **(env or {})}
+        from deploy import appliance_services as svc
+        # Round-3 finding 5: owner/secret database URLs inherited from the
+        # invoking shell NEVER reach provisioning, build or native helper
+        # children. A call site that authorizes a channel passes it
+        # explicitly in env= — explicit wins, ambient never.
+        environ = {**{k: v for k, v in os.environ.items()
+                      if k not in svc.credential_env_names()},
+                   **(env or {})}
+        # subprocess requires every environment value to be a str; an
+        # IPv4Address (live find 2026-10-23: HTTPS_IP reached the TLS
+        # bootstrap as a real IPv4Address and died inside subprocess with a
+        # message naming nothing) must fail HERE, naming the key, and never
+        # mid-script.
+        for key, value in environ.items():
+            if not isinstance(value, str):
+                raise InstallError(
+                    f"environment value for {key!r} is {type(value).__name__}, "
+                    f"not str: convert explicitly at the call site "
+                    f"(str({key})) rather than at the process boundary")
         r = subprocess.run([str(c) for c in cmd], capture_output=True,
                            text=True, env=environ, cwd=cwd)
         if check and r.returncode != 0:
@@ -714,8 +906,21 @@ def _ids(name: str) -> tuple[int, int]:
 
 
 def _ensure_dirs(m: ApplianceManifest, run: Runner, lay: Layout) -> None:
-    for path, mode, user, group in (
-            (pathlib.Path(m.state_dir), 0o750, "srrange", "srrange"),
+    # The state directory is SHARED (plan 18 review): the broker creates and
+    # journals its ledger directly inside, the API reads anchors/pins and
+    # writes only inside its own 0700 controller / 0755 known_hosts
+    # subtrees, and runner/bastion/worker merely TRAVERSE to world-readable
+    # pins (the API chmods published pins 0644).  0751 owner srbroker =
+    # write for the ledger, traverse-without-enumeration for everyone else
+    # — narrow, and it widens no group.  When the ledger lives elsewhere the
+    # shared parent is left ALONE and the ledger directory gets its own
+    # srbroker-owned entry; two entries must never fight over one
+    # directory's ownership on every apply.
+    ledger_parent = pathlib.Path(m.broker_ledger).parent
+    ledger_in_state = ledger_parent.resolve() == pathlib.Path(
+        m.state_dir).resolve()
+    entries = [
+            (pathlib.Path(m.state_dir), 0o751, "srbroker", "srrange"),
             (pathlib.Path(m.images_dir), 0o755, "root", "root"),
             (pathlib.Path(m.recordings_dir), 0o750, "srbastion", "srbastion"),
             # The secrets directory is traversable by the two identities
@@ -723,12 +928,37 @@ def _ensure_dirs(m: ApplianceManifest, run: Runner, lay: Layout) -> None:
             # every file inside keeps its own 0600 ownership.
             (pathlib.Path(m.secrets_dir), SECRET_DIR_MODE, "root",
              SECRET_DIR_GROUP),
-            (pathlib.Path(m.broker_ledger).parent, 0o750, "srbroker",
-              "sr-broker-clients"),
             (pathlib.Path(m.state_dir) / "controller", 0o700, "srrange", "srrange"),
+            # The worker supervisor's private state directory (plan 18
+            # review): sr-worker-supervisor.service REQUIRES
+            # ReadWritePaths=<state>/worker — a missing directory breaks
+            # the unit's mount namespace before ExecStart, and the shared
+            # state parent (0751) only ever provides TRAVERSAL, never the
+            # child.  Dedicated, srworker-owned, 0750: nothing else may
+            # write what the supervisor will execute state from.
+            (pathlib.Path(m.state_dir) / "worker", 0o750, "srworker",
+             "srworker"),
+            # Runtime host pins live under state (plan 18): the API is the
+            # only writer (ProtectSystem=strict makes /etc read-only for it),
+            # the runner/verifier/bastion clients only need read access, and
+            # public host keys carry no secret.
+            (pathlib.Path(m.state_dir) / "known_hosts", 0o755, "srrange",
+             "srrange"),
+            # Account-bound bastion enrollment (plan 22 review): the API
+            # (srrange) creates and replaces the file inside; the bastion
+            # identity only needs TRAVERSAL here plus the 0644 file — the
+            # 0700 controller directory stays private and is NOT widened.
+            # Provisioned on fresh AND populated-upgrade apply, since apply
+            # runs _ensure_dirs on every path through here.
+            (pathlib.Path(m.state_dir) / ENROLLMENT_DIR_NAME, 0o775,
+             "srrange", "root"),
             (lay.run, 0o750, "srbroker", "sr-broker-clients"),
             (lay.etc / "tls", 0o755, "root", "root"),
-            (lay.etc / "ssh", SSH_DIR_MODE, "root", SSH_DIR_GROUP)):
+            (lay.etc / "ssh", SSH_DIR_MODE, "root", SSH_DIR_GROUP)]
+    if not ledger_in_state:
+        entries.append((ledger_parent, 0o750, "srbroker",
+                        "sr-broker-clients"))
+    for path, mode, user, group in entries:
         if lay.sandboxed:
             # A sandbox install cannot create system identities; the mode is
             # still enforced so the receipt describes the intended layout.
@@ -851,6 +1081,26 @@ def _receipt(m: ApplianceManifest, plan: Plan, lay: Layout) -> dict:
     return receipt
 
 
+def storage_headroom_problem(free_bytes: int, image_bytes: int,
+                             min_free_gb: int) -> str | None:
+    """Pure pre-flight: does the images filesystem still have room?
+
+    Live practice 2026-10-23: a nearly-full appliance accepted the image
+    copy and only failed later, mid-clone, with generic I/O errors.  The
+    rule stated HERE (and checked before apply's effects) is: the space
+    already occupied by the release images PLUS the operator's configured
+    free-space floor must fit in the current free space.  Returns None
+    when fine, otherwise an actionable one-liner naming the numbers."""
+    need = int(min_free_gb) * 1024**3 + int(image_bytes)
+    if int(free_bytes) >= need:
+        return None
+    return (f"images filesystem has {int(free_bytes) / 1024**3:.1f} GiB free "
+            f"but needs {need / 1024**3:.1f} GiB "
+            f"({int(image_bytes) / 1024**3:.1f} GiB of images already placed "
+            f"plus a {min_free_gb} GiB floor for guest clones) - free space "
+            "or point images at a larger filesystem before installing")
+
+
 def apply_plan(m: ApplianceManifest, plan: Plan, *,
                prefix: pathlib.Path = DEFAULT_PREFIX,
                etc: pathlib.Path = DEFAULT_ETC,
@@ -870,6 +1120,7 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
                 run("usermod", "-a", "-G", extra, user, check=False)
     _ensure_dirs(m, run, lay)
     token_action = _ensure_supervisor_token(lay.etc, run, lay)
+    model_key_action = None
     if not lay.sandboxed and not dry_run:
         # The operator's runtime environment is read by the API, the ingest
         # listener and the bastion: it must be readable by them and by
@@ -879,8 +1130,37 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
         if runtime_env.is_file():
             run("chown", "root:srrange", str(runtime_env), check=False)
             run("chmod", "0640", str(runtime_env), check=False)
+        # The MODEL credential belongs to the API identity alone (plan 18).
+        # Not the supervisor (srworker), not the bastion, not the broker;
+        # the API requests every model call through its own gateway, so no
+        # other identity needs it. LIVE-01: the reach is a NAMED POSIX ACL
+        # (traverse the secrets directory, read this one file) instead of a
+        # group chmod, so the same repair also runs from upgrade
+        # provisioning — where no apply ever ran — and never touches the
+        # operator's ownership, mode or secret bytes.
+        model_key = pathlib.Path(m.model_api_key_file)
+        from deploy import appliance_services as svc
+        if model_key.is_file():
+            model_key_action = svc.ensure_model_key_access(
+                run, key_file=model_key, secrets_dir=m.secrets_dir)
+        else:
+            model_key_action = {"skipped": "no model key file yet"}
     services: dict = {}
     if not lay.sandboxed and not dry_run:
+        # Storage headroom BEFORE any effect (plan 18): a nearly-full
+        # images filesystem must refuse the installation here, naming the
+        # numbers, not fail later mid-clone with generic I/O errors.
+        probe = pathlib.Path(m.images_dir)
+        while not probe.is_dir() and probe != probe.parent:
+            probe = probe.parent
+        image_bytes = sum(
+            int(img.size_bytes) for img in m.images.values()
+            if pathlib.Path(img.path).is_file())
+        problem = storage_headroom_problem(
+            shutil.disk_usage(str(probe)).free, image_bytes,
+            m.budgets.min_free_gb)
+        if problem:
+            raise InstallError(problem)
         # The REAL service steps.  A sandbox install renders the same files
         # and proves the sequences, but it never pretends the services ran.
         from deploy import appliance_services as svc
@@ -888,10 +1168,22 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
         if not (source / "requirements.lock").is_file():
             raise InstallError(f"missing {source / 'requirements.lock'}")
         services["native_packages"] = svc.ensure_native_dependencies(run)
+        # Node BEFORE the web build (plan 18): Ubuntu 24.04's Node 18 cannot
+        # build or start Next 16; the pinned LTS is fetched, digest-checked
+        # and installed here rather than hand-installed mid-hand-off.
+        services["node"] = svc.ensure_node_runtime(run)
         services["venv"] = str(svc.ensure_venv(
             run, prefix=lay.prefix, source=source))
+        # A rendered unit is not a process (plan 18): every service identity
+        # must ACTUALLY execute what its unit execs, verified per real UID
+        # before apply claims success (the umask-027 venv passed every
+        # rendered check and still died 203/EXEC on first start).
+        services["runtime_verification"] = svc.verify_service_runtime(
+            run, pathlib.Path(services["venv"]),
+            node_binary=services["node"]["binary"])
         services["database"] = svc.ensure_database(
-            run, prefix=lay.prefix, env_file=lay.etc / "control-plane.env")
+            run, prefix=lay.prefix, env_file=lay.etc / "control-plane.env",
+            sandboxed=lay.sandboxed)
         services["tls"] = svc.ensure_tls(
             run, etc=lay.etc, public_ip=m.network.lan_address or "127.0.0.1",
             ingest_sans=_ingest_sans(m))
@@ -911,7 +1203,9 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
             access_keys={role: m.access_keys[role].path
                          for role in m.access_keys})
         services["web"] = svc.ensure_web_build(run, source=source,
-                                               public_url=m.public_url)
+                                               public_url=m.public_url,
+                                               node_binary=
+                                               services["node"]["binary"])
         # the public front door: enable the rendered site and reload nginx
         run("ln", "-sfn", str(lay.nginx_dir / "sparring-range.conf"),
             str(lay.nginx_dir.parent / "sites-enabled/sparring-range.conf"),
@@ -925,14 +1219,57 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
                       + "\n", 0o644, os.getuid(), os.getgid())
     if not lay.sandboxed:
         run("systemctl", "daemon-reload", check=False)
-        run("systemd-sysctl", check=False)
+        _apply_sysctls(run)
         # Network artifacts are installed but not applied to the host by this
         # command: the operator applies them during the approved maintenance
-        # window after reviewing the generated rules.
-        for unit in plan.units:
+        # window after reviewing the generated rules.  The netrules LOADER is
+        # enabled too — once the operator starts it (or reboots), the range
+        # isolation survives restarts instead of silently vanishing.
+        for unit in [*plan.units, NETRULES_UNIT]:
             run("systemctl", "enable", unit, check=False)
     return {"changed": changed, "supervisor_token": token_action,
+            "model_key": model_key_action,
             "services": services, "dry_run": dry_run}
+
+
+def _resolve_binary(name: str) -> str | None:
+    """Locate a system binary by absolute path.
+
+    A bare lookup through the inherited PATH failed on the appliance
+    (live find 2026-10-23: `systemd-sysctl` is in /usr/bin, and the sudo
+    PATH of a non-login shell did not contain it).  Searching the standard
+    absolute locations never depends on the caller's PATH, and a failure
+    names the binary instead of dying inside exec with a bare
+    FileNotFoundError.
+    """
+    found = shutil.which(name)
+    if found:
+        return found
+    for base in ("/usr/bin", "/bin", "/usr/sbin", "/sbin"):
+        p = pathlib.Path(base) / name
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    return None
+
+
+def _apply_sysctls(run: Runner) -> None:
+    """Apply the system sysctl configuration by absolute path (plan 18).
+
+    Not fatal on failure (the same contract as the old bare call), but the
+    failure is LOUD and names the exact remediation, so a half-applied
+    network configuration is never mistaken for a complete one."""
+    binary = _resolve_binary("systemd-sysctl")
+    if binary is None:
+        print("WARNING: systemd-sysctl not found in PATH or /usr/bin; run "
+              "`systemd-sysctl` manually after installing systemd",
+              file=sys.stderr)
+        return
+    result = run(binary, check=False)
+    if result.returncode != 0:
+        print("WARNING: systemd-sysctl exited "
+              f"{result.returncode}: {(result.stderr or result.stdout)[-200:]}; "
+              "review /etc/sysctl.d/ before relying on those settings",
+              file=sys.stderr)
 
 
 # --------------------------------------------------------------------------- #
@@ -951,13 +1288,36 @@ def _broker_status(m: ApplianceManifest) -> dict:
         client = BrokerClient(HttpTransport(f"unix://{m.broker_socket}"))
         return {"ok": True, "inventory": client.inventory()}
     except Exception as exc:  # noqa: BLE001 — status reports, never crashes
+        # LIVE-03: a REFUSAL is not an outage. The broker allowlists the
+        # service identities that may query it (and deliberately refuses
+        # root); when the socket answers with HTTP 403, the honest
+        # diagnostic is "your identity is not allowed here", not
+        # "broker unreachable" — which previously sent operators hunting
+        # for a broker failure while /readyz proved the broker healthy.
+        try:
+            from infra.broker.errors import PolicyViolation
+        except ImportError:  # pragma: no cover - protocol always present
+            PolicyViolation = ()  # type: ignore[assignment]
+        if isinstance(exc, PolicyViolation):
+            return {
+                "ok": False,
+                "reason": "peer-identity-refused",
+                "error": str(exc)[:300],
+                "advice": ("the broker answered and REFUSED this process's "
+                           "identity (peer-UID allowlist; root is "
+                           "deliberately not authorized). Re-run this "
+                           "diagnostic as the API service identity (for "
+                           "example sudo -u srrange) — do NOT widen the "
+                           "allowlist; a refused identity proves the "
+                           "broker is listening, not failing"),
+            }
         return {"ok": False, "error": str(exc)[:300]}
 
 
 def status(m: ApplianceManifest, *, as_json: bool = False) -> dict:
     data = {
         "installation_id": m.installation_id,
-        "units": {u: _unit_state(u) for u in UNITS},
+        "units": {u: _unit_state(u) for u in (*UNITS, NETRULES_UNIT)},
         "broker": _broker_status(m),
         "paths": {
             "broker_socket": m.broker_socket,
@@ -997,7 +1357,9 @@ def doctor(m: ApplianceManifest, *, as_json: bool = False) -> dict:
     for unit in UNITS:
         state = _unit_state(unit)
         add(f"unit {unit}", state == "active", state)
-    add("broker reachable", _broker_status(m)["ok"])
+    broker_now = _broker_status(m)
+    add("broker reachable", broker_now["ok"],
+        str(broker_now.get("advice") or broker_now.get("error", ""))[:300])
     # libvirt/KVM visibility is a broker-UID concern; a root doctor can still
     # report it without granting the API anything.
     try:
@@ -1028,21 +1390,44 @@ def firstboot_report(m: ApplianceManifest, layout: Layout) -> dict:
     The operator runs this in THEIR virtual machine: it answers "is the
     appliance actually up?" without guessing, and without printing anything
     secret.  Every check names what it looked at and what it saw.
+
+    Staged first boot (plan 18): the hand-off deliberately leaves the
+    bridge, the nftables rules and the service starts to the operator's
+    maintenance window.  While the bridge does not exist yet, every check
+    downstream of those manual steps is reported PENDING — visibly, with the
+    exact remediation — instead of a wall of FAILs that hides the two things
+    that are genuinely broken.  Once the manual steps are done, the same
+    checks become real pass/fail again.  Machine-readable semantics
+    (review finding: the CLI's exit 3 was honest, the JSON was not): a
+    pending check reports ``ok: false`` WITH ``pending: true`` — pending is
+    never folded into ok.  The overall ``ok`` is true ONLY when every check
+    genuinely passed; ``failed`` names the genuine failures separately from
+    ``pending``, so a consumer reading only ``ok`` can never mistake a
+    half-installed appliance for a healthy one, and one reading ``failed``
+    can tell "broken" from "not my window yet".
     """
     import socket as _socket
     import urllib.error
     import urllib.request
 
     checks: list[dict] = []
+    bridge_ready = pathlib.Path("/sys/class/net/"
+                                f"{m.network.range_bridge}").exists()
 
-    def add(name: str, ok: bool, detail: str = "") -> None:
-        checks.append({"check": name, "ok": bool(ok), "detail": detail[:200]})
+    def add(name: str, ok: bool, detail: str = "",
+            pending_if_manual: bool = False) -> None:
+        pending = bool(pending_if_manual and not bridge_ready and not ok)
+        checks.append({"check": name, "ok": bool(ok),
+                       "pending": pending, "detail": detail[:200]})
 
     add("manifest", True, m.installation_id)
-    add("broker socket", pathlib.Path(m.broker_socket).exists(), m.broker_socket)
+    add("broker socket", pathlib.Path(m.broker_socket).exists(), m.broker_socket,
+        pending_if_manual=True)
     broker = _broker_status(m)
     add("broker answers", broker.get("ok", False),
-        "inventory" if broker.get("ok") else str(broker.get("error", ""))[:120])
+        "inventory" if broker.get("ok")
+        else str(broker.get("advice") or broker.get("error", ""))[:300],
+        pending_if_manual=True)
 
     def http(url: str) -> tuple[bool, str]:
         try:
@@ -1055,9 +1440,9 @@ def firstboot_report(m: ApplianceManifest, layout: Layout) -> dict:
             return False, f"{type(exc).__name__}"
 
     ok_health, body = http(m.internal_url.rstrip("/") + "/healthz")
-    add("api /healthz", ok_health, body)
+    add("api /healthz", ok_health, body, pending_if_manual=True)
     ok_ready, body = http(m.internal_url.rstrip("/") + "/readyz")
-    add("api /readyz", ok_ready, body)
+    add("api /readyz", ok_ready, body, pending_if_manual=True)
 
     def tcp(host: str, port: int) -> bool:
         try:
@@ -1069,16 +1454,28 @@ def firstboot_report(m: ApplianceManifest, layout: Layout) -> dict:
     ingest = m.network.ingest_address
     add("ingest listener",
         bool(ingest) and tcp(str(ingest), int(m.network.ingest_port)),
-        f"{ingest}:{m.network.ingest_port}" if ingest else "not configured")
-    bastion = m.network.bastion_address
-    add("bastion listener", bool(bastion) and tcp(str(bastion), 2222),
-        f"{bastion}:2222" if bastion else "not configured")
-    for unit in UNITS:
+        f"{ingest}:{m.network.ingest_port}" if ingest else "not configured",
+        pending_if_manual=True)
+    # The bastion listens on every appliance address, but the RANGE-side
+    # bastion address may name no local interface at all (it is a range
+    # planning address); the reachable check is the appliance's own LAN
+    # address (or loopback), the one members are told to use
+    # (live find 2026-10-23: `.2:2222` on the range never answers, so a
+    # healthy bastion failed firstboot forever).
+    bastion_probe = str(m.network.lan_address) if m.network.lan_address \
+        else "127.0.0.1"
+    add("bastion listener", tcp(bastion_probe, 2222),
+        f"{bastion_probe}:2222 "
+        f"(range-side {m.network.bastion_address}; members connect via the "
+        "LAN address)",
+        pending_if_manual=True)
+    for unit in (*UNITS, NETRULES_UNIT):
         state = _unit_state(unit)
-        add(f"unit {unit}", state == "active", state)
-    add("isolated bridge", pathlib.Path("/sys/class/net/"
-                                         f"{m.network.range_bridge}").exists(),
-        m.network.range_bridge)
+        add(f"unit {unit}", state == "active", state, pending_if_manual=True)
+    add("isolated bridge", bridge_ready,
+        m.network.range_bridge if bridge_ready else
+        f"{m.network.range_bridge} missing — apply step-6 networkd + reload",
+        pending_if_manual=True)
     add("nftables rules", shutil.which("nft") is not None,
         "nft is required for the range isolation rules")
     for role, image in sorted(m.images.items()):
@@ -1092,7 +1489,11 @@ def firstboot_report(m: ApplianceManifest, layout: Layout) -> dict:
     add("worker capability",
         (layout.etc / "secrets" / "worker-supervisor.token").is_file(),
         str(layout.etc / "secrets" / "worker-supervisor.token"))
-    return {"ok": all(c["ok"] for c in checks), "checks": checks,
+    return {"ok": all(c["ok"] for c in checks),
+            "failed": [c["check"] for c in checks
+                       if not c["ok"] and not c.get("pending")],
+            "pending": [c["check"] for c in checks if c.get("pending")],
+            "checks": checks,
             "installation_id": m.installation_id}
 
 
@@ -1344,6 +1745,55 @@ def main(argv: list[str] | None = None) -> int:
     common(pu)
     pu.add_argument("--prefix", default=str(DEFAULT_PREFIX))
     pu.add_argument("--etc", default=str(DEFAULT_ETC))
+    pu.add_argument("--payload",
+                    help="the release bundle to upgrade to (built by "
+                         "deploy/bundle.py; carries the MANIFEST upgrade "
+                         "contract and forward migrations)")
+    pu.add_argument("--db-url-env", metavar="NAME", default=None,
+                    help="NAME of an environment variable holding the "
+                         "database owner URL (default: $SR_PG_UPGRADE_URL, "
+                         "then $POSTGRES_URL_OWNER). The URL is deliberately "
+                         "NOT a command-line argument: argv is world-readable "
+                         "in the process table for the whole upgrade, and a "
+                         "URL there leaks the owner credential. Run it as "
+                         "`SR_PG_UPGRADE_URL=... appliance.py upgrade ...` "
+                         "(inline environment, never shown by ps auxww)")
+    pu.add_argument("--resume", metavar="ATTEMPT",
+                    help="resume one specific journaled attempt instead of "
+                         "starting new work")
+    pu.add_argument("--restore-config", metavar="ATTEMPT",
+                    help="config-only restore from an attempt's verified "
+                         "backup; issues NO service action — nothing is "
+                         "started or resumed")
+    pu.add_argument("--pg-dump-bin", help="pg_dump binary or wrapper for the "
+                                          "preserving database backup "
+                                          "(reads PGPASSFILE from its "
+                                          "environment; no URL in argv)")
+    pu.add_argument("--python-exe", help="interpreter used for alembic "
+                                         "(default: the INSTALLED venv at "
+                                         "<prefix>/.venv/bin/python)")
+    pu.add_argument("--skip-provision", action="store_true",
+                    help="explicit exception only: skip installing the "
+                         "locked dependencies / frontend build for the "
+                         "activated payload (an externally maintained "
+                         "runtime is then the operator's claim)")
+    pu.add_argument("--skip-frontend", action="store_true",
+                    help="provision everything except the frontend build "
+                         "(a pre-built web release is then the operator's "
+                         "claim)")
+    pu.add_argument("--allow-fresh-install", action="store_true",
+                    help="attest that this installation provably never "
+                         "claimed work (a missing broker ledger then "
+                         "qualifies; NEVER set this to work around a "
+                         "refusal)")
+    pu.add_argument("--maintenance-flag", help="path of the admission-fence "
+                                               "file (default: "
+                                               "<state-dir>/maintenance)")
+    pu.add_argument("--web-url", default="http://127.0.0.1:3000/",
+                    help="frontend readiness URL probed after restart "
+                         "(default: the sr-web bind address); the version "
+                         "stamp is written only after this AND /readyz "
+                         "answer 200")
     pu.add_argument("--dry-run", action="store_true")
 
     pr = sub.add_parser("recovery")
@@ -1388,19 +1838,53 @@ def main(argv: list[str] | None = None) -> int:
             out = apply_plan(sm, plan, layout=lay, dry_run=args.dry_run)
             print(json.dumps(out, indent=2, sort_keys=True))
         elif args.cmd == "upgrade":
-            # Re-render config/units and run forward migrations; data, keys and
-            # the ledger are never deleted or recreated.
+            # The preserving in-place upgrade runs through the release
+            # engine: journal first, private config + database backups,
+            # verified staged payload, per-file atomic activation, proven
+            # forward-only migrations, config re-render, version stamp,
+            # ordered service reload. Data, keys and the ledger are never
+            # deleted or recreated, and unknown in-flight work is refused
+            # until it is resolved — never silently.
+            from deploy import upgrade as engine
             lay = _layout(args)
-            sm = sandbox_manifest(m, lay.root)
-            plan = render_files(sm, layout=lay)
-            out = apply_plan(sm, plan, layout=lay, dry_run=args.dry_run)
-            if not lay.sandboxed:
-                run = Runner(dry_run=args.dry_run)
-                run("systemctl", "restart", "sr-appliance-broker.service",
-                    "sr-api.service", "sr-appliance-ingest.service",
-                    "sr-worker-supervisor.service", "sr-bastion.service",
-                    check=False)
-            out["upgrade"] = "config/units re-rendered; data and keys preserved"
+            if args.restore_config:
+                out = engine.restore_config(m, lay, args.restore_config,
+                                            dry_run=args.dry_run)
+                print(json.dumps(out, indent=2, sort_keys=True))
+                return 0
+            if not args.payload:
+                ap.error(
+                    "upgrade requires --payload (a built release bundle): "
+                    "the preserving upgrade backs up, verifies and migrates "
+                    "against that artifact; config re-rendering alone is "
+                    "`apply`, and calling that an upgrade would be a lie")
+            payload = engine.ReleasePayload(pathlib.Path(args.payload))
+            # The owner URL arrives via the ENVIRONMENT only: the name of
+            # the variable is a safe argument, its value never touches any
+            # argv (the process table would show the credential for the
+            # whole upgrade).  The engine additionally keeps it out of the
+            # pg_dump child's argv via a private PGPASSFILE.
+            url_name = args.db_url_env or "SR_PG_UPGRADE_URL"
+            db_url = os.environ.get(url_name) or os.environ.get(
+                "POSTGRES_URL_OWNER")
+            if not db_url:
+                ap.error(
+                    "no database owner URL: export it as $SR_PG_UPGRADE_URL "
+                    "(or the named --db-url-env variable) — passing a "
+                    "credential as a command-line argument is refused, it "
+                    "would be visible in the process table")
+            out = engine.run_upgrade(
+                m, lay, payload, db_url=db_url, resume=args.resume,
+                dry_run=args.dry_run, python_exe=args.python_exe,
+                pg_dump_bin=args.pg_dump_bin,
+                skip_provision=args.skip_provision,
+                skip_frontend=args.skip_frontend,
+                allow_fresh_install=args.allow_fresh_install,
+                maintenance_flag=(pathlib.Path(args.maintenance_flag)
+                                  if args.maintenance_flag else None),
+                web_url=args.web_url,
+                credential_env_names=(
+                    tuple(n for n in (args.db_url_env,) if n)))
             print(json.dumps(out, indent=2, sort_keys=True))
         elif args.cmd == "firstboot":
             lay = _layout(args)
@@ -1409,10 +1893,19 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(report, indent=2, sort_keys=True))
             else:
                 for c in report["checks"]:
-                    print(("  [ok]  " if c["ok"] else "  [FAIL] ")
-                          + c["check"] + (f" - {c['detail']}" if c["detail"] else ""))
-            if not report["ok"]:
+                    mark = ("[PEND] " if c.get("pending")
+                            else ("[ok]   " if c["ok"] else "[FAIL] "))
+                    print(mark + c["check"]
+                          + (f" - {c['detail']}" if c["detail"] else ""))
+            if report["failed"]:
                 return 1
+            if report["pending"]:
+                print("firstboot PENDING: the operator manual steps "
+                      "(network reload, nft apply, service starts) are not "
+                      "complete; re-run firstboot after finishing them",
+                      file=sys.stderr)
+                return 3
+            return 0
         elif args.cmd == "verify":
             lay = _layout(args)
             out = verify_install(sandbox_manifest(m, lay.root), lay)

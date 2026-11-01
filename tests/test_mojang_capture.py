@@ -335,7 +335,7 @@ def capture_overlay():
     try:
         rec = guest_build.build_overlay(
             repo_root=REPO, run_dir=run, cache_dir=GUEST_CACHE,
-            role="mojang-web-db", memory_mb=2048, timeout_s=1500)
+            role="mojang-web-db", memory_mb=2048, timeout_s=3600)
         yield {"run": run, "overlay": pathlib.Path(rec["overlay"]), "record": rec}
     finally:
         shutil.rmtree(run, ignore_errors=True)

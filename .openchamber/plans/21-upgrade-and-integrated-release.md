@@ -3,8 +3,8 @@
 > Workflow normalized 2026-10-28: the [native-workflow decision](../../docs/ARCHITECTURE.md#workflow-decision--native-openchamber-2026-10-28) supersedes old procedural rules in this record, not product requirements or acceptance gates. Retained status is not fresh verification.
 
 ## Steps
-- [ ] Inventory installed overrides and define versioned upgrade/preflight contract.
-- [ ] Deliver preserving in-place upgrade and corrected fresh-install bundle.
+- [x] Inventory installed overrides and define versioned upgrade/preflight contract.
+- [x] Deliver preserving in-place upgrade and corrected fresh-install bundle.
 - [ ] Prove real install/upgrade/failure/recovery sequences and integrated journeys.
 - [ ] Reconcile full backlog, evidence, manuals and handoff.
 - [ ] Tick 21 only on its gates; update roadmap/architecture and retained manual status.

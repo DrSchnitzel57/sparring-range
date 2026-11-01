@@ -68,9 +68,16 @@ def test_journey_creates_a_session_for_every_option(monkeypatch):
             if url.endswith("/score"):
                 return _Resp({"status": "unscored"})
             if url.endswith("/replay"):
+                # plan 20: the page only counts; casts moved to /casts
+                return _Resp({"casts_total": 1, "operations_total": 0,
+                              "sealed": False, "timeline": [],
+                              "has_more": False, "next_after_event_id": None})
+            if "/casts" in url:
                 # the member's SSH transcript exists after the rehearsal
-                return _Resp({"casts": [{"frames": [{"t": 0, "text": "hello"}]}],
-                              "timeline": []})
+                return _Resp({"casts": [{"frames": [[0, "o", "hello"]],
+                                         "header": {"timestamp": 1},
+                                         "frame_count": 1}],
+                              "has_more": False, "next_after": None})
             return _Resp({"session_id": "sid-1", "status": "complete",
                            "deployment_status": "ready",
                            "match": {"state": "ready", "snapshot_version": 7,
@@ -159,9 +166,16 @@ def test_journey_refuses_a_session_that_ignored_its_options(monkeypatch):
             if url.endswith("/score"):
                 return _Resp({"status": "unscored"})
             if url.endswith("/replay"):
+                # plan 20: the page only counts; casts moved to /casts
+                return _Resp({"casts_total": 1, "operations_total": 0,
+                              "sealed": False, "timeline": [],
+                              "has_more": False, "next_after_event_id": None})
+            if "/casts" in url:
                 # the member's SSH transcript exists after the rehearsal
-                return _Resp({"casts": [{"frames": [{"t": 0, "text": "hello"}]}],
-                              "timeline": []})
+                return _Resp({"casts": [{"frames": [[0, "o", "hello"]],
+                                         "header": {"timestamp": 1},
+                                         "frame_count": 1}],
+                              "has_more": False, "next_after": None})
             return _Resp({"session_id": "sid-1", "status": "ready",
                            "deployment_status": "ready",
                            "match": {"state": "ready", "snapshot_version": 7,

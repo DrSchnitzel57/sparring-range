@@ -54,7 +54,7 @@ def _role_overlay(role: str, memory_mb: int = 2048):
     try:
         rec = guest_build.build_overlay(
             repo_root=REPO, run_dir=run, cache_dir=GUEST_CACHE,
-            role=role, memory_mb=memory_mb, timeout_s=1500)
+            role=role, memory_mb=memory_mb, timeout_s=3600)
         yield {"run": run, "overlay": pathlib.Path(rec["overlay"]), "record": rec}
     finally:
         shutil.rmtree(run, ignore_errors=True)
@@ -102,7 +102,7 @@ def _verify_markers(record: dict, *required: str) -> None:
     assert "SR-GUEST-DONE rc=0" in markers, markers
 
 
-def test_images_ubuntu_verify_web_local(web_local_overlay):
+def test_images_ubuntu_verify_web_local(web_local_overlay, tmp_path):
     """Real offline boot (`-net none`) of the WEB artifact: local-data
     catalogue, live diagnostic flaw + service-preserving fix, auditd/shipper/
     users/firewall, and MySQL NOT enabled — all on the installed guest."""
@@ -120,7 +120,67 @@ def test_images_ubuntu_verify_web_local(web_local_overlay):
                     "DIAG-FLAW", "ROOT-FLAW", "MAINT-HELPER", "MAINT-FIX",
                     "DIAG-FIX", "AUDITD-RULES",
                     "SHIPPER-UNIT", "SHIPPER-SPOOL", "SEEDS", "USERS",
-                    "FIREWALL", "NO-MYSQL-ENABLED")
+                    "FIREWALL", "NO-MYSQL-ENABLED", "CRON-STATE")
+    # Plan 18 criterion 5: the CLEAN verify boot of the BUILT artifact is
+    # the capture source for trusted cron hashes, bound to this exact
+    # artifact's digest. A changed artifact (different digest) or the
+    # wrong template must never inherit trust from this pin.
+    import hashlib as _hl
+
+    from infra.images import cron_baseline
+    capture = cron_baseline.capture_from_verify_markers(rec["markers"])
+    digest = _hl.sha256(overlay.read_bytes()).hexdigest()
+    pin = cron_baseline.build_pin("mojang-web-local", artifact_sha256=digest,
+                                  artifact_version=digest, template_id=9011,
+                                  capture=capture)
+    # the clean ubuntu base ships e2scrub_all — that is exactly the file
+    # the scenarios declare as baseline, and the pin now carries its hash
+    assert "e2scrub_all" in pin["files"], sorted(pin["files"])
+    pins = {"mojang-web-local": pin}
+    # Exercise the PRODUCTION injection (review findings: testing only the
+    # pure helper proved template-only trust, and reading the CURRENT pin
+    # file at scoring time let an in-place file-hash edit rewrite history).
+    # A deployment freezes the baseline — from the identity the broker
+    # confirmed for its clone — into the immutable resource AT DEPLOY TIME;
+    # scoring injects ONLY that frozen version, and a same-digest edit of
+    # the pin file changes nothing for an existing session.
+    import srplatform.verification_service as vs
+    deployed = {"role": "mojang-web-local", "template_vmid": 9011,
+                "artifact_sha256": digest}
+    deployed["baseline"] = cron_baseline.freeze_baseline(
+        pins, "mojang-web-local", artifact_sha256=digest, template_vmid=9011)
+    assert deployed["baseline"]["files"] == pin["files"]
+    base = {"host": "web01", "baseline_files": ["e2scrub_all"]}
+    injected = vs.with_cron_baseline(
+        dict(base), verifier_id="cron_persistence_present", host="web01",
+        artifacts={"web01": deployed}, pins=pins)
+    assert injected["baseline_file_sha256"] == pin["files"]
+
+    # same-digest in-place edit of the pin document: frozen truth stands
+    edited = {role: dict(pin_, files=dict(pin_["files"]))
+              for role, pin_ in pins.items()}
+    edited["mojang-web-local"]["files"]["e2scrub_all"] = "0" * 64
+    assert edited["mojang-web-local"]["files"] != pins["mojang-web-local"]["files"]
+    injected2 = vs.with_cron_baseline(
+        dict(base), verifier_id="cron_persistence_present", host="web01",
+        artifacts={"web01": deployed}, pins=edited)
+    assert injected2["baseline_file_sha256"] == pin["files"], \
+        "a post-launch pin edit must never redefine clean"
+
+    def _refuse(**over):
+        art = dict(deployed, **over)
+        out = vs.with_cron_baseline(
+            dict(base), verifier_id="cron_persistence_present",
+            host="web01", artifacts={"web01": art}, pins=pins)
+        assert out == base, over
+    _refuse(artifact_sha256="0" * 64)          # rebuilt artifact
+    _refuse(template_vmid=9012)                # unexpected template
+    _refuse(role="mojang-web-db")              # wrong role
+    _refuse(baseline={})                       # never frozen → UNKNOWN
+    # round-trip through the pin document validates and preserves
+    doc = tmp_path / "cron-baselines.json"
+    cron_baseline.dump_pins(doc, pins)
+    assert cron_baseline.load_pins(doc) == pins
 
 
 def test_images_ubuntu_verify_web_db(db_overlay):

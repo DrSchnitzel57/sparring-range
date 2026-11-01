@@ -2,12 +2,15 @@
 
 > Workflow normalized 2026-10-28: the [native-workflow decision](../../docs/ARCHITECTURE.md#workflow-decision--native-openchamber-2026-10-28) supersedes old procedural rules in this record, not product requirements or acceptance gates. Retained status is not fresh verification.
 
+> Reviews: `168a9e1`→FIX (seven, `806d239`…`dfaa954`); `41d8df9`→FIX
+> (six, `e20604a`/`cd19b1d`). Receipts: FINDINGS "Plan-18 second review round".
+
 ## Steps
-- [ ] Reproduce baselines and reconcile retained defects.
-- [ ] Repair bootstrap, native/runtime provisioning, identities and trust.
-- [ ] Implement safe latched teardown and audited obligation recovery.
-- [ ] Bind clean cron evidence to images; qualify scoped containment.
-- [ ] Run acceptance; update findings, tick 18 on its gates and update architecture if changed.
+- [x] Reproduce baselines and reconcile retained defects.
+- [x] Repair bootstrap, native/runtime provisioning, identities and trust.
+- [x] Implement safe latched teardown and audited obligation recovery.
+- [x] Bind clean cron evidence to images; qualify scoped containment.
+- [x] Run acceptance; update findings, tick 18 on its gates and update architecture if changed.
 
 ## Goal and context
 Replace operator workarounds with reproducible source fixes. Binding references:

@@ -43,6 +43,7 @@ import os
 import pathlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -50,7 +51,7 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-BUNDLE_VERSION = 1
+BUNDLE_VERSION = 2
 MANIFEST_NAME = "MANIFEST.json"
 TARGET_OS = "ubuntu-24.04"
 TARGET_PYTHON = "3.12"
@@ -211,14 +212,210 @@ def _add_image(src: pathlib.Path, dst: pathlib.Path) -> None:
                           "images; a released image must stand alone")
 
 
+def _ship_image(src: pathlib.Path, dst: pathlib.Path, *,
+                link: bool = False) -> None:
+    """Place an image into the bundle (see _add_image). With ``link`` the
+    SHIPPED inode is a HARDLINK to the source — bytes identical, no second
+    copy — which requires the source to be a REGULAR (non-symlink),
+    self-contained single-image qcow2 already in bundle mode (verified
+    exactly as _add_image would): a symlinked "source" would ship a
+    symlink artifact pointing OUTSIDE the bundle, and the release must
+    never depend on a build-machine path. Nothing here writes to the
+    shared source inode (no chmod/chown/truncate) — the seal stays
+    exactly as sealed."""
+    if not link:
+        _add_image(src, dst)
+        return
+    lst = os.lstat(str(src))
+    if stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode):
+        raise BundleError(
+            f"--link-images requires a regular non-symlink source image; "
+            f"{src} is a {'symlink' if stat.S_ISLNK(lst.st_mode) else 'non-regular file'}"
+            " — linking it would ship a pointer outside the bundle")
+    info = _image_info(src)
+    if info.get("backing-filename"):
+        raise BundleError(
+            f"--link-images requires a self-contained source image, but "
+            f"{src} has backing file {info['backing-filename']!r}")
+    chain = _qemu_img("info", "--backing-chain", str(src))
+    images = [ln for ln in chain.splitlines() if ln.startswith("image:")]
+    if len(images) != 1:
+        raise BundleError(f"{src} has a backing chain of {len(images)} "
+                          "images; a released image must stand alone")
+    mode = lst.st_mode & 0o777
+    if mode != 0o644:
+        raise BundleError(
+            f"--link-images shares the source inode (mode {mode:04o}); "
+            f"{src} must already carry the bundle mode 0644 so linking "
+            "cannot mutate a sealed artifact")
+    os.link(src, dst)
+
+
+_RENAME_NOREPLACE = 0x1  # Linux renameat2 flag
+_AT_FDCWD = -100
+
+# Test seams ONLY (round-5 F4 proofs): a hook that runs in the exact
+# window between the last preflight and the atomic activation, and a hook
+# that makes the activation rename itself fail. Production leaves both
+# None; neither weakens the primitive, they only exercise it.
+_test_before_activation = None
+_test_fail_activation = None
+
+
+def _renameat2_noreplace(src: pathlib.Path, dst: pathlib.Path) -> None:
+    """ATOMICALLY rename src -> dst, refusing (FileExistsError) if ANY-
+    THING exists at dst at that very instant (Linux renameat2 with
+    RENAME_NOREPLACE). There is no check-then-delete window and the
+    destination's inode is never touched by this call. If the primitive
+    is unsupported, FAIL CLOSED — a destructive fallback is exactly what
+    this contract forbids."""
+    import ctypes
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        sys_renameat2 = libc.renameat2
+    except (AttributeError, OSError):
+        raise BundleError(
+            "atomic bundle activation is unsupported on this platform "
+            "(renameat2 unavailable) — refusing a destructive fallback") \
+            from None
+    res = int(sys_renameat2(_AT_FDCWD, os.fsencode(str(src)),
+                            _AT_FDCWD, os.fsencode(str(dst)),
+                            _RENAME_NOREPLACE))
+    if res != 0:
+        errno = ctypes.get_errno()
+        if errno == 17:                       # EEXIST
+            raise FileExistsError(errno, os.strerror(errno), str(dst))
+        if errno == 38:                       # ENOSYS
+            raise BundleError(
+                "atomic bundle activation is unsupported here (renameat2 "
+                "ENOSYS) — refusing a destructive fallback")
+        raise OSError(errno, os.strerror(errno), str(dst))
+
+
+def _activate_bundle(staged: pathlib.Path, output: pathlib.Path, *,
+                     force: bool) -> None:
+    """Activate a fully built staging directory onto the output path with
+    NO check-then-delete window (plan 22 review round 5 F4).
+
+    Without force: a destination that appears after the preflight makes
+    the atomic activation REFUSE — the foreign bytes and inode stay
+    untouched. With force: the existing release is FIRST moved aside
+    atomically to a tokenized backup, the staged build is activated, and
+    ONLY THEN the superseded release is removed; if activation fails the
+    backup is renamed straight back — under NOREPLACE, so a foreign
+    destination that appeared meanwhile is never replaced (round 6,
+    owner contract 3: force grants no ownership of anything that was
+    not ours; the previous valid release stays retained at its known
+    backup path with a durable rollback obligation)."""
+    if _test_before_activation is not None:
+        _test_before_activation(output)
+    backup: pathlib.Path | None = None
+    try:
+        if force and output.exists():
+            import secrets
+
+            backup = output.parent / (
+                f".{output.name}.superseded-{os.getpid()}-"
+                f"{secrets.token_hex(4)}")
+            try:
+                _renameat2_noreplace(output, backup)
+            except (FileExistsError, BundleError) as exc:
+                backup = None
+                raise BundleError(
+                    f"cannot move the existing bundle aside for "
+                    f"replacement ({exc}) — nothing was deleted") from None
+        try:
+            if _test_fail_activation is not None:
+                # fires where the activation rename itself would run, so
+                # the rollback path is exercised for real
+                _test_fail_activation()
+            _renameat2_noreplace(staged, output)
+        except FileExistsError:
+            raise BundleError(
+                f"refusing to activate the bundle over {output}: something "
+                "appeared at the destination after the preflight — its "
+                "bytes were NOT touched; pass --force only when replacing "
+                "it is genuinely intended") from None
+    except BaseException as exc:
+        if backup is not None:
+            try:
+                # ROUND 6 CONTRACT 3: rollback uses the SAME no-replace
+                # primitive. Nothing that is not ours may be overwritten
+                # on the way back, and the previous release is never
+                # discarded on the way out.
+                _renameat2_noreplace(backup, output)
+            except (FileExistsError, BundleError) as rb_exc:
+                raise BundleError(
+                    f"ROLLBACK OBLIGATION — activation failed ({exc}) and "
+                    f"the previous release could NOT be restored to "
+                    f"{output}: something that is not ours appeared there "
+                    f"and was left untouched ({rb_exc}). The previous "
+                    f"VALID release is RETAINED at {backup} — resolve the "
+                    "foreign destination and move it back (it verifies "
+                    "with `bundle.py verify`), or deliberately activate a "
+                    "replacement. Nothing was deleted or overwritten; "
+                    "this obligation stays until honoured.") from None
+        raise
+    if backup is not None:
+        shutil.rmtree(backup, ignore_errors=True)
+
+
 def build(output: pathlib.Path, *, base_image: pathlib.Path,
           role_images: dict[str, pathlib.Path], app_dir: pathlib.Path = REPO,
-          guest_agent_available: bool = True) -> dict:
-    output = pathlib.Path(output)
-    if output.exists():
-        shutil.rmtree(output)
-    output.mkdir(parents=True)
+          guest_agent_available: bool = True,
+          link_images: bool = False, force: bool = False) -> dict:
+    """Build the release bundle ATOMICALLY (plan 22 review rounds 4-5 F4).
 
+    Every input is validated BEFORE any mutation, so a missing image or a
+    bad flag never destroys an existing release; an existing output is
+    REFUSED by default — replacing a release artifact is a deliberate act
+    (``force=True`` / ``--force``), never a side effect of rerunning the
+    builder. The build happens in a staging directory beside the target
+    and activation is an exclusive atomic rename: a destination that
+    appears between preflight and activation is refused with its bytes
+    and inode intact, and a forced replacement rolls the previous
+    release back if the activation itself fails."""
+    import secrets
+
+    output = pathlib.Path(output)
+    app_dir = pathlib.Path(app_dir)
+    base_image = pathlib.Path(base_image)
+
+    # ---- preflight: every input validated before ANY mutation ----
+    if not app_dir.is_dir():
+        raise BundleError(f"application directory missing: {app_dir}")
+    if not base_image.is_file():
+        raise BundleError(f"base image missing: {base_image}")
+    for role, path in sorted(role_images.items()):
+        if not pathlib.Path(path).is_file():
+            raise BundleError(f"role image missing: {role}: {path}")
+    if not guest_agent_available:
+        raise BundleError("the guest agent is not available in the base image")
+    if output.exists() and not force:
+        raise BundleError(
+            f"refusing to replace existing bundle output {output} — a "
+            "release artifact is only replaced deliberately (pass --force "
+            "when replacement is genuinely intended)")
+
+    staged = output.parent / f".{output.name}.staging-" \
+        f"{os.getpid()}-{secrets.token_hex(4)}"
+    staged.mkdir(parents=True)
+    try:
+        manifest = _build_into(staged, base_image=base_image,
+                               role_images=role_images, app_dir=app_dir,
+                               link_images=link_images)
+        _activate_bundle(staged, output, force=force)
+    except BaseException:
+        shutil.rmtree(staged, ignore_errors=True)
+        raise
+    return manifest
+
+
+def _build_into(output: pathlib.Path, *, base_image: pathlib.Path,
+                role_images: dict[str, pathlib.Path],
+                app_dir: pathlib.Path, link_images: bool) -> dict:
+    """Populate a fresh staging directory (called by build() only)."""
     files: dict[str, dict] = {}
 
     def add(src: pathlib.Path, rel: str) -> None:
@@ -238,28 +435,28 @@ def build(output: pathlib.Path, *, base_image: pathlib.Path,
         rel = f"images/{base_image.name}"
         dst = output / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
-        _add_image(base_image, dst)
-        os.chmod(dst, 0o644)
+        _ship_image(base_image, dst, link=link_images)
+        if not link_images:
+            os.chmod(dst, 0o644)
         files[rel] = {"sha256": _sha256(dst), "bytes": dst.stat().st_size}
         images["appliance-base"] = {"path": rel, "sha256": files[rel]["sha256"],
                                     "bytes": files[rel]["bytes"]}
     for role, path in sorted(role_images.items()):
-        if not path.is_file():
-            raise BundleError(f"role image missing: {path}")
+        path = pathlib.Path(path)
         rel = f"images/{path.name}"
         dst = output / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
-        _add_image(path, dst)
-        os.chmod(dst, 0o644)
+        _ship_image(path, dst, link=link_images)
+        if not link_images:
+            os.chmod(dst, 0o644)
         files[rel] = {"sha256": _sha256(dst), "bytes": dst.stat().st_size}
         images[role] = {"path": rel, "sha256": files[rel]["sha256"],
                         "bytes": files[rel]["bytes"]}
-    if not guest_agent_available:
-        raise BundleError("the guest agent is not available in the base image")
 
+    manifest_revision = _revision()
     manifest = {
         "bundle_version": BUNDLE_VERSION,
-        "revision": _revision(),
+        "revision": manifest_revision,
         "target": {"os": TARGET_OS, "python": TARGET_PYTHON},
         "images": images,
         "files": dict(sorted(files.items())),
@@ -267,6 +464,25 @@ def build(output: pathlib.Path, *, base_image: pathlib.Path,
             "command": "python deploy/appliance.py apply --manifest manifest.json",
             "notes": "render the operator manifest with: "
                      "python deploy/bundle.py manifest <bundle> --out manifest.json ...",
+        },
+        "upgrade": {
+            "engine": "deploy/upgrade.py",
+            "migrations": "srplatform/db/migrations/versions",
+            "bundle_version": BUNDLE_VERSION,
+            "revision": manifest_revision,
+            "command": "SR_PG_UPGRADE_URL=... python deploy/appliance.py "
+                       "upgrade --manifest manifest.json --payload <this "
+                       "bundle>  # owner URL via environment ONLY: a URL "
+                       "with a credential must never be a process argument",
+            "notes": "preserving in-place upgrade: journal first, admission "
+                     "fence, private config + database backups (password "
+                     "via private PGPASSFILE, never argv), digest-verified "
+                     "staging, per-file atomic activation, provisioning of "
+                     "the locked runtime + frontend BEFORE migration, "
+                     "forward-only migrations, checked service restart with "
+                     "readiness, version stamp last; data, keys and the "
+                     "ledger are never deleted, and unknown in-flight work "
+                     "is refused until resolved",
         },
     }
     (output / MANIFEST_NAME).write_text(
@@ -284,11 +500,54 @@ def verify(bundle: pathlib.Path) -> dict:
         raise BundleError(f"unsupported bundle version "
                           f"{manifest.get('bundle_version')!r}")
     problems: list[str] = []
+
+    # STRUCTURAL SELF-CONTAINMENT (plan 22 review round 4 F5): never trust
+    # bytes reached THROUGH a symlink. Every path below the bundle root —
+    # listed files, images, and their intermediate directories — must be
+    # real non-symlink inodes whose realpath stays inside the bundle; an
+    # external pointer (or an internal one posing as the release) is
+    # refused before its digest is ever compared. A symlinked DIRECTORY
+    # is refused too: it could hide or smuggle content on the build host.
+    root_real = os.path.realpath(bundle)
+
+    def _trustworthy(rel: str, *, missing_msg: str | None = None) -> bool:
+        """EVERY refusal below RECORDS the problem — a mandatory inventory
+        entry that cannot be trusted is a failure, never a silent skip
+        (plan 22 review round 5 F3: returning False without accounting
+        let a COMPLETELY MISSING listed file or image verify ok)."""
+        p = bundle
+        for part in pathlib.PurePosixPath(rel).parts:
+            p = p / part
+            if os.path.islink(p):
+                problems.append(f"symlink component refused: {rel}")
+                return False
+        try:
+            st = os.lstat(p)
+        except FileNotFoundError:
+            problems.append(missing_msg or f"missing: {rel}")
+            return False
+        except OSError as exc:
+            problems.append(f"cannot stat {rel}: {exc}")
+            return False
+        if not stat.S_ISREG(st.st_mode):
+            problems.append(f"not a regular file: {rel}")
+            return False
+        rp = os.path.realpath(p)
+        if rp != root_real and not rp.startswith(root_real + os.sep):
+            problems.append(f"path escapes the bundle: {rel}")
+            return False
+        return True
+
+    for dirpath, dirnames, _filenames in os.walk(bundle):
+        for name in list(dirnames):
+            if os.path.islink(os.path.join(dirpath, name)):
+                rel = os.path.relpath(os.path.join(dirpath, name), bundle)
+                problems.append(f"symlink directory refused: {rel}")
+                dirnames.remove(name)   # do not descend through it
     files = manifest.get("files") or {}
     for rel, expect in sorted(files.items()):
         path = bundle / rel
-        if not path.is_file():
-            problems.append(f"missing: {rel}")
+        if not _trustworthy(rel):
             continue
         if path.stat().st_size != expect.get("bytes"):
             problems.append(f"size drift: {rel}")
@@ -299,12 +558,44 @@ def verify(bundle: pathlib.Path) -> dict:
         secret = _scan_for_secrets(rel, path.read_bytes())
         if secret:
             problems.append(secret)
+    # the upgrade payload contract: a bundle that cannot drive the
+    # preserving upgrade is not a release artifact (milestone 21)
+    upgrade = manifest.get("upgrade") or {}
+    if not upgrade:
+        problems.append("no `upgrade` contract in the manifest: pre-21 "
+                        "bundles must be rebuilt before they can upgrade "
+                        "an appliance")
+    else:
+        engine_rel = str(upgrade.get("engine") or "")
+        if not engine_rel:
+            problems.append("upgrade contract missing 'engine'")
+        elif engine_rel not in files:
+            problems.append(f"upgrade contract names {engine_rel} which the "
+                            "bundle does not carry")
+        if "revision" not in upgrade or upgrade.get("revision") != \
+                manifest.get("revision"):
+            problems.append("upgrade contract revision does not match the "
+                            "bundle revision")
+        mig_dir = str(upgrade.get("migrations") or "").rstrip("/")
+        if not mig_dir:
+            problems.append("upgrade contract missing 'migrations'")
+        elif not any(rel.startswith(mig_dir + "/") and
+                     rel.endswith(".py") for rel in files):
+            problems.append(f"upgrade contract names {mig_dir} but the "
+                            "bundle carries no migrations there")
+        elif (bundle / mig_dir).is_dir():
+            from deploy.upgrade import migration_heads
+            heads = migration_heads(bundle / mig_dir)
+            if len(heads) != 1:
+                problems.append(
+                    f"upgrade payload migration graph has {len(heads)} "
+                    f"heads ({sorted(heads)}); refusing")
     # the shipped images must stand alone: an image that depends on a file
     # outside the bundle cannot be installed on the operator's machine.
     for rel, meta in sorted((manifest.get("images") or {}).items()):
         path = bundle / meta["path"]
-        if not path.is_file():
-            problems.append(f"missing image: {meta['path']}")
+        if not _trustworthy(meta["path"],
+                            missing_msg=f"missing image: {meta['path']}"):
             continue
         if shutil.which("qemu-img") is None:
             continue
@@ -453,6 +744,16 @@ def _parser() -> argparse.ArgumentParser:
     pb.add_argument("--base-image", required=True)
     pb.add_argument("--role-image", action="append", default=[],
                     metavar="ROLE=PATH")
+    pb.add_argument("--link-images", action="store_true",
+                    help="ship the qcow2 files as hardlinks to the (already "
+                         "self-contained, regular, 0644) source images "
+                         "instead of a second full copy; bytes and seals "
+                         "are unchanged")
+    pb.add_argument("--force", action="store_true",
+                    help="replace OUTPUT if it already exists (default: "
+                         "refuse — a release artifact is only replaced "
+                         "deliberately; inputs are validated either way "
+                         "before ANY mutation)")
 
     pv = sub.add_parser("verify")
     pv.add_argument("bundle")
@@ -500,7 +801,9 @@ def main(argv: list[str] | None = None) -> int:
                 role_images[role] = pathlib.Path(path)
             manifest = build(pathlib.Path(args.output),
                              base_image=pathlib.Path(args.base_image),
-                             role_images=role_images)
+                             role_images=role_images,
+                             link_images=args.link_images,
+                             force=args.force)
             from infra.images.specs import GUEST_BUDGETS
             carried = set(manifest["images"])
             missing = [role for role in sorted(GUEST_BUDGETS)

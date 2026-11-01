@@ -10,8 +10,12 @@
 #        --installation-id "$(uuidgen)" \
 #        --lan-address 10.10.10.50 --range-cidr 10.66.0.0/24 \
 #        --public-url https://sr.example.edu \
-    --model-base-url http://127.0.0.1:8001/v1 --model-alias my-model
+#        --model-base-url http://127.0.0.1:8001/v1 --model-alias my-model
 #
+# (Every documentation line above MUST stay commented: this file executes
+# from line 1, and a bare `--model-base-url ...` line used to run as a
+# command before `set -e` ever existed — bash -n never sees it because the
+# command simply fails at execution time on a live hand-off.)
 # The internal and ingest URLs default to the loopback API and the
 # controller's range address; override them with --internal-url/--ingest-url
 # when the appliance is not the controller host.
@@ -35,9 +39,19 @@ DB_HOST="127.0.0.1"
 DB_NAME="sparring_range"
 MEMBER_USER="member"
 PYTHON="${SR_PYTHON:-python3}"
+# Sealed-tree hygiene (same contract as docs/OPERATOR_RUNBOOK.md §7): every
+# python call below executes the BUNDLE's own CLI from inside the unpacked
+# bundle, and `bundle.py verify` refuses ANY file the manifest does not
+# list — one stray __pycache__/*.pyc would fail every later verify. So the
+# whole hand-off runs bytecode-suppressed: explicit -B on each direct call
+# AND PYTHONDONTWRITEBYTECODE=1 exported for every child interpreter
+# (the -B flag is not inherited; appliance.py's runner passes this
+# environment through to its children). This only suppresses bytecode
+# caching — no installation behaviour changes.
+export PYTHONDONTWRITEBYTECODE=1
 
 usage() {
-  sed -n '2,20p' "$0" >&2
+  sed -n '2,21p' "$0" >&2
   exit 2
 }
 
@@ -74,11 +88,22 @@ cd "$BUNDLE"
 say() { printf '\n== %s\n' "$*"; }
 
 say "1/7 verify the bundle"
-"$PYTHON" deploy/bundle.py verify .
+"$PYTHON" -B deploy/bundle.py verify .
 
 say "2/7 prepare the operator's keys and secrets"
 install -d -m 0750 "$KEYS_DIR"
 install -d -m 0700 "$SECRETS_DIR"
+# EARLY model-key preflight (plan 18): the manifest load and the production
+# settings both refuse a missing or empty model credential. Failing HERE —
+# before any key is generated, before rendering, before apply — replaces
+# the old mid-flight death after side effects. The credential is
+# provisioned out of band (never in Git, never in a log); the installer
+# never invents one and never leaves an empty placeholder behind.
+if [ ! -s "$SECRETS_DIR/model.key" ]; then
+  echo "  MODEL CREDENTIAL MISSING: create $SECRETS_DIR/model.key with the" >&2
+  echo "  model API key inside (mode 0600) and re-run this hand-off." >&2
+  exit 1
+fi
 for role in runner bastion mgmt; do
   if [ ! -f "$KEYS_DIR/$role" ]; then
     ssh-keygen -q -t ed25519 -N '' -f "$KEYS_DIR/$role"
@@ -93,11 +118,8 @@ if [ ! -f "$KEYS_DIR/$MEMBER_USER" ]; then
   echo "  generated $KEYS_DIR/$MEMBER_USER (the member's login '$MEMBER_USER';"
   echo "  keep the PRIVATE half safe — it is the member's SSH key)"
 fi
-if [ ! -f "$SECRETS_DIR/model.key" ]; then
-  install -m 0600 /dev/null "$SECRETS_DIR/model.key"
-  echo "  created $SECRETS_DIR/model.key - put the model credential in it"
-fi
-# The SCHEMA OWNER credential and the RUNTIME credential are separate files.
+# The MODEL credential must already exist (preflight above). The schema
+# owner credential and the RUNTIME credential are separate files.
 # The owner URL is used ONLY to run the migrations and lives in a root-only
 # file that no service loads; the runtime URL goes into the env the API,
 # the ingest listener and the bastion load.  Never put the owner URL in
@@ -129,7 +151,7 @@ say "3/7 render the operator manifest from the bundle"
 if [ -z "$INGEST_URL" ]; then
   INGEST_URL="https://$(printf '%s' "$RANGE_CIDR" | awk -F. '{print $1"."$2"."$3".1"}'):8443"
 fi
-"$PYTHON" deploy/bundle.py manifest . --out "$MANIFEST" \
+"$PYTHON" -B deploy/bundle.py manifest . --out "$MANIFEST" \
   --installation-id "$INSTALLATION_ID" \
   --lan-address "$LAN_ADDRESS" --range-cidr "$RANGE_CIDR" \
   --public-url "$PUBLIC_URL" --internal-url "$INTERNAL_URL" \
@@ -143,14 +165,14 @@ fi
   --model-base-url "$MODEL_BASE_URL" --model-alias "$MODEL_ALIAS"
 
 say "4/7 plan the installation"
-"$PYTHON" deploy/appliance.py plan --manifest "$MANIFEST"
+"$PYTHON" -B deploy/appliance.py plan --manifest "$MANIFEST"
 
 say "5/7 apply the installation"
 if [ "$(id -u)" != "0" ]; then
   echo "apply needs root: re-run this step with sudo" >&2
   exit 1
 fi
-"$PYTHON" deploy/appliance.py apply --manifest "$MANIFEST"
+"$PYTHON" -B deploy/appliance.py apply --manifest "$MANIFEST"
 
 say "6/7 apply the range network and start the services"
 cat <<'NOTE'
@@ -162,12 +184,26 @@ in a maintenance window.
   less /etc/systemd/network/10-srlab.netdev /etc/systemd/network/20-srlab.network
   networkctl reload
   nft -f /etc/nftables.d/sr-appliance.nft
-  systemctl enable --now sr-appliance-broker sr-api sr-appliance-ingest \
-    sr-worker-supervisor sr-bastion sr-web
+  systemctl enable --now sr-appliance-netrules sr-appliance-broker sr-api \
+    sr-appliance-ingest sr-worker-supervisor sr-bastion sr-web
 NOTE
 
 say "7/7 check that the appliance came up"
-"$PYTHON" deploy/appliance.py firstboot --manifest "$MANIFEST"
+# Staged firstboot (plan 18): step 6 deliberately leaves the bridge and the
+# nftables rules UNAPPLIED and the services ENABLED-BUT-UNSTARTED until the
+# operator completes them in the maintenance window. A first run of
+# firstboot before that window is therefore PENDING, not broken: the
+# installer distinguishes the two (exit 3 = pending manual steps) and this
+# hand-off reports it honestly instead of a confusing all-FAIL report.
+"$PYTHON" -B deploy/appliance.py firstboot --manifest "$MANIFEST" && FB=0 || FB=$?
+
+if [ "$FB" = "3" ]; then
+  printf '\nfirstboot is PENDING: complete the step-6 manual sequence first,\n'
+  printf 'then re-run it. It exits 3 until the bridge, the nft rules and the\n'
+  printf 'service starts from step 6 are actually in place.\n'
+  exit 3
+fi
+[ "$FB" = "0" ] || exit "$FB"
 
 printf '\nhand-off complete: the manual rehearsal (fresh launch, member SSH,\n'
 printf 'sudo, reconnect, replay, cleanup, second fresh launch) is still yours.\n'

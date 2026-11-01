@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
@@ -42,7 +42,9 @@ app = FastAPI(title="sparring-range API", version="0.2.0")
 
 # LAN origins are EXPLICIT (F23) — never wildcard, never silently localhost.
 from srplatform.controller_lock import ControllerLock
-from srplatform.settings import get_settings  # noqa: E402
+from srplatform import host_roles  # noqa: E402
+from srplatform.bastion import enrollment  # noqa: E402
+from srplatform.settings import bastion_login_target, get_settings  # noqa: E402
 
 
 class _StartupCORSMiddleware(CORSMiddleware):
@@ -119,6 +121,71 @@ async def _ingest_only_guard(request, call_next):
     return await call_next(request)
 
 
+#: Paths that may still CHANGE state while the admission fence is up:
+#: they complete or authenticate EXISTING work, they never admit new
+#: engagements. Blocking them would strand in-flight runs un-terminalized.
+_FENCE_EXEMPT_PATHS = frozenset({
+    "/auth/login", "/auth/logout", "/healthz", "/readyz",
+    "/enroll/confirm", "/ingest/auditd",
+})
+#: Round-3 finding 2: the blanket ``/internal/`` exemption was the hole —
+#: ``/internal/model/*`` ADMITS NEW durable generations (every completion
+#: callback queues the next turn/summary), and an OLD process that never
+#: knew the fence existed was serving those routes. Only TERMINALITY
+#: callbacks are exempt now; generation-admitting internal routes are
+#: refused like any other new work, and the transaction-boundary check in
+#: ``model_jobs.enqueue`` backstops even these exempt paths.
+_FENCE_EXEMPT_PREFIXES = (
+    "/internal/worker/",       # claim/assign/heartbeat/failed bookkeeping
+    "/internal/runs/",         # run terminality + dispatched-command ledger
+)
+
+
+from srplatform import model_jobs as _model_jobs_fence
+
+
+@app.exception_handler(_model_jobs_fence.AdmissionFenced)
+async def _admission_fenced_handler(request, exc):  # noqa: ARG001
+    """One mapping for the transaction-boundary refusal: wherever
+    ``model_jobs.enqueue``/``runs.start_run`` raise AdmissionFenced (an
+    exempt path that raced the fence, a re-entrancy), the client-visible
+    contract is the same 503 + Retry-After the middleware gives."""
+    return JSONResponse(
+        {"detail": "maintenance: the appliance is completing a "
+                   "preserving upgrade; new work is refused at the "
+                   "admission boundary",
+         "retry_after_s": 30},
+        status_code=503, headers={"Retry-After": "30"})
+_FENCE_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+@app.middleware("http")
+async def _maintenance_fence(request, call_next):
+    """Plan 21 preserving upgrade: while the fence FILE exists the API is
+    the business-logic front door for NEW work — and new work is refused.
+    The upgrade creates the file before its quiescence is consumed and
+    removes it only after the restarted services are verified, so no
+    request can race the check/mutation boundary. Fail-open would defeat
+    the fence: a stat() error is treated as fenced."""
+    import pathlib
+    from srplatform.settings import get_settings as _gs
+    s = _gs()
+    try:
+        if not pathlib.Path(s.maintenance_flag).exists():
+            return await call_next(request)
+    except OSError:
+        pass  # unreadable flag location: treat as fenced (fail closed)
+    if (request.method in _FENCE_WRITE_METHODS
+            and request.url.path not in _FENCE_EXEMPT_PATHS
+            and not request.url.path.startswith(_FENCE_EXEMPT_PREFIXES)):
+        return JSONResponse(
+            {"detail": "maintenance: the appliance is completing a "
+                       "preserving upgrade; new work is refused",
+             "retry_after_s": 30},
+            status_code=503, headers={"Retry-After": "30"})
+    return await call_next(request)
+
+
 # The ONE shared request DB session (function scope — commit completes before
 # the response is sent; see srplatform/api/deps.py for why) and the auth
 # dependencies built on it.
@@ -170,6 +237,12 @@ def readyz():
     except Exception as e:  # noqa: BLE001
         issues.append(f"db: {e}")
     s = _gs()
+    # Review F3: the runner fact here is CONFIG READINESS only (transport
+    # named, key present, non-empty host trust) — never current runner HEALTH.
+    # A live runner probe at /readyz would couple installation readiness to a
+    # reachable attacker runner, which bootstrap cannot require. Label the
+    # fact so no consumer reads runner.ok as "runner healthy / may Begin";
+    # current health lives in the admission probes at /safety/qualification.
     runner_ok, runner_why = get_supervisor().runner_available()
     rec_dir = s.recordings_dir
     rec_ok = os.access(rec_dir, os.W_OK) if os.path.isdir(rec_dir) else False
@@ -192,7 +265,10 @@ def readyz():
     return {"ready": v is not None and not issues,
             "migration_version": v, "issues": issues,
             "controller": {"ok": controller, "detail": controller_detail},
-            "runner": {"ok": runner_ok, "detail": runner_why},
+            "runner": {"ok": runner_ok, "detail": runner_why,
+                       "fact": "config-readiness (deterministic; no live "
+                               "probe) — current runner health: "
+                               "/safety/qualification"},
             "recordings_writable": rec_ok,
             "safety": get_supervisor().verify()}
 
@@ -239,11 +315,24 @@ def release_stages(p: Principal = Depends(operator), db: DbSession = None):
         except Exception as e:  # noqa: BLE001
             broker = {"ok": False, "detail": str(e)[:200]}
     lab_ready = install_ready and bool(broker and broker.get("ok"))
+    # LIVE-07: the stage ladder carries the SAME Begin eligibility the gate
+    # applies, so the safety page, the stage page and Begin cannot disagree.
+    try:
+        qual = get_supervisor().qualification_report()
+        safety = {"begin_allowed": qual["begin_allowed"],
+                  "begin_blockers": qual["begin_blockers"],
+                  "advisories": qual["advisories"]}
+    except Exception as e:  # noqa: BLE001 — a stage report never 500s
+        safety = {"begin_allowed": False,
+                  "begin_blockers": [f"safety report unavailable: "
+                                     f"{str(e)[:150]}"],
+                  "advisories": []}
     return {"install_ready": install_ready,
             "lab_ready": lab_ready,
             "attack_authorized": lab_ready and s.attack_authorized,
             "operator_gate": s.attack_authorized,
             "broker": broker,
+            "safety": safety,
             "issues": issues}
 
 
@@ -410,17 +499,104 @@ def create_session(body: SessionCreate, p: Principal = Depends(any_member),
 
 
 @app.get("/sessions")
-def list_sessions(mine: bool = Query(True), p: Principal = Depends(any_member),
-                  db: DbSession = None):
-    q = select(SessionModel).order_by(SessionModel.started_at, SessionModel.session_id)
+def list_sessions(mine: bool = Query(True),
+                  view: str = Query("all"),      # all | active | history
+                  limit: int = Query(50, ge=1, le=200),
+                  offset: int = Query(0, ge=0),
+                  p: Principal = Depends(any_member), db: DbSession = None):
+    """Paginated session list with per-session honesty flags (plan 20).
+
+    ``view=active`` is what is (or was just) in flight; ``history`` is
+    everything finished. Flags ride each row so the dashboard can say
+    what needs attention WITHOUT loading each session: ``interrupted``
+    (failed / worker failure / stop unconfirmed / the match lifecycle's
+    own INTERRUPTED state), ``unscored`` (finished without any
+    scorecard snapshot), ``cleanup_pending`` (cleanup still retrying or
+    never completed, or an operation whose cessation is unresolved).
+    Members only ever see their own sessions; operators may pass
+    ``mine=false`` for the all-session view — authorization, not a
+    filter checkbox, enforces this.
+
+    Independent review finding 19-FIX/7: the flags derive from
+    DURABLE LIFECYCLE FACTS ONLY — match state, run state, operation
+    state, scorecard presence. The old prose probe (``agent_note LIKE
+    '%worker failure%'``) is gone: warnings were hidden or invented by
+    wording, and a completed session with an INTERRUPTED match and a
+    teardown_incomplete fact rendered as fully healthy. UNSCORED stays
+    a distinct fact: an AI failure never folds it in and never removes
+    it."""
+    from sqlalchemy import func as sa_func
+    from sqlalchemy import select as sa_select
+    from sqlalchemy import text as sa_text
+    ACTIVE = ("preparing", "ready", "running", "stopping", "canceling")
+    q = select(SessionModel).order_by(SessionModel.started_at.desc(),
+                                      SessionModel.session_id.desc())
+    count_q = sa_select(sa_func.count()).select_from(SessionModel)
     if mine or not p.is_operator:
         q = q.where(SessionModel.user_id == p.user_id)
-    rows = db.execute(q).scalars().all()
-    return [{"session_id": str(r.session_id), "scenario_id": r.scenario_id,
-             "user_id": str(r.user_id) if r.user_id else None,
-             "started_at": r.started_at.isoformat() if r.started_at else None,
-             "ended_at": r.ended_at.isoformat() if r.ended_at else None,
-             "status": r.status, "outcome": r.outcome} for r in rows]
+        count_q = count_q.where(SessionModel.user_id == p.user_id)
+    if view == "active":
+        q = q.where(SessionModel.status.in_(ACTIVE))
+        count_q = count_q.where(SessionModel.status.in_(ACTIVE))
+    elif view == "history":
+        q = q.where(SessionModel.status.notin_(ACTIVE))
+        count_q = count_q.where(SessionModel.status.notin_(ACTIVE))
+    total = db.execute(count_q).scalar() or 0
+    rows = db.execute(q.limit(limit).offset(offset)).scalars().all()
+
+    sids = [r.session_id for r in rows]
+    match_interrupted, cleanup, unscored, run_unconfirmed = (
+        set(), set(), set(), set())
+    if sids:
+        # one batched probe per flag — a list page never runs a per-row
+        # scan, and never claims a flag it cannot prove
+        for row in db.execute(sa_text(
+                "SELECT session_id, state FROM matches "
+                "WHERE session_id = ANY(CAST(:ids AS uuid[]))"),
+                {"ids": [str(s) for s in sids]}).fetchall():
+            if row[1] == "interrupted":
+                match_interrupted.add(str(row[0]))
+            if row[1] in ("interrupted", "finalizing"):
+                # 'finalizing' is the durable cleanup-intent marker: an
+                # unfinished or crashed cleanup keeps it until retried
+                # to completion (lifecycle contract)
+                cleanup.add(str(row[0]))
+        for row in db.execute(sa_text(
+                "SELECT DISTINCT session_id FROM run_operations "
+                "WHERE session_id = ANY(CAST(:ids AS uuid[])) "
+                "AND state IN ('active','cancel-unknown')"),
+                {"ids": [str(s) for s in sids]}).fetchall():
+            cleanup.add(str(row[0]))
+        for row in db.execute(sa_text(
+                "SELECT DISTINCT session_id FROM runs "
+                "WHERE session_id = ANY(CAST(:ids AS uuid[])) "
+                "AND status = 'cancel-unknown'"),
+                {"ids": [str(s) for s in sids]}).fetchall():
+            # a run whose cessation never got confirmed: the attacker
+            # process may still exist — interrupted AND unclean
+            run_unconfirmed.add(str(row[0]))
+            cleanup.add(str(row[0]))
+        for row in db.execute(sa_text(
+                "SELECT DISTINCT session_id FROM events "
+                "WHERE session_id = ANY(CAST(:ids AS uuid[])) AND action_type = "
+                "'score_snapshot'"), {"ids": [str(s) for s in sids]}).fetchall():
+            unscored.add(str(row[0]))
+    return {"sessions": [{
+        "session_id": str(r.session_id), "scenario_id": r.scenario_id,
+        "user_id": str(r.user_id) if r.user_id else None,
+        "started_at": r.started_at.isoformat() if r.started_at else None,
+        "ended_at": r.ended_at.isoformat() if r.ended_at else None,
+        "status": r.status, "outcome": r.outcome,
+        "interrupted": (r.status == "failed"
+                        or r.outcome in ("worker_failure", "cancel_unconfirmed",
+                                         "canceled")
+                        or str(r.session_id) in match_interrupted
+                        or str(r.session_id) in run_unconfirmed),
+        "unscored": (r.status == "complete"
+                     and str(r.session_id) not in unscored),
+        "cleanup_pending": str(r.session_id) in cleanup,
+    } for r in rows], "total": total, "limit": limit, "offset": offset,
+        "has_more": offset + len(rows) < total}
 
 
 def _get_session(db, p, session_id) -> SessionModel:
@@ -481,21 +657,45 @@ def get_connections(session_id: uuid.UUID, p: Principal = Depends(any_member),
                                               Deployment.status == "ready")
                      .order_by(Deployment.created_at.desc())).scalars().first()
     name_by_ip = {}
+    tmpl_by_ip = {}
     if dep:
         for r in (dep.resources or []):
             if r.get("ip"):
                 name_by_ip[r["ip"]] = r.get("host")
+                tmpl_by_ip[r["ip"]] = r.get("template_vmid")
     out = []
     for lt in db.execute(select(LoginToken).where(
             LoginToken.session_id == session_id,
             LoginToken.user_id == p.user_id,
             LoginToken.revoked_at.is_(None),
             LoginToken.expires_at > _now())).scalars():
-        out.append({"host": name_by_ip.get(lt.target_host, lt.target_host),
-                    "ip": lt.target_host, "login_token": lt.token,
-                    "ssh": f"ssh {s.bastion_address} -p {s.bastion_listen_port} -l {lt.token}",
-                    "expires_at": lt.expires_at.isoformat() if lt.expires_at else None})
-    return {"session_id": str(session_id), "connections": out}
+        entry = {"host": name_by_ip.get(lt.target_host, lt.target_host),
+                 "ip": lt.target_host, "login_token": lt.token,
+                 "template_vmid": tmpl_by_ip.get(lt.target_host),
+                 "ssh": f"ssh {bastion_login_target(s)} "
+                        f"-p {s.bastion_listen_port} -l {lt.token}",
+                 "expires_at": lt.expires_at.isoformat() if lt.expires_at else None}
+        host_roles.annotate(entry)          # plan 22 LIVE-09 role policy
+        out.append(entry)
+    # plan 22 LIVE-06: tell the account whether its OWN public key can
+    # authenticate at all — the desktop failure was an unenrolled account,
+    # not a broken network. Fingerprints only; the file is never exposed.
+    enroll_hint = {"enrolled": None, "fingerprints": []}
+    try:
+        import pathlib
+        epath = enrollment.enrolled_keys_path(s)
+        fps = enrollment.status(epath).get(p.username or "", []) \
+            if epath is not None else []
+        op_file = s.bastion_authorized_keys_file
+        operator_file_has = bool(
+            enrollment.parse(pathlib.Path(op_file)).get(p.username or "")) \
+            if op_file else False
+        enroll_hint = {"enrolled": bool(fps) or operator_file_has,
+                       "fingerprints": fps}
+    except OSError:
+        pass
+    return {"session_id": str(session_id), "connections": out,
+            "key_enrollment": enroll_hint}
 
 
 # --- launch / end / reset / teardown (F08/F13) ----------------------------------
@@ -1211,33 +1411,347 @@ class ModelCompleteIn(BaseModel):
     name: str = "red-turn"
     system: str
     user: str
+    role: str = "summarizer"   # plan 19: compression rides the summarizer pin
+
+
+def _model_job_wait(s, jid, bound: float):
+    """Wait on a durable job (following its retry chain to ONE final
+    result) within the caller's bound. Exceeding the bound requests
+    cessation — the live call is CANCELLED (the watcher closes it), and
+    if its cessation cannot be confirmed the row stays a visible
+    obligation holding the slot; a request that timed out is never left
+    to silently complete later and never replayed."""
+    from srplatform import model_jobs
+    try:
+        return model_jobs.wait(s, jid, bound)
+    except TimeoutError:
+        try:
+            model_jobs.cancel(s, jid, actor="request wait bound")
+        except Exception:  # noqa: BLE001 — the 504 below is the point
+            pass
+        raise HTTPException(504, "model call exceeded its declared bound")
+
+
+def _model_job_http(job):
+    """Terminal job state → visible HTTP outcome (never a silent
+    success). An unconfirmed cessation is reported AS ONE: the caller
+    must know the provider may still be working and the slot is held
+    pending operator resolution."""
+    from srplatform import model_jobs
+    if job.state == "succeeded":
+        return job.result
+    if job.state == "cessation_unknown":
+        raise HTTPException(502, (
+            "model call cessation cannot be confirmed (the request timed "
+            "out or was closed mid-flight); the provider may still be "
+            "working and the admission slot is held until an operator "
+            "resolves the obligation — do not retry automatically"))
+    if job.state == "cancelled":
+        raise HTTPException(502, "model call cancelled: "
+                            f"{model_jobs.redact_error(job.error or '')[:400]}")
+    raise HTTPException(502, "model call failed: "
+                        f"{model_jobs.redact_error(job.error or job.state)[:400]}")
 
 
 @app.post("/internal/model/complete")
 def internal_model_complete(body: ModelCompleteIn, p: Principal = Depends(service("runner"))):
-    """ONE SHARED MODEL SCHEDULER (audit Stage 5): the worker's red turns are
-    scheduled through the SAME gateway that serves interactive hints and AARs
-    in this process — an interactive hint jumps the queue ahead of queued red
-    turns ACROSS PROCESSES. The run-scoped capability is the authorization;
-    no direct model credential ever reaches the worker. A running request is
-    never preempted (documented bound); queue overflow is a visible 503."""
-    from srplatform.model_gateway import PRIORITY_RED, QueueFull, get_model_gateway
-    from srplatform.red_agent.llm import CompletionRejected, LLM
+    """WORKER TEXT CALLS (compaction summaries) queue through the DURABLE
+    JOBS store — the same single admission slot as turns, hints and AARs
+    (the slot is a database invariant now, not one process's courtesy).
+    The run-scoped capability is the authorization; no model credential
+    ever reaches the worker: the profile version is pinned per session and
+    its key lives only in this process' database."""
+    from srplatform import model_admin as ma
+    from srplatform import model_jobs
     if len(body.system) + len(body.user) > 200_000:
         raise HTTPException(413, "model request too large")
-    s = get_settings()
-    llm = LLM()
+    s0 = get_settings()
     try:
-        fut = get_model_gateway().submit(PRIORITY_RED, f"{p.session_id}:{body.name}",
-                                         llm.complete, body.system, body.user)
-        text = get_model_gateway().wait(fut, s.llm_timeout_s + s.model_hint_max_wait_s + 60)
-    except QueueFull:
-        raise HTTPException(503, "model gateway saturated — retry the turn shortly")
-    except TimeoutError:
-        raise HTTPException(504, "model turn exceeded its bound")
-    except CompletionRejected as e:
-        raise HTTPException(502, str(e)) from e
-    return {"text": text}
+        with db() as s:
+            _pin, prof = ma.bind_for(s, p.session_id, body.role)
+            # TEXT calls carry the SAME server-authoritative deadline as
+            # turns and coach work (round-2 finding 8): a match that has
+            # already expired cannot buy a fresh provider call through
+            # the text endpoint — enqueue itself refuses admission, and
+            # a still-live match bounds the wait at its own end.
+            deadline = _match_deadline(s, p.session_id)
+            job = model_jobs.enqueue(
+                s, kind=f"text:{body.name}", priority=model_jobs.PRIORITY_RED,
+                payload={"mode": "text", "system": body.system,
+                         "user": body.user},
+                session_id=p.session_id, profile=prof, actor="worker",
+                deadline_at=deadline)
+            jid = job.job_id
+    except ma.ProfileProblem as e:
+        raise HTTPException(503, str(e)) from e
+    except model_jobs.QueueFull:
+        raise HTTPException(503, "model queue saturated — retry the turn shortly")
+    bound = s0.llm_timeout_s + s0.model_hint_max_wait_s + 60
+    if deadline is not None:
+        remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
+        bound = min(bound, max(1.0, remaining + 30))
+    with db() as s:
+        job = _model_job_wait(s, jid, bound)
+        result = _model_job_http(job)
+    return {"text": result["text"]}
+
+
+class ModelTurnIn(BaseModel):
+    name: str = "red-turn"
+    system: str
+    user: str
+    tool_result: dict | None = None
+    wait: bool = True
+    deadline_at: str | None = None    # ISO-8601; the worker's clock for
+    #                                  the match is NOT authority — the
+    #                                      server also caps at the match row
+
+
+SUMMARIZE_SYSTEM = (
+    "You compress a red-team engagement conversation into a concise "
+    "situation report for the attacker agent continuing it: what is "
+    "confirmed, what access is held, promising leads, dead ends to avoid, "
+    "defender activity observed, and FAILED attempts with their results "
+    "(do not repeat them). Reference ONLY what the conversation shows. "
+    "Under 350 words.")
+
+
+def _parse_deadline(value: str | None):
+    if not value:
+        return None
+    from datetime import datetime
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(422, "deadline_at must be ISO-8601") from None
+    if dt.tzinfo is None:
+        from datetime import timezone
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _match_deadline(db, session_id):
+    """Authoritative match end — single implementation in model_jobs."""
+    from srplatform import model_jobs
+    return model_jobs.match_deadline(db, session_id)
+
+
+def _compaction_deferral(db, session_id, pressure) -> str | None:
+    """Bounded failure backoff (finding 4): if the most recent
+    summarize job for this session did NOT succeed and context has not
+    grown materially (5% of the budget) since it was enqueued, the
+    SAME window is not re-summarized every turn — the turn proceeds
+    with a visibly deferred compaction instead of an identical retry
+    loop against a broken summarizer."""
+    from srplatform.db.models import ModelJob
+    last = db.execute(select(ModelJob).where(
+        ModelJob.session_id == session_id, ModelJob.kind == "summarize")
+        .order_by(ModelJob.requested_at.desc())).scalars().first()
+    if last is None or last.state == "succeeded":
+        return None
+    if last.state in ("queued", "running"):
+        return None  # a live summarize gates the turn via depends_on
+    used_before = int((last.payload or {}).get("used_at_enqueue") or 0)
+    growth = pressure["used_tokens"] - used_before
+    if growth < 0.05 * pressure["budget_tokens"]:
+        return ("compaction backoff: the last summarize attempt ended "
+                f"{last.state} and context has not grown materially — "
+                "retrying the identical window would only repeat the "
+                "failure; the turn proceeds and compaction retries as "
+                "history grows (operator: see the job list)")
+    return None
+
+
+@app.post("/internal/model/turn")
+def internal_model_turn(body: ModelTurnIn, p: Principal = Depends(service("runner"))):
+    """ONE STRUCTURED TURN of the session's DURABLE conversation (plan
+    19 review round):
+
+    * history is reconstructed from append-only revisions INCLUDING the
+      system framing and every tool return; this turn's INPUT messages
+      are persisted transactionally with its OUTPUT (finding 1) — the
+      wire never sees a conversation the ledger does not contain, and
+      the ledger never holds a message the wire did not see;
+    * token pressure is checked BEFORE the request at a protocol-
+      complete boundary; when compaction is due a summarize job covering
+      the range CAPTURED NOW is enqueued and this turn is GATED behind
+      it via depends_on (finding 4) — the next request never leaves with
+      an over-budget context;
+    * the request joins the pinned attacker profile's queue as a durable
+      job; ``wait=false`` returns the job id immediately and
+      ``GET /internal/model/jobs/{id}`` follows it (finding 11);
+    * the worker holds no credential and executes nothing: a tool call
+      is a PROPOSAL, dispatched by the loop, returned as tool_result."""
+    from pydantic_ai.messages import (ModelRequest, SystemPromptPart,
+                                      ToolReturnPart, UserPromptPart)
+    from srplatform import conversation_store as store
+    from srplatform import model_admin as ma
+    from srplatform import model_jobs
+    from srplatform.red_agent import conversation as conv
+    if len(body.system) + len(body.user) > 200_000:
+        raise HTTPException(413, "model request too large")
+    sid = p.session_id
+    s0 = get_settings()
+    requested_deadline = _parse_deadline(body.deadline_at)
+    # ---- rebuild thread + append this turn's input + compaction plan ----
+    try:
+        with db() as s:
+            _pin, prof = ma.bind_for(s, sid, "attacker")
+            msgs, _cp, _covered = store.load_thread(s, sid)
+            if body.tool_result is not None:
+                tr = body.tool_result
+                new_input = [ModelRequest(parts=[ToolReturnPart(
+                    tool_name=conv.RANGE_TOOL_NAME,
+                    content={"exit_code": tr.get("exit_code"),
+                             "output": str(tr.get("output") or "")[:60_000],
+                             "timed_out": bool(tr.get("timed_out")),
+                             "error": tr.get("error")},
+                    tool_call_id=str(tr.get("call_id") or ""))])]
+            else:
+                parts = []
+                if not msgs:      # system framing belongs to the FIRST turn
+                    parts.append(SystemPromptPart(content=body.system))
+                parts.append(UserPromptPart(content=body.user))
+                new_input = [ModelRequest(parts=parts)]
+            msgs_full = msgs + new_input
+            blob = conv.dump_messages(msgs_full)
+            input_new = conv.dump_messages(new_input)
+            import json as _json
+            if len(_json.dumps(blob)) > 4_000_000:
+                raise HTTPException(413, "conversation exceeds its serialization bound")
+            deadline = requested_deadline
+            md = _match_deadline(s, sid)
+            deadline = min(x for x in (deadline, md) if x is not None) \
+                if (deadline or md) else None
+            # pressure BEFORE the request — the boundary is protocol-
+            # complete: any previous tool call was answered by the loop
+            pressure = conv.context_pressure(
+                msgs_full, prof, store.last_usage(s, sid))
+            turn_depends = None
+            compaction_error = None
+            if pressure["compact"]:
+                compaction_error = _compaction_deferral(s, sid, pressure)
+                if compaction_error is None:
+                    # the covered range must end at a PROTOCOL-COMPLETE
+                    # boundary: a tool call whose result has not been
+                    # persisted yet may never be covered (round-2
+                    # finding 1 — the result would replay after the
+                    # checkpoint as an orphan, strict-400)
+                    boundary = store.pair_safe_coverage_end(s, sid)
+                    _cp_now = store.latest_checkpoint(s, sid)
+                    covered_now = int((_cp_now.payload or {}).get(
+                        "covers_through") or 0) if _cp_now else 0
+                    if boundary <= covered_now:
+                        compaction_error = (
+                            "no protocol-complete compaction boundary "
+                            "yet: the newest tool call has no persisted "
+                            "result, and compaction may never split a "
+                            "call from its return — the turn proceeds "
+                            "and compaction retries once the pair "
+                            "completes")
+                    else:
+                        try:
+                            _spin, sprof = ma.bind_for(s, sid, "summarizer")
+                            text, covers = store.render_summary_input(
+                                s, sid, through=boundary)
+                            sj = model_jobs.enqueue(
+                                s, kind="summarize",
+                                priority=model_jobs.PRIORITY_RED,
+                                payload={"mode": "text",
+                                         "system": SUMMARIZE_SYSTEM,
+                                         "user": text,
+                                         "persist": {"session_id": str(sid)},
+                                         "covers_through": covers,
+                                         "used_at_enqueue":
+                                             int(pressure["used_tokens"])},
+                                session_id=sid, profile=sprof,
+                                actor="worker",
+                                deadline_at=deadline)
+                            turn_depends = sj.job_id
+                        except (ma.ProfileProblem,
+                                model_jobs.QueueFull) as e:
+                            compaction_error = (f"compaction deferred: "
+                                                f"{str(e)[:200]} — the "
+                                                "next turn retries it")
+            job = model_jobs.enqueue(
+                s, kind="turn", priority=model_jobs.PRIORITY_RED,
+                payload={"mode": "turn", "messages": blob,
+                         "persist": {"session_id": str(sid),
+                                     "input_new": input_new}},
+                session_id=sid, profile=prof, actor="worker",
+                depends_on=turn_depends, deadline_at=deadline)
+            jid = job.job_id
+    except ma.ProfileProblem as e:
+        raise HTTPException(503, str(e)) from e
+    except model_jobs.QueueFull:
+        raise HTTPException(503, "model queue saturated — retry the turn shortly")
+    # ---- durable async surface (finding 11) ----
+    if not body.wait:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=202, content={
+            "job_id": str(jid), "state": "queued",
+            "status_url": f"/internal/model/jobs/{jid}"})
+    # ---- wait for the durable turn (chain-following, bounded) ----
+    bound = prof.timeout_s + s0.model_hint_max_wait_s + 60
+    if deadline is not None:
+        from datetime import datetime, timezone
+        remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
+        bound = min(bound, max(1.0, remaining + 30))
+    with db() as s:
+        job = _model_job_wait(s, jid, bound)
+        result = _model_job_http(job)
+    # ---- post-turn pressure report ----
+    needs_compaction = False
+    with db() as s:
+        full_msgs, _cp, _c = store.load_thread(s, sid)
+        pressure = conv.context_pressure(full_msgs, prof,
+                                         store.last_usage(s, sid))
+        needs_compaction = bool(pressure["compact"])
+    return {"kind": result["kind"], "text": result.get("text"),
+            "tool_call": result.get("tool_call"),
+            "usage": result.get("usage"),
+            "finish_reason": result.get("finish_reason"),
+            "job_id": str(jid),
+            "profile": {"name": prof.name, "version": prof.version},
+            "needs_compaction": needs_compaction,
+            "compaction_error": compaction_error}
+
+
+def _chain_status_body(s, job_id: uuid.UUID, *, errors: bool) -> dict:
+    """Delegates to the ONE job serializer (see srplatform/api/job_views)."""
+    from srplatform.api.job_views import chain_status_body
+    return chain_status_body(s, job_id, errors=errors)
+
+
+def _own_job_or_404(s, job_id: uuid.UUID, p: Principal):
+    from srplatform.db.models import ModelJob
+    job = s.get(ModelJob, job_id)
+    if job is None or str(job.session_id) != str(p.session_id):
+        raise HTTPException(404, "job not found")
+
+
+@app.get("/internal/model/jobs/{job_id}")
+def internal_model_job_status(job_id: uuid.UUID,
+                              p: Principal = Depends(service("runner"))):
+    """Async job status for the worker (run-scoped: only this session's
+    own jobs are visible; finding 11 reload-recovery, round-2 finding 6
+    chain-aware finality)."""
+    with db() as s:
+        _own_job_or_404(s, job_id, p)
+        return _chain_status_body(s, job_id, errors=True)
+
+
+@app.get("/internal/model/jobs/{job_id}/stream")
+def internal_model_job_stream(job_id: uuid.UUID,
+                              p: Principal = Depends(service("runner"))):
+    """Bounded progress/result stream for the worker's own session."""
+    s0 = get_settings()
+    with db() as s:
+        _own_job_or_404(s, job_id, p)
+    from srplatform.api.job_views import job_event_stream
+    return job_event_stream(db, job_id, errors=True,
+                            bound_s=s0.llm_timeout_s
+                            + s0.model_hint_max_wait_s + 120)
 
 
 # --- separate-UID worker supervisor (milestone 15) ---------------------------
@@ -1456,6 +1970,280 @@ def complete_run_operation(run_id: uuid.UUID, op_id: str, body: OperationDoneIn,
                              ended_at=_now() if body.state == "completed" else None))
     db.commit()
     return {"ok": True, "updated": res.rowcount}
+
+
+# Independent review findings 3/9 (FIX round): the server is the quota
+# authority for EVERY payload it stores — output text, gap text, the
+# truncation marker itself and claimed drop counts. A single chunk may
+# never exceed this text bound (workers chunk far below it), and a
+# worker-claimed dropped-byte total is clamped, never trusted.
+_CAPTURE_MAX_TEXT_BYTES = 64 * 1024
+_CAPTURE_MAX_CLAIMED_DROPPED = 1_000_000_000
+# The server-generated truncation marker is itself stored bytes: its full
+# size is RESERVED inside every budget (review F2: a 63-byte marker was
+# inserted through a 10-byte remainder, exceeding the declared cap).
+_CAPTURE_MARKER_TEXT = ("server capture quota reached — further chunks "
+                        "were not stored")
+_CAPTURE_MARKER_BYTES = len(_CAPTURE_MARKER_TEXT.encode("utf-8"))
+# F9, sharpened by plan 22 review (item 8): a worker-claimed pipe-read
+# instant is adjudicated against the OPERATION's server-trusted lifetime
+# (registration → end), not a 400-day window around server time. The one
+# allowance is clock skew between worker and server clocks — documented,
+# bounded, and the reason the interval is inclusive at both ends.
+_CAPTURE_READ_TS_MAX_SKEW_S = 300
+
+
+class OperationOutputIn(BaseModel):
+    seq: int = Field(ge=0, le=10_000_000)
+    kind: str = "output"            # output | gap | truncated
+    text: str | None = None
+    dropped_bytes: int | None = Field(default=None, ge=0)
+    read_ts: float | None = Field(default=None, ge=0, lt=1e12)
+
+
+def _read_ts_verdict(claim: float | None, op_created, op_ended,
+                     run_ended) -> tuple[float | None, str]:
+    """Adjudicate a worker timing claim against the operation's own
+    server-trusted interval (plan 22 review, item 8).
+
+    A pipe read can only have happened while the operation was alive:
+    from its registration (the earliest instant the server knows the
+    operation existed — chunks never attach to unregistered ops) until it
+    ended (operation end; else run end; else still running ⇒ now), plus a
+    documented ±300 s clock-skew allowance at each bound. Returns
+    ``(accepted_value_or_None, status)`` — a rejected claim is NOT
+    laundered: it is stored verbatim in ``read_ts_claim`` with status
+    ``rejected-out-of-interval`` so the surface can say so, and a retry
+    of the SAME claim stays idempotent.
+    """
+    if claim is None:
+        return None, "absent"
+    skew = _CAPTURE_READ_TS_MAX_SKEW_S
+    lower = op_created.timestamp() - skew
+    if op_ended is not None:
+        upper = op_ended.timestamp() + skew
+    elif run_ended is not None:
+        upper = run_ended.timestamp() + skew
+    else:
+        upper = _now().timestamp() + skew
+    if lower <= claim <= upper:
+        return claim, "accepted"
+    return None, "rejected-out-of-interval"
+
+
+def _capture_quota_response(db, run_id, session_id, op_id, dropped):
+    """Honest refusal once any authoritative budget is closed. Exactly
+    ONE truncated marker per operation exists — the partial unique index
+    (run_id, op_id) WHERE kind='truncated' makes even the racing second
+    marker a database impossibility (finding 3)."""
+    from sqlalchemy import func as sa_func
+    from srplatform.db.models import OperationOutput
+    exists = db.execute(
+        select(OperationOutput.id)
+        .where(OperationOutput.run_id == run_id,
+               OperationOutput.op_id == op_id,
+               OperationOutput.kind == "truncated")
+        .limit(1)).first()
+    if exists is None:
+        next_seq = db.execute(
+            select(sa_func.coalesce(sa_func.max(OperationOutput.seq), -1))
+            .where(OperationOutput.run_id == run_id,
+                   OperationOutput.op_id == op_id)).scalar()
+        db.execute(OperationOutput.__table__.insert().values(
+            run_id=run_id, session_id=session_id, op_id=op_id,
+            seq=int(next_seq) + 1, kind="truncated",
+            text=_CAPTURE_MARKER_TEXT,
+            dropped_bytes=dropped,
+            read_ts_status="absent"))    # a marker carries no claim
+    db.commit()
+    return JSONResponse({"ok": True, "status": "quota"}, status_code=200)
+
+
+def _capture_marker_exists(db, run_id, op_id) -> bool:
+    from srplatform.db.models import OperationOutput
+    return db.execute(
+        select(OperationOutput.id)
+        .where(OperationOutput.run_id == run_id,
+               OperationOutput.op_id == op_id,
+               OperationOutput.kind == "truncated")
+        .limit(1)).first() is not None
+
+
+@app.post("/internal/runs/{run_id}/operations/{op_id}/output", status_code=201)
+def append_operation_output(run_id: uuid.UUID, op_id: str,
+                            body: OperationOutputIn,
+                            x_worker_token: str | None = Header(default=None),
+                            db: DbSession = None):
+    """Append one bounded output chunk for a REGISTERED operation (plan
+    20 timed replay; hardened per the independent review).
+
+    Worker-token authenticated, and:
+
+    * EVERY stored byte counts — output text, gap text and the marker
+      are all bound by per-operation and per-session byte budgets plus
+      a per-operation ROW cap (finding 3: the old code charged only
+      non-empty output text, so markers/gaps were unbounded);
+    * admission is ATOMIC: all budget/row reads and the insert happen
+      under the session row lock (SELECT … FOR UPDATE), never a racy
+      count-then-insert (finding 3);
+    * re-delivery of identical content at a known ``(run_id, op_id,
+      seq)`` answers ``duplicate`` (idempotent success); different
+      content at the same seq answers ``conflict`` — never silently,
+      never overwriting (finding 9);
+    * exactly ONE ``truncated`` marker exists per operation, enforced
+      by a partial unique index, and worker-claimed drop totals are
+      clamped, not trusted;
+    * ``read_ts`` (the worker's observed pipe-read instant) is stored
+      separately from the row's persist time (finding 10) — and only if
+      it falls inside the operation's server-trusted lifetime ± the
+      documented skew allowance (plan 22 review item 8); a rejected
+      claim is kept verbatim in ``read_ts_claim`` with its status, and
+      replay labels the provenance either way;
+    * chunks attach only to an operation the worker registered BEFORE
+      dispatch — orphans (forged op ids) are refused.
+    """
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from srplatform.db.models import (OperationOutput, RunOperation,
+                                       Session as SessionModel)
+    run = _require_worker(db, run_id, x_worker_token)
+    if body.kind not in ("output", "gap", "truncated"):
+        raise HTTPException(422, "kind must be output, gap or truncated")
+    if body.text is not None and body.text == "" and body.kind == "output":
+        raise HTTPException(422, "output chunks must carry text")
+    if body.text is not None and \
+            len(body.text.encode("utf-8", "replace")) > _CAPTURE_MAX_TEXT_BYTES:
+        raise HTTPException(422, "chunk text exceeds the server bound")
+    registered = db.execute(
+        select(RunOperation.created_at, RunOperation.ended_at,
+               Run.ended_at)
+        .join(Run, Run.run_id == RunOperation.run_id)
+        .where(RunOperation.run_id == run_id,
+               RunOperation.op_id == op_id)
+        .limit(1)).first()
+    if registered is None:
+        raise HTTPException(404, "operation not registered for this run")
+
+    # F9, per the plan-22 counterexample (180-days-ago on a fresh op):
+    # the claim is adjudicated against THIS operation's lifetime, not a
+    # wall window around server time. The BYTES are still stored —
+    # completeness outranks a bad timestamp — but an out-of-interval
+    # claim never places the chunk; it is kept verbatim, with its status,
+    # for the honest surface and for claim-exact idempotence.
+    raw_claim = body.read_ts
+    body.read_ts, claim_status = _read_ts_verdict(
+        raw_claim, registered[0], registered[1], registered[2])
+
+    dropped = body.dropped_bytes
+    if dropped is not None and dropped > _CAPTURE_MAX_CLAIMED_DROPPED:
+        dropped = _CAPTURE_MAX_CLAIMED_DROPPED
+
+    # ---- atomic admission: serialize every store for this session ----
+    db.execute(select(SessionModel.session_id)
+               .where(SessionModel.session_id == run.session_id)
+               .with_for_update())
+
+    existing = db.execute(
+        select(OperationOutput.kind, OperationOutput.text,
+               OperationOutput.read_ts_claim, OperationOutput.dropped_bytes)
+        .where(OperationOutput.run_id == run_id,
+               OperationOutput.op_id == op_id,
+               OperationOutput.seq == body.seq)
+        .limit(1)).first()
+    if existing is not None:
+        db.commit()
+        # F8 + plan 22 item 8: idempotence means EQUAL, not merely
+        # same-text — and the timing comparison is against the RAW claim
+        # the worker sent, never the server-normalized column. Two
+        # different rejected claims (both normalized to NULL) are a
+        # genuine conflict, and a retry of one REJECTED claim stays an
+        # honest duplicate instead of being forced to "match" the first
+        # rejected value it never sent. Anything else at a known seq is
+        # a conflict and answers 409 — silent 200s would let a lying or
+        # buggy worker rewrite history one retry at a time.
+        if (existing[0] == body.kind and existing[1] == body.text
+                and existing[2] == raw_claim
+                and existing[3] == dropped):
+            return JSONResponse({"ok": True, "status": "duplicate"},
+                                status_code=200)
+        return JSONResponse({"ok": False, "status": "conflict",
+                             "detail": "same seq, different content or "
+                                       "timing metadata — nothing stored"},
+                            status_code=409)
+
+    # A closed operation stores nothing further — the marker already
+    # exists, and a racing or repeated explicit marker answers the
+    # idempotent protocol instead of colliding with the unique index in
+    # a 500 (review F2).
+    if _capture_marker_exists(db, run_id, op_id):
+        db.commit()
+        return JSONResponse({"ok": True, "status": "quota"}, status_code=200)
+
+    s = get_settings()
+    # EVERY kind of row is admitted under the SAME atomic bounds — output,
+    # gap and marker alike, with OR without text (review F2: the old
+    # `if body.text:` gate let 20 null-text gap rows past a 5-row cap).
+    from sqlalchemy import func as sa_func
+
+    def _op_bytes():
+        return db.execute(
+            select(sa_func.coalesce(
+                sa_func.sum(sa_func.octet_length(OperationOutput.text)), 0))
+            .where(OperationOutput.run_id == run_id,
+                   OperationOutput.op_id == op_id)).scalar() or 0
+
+    def _sess_bytes():
+        return db.execute(
+            select(sa_func.coalesce(
+                sa_func.sum(sa_func.octet_length(OperationOutput.text)), 0))
+            .where(OperationOutput.session_id == run.session_id)).scalar() \
+            or 0
+
+    def _op_rows():
+        return db.execute(
+            select(sa_func.count())
+            .where(OperationOutput.run_id == run_id,
+                   OperationOutput.op_id == op_id)).scalar() or 0
+
+    incoming = len(body.text.encode("utf-8", "replace")) if body.text else 0
+    if (_op_rows() >= s.runner_op_capture_rows
+            or incoming + _CAPTURE_MARKER_BYTES > s.runner_op_capture_bytes
+            or _op_bytes() + incoming + _CAPTURE_MARKER_BYTES
+            > s.runner_op_capture_bytes
+            or _sess_bytes() + incoming + _CAPTURE_MARKER_BYTES
+            > s.runner_session_capture_bytes):
+        return _capture_quota_response(db, run_id, run.session_id, op_id,
+                                       dropped)
+
+    from sqlalchemy.exc import IntegrityError
+    try:
+        res = db.execute(
+            pg_insert(OperationOutput)
+            .values(run_id=run_id, session_id=run.session_id, op_id=op_id,
+                    seq=body.seq, kind=body.kind, text=body.text,
+                    dropped_bytes=dropped, read_ts=body.read_ts,
+                    read_ts_claim=raw_claim, read_ts_status=claim_status)
+            .on_conflict_do_nothing(
+                index_elements=["run_id", "op_id", "seq"]))
+    except IntegrityError:
+        # a partial-unique collision (e.g. a second truncation marker on
+        # a legacy schema predating the forward guard) is a controlled
+        # outcome, never a 500
+        db.rollback()
+        return JSONResponse({"ok": True, "status": "quota"}, status_code=200)
+    if res.rowcount == 0:
+        # cannot happen under the session lock with the pre-check, but a
+        # conflict is NEVER silently folded into success
+        row = db.execute(
+            select(OperationOutput.kind, OperationOutput.text)
+            .where(OperationOutput.run_id == run_id,
+                   OperationOutput.op_id == op_id,
+                   OperationOutput.seq == body.seq)).first()
+        db.commit()
+        status = "duplicate" if row and row[0] == body.kind and row[1] == body.text \
+            else "conflict"
+        return JSONResponse({"ok": True, "status": status}, status_code=200)
+    db.commit()
+    return {"ok": True, "status": "stored"}
 
 
 # --- trusted verification (backend executes; request is not a result) ----------
@@ -1712,6 +2500,18 @@ def safety_status(p: Principal = Depends(operator)):
     return get_supervisor().verify()
 
 
+@app.get("/safety/qualification")
+def safety_qualification(p: Principal = Depends(principal)):
+    """Plan 22 LIVE-07: the ONE Begin-eligibility classification — config-
+    bound commissioning qualification (age advisory only), the bounded
+    non-disruptive admission probes, and the actionable blockers Begin will
+    cite. Authenticated (members must see why their own Begin is refused
+    BEFORE clicking); read-only; the values are safety posture, never
+    match content. /stages and the safety/session pages consume this same
+    report, so the UI can never disagree with the gate."""
+    return get_supervisor().qualification_report()
+
+
 @app.get("/safety/panel")
 def safety_panel(p: Principal = Depends(operator), db: DbSession = None):
     """Operator safety panel (plan 13 phase 7): BOTH latch states side by
@@ -1824,6 +2624,83 @@ def safety_killswitch_test(body: KillswitchTestIn, p: Principal = Depends(operat
                     "until a complete test passes"}
 
 
+class ReclassifyIn(BaseModel):
+    kind: str = Field(min_length=1, max_length=64)
+    reason: str = Field(min_length=3, max_length=500)
+    expect_recorded_at: float | None = None
+
+
+@app.post("/safety/reclassify-qualification")
+def safety_reclassify_qualification(body: ReclassifyIn,
+                                    p: Principal = Depends(operator)):
+    """SUPPORTED one-time operator classification of a pre-contract
+    qualification record (plan 22 review F4) — the endpoint behind the
+    recovery instruction the safety surfaces print, so the documented
+    command must never be a dead end.
+
+    Not a recommission: this records the operator's explicit compatibility
+    decision over the EXACT source record they examined (kind allowlist,
+    operator-only, source recorded_at binding against concurrent moves,
+    failed/newest-already-contracted records refused, original append-only
+    line untouched, actor + digests persisted). A fresh live observation
+    is recorded with its own endpoint and its own proof; nothing here
+    accepts a bare reason string in place of a record."""
+    from srplatform.safety import QUALIFICATION_KINDS, SafetyStoreUnavailable
+    if body.kind not in QUALIFICATION_KINDS:
+        raise HTTPException(422, f"{body.kind} is not a qualification kind "
+                                 f"(allowed: {', '.join(sorted(QUALIFICATION_KINDS))})")
+    try:
+        return get_supervisor().reclassify_qualification(
+            body.kind, reason=body.reason, actor=p.username,
+            expect_recorded_at=body.expect_recorded_at)
+    except SafetyStoreUnavailable as exc:
+        # truthful refusal: without the authoritative append-only store a
+        # classification cannot be fenced, so NOTHING was published
+        raise HTTPException(503, str(exc)) from None
+    except ValueError as exc:
+        msg = str(exc)
+        if "no " in msg and "record exists" in msg:
+            raise HTTPException(404, msg) from None
+        raise HTTPException(409, msg) from None
+
+
+class ReconcileOutageIn(BaseModel):
+    kind: str = Field(min_length=1, max_length=64)
+    reason: str = Field(min_length=3, max_length=500)
+
+
+@app.post("/safety/reconcile-outage")
+def safety_reconcile_outage(body: ReconcileOutageIn,
+                            p: Principal = Depends(operator)):
+    """AUDITED recovery over retained outage evidence (plan 22 review
+    round 6, contract 2) — the endpoint behind the recovery instruction
+    the safety surfaces print for UNTRUSTED or recovery-window failures.
+
+    The automatic path needs nothing here: recording a fresh pass with
+    working storage supersedes older order-unprovable failed
+    observations at once. This call closes what auto-supersession must
+    never touch: it REQUIRES the newest authoritative record of that
+    kind to be PASSED under the current configuration (refused while a
+    failure is current), appends an audit event through the same CAS
+    boundary (actor, reason, the record it vouches for), and deletes
+    NOTHING — failed ledger lines stay forever, and only evidence
+    stamped earlier than the audit is superseded."""
+    from srplatform.safety import QUALIFICATION_KINDS, SafetyStoreUnavailable
+    if body.kind not in QUALIFICATION_KINDS:
+        raise HTTPException(422, f"{body.kind} is not a qualification kind "
+                                 f"(allowed: {', '.join(sorted(QUALIFICATION_KINDS))})")
+    try:
+        return get_supervisor().reconcile_outage(
+            body.kind, reason=body.reason, actor=p.username)
+    except SafetyStoreUnavailable as exc:
+        raise HTTPException(503, str(exc)) from None
+    except ValueError as exc:
+        msg = str(exc)
+        if "no " in msg and "record exists" in msg:
+            raise HTTPException(404, msg) from None
+        raise HTTPException(409, msg) from None
+
+
 # --- agent_state (worker-scoped working memory) ---------------------------------
 class AgentStateIn(BaseModel):
     summary: str | None = None
@@ -1898,6 +2775,410 @@ def create_service_token(body: ServiceTokenIn, p: Principal = Depends(operator),
                         if body.ttl_hours else None))
     return {"token": token, "scope": body.scope, "session_id": str(body.session_id)
             if body.session_id else None, "host": body.host}
+
+
+# --- model administration (plan 19) -----------------------------------------
+# Operator-only: profiles carry provider credentials, so NOTHING here is
+# reachable by members or services, and every response goes through the
+# masked shapes — an API key never leaves the database by any read path.
+
+class ProfileIn(BaseModel):
+    name: str
+    base_url: str | None = None      # required on CREATE; omit to keep on REVISE
+    model_name: str | None = None    # required on CREATE; omit to keep on REVISE
+    api_key: str | None = None
+    thinking_level: str | None = None
+    thinking_map: dict | None = None
+    generation_kwargs: dict | None = None
+    context_window: int | None = None
+    max_completion_tokens: int | None = None
+    compaction_ratio: float | None = None
+    timeout_s: int | None = None
+    capabilities: dict | None = None
+    note: str | None = None
+
+
+class RoleOverrideIn(BaseModel):
+    role: str
+    profile_name: str
+
+
+# --- bastion public-key enrollment (plan 22 LIVE-06) ---------------------------
+# PUBLIC keys only; SHA256 fingerprints are the display currency. The
+# operator-provisioned commissioning file stays untouched; this store is
+# API-managed and hot-reloaded by the bastion (mtime), so an enrollment
+# takes effect on the NEXT authentication — no restart, no privileged
+# signal, and a mistake here can never evict the operator's key.
+
+class EnrollmentIn(BaseModel):
+    username: str
+    public_key: str
+
+
+def _enrollment_path():
+    path = enrollment.enrolled_keys_path(get_settings())
+    if path is None:
+        raise HTTPException(503, "enrollment store unconfigured — set "
+                                 "SR_BASTION_ENROLLED_KEYS_FILE or a "
+                                 "safety state path")
+    return path
+
+
+@app.get("/admin/bastion/enrollment")
+def admin_bastion_enrollment(p: Principal = Depends(operator)):
+    s = get_settings()
+    return {"enrolled": enrollment.status(_enrollment_path()),
+            "operator_file_configured": bool(s.bastion_authorized_keys_file)}
+
+
+@app.post("/admin/bastion/enrollment", status_code=201)
+def admin_bastion_enroll(body: EnrollmentIn, p: Principal = Depends(operator)):
+    user = (body.username or "").strip()
+    if not user or len(user) > 64:
+        raise HTTPException(400, "username must be 1-64 characters")
+    try:
+        created, fps = enrollment.enroll(_enrollment_path(), user, body.public_key)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"created": created, "username": user, "fingerprints": fps}
+
+
+@app.delete("/admin/bastion/enrollment")
+def admin_bastion_revoke(username: str = Query(...), fingerprint: str = Query(...),
+                         p: Principal = Depends(operator)):
+    if not enrollment.revoke(_enrollment_path(), username.strip(),
+                             fingerprint.strip()):
+        raise HTTPException(404, "that fingerprint is not enrolled "
+                                 "for that account")
+    return {"revoked": True}
+
+
+@app.get("/bastion/enrollment/me")
+def my_bastion_enrollment(p: Principal = Depends(any_member)):
+    """Own-account self-diagnosis (the LIVE-06 failure was an unenrolled
+    account): is there ANY public key enrolled for ME, and which
+    fingerprints? Public material only; never other accounts."""
+    s = get_settings()
+    import pathlib
+    fps = enrollment.status(_enrollment_path()).get(p.username or "", [])
+    operator_file_has = False
+    if s.bastion_authorized_keys_file:
+        operator_file_has = bool(enrollment.parse(
+            pathlib.Path(s.bastion_authorized_keys_file)).get(p.username or ""))
+    return {"username": p.username, "enrolled": bool(fps) or operator_file_has,
+            "fingerprints": fps}
+
+
+class RebindIn(BaseModel):
+    role: str
+
+
+class RevokeIn(BaseModel):
+    reason: str = "revoked by operator"
+
+
+class ResolveIn(BaseModel):
+    resolution: str
+    action: str = "release"
+
+
+def _actor_name(p: Principal) -> str:
+    return getattr(p, "username", None) or "operator"
+
+
+@app.get("/admin/model/profiles")
+def admin_model_profiles(all_versions: bool = False,
+                         p: Principal = Depends(operator), db: DbSession = None):
+    from srplatform import model_admin as ma
+    from srplatform.db.models import ModelProfile
+    rows = db.execute(select(ModelProfile).order_by(
+        ModelProfile.name, ModelProfile.version.desc())).scalars().all()
+    if not all_versions:
+        rows = [r for r in rows if r.status == "active"]
+    # api_key_set comes from the SECRET STORE membership — the profile
+    # row cannot answer it (and must not; finding 8). If the secret
+    # identity is unreachable the field reports None, never a guess.
+    keyed: set[str] | None
+    try:
+        from srplatform import secret_store
+        keyed = secret_store.keyed_profile_ids()
+    except Exception:  # noqa: BLE001 — honest unknown, not a failure here
+        keyed = None
+    return {"profiles": [ma.masked(r, key_present=(str(r.profile_id) in keyed
+                                                   if keyed is not None
+                                                   else None))
+                         for r in rows],
+            "roles": ma.role_overrides(db)}
+
+
+@app.post("/admin/model/profiles", status_code=201)
+def admin_model_profile_create(body: ProfileIn,
+                               p: Principal = Depends(operator), db: DbSession = None):
+    """Create profile version 1 (or the NEXT version of an existing name —
+    edits of a serving profile go through /revise so the demotion of the
+    previous version and the cancellation duty over its references happen
+    together)."""
+    from srplatform import model_admin as ma
+    try:
+        prof = ma.create_profile(
+            db, name=body.name, base_url=body.base_url,
+            model_name=body.model_name, api_key=body.api_key or "",
+            thinking_level=body.thinking_level, thinking_map=body.thinking_map,
+            generation_kwargs=body.generation_kwargs,
+            context_window=body.context_window,
+            max_completion_tokens=body.max_completion_tokens,
+            compaction_ratio=body.compaction_ratio,
+            timeout_s=body.timeout_s, capabilities=body.capabilities,
+            actor=_actor_name(p), note=body.note)
+        return ma.masked(prof, key_present=bool(body.api_key))
+    except ma.ProfileProblem as e:
+        db.rollback()
+        raise HTTPException(422, str(e)) from e
+    except Exception:
+        db.rollback()
+        raise
+
+
+@app.post("/admin/model/profiles/{name}/revise")
+def admin_model_profile_revise(name: str, body: ProfileIn,
+                               p: Principal = Depends(operator), db: DbSession = None):
+    """Rotation semantics split on the SECRET axis: omitting ``api_key``
+    is a NON-secret edit — the old version becomes SUPERSEDED and
+    sessions pinned to it keep running (edits never break matches).
+    Supplying a key REPLACES the credential: the old version is revoked
+    immediately, its stored key deleted, its queued jobs cancelled and
+    its running jobs asked to cease; pinned sessions then fail visibly
+    until an operator rebinds them."""
+    from srplatform import model_admin as ma
+    changes = {k: v for k, v in {
+        "base_url": body.base_url, "model_name": body.model_name,
+        "thinking_level": body.thinking_level,
+        "thinking_map": body.thinking_map,
+        "generation_kwargs": body.generation_kwargs,
+        "context_window": body.context_window,
+        "max_completion_tokens": body.max_completion_tokens,
+        "compaction_ratio": body.compaction_ratio,
+        "timeout_s": body.timeout_s, "capabilities": body.capabilities}.items()
+        if v is not None}
+    try:
+        # NOTE the explicit rollback: the secret store commits outside
+        # this transaction, and the rollback guard that restores/deletes
+        # secrets fires on Session.rollback — which must NOT depend on
+        # how the framework propagates an unexpected error into the
+        # dependency teardown. Any failure after a secret effect rolls
+        # the transaction back HERE (round-2 finding 11).
+        prof = ma.revise(db, name, api_key=body.api_key,
+                         actor=_actor_name(p), note=body.note, **changes)
+        return ma.masked(prof,
+                         key_present=(body.api_key is not None
+                                      and bool(body.api_key) or None))
+    except ma.ProfileProblem as e:
+        db.rollback()
+        raise HTTPException(422, str(e)) from e
+    except Exception:
+        db.rollback()
+        raise
+
+
+@app.post("/admin/model/profiles/{profile_id}/revoke")
+def admin_model_profile_revoke(profile_id: uuid.UUID, body: RevokeIn,
+                               p: Principal = Depends(operator), db: DbSession = None):
+    from srplatform import model_admin as ma
+    try:
+        prof = ma.revoke(db, profile_id, actor=_actor_name(p),
+                         reason=body.reason)
+        return ma.masked(prof)
+    except ma.ProfileProblem as e:
+        db.rollback()
+        raise HTTPException(422, str(e)) from e
+    except Exception:
+        db.rollback()
+        raise
+
+
+@app.put("/admin/model/roles")
+def admin_model_role_set(body: RoleOverrideIn,
+                         p: Principal = Depends(operator), db: DbSession = None):
+    """Role selection lives HERE — never in the process environment."""
+    from srplatform import model_admin as ma
+    try:
+        ma.set_role_override(db, body.role, body.profile_name,
+                             actor=_actor_name(p))
+    except ma.ProfileProblem as e:
+        raise HTTPException(422, str(e)) from e
+    return {"role": body.role, "profile_name": body.profile_name}
+
+
+@app.post("/admin/model/probe")
+def admin_model_probe(body: RoleOverrideIn,
+                      p: Principal = Depends(operator), db: DbSession = None):
+    """A probe is a QUEUE MEMBER like any other call (never an out-of-queue
+    ping): it admits through the single slot and its state is visible in
+    the job list. Runs the ROLE's current active profile, un-pinned."""
+    from srplatform import model_admin as ma
+    from srplatform import model_jobs
+    if body.role not in ma.ROLES:
+        raise HTTPException(422, f"role must be one of {', '.join(ma.ROLES)}")
+    prof = ma.active_profile(db, body.profile_name)
+    if prof is None:
+        raise HTTPException(422, f"no active profile named {body.profile_name!r}")
+    try:
+        job = model_jobs.enqueue(
+            db, kind="probe", priority=model_jobs.PRIORITY_HINT,
+            payload={"mode": "text", "system": "ping", "user": "ping"},
+            profile=prof, actor=_actor_name(p))
+    except model_jobs.QueueFull:
+        raise HTTPException(503, "model queue saturated — try again shortly")
+    return {"job_id": str(job.job_id), "state": job.state,
+            "profile": {"name": prof.name, "version": prof.version}}
+
+
+@app.get("/admin/model/jobs")
+def admin_model_jobs(limit: int = 50, p: Principal = Depends(operator),
+                     db: DbSession = None):
+    from srplatform import model_jobs
+    from srplatform.db.models import ModelJob
+    from sqlalchemy import func as _f
+    limit = max(1, min(limit, 200))
+    rows = db.execute(select(ModelJob).order_by(
+        ModelJob.requested_at.desc()).limit(limit)).scalars().all()
+    counts = dict(db.execute(select(ModelJob.state, _f.count())
+                             .group_by(ModelJob.state)).all())
+    return {"jobs": [{
+        "job_id": str(j.job_id), "kind": j.kind, "priority": j.priority,
+        "state": j.state, "session_id": str(j.session_id) if j.session_id else None,
+        "profile_name": j.profile_name, "attempt": j.attempt,
+        "parent_job": str(j.parent_job) if j.parent_job else None,
+        "depends_on": str(j.depends_on) if j.depends_on else None,
+        "deadline_at": j.deadline_at.isoformat() if j.deadline_at else None,
+        "cancel_requested": j.cancel_requested, "actor": j.actor,
+        # defense-in-depth redaction at every display surface (finding 3)
+        "error": model_jobs.redact_error(j.error) if j.error else None,
+        "resolution": j.resolution,
+        "resolved_by": j.resolved_by,
+        "requested_at": j.requested_at.isoformat() if j.requested_at else None,
+        "started_at": j.started_at.isoformat() if j.started_at else None,
+        "finished_at": j.finished_at.isoformat() if j.finished_at else None,
+    } for j in rows], "counts": counts}
+
+
+@app.get("/admin/model/jobs/{job_id}")
+def admin_model_job_detail(job_id: uuid.UUID,
+                           p: Principal = Depends(operator),
+                           db: DbSession = None):
+    """ONE logical request, chain-aware (round-2 finding 6): whichever
+    attempt id the operator clicked, the detail is the chain's final
+    outcome plus every attempt row with its own redacted diagnostic —
+    the GUI never has to guess whether it is looking at a superseded
+    failed attempt."""
+    from srplatform import model_jobs
+    try:
+        return _chain_status_body(db, job_id, errors=True)
+    except model_jobs.JobProblem as e:
+        raise HTTPException(404, str(e)) from e
+
+
+@app.post("/admin/model/jobs/{job_id}/resolve-cessation")
+def admin_model_job_resolve(job_id: uuid.UUID, body: ResolveIn,
+                            p: Principal = Depends(operator),
+                            db: DbSession = None):
+    """The BOUNDED resolution for an unknown-cessation obligation: the
+    operator confirms from the outside world what happened to the call
+    (finished/stopped out-of-band) and releases the slot. Audited;
+    there is deliberately no automatic expiry (finding 2)."""
+    from srplatform import model_admin as ma
+    from srplatform import model_jobs
+    try:
+        job = model_jobs.resolve_cessation(
+            db, job_id, actor=_actor_name(p), resolution=body.resolution,
+            action=body.action)
+    except model_jobs.JobProblem as e:
+        raise HTTPException(422, str(e)) from e
+    db.add(Event(session_id=job.session_id, ts=datetime.now(timezone.utc),
+                 actor="operator", action_type="model_admin.job.resolve",
+                 payload={"job_id": str(job.job_id), "kind": job.kind,
+                          "resolution": body.resolution[:500],
+                          "by": _actor_name(p)}))
+    return {"job_id": str(job.job_id), "state": job.state}
+
+
+@app.get("/admin/model/profiles/{profile_id}/discover")
+def admin_model_discover(profile_id: uuid.UUID,
+                         p: Principal = Depends(operator), db: DbSession = None):
+    """Capability discovery: ask the endpoint itself what models it
+    serves (GET {base}/models), server-side with the profile's stored
+    credential. This is an admin-facing catalog read, NOT a completion:
+    it never enters the admission queue (no slot semantics) and never
+    sends messages/tools. The response is catalog ids only — a claim
+    about thinking support still requires the operator to record
+    capabilities deliberately; discovery alone cannot authorize a
+    level (finding 6)."""
+    from srplatform import model_admin as ma
+    from srplatform.db.models import ModelProfile
+    prof = db.get(ModelProfile, profile_id)
+    if prof is None:
+        raise HTTPException(404, "profile version not found")
+    import httpx
+    try:
+        key = ma.resolve_credential(prof)
+    except ma.ProfileProblem as e:
+        raise HTTPException(422, str(e)) from e
+    url = prof.base_url.rstrip("/") + "/models"
+    try:
+        r = httpx.get(url, headers={"Authorization": f"Bearer {key}"},
+                      timeout=10.0)
+    except httpx.HTTPError as exc:
+        from srplatform.red_agent.conversation import redact_secrets
+        raise HTTPException(502, redact_secrets(
+            f"discovery request failed: {type(exc).__name__}")) from exc
+    if r.status_code != 200:
+        raise HTTPException(502, f"discovery endpoint returned HTTP {r.status_code}")
+    try:
+        data = r.json().get("data") or []
+    except ValueError as exc:
+        raise HTTPException(502, "discovery response was not JSON") from exc
+    return {"models": [d.get("id") for d in data if isinstance(d, dict)
+                       and d.get("id")],
+            "note": "record capabilities deliberately; the catalog alone "
+                    "does not prove thinking support"}
+
+
+@app.post("/admin/model/jobs/{job_id}/cancel")
+def admin_model_job_cancel(job_id: uuid.UUID, p: Principal = Depends(operator),
+                           db: DbSession = None):
+    from srplatform import model_jobs
+    try:
+        job = model_jobs.cancel(db, job_id, actor=_actor_name(p))
+    except model_jobs.JobProblem as e:
+        raise HTTPException(404, str(e)) from e
+    return {"job_id": str(job.job_id), "state": job.state,
+            "cancel_requested": job.cancel_requested, "error": job.error}
+
+
+@app.get("/admin/model/sessions/{session_id}/pins")
+def admin_model_pins(session_id: uuid.UUID, p: Principal = Depends(operator),
+                     db: DbSession = None):
+    from srplatform.db.models import SessionModelPin
+    rows = db.execute(select(SessionModelPin).where(
+        SessionModelPin.session_id == session_id)).scalars().all()
+    return {"pins": [{
+        "role": r.role, "profile_id": str(r.profile_id), "config": r.config,
+        "bound_at": r.bound_at.isoformat() if r.bound_at else None,
+    } for r in rows]}
+
+
+@app.post("/admin/model/sessions/{session_id}/rebind")
+def admin_model_rebind(session_id: uuid.UUID, body: RebindIn,
+                       p: Principal = Depends(operator), db: DbSession = None):
+    """The ONLY way a session continues on models after its pinned version
+    was replaced/revoked — explicit, audited, never automatic."""
+    from srplatform import model_admin as ma
+    try:
+        pin = ma.rebind(db, session_id, body.role, actor=_actor_name(p))
+    except ma.ProfileProblem as e:
+        raise HTTPException(422, str(e)) from e
+    return {"role": pin.role, "profile_id": str(pin.profile_id),
+            "config": pin.config}
 
 
 def dial_pin_for(resources, target_host):
@@ -2106,6 +3387,22 @@ def _log_event(db: Session, session_id, actor, host, action_type, payload, phase
 # run the match scheduler: those belong to the single internal instance,
 # and a listener restart would otherwise interrupt live operations and
 # remove their serialization. The listener serves ingest routes only.
+@app.on_event("shutdown")
+def _shutdown():
+    """Graceful exit releases the controller seat instead of waiting for a
+    session timeout: a successor process (or the next test client) must be
+    able to take over duties immediately. Crash safety is unchanged — a
+    dead process's advisory lock dies with its database session."""
+    lock = getattr(app.state, "controller_lock", None)
+    if lock is not None:
+        try:
+            lock._stop.set()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            lock.release()
+        except Exception:  # noqa: BLE001
+            pass
 @app.on_event("startup")
 def _startup():
     """Start the controller duties - ONCE, and visibly.
@@ -2121,12 +3418,29 @@ def _startup():
     healthy.
     """
     from srplatform.settings import get_settings as _gs0
+    # Origins are read at STARTUP — and a process may serve several
+    # lifespans (uvicorn reload, or test harnesses): force the middleware
+    # stack to rebuild so THIS lifespan's configured origins apply, never
+    # the ones frozen by the first lifespan of the process.
+    app.middleware_stack = None
     ingest_only = _gs0().api_ingest_only
     if ingest_only:
         return
     issues: list[str] = []
     app.state.startup_issues = issues
     app.state.controller = False
+    # plan 19 foundation: profile bootstrap is IDEMPOTENT and race-safe (the
+    # one-ACTIVE / (name,version) unique indexes decide any concurrent winner),
+    # so it runs on EVERY process start: a process that lost the controller
+    # lock must still serve model traffic. Only reconciling crashed-live
+    # jobs is controller duty (below) — it must never stamp another live
+    # process's in-flight calls.
+    try:
+        from srplatform import model_admin as _ma
+        with db() as _s:
+            _ma.ensure_bootstrap_profile(_s)
+    except Exception as exc:  # noqa: BLE001 - reported, never hidden
+        issues.append(f"model admin bootstrap: {type(exc).__name__}: {exc}")
     lock = ControllerLock()
     app.state.controller_lock = lock
     try:
@@ -2147,6 +3461,21 @@ def _startup():
         runs_svc.reconcile_on_startup()
     except Exception as exc:  # noqa: BLE001 - reported, never hidden
         issues.append(f"reconcile on startup: {type(exc).__name__}: {exc}")
+    try:
+        # plan 19: expose crashed-live model calls as cessation_unknown
+        # obligations (controller-only: never stamp another live process's
+        # in-flight calls). Profile bootstrap already ran above, on every
+        # start. The scheduler starts LAZILY on this process's first enqueue
+        # (see model_jobs.enqueue): a process that never queues model work
+        # never polls the queue, and workers — which only POST — never run.
+        from srplatform import model_jobs as _mj
+        with db() as _s:
+            _unknown = _mj.reconcile_startup(_s)
+        if _unknown:
+            issues.append(f"model jobs: {_unknown} live call(s) left "
+                          "cessation_unknown after restart")
+    except Exception as exc:  # noqa: BLE001 - reported, never hidden
+        issues.append(f"model admin startup: {type(exc).__name__}: {exc}")
     try:
         # durable operation claims only have meaning while THIS process serves;
         # anything left over belongs to a dead request (crash recovery).

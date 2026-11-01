@@ -11,6 +11,8 @@ from __future__ import annotations
 import subprocess
 from typing import Callable, Protocol
 
+from srplatform.ssh_channel import SSH_ALIVE_OPTS
+
 
 class Sandbox(Protocol):
     def run(self, command: str) -> tuple[int, str]: ...
@@ -40,10 +42,16 @@ class KaliSandbox:
             return 124, "[sandbox] command timed out"
 
     def verifier_exec(self, host: str, command: str) -> tuple[int, str]:
-        """Management exec channel for verifiers (see class docstring)."""
+        """Management exec channel for verifiers (see class docstring).
+
+        Bounded (plan 18): keepalives catch a wedged guest, and stdin is
+        /dev/null so a remote shell can never block waiting for input."""
         try:
-            p = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-                                f"root@{host}", command], capture_output=True, text=True, timeout=30)
+            p = subprocess.run(["ssh", "-o", "BatchMode=yes",
+                                "-o", "ConnectTimeout=5", *SSH_ALIVE_OPTS,
+                                f"root@{host}", command],
+                               capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL, timeout=30)
             return p.returncode, (p.stdout + p.stderr)[:8000]
         except (subprocess.TimeoutExpired, OSError) as e:
             return 124, f"[verifier-exec] {e}"

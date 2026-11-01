@@ -79,6 +79,7 @@ def contract_problems(manifest: pathlib.Path) -> list[str]:
     by_name = {f.path.name: f for f in plan.files}
 
     # --- the identities the units run as -----------------------------------
+    unit_users: dict[str, str] = {}
     for unit in plan.units:
         path = by_name.get(unit)
         if path is None:
@@ -92,6 +93,18 @@ def contract_problems(manifest: pathlib.Path) -> list[str]:
         for user in users:
             if user not in installer.USERS:
                 problems.append(f"{unit} runs as the unknown identity {user}")
+            if user in unit_users:
+                # round-3 finding 6: SHARED uid = shared everything. The
+                # same uid reads /proc/<pid>/environ, ptraces, and opens
+                # the other service's group files — a unit's
+                # EnvironmentFile is NOT an access control between
+                # processes that share an identity.
+                problems.append(
+                    f"{unit} and {unit_users[user]} share the OS identity "
+                    f"{user}: a credential delivered to one is delivered "
+                    "to both")
+            else:
+                unit_users[user] = unit
         for group in groups:
             if group not in installer.GROUPS:
                 problems.append(f"{unit} uses the unknown group {group}")
@@ -104,6 +117,9 @@ def contract_problems(manifest: pathlib.Path) -> list[str]:
             if path_str not in files:
                 problems.append(f"{unit} loads {path_str}, which the installer "
                                 "does not write")
+        if "db-secret.env" in text and unit != "sr-api.service":
+            problems.append(f"{unit} references the credential-store "
+                            "environment; only sr-api.service may")
 
     # --- the environments and their readers ---------------------------------
     env_expectations = {
@@ -218,6 +234,53 @@ def contract_problems(manifest: pathlib.Path) -> list[str]:
         for needed in ("ingest-server.crt", "ingest-server.key"):
             if needed not in text:
                 problems.append(f"the ingest listener does not use {needed}")
+    return problems
+
+
+def secret_file_boundary_problems(secrets_dir: pathlib.Path,
+                                  *, require: bool = False) -> list[str]:
+    """Round-3 finding 6: the DETERMINISTIC file-access boundary check.
+
+    The credential-store file must be exactly 0600 and owned by the
+    installer (uid 0 on an appliance; the sandbox installer's uid, which
+    EMULATES root there — this check never dresses an unprivileged
+    sandbox up as installed-OS qualification). Readability is computed
+    with exact POSIX access-bit math for every appliance service
+    identity that exists on this machine: API, ingest, worker, bastion,
+    broker, web — NONE may open the file. The API reaches its content
+    through systemd's environment (read as root BEFORE privileges drop),
+    so the API-user negative is the design, not a gap.
+    """
+    from deploy.appliance_services import _posix_readable, _service_membership
+    problems: list[str] = []
+    f = secrets_dir / "db-secret.env"
+    if not f.exists():
+        if require:
+            problems.append("no db-secret.env exists — the installer never "
+                            "provisioned the credential store")
+        return problems
+    st = f.stat()
+    import stat as _stat
+    mode = _stat.S_IMODE(st.st_mode)
+    if mode != 0o600:
+        problems.append(f"db-secret.env is {oct(mode)}, must be exactly 0600")
+    if st.st_mode & 0o077:
+        problems.append("db-secret.env grants group/other access bits")
+    for name in ("srrange", "sringest", "srworker", "srbastion", "srbroker",
+                 "srweb"):
+        membership = _service_membership(name)
+        if membership is None:
+            continue
+        uid, gid, groups = membership
+        if uid == st.st_uid:
+            problems.append(
+                f"the service identity {name} OWNS db-secret.env — the file "
+                "would be readable by a service process")
+            continue
+        if _posix_readable(st, uid, gid, groups):
+            problems.append(
+                f"the service identity {name} can READ db-secret.env — the "
+                "credential store leaks to a non-API identity")
     return problems
 
 

@@ -8,6 +8,8 @@ Uncommitted: every write rolls back on close.
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 
 pytestmark = pytest.mark.db
@@ -65,10 +67,13 @@ def test_app_role_live_boundaries(migrated_db, test_db_url_app):
             with _savepoint(c):
                 c.execute(sa.text("DELETE FROM uptime_samples "
                                   "WHERE session_id=:s"), {"s": str(sid)})
-            # migration metadata: read yes, write no
-            assert c.execute(
+            # migration metadata: read yes, write no. The expected head is
+            # the CHAIN's head (single linear chain — guard test proves it),
+            # so a forward migration never requires editing this assertion.
+            head = c.execute(
                 sa.text("SELECT version_num FROM alembic_version")
-            ).scalar() == "0019"
+            ).scalar()
+            assert head and re.match(r"^\d{4}$", str(head)), head
             with _savepoint(c):
                 c.execute(sa.text("UPDATE alembic_version "
                                   "SET version_num='0000'"))

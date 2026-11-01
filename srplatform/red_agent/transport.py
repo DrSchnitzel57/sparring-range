@@ -24,9 +24,21 @@ class Transport(Protocol):
     def register_operation(self, op_uuid: str, kind: str = "remote") -> None: ...
     def complete_operation(self, op_uuid: str, state: str = "completed",
                            detail: str | None = None) -> None: ...
+    # plan 20 timed output capture (implemented by the real transports; the
+    # loop only builds a capture sink when append_output is present).
+    # Returns the SERVER status string ("stored" | "duplicate" |
+    # "conflict" | "quota") or "error"; it NEVER raises (finding 9).
+    def append_output(self, op_uuid: str, seq: int, kind: str,
+                      text: str | None = None,
+                      dropped_bytes: int | None = None,
+                      read_ts: float | None = None) -> str: ...
 
 
 PAGE = 1000
+
+# Capture delivery statuses (finding 9): the ONLY values the capture
+# consumer trusts from the server; anything else is transport noise.
+_DELIVERY_STATUSES = ("stored", "duplicate", "conflict", "quota")
 
 
 def _fetch_since(client, session_id: str, after_event_id: int, max_rows: int = 50_000) -> list[dict]:
@@ -78,6 +90,57 @@ class HttpTransport:
         self.client.post(f"/internal/runs/{self.run_id}/operations/{op_uuid}/done",
                          json={"state": state, "detail": detail},
                          headers={"X-Worker-Token": self.token or ""}).raise_for_status()
+
+    def append_output(self, op_uuid: str, seq: int, kind: str,
+                      text: str | None = None,
+                      dropped_bytes: int | None = None,
+                      read_ts: float | None = None,
+                      absolute_timeout_s: float = 12.0) -> str:
+        """Deliver one timed output chunk. NEVER raises: capture is
+        additive evidence — a failed POST becomes the "error" status and
+        the capture counts it honestly; the command and the stop path
+        are never blocked by it. The server's status string
+        (stored/duplicate/conflict/quota) is returned verbatim so the
+        producer can distinguish an idempotent re-delivery from a real
+        content conflict (finding 9).
+
+        Review F4: a per-read timeout does NOT bound request AGE — an
+        endpoint that dribbles one byte every timeout window holds a
+        capture thread forever. The delivery therefore runs on a
+        one-shot client that a timer CLOSES at the absolute deadline:
+        worst-case thread lifetime is bounded by ``absolute_timeout_s``,
+        and the interrupted delivery becomes an honest counted gap.
+        """
+        if not self.run_id:
+            return "error"
+        import httpx
+        import threading as _threading
+        one_shot = httpx.Client(base_url=self.client.base_url, timeout=10,
+                                headers={"X-Worker-Token": self.token or ""})
+        killer = _threading.Timer(max(1.0, float(absolute_timeout_s)),
+                                  one_shot.close)
+        killer.daemon = True
+        killer.start()
+        try:
+            r = one_shot.post(
+                f"/internal/runs/{self.run_id}/operations/{op_uuid}/output",
+                json={"seq": seq, "kind": kind, "text": text,
+                      "dropped_bytes": dropped_bytes, "read_ts": read_ts})
+            if r.status_code in (200, 201):
+                status = (r.json() or {}).get("status")
+                return (status if status in _DELIVERY_STATUSES
+                        else "stored")
+            if r.status_code == 409:
+                return "conflict"   # F8: server-refused divergence, still typed
+            return "error"
+        except Exception:  # noqa: BLE001 — honest gap, never an abort
+            return "error"
+        finally:
+            killer.cancel()
+            try:
+                one_shot.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def log_event(self, event: dict) -> None:
         self.client.post("/events", json=event).raise_for_status()
@@ -134,6 +197,28 @@ class TestClientTransport:
                         json={"state": state, "detail": detail},
                         headers={"X-Worker-Token": self.token or ""})
         r.raise_for_status()
+
+    def append_output(self, op_uuid: str, seq: int, kind: str,
+                      text: str | None = None,
+                      dropped_bytes: int | None = None,
+                      read_ts: float | None = None) -> str:
+        if not self.run_id:
+            return "error"
+        try:
+            r = self.c.post(
+                f"/internal/runs/{self.run_id}/operations/{op_uuid}/output",
+                json={"seq": seq, "kind": kind, "text": text,
+                      "dropped_bytes": dropped_bytes, "read_ts": read_ts},
+                headers={"X-Worker-Token": self.token or ""})
+            if r.status_code in (200, 201):
+                status = (r.json() or {}).get("status")
+                return (status if status in _DELIVERY_STATUSES
+                        else "stored")
+            if r.status_code == 409:
+                return "conflict"   # F8: server-refused divergence, still typed
+            return "error"
+        except Exception:  # noqa: BLE001 — capture never breaks the run
+            return "error"
 
     def log_event(self, event: dict) -> None:
         self.c.post("/events", json=event, headers=self.headers).raise_for_status()

@@ -153,8 +153,27 @@ def test_m7_replay_shape_epoch_and_containment(client, users, tmp_path):
     rid = r.json()["recording_id"]
 
     rp = client.get(f"/sessions/{sid}/replay", headers=users["member"]).json()
-    assert rp["casts"][0]["header"]["timestamp"]              # epoch anchor present
-    assert rp["casts"][0]["frames"][1] == [0.4, "i", "id\n"]
+    # Review finding 11: the replay page carries NO cast bodies and NO
+    # operations at all — only counts. Casts are their own bounded page.
+    assert rp["casts_total"] == 1 and rp["operations_total"] == 0
+    assert "casts" not in rp and "operations" not in rp
+    cpage = client.get(f"/sessions/{sid}/casts",
+                       headers=users["member"]).json()
+    # plan 20: the casts endpoint returns SUMMARIES; frames only on
+    # explicit request (rendering a list never downloads a cast)
+    assert cpage["casts"][0]["header"]["timestamp"]           # epoch anchor
+    assert "frames" not in cpage["casts"][0]
+    assert cpage["casts"][0]["frame_count"] == 2
+    assert cpage["has_more"] is False and cpage["next_after"] is None
+    full = client.get(f"/sessions/{sid}/casts",
+                      params={"include_frames": True},
+                      headers=users["member"]).json()
+    assert full["casts"][0]["frames"][1] == [0.4, "i", "id\n"]
+    via_id = client.get(f"/recordings/{rid}", headers=users["member"]).json()
+    assert via_id["frames"][1] == [0.4, "i", "id\n"]
+    ops = client.get(f"/sessions/{sid}/operations",
+                     headers=users["member"]).json()
+    assert ops["operations"] == []         # no commands ran in this session
 
     # path containment: a path outside the recordings root is rejected at REGISTRATION
     outside = tmp_path / "evil.cast"
@@ -171,8 +190,8 @@ def test_m7_replay_shape_epoch_and_containment(client, users, tmp_path):
     with db_ctx() as s:
         s.add(Recording(session_id=uuid.UUID(sid), cast_path=str(link), status="open"))
         s.commit()
-    rp = client.get(f"/sessions/{sid}/replay", headers=users["member"]).json()
-    broken = [c for c in rp["casts"] if c.get("error")]
+    rpage = client.get(f"/sessions/{sid}/casts", headers=users["member"]).json()
+    broken = [c for c in rpage["casts"] if c.get("error")]
     assert broken and "symlink" in broken[0]["error"]
 
 

@@ -53,6 +53,7 @@ import threading
 from dataclasses import dataclass
 
 from srplatform.settings import Settings, get_settings
+from srplatform.ssh_channel import SSH_ALIVE_OPTS
 
 # --------------------------------------------------------------- supervision
 # Command handles are supervised HERE (in the worker process), so that the
@@ -334,10 +335,12 @@ class RunResult:
     op_id: str | None = None
     cancel_state: str | None = None   # confirmed | unknown | failed (N05)
     note: str | None = None           # truthful completion detail (audit T-04)
+    capture: dict | None = None       # plan 20 timed-output capture summary
 
 
 def _bounded_reader(proc: subprocess.Popen, max_bytes: int,
-                    deadline: float | None = None) -> tuple[bytes, bool]:
+                    deadline: float | None = None,
+                    sink=None) -> tuple[bytes, bool]:
     """Streaming capture with a HARD BYTE bound and an INDEPENDENT DEADLINE
     (audit N05/T07).
 
@@ -385,6 +388,13 @@ def _bounded_reader(proc: subprocess.Popen, max_bytes: int,
             break
         if not chunk:
             break  # EOF
+        if sink is not None:
+            # plan 20 timed replay: the SEPARATE capture consumer sees every
+            # byte (its own bounded quota), independent of the result
+            # buffer. The READ INSTANT travels with the bytes (finding 10)
+            # and hand-off never blocks on the network (finding 2): a slow
+            # capture endpoint cannot stretch this loop or the deadline.
+            sink.feed(chunk, at=time.time())
         if len(buf) < max_bytes:
             buf.extend(chunk[: max_bytes - len(buf)])
         # past the bound: keep draining (prevents pipe deadlock) without keeping
@@ -432,10 +442,42 @@ class SshRunner(Runner):
 
     def _base_cmd(self) -> list[str]:
         s = self.s
+        # Bounded channel (plan 18, live find): keepalives turn a wedged
+        # guest (TCP established, daemon stuck) into a loud ssh exit 255
+        # in ~15 s instead of an eternal silent hang.
+        #
+        # Target may carry an explicit port in bracket form —
+        # `user@[host]:2222` (the acceptance fixtures run sshd on
+        # unprivileged ports; so can a real deployment). Splitting it into
+        # `-p` keeps the hostname argument unambiguous for the OpenSSH
+        # client; plain targets keep the exact argv they always had.
+        # IdentitiesOnly pins authentication to the CONFIGURED identity:
+        # an unrelated agent key must never authenticate (or mask a rotated
+        # key) against the isolated runner.
+        target, port = self._split_target(s.runner_ssh_target)
+        port_opt = ["-p", port] if port else []
         return ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+                "-o", "IdentitiesOnly=yes",
                 "-o", f"UserKnownHostsFile={s.runner_ssh_known_hosts}",
-                "-o", "ConnectTimeout=10", "-i", s.runner_ssh_key_path,
-                "--", s.runner_ssh_target]
+                "-o", "ConnectTimeout=10", *SSH_ALIVE_OPTS,
+                "-i", s.runner_ssh_key_path, *port_opt,
+                "--", target]
+
+    @staticmethod
+    def _split_target(target: str) -> tuple[str, str | None]:
+        """`user@[h]:p` -> ('user@h', 'p'); anything else -> (target, None).
+        The brackets are a PORT delimiter (the OpenSSH client refuses a
+        bracketed IPv4 otherwise); the pinned-name lookup in known_hosts
+        still uses the canonical `[host]:port` form, which the pin file
+        must carry for non-default ports."""
+        import re
+        m = re.match(r"^(.*?)\[([^\]]+)\]:(\d+)$", target or "")
+        if m:
+            host = m.group(2)
+            if ":" in host:      # IPv6 literal: the brackets ARE required
+                host = f"[{host}]"
+            return f"{m.group(1)}{host}", m.group(3)
+        return target, None
 
     # --- runner-side supervisor control channel -------------------------------
     def _supervisor_bin(self) -> str:
@@ -455,6 +497,7 @@ class SshRunner(Runner):
         proc = subprocess.Popen(self._base_cmd() +
                                 [f"{shlex.quote(self._supervisor_bin())} {verb} "
                                  f"{shlex.quote(op_id)}"],
+                                stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, start_new_session=True)
         try:
@@ -492,7 +535,7 @@ class SshRunner(Runner):
         return None   # unparseable answer is unknown, not gone
 
     def run(self, command: str, timeout: int | None = None,
-            op_id: str | None = None) -> RunResult:
+            op_id: str | None = None, output_sink=None) -> RunResult:
         t = timeout or self.s.runner_command_timeout_s
         op_id = op_id or _new_op_id()
         _register(op_id, {"kind": "remote", "state": "pending", "remote": True,
@@ -504,13 +547,17 @@ class SshRunner(Runner):
                       f"-- bash -lc {shlex.quote(command)}")
         full = self._base_cmd() + [remote_cmd]
         try:
-            proc = subprocess.Popen(full, stdout=subprocess.PIPE,
+            proc = subprocess.Popen(full, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT,
                                     start_new_session=True)
         except OSError as e:
             _finish_op(op_id)
             return RunResult(exit_code=-1, output="", error=f"runner spawn failed: {e}",
-                             op_id=op_id)
+                             op_id=op_id,
+                             capture=output_sink.finish(
+                                 error="runner spawn failed — nothing executed")
+                                 if output_sink else None)
         _attach_proc(op_id, proc)
         with _ACTIVE_LOCK:
             cancelled_early = (_ACTIVE.get(op_id) or {}).get("state") == "cancelled-before-attach"
@@ -521,7 +568,8 @@ class SshRunner(Runner):
         else:
             import time as _time
             raw, timed_out = _bounded_reader(proc, self.s.runner_max_output_bytes,
-                                             deadline=_time.monotonic() + t)
+                                             deadline=_time.monotonic() + t,
+                                             sink=output_sink)
         # bounded wait for exit (the reader already drained; guard stragglers)
         if not timed_out:
             try:
@@ -543,18 +591,34 @@ class SshRunner(Runner):
             entry = _ACTIVE.pop(op_id, None)
         cancel_state = (entry or {}).get("state")
         out = raw.decode("utf-8", "replace")[: self.s.runner_max_output_bytes]
+        capture_summary = None
+        if output_sink is not None:
+            reason = None
+            if cancelled_early:
+                reason = "cancelled before dispatch — nothing executed"
+            elif timed_out:
+                reason = "command timed out — capture ended at the deadline"
+            elif proc.returncode == 255:
+                reason = "ssh transport lost — stream may be incomplete"
+            elif cancel_state in ("cancelling", "cancelled",
+                                  "cancelled-before-attach", "cancel-unknown"):
+                reason = "operation cancelled — the output stream ended early"
+            capture_summary = output_sink.finish(error=reason)
         if timed_out:
             # the LOCAL ssh client died — the REMOTE job needs the supervisor
             confirmed = self.cancel_remote(op_id, timeout_s=10)
             return RunResult(exit_code=124, output=out + "\n[runner] command timed out",
                              timed_out=True, op_id=op_id,
+                             capture=capture_summary,
                              cancel_state="confirmed" if confirmed else "unknown")
         code = proc.returncode if proc.returncode is not None else -1
         if cancel_state in ("cancelling", "cancelled", "cancelled-before-attach"):
             return RunResult(exit_code=code, output=out, cancelled=True, op_id=op_id,
+                             capture=capture_summary,
                              cancel_state="confirmed")
         if cancel_state == "cancel-unknown":
             return RunResult(exit_code=code, output=out, cancelled=False, op_id=op_id,
+                             capture=capture_summary,
                              cancel_state="unknown",
                              error="remote cessation UNCONFIRMED — report partial stop")
         if code == 255:
@@ -565,6 +629,7 @@ class SshRunner(Runner):
             # remote cessation.
             confirmed = self.cancel_remote(op_id, timeout_s=10)
             return RunResult(exit_code=code, output=out, op_id=op_id,
+                             capture=capture_summary,
                              cancelled=confirmed,
                              cancel_state="confirmed" if confirmed else "unknown",
                              error=None if confirmed else
@@ -580,18 +645,22 @@ class SshRunner(Runner):
             confirmed = self.cancel_remote(op_id, timeout_s=10)
             if confirmed:
                 return RunResult(exit_code=code, output=out, op_id=op_id,
+                                 capture=capture_summary,
                                  note="command exited with surviving remote descendants "
                                       "— contained and confirmed gone via supervisor")
             return RunResult(exit_code=code, output=out, op_id=op_id,
+                             capture=capture_summary,
                              cancel_state="unknown",
                              error="command exited with SURVIVING REMOTE DESCENDANTS "
                                    "and containment is UNCONFIRMED — report partial stop")
         if verdict is None:
             return RunResult(exit_code=code, output=out, op_id=op_id,
+                             capture=capture_summary,
                              cancel_state="unknown",
                              error="command exited but supervisor containment status is "
                                    "UNREACHABLE — remote cessation UNKNOWN, not gone")
-        return RunResult(exit_code=code, output=out, op_id=op_id)
+        return RunResult(exit_code=code, output=out, op_id=op_id,
+                         capture=capture_summary)
 
     def health(self) -> tuple[bool, str]:
         r = self.run("true", timeout=15)
@@ -600,8 +669,13 @@ class SshRunner(Runner):
         if r.exit_code == 0 and r.cancel_state != "unknown":
             return True, f"runner reachable at {self.s.runner_ssh_target} (supervised)"
         if r.cancel_state == "unknown":
+            # Include the transport's own words (merged stderr): an operator
+            # reading the safety page must see WHY (host key, auth, refused),
+            # not only that the verdict is unknown.
+            diag = " ".join(x for x in ((r.error or "").strip(),
+                                        (r.output or "").strip()) if x)
             return False, ("runner health FAILED: cessation verdict UNKNOWN — "
-                           f"{(r.error or r.output or '')[:200]}")
+                           + diag[:400])
         return False, f"runner health failed (exit {r.exit_code}): {r.output[:200] or r.error}"
 
 
@@ -616,19 +690,23 @@ class LocalDevRunner(Runner):
             raise RunnerUnavailable("local-dev runner is forbidden in production")
 
     def run(self, command: str, timeout: int | None = None,
-            op_id: str | None = None) -> RunResult:
+            op_id: str | None = None, output_sink=None) -> RunResult:
         if self.s.sr_env == "production":
             raise RunnerUnavailable("local-dev runner is forbidden in production")
         t = timeout or self.s.runner_command_timeout_s
         op_id = op_id or _new_op_id()
         _register(op_id, {"kind": "local", "state": "pending", "remote": False})
         try:
-            proc = subprocess.Popen(["/bin/bash", "-lc", command], stdout=subprocess.PIPE,
+            proc = subprocess.Popen(["/bin/bash", "-lc", command],
+                                    stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT,
                                     start_new_session=True)
         except OSError as e:
             _finish_op(op_id)
-            return RunResult(exit_code=-1, output="", error=f"spawn failed: {e}", op_id=op_id)
+            return RunResult(exit_code=-1, output="", error=f"spawn failed: {e}", op_id=op_id,
+                             capture=output_sink.finish(error="spawn failed — nothing executed")
+                                     if output_sink else None)
         _attach_proc(op_id, proc)
         # RECORD the independent command-group identity (audit F7): the API's
         # resolution pass needs real cessation evidence after a worker death.
@@ -637,7 +715,8 @@ class LocalDevRunner(Runner):
         timed_out = False
         import time as _time
         raw, timed_out = _bounded_reader(proc, self.s.runner_max_output_bytes,
-                                         deadline=_time.monotonic() + t)
+                                         deadline=_time.monotonic() + t,
+                                         sink=output_sink)
         if not timed_out:
             try:
                 proc.wait(timeout=5)
@@ -653,6 +732,14 @@ class LocalDevRunner(Runner):
             entry = _ACTIVE.pop(op_id, None)
         cancelled = (entry or {}).get("state") in ("cancelled", "cancelled-before-attach")
         out = raw.decode("utf-8", "replace")[: self.s.runner_max_output_bytes]
+        capture_summary = None
+        if output_sink is not None:
+            reason = None
+            if timed_out:
+                reason = "command timed out — capture ended at the deadline"
+            elif cancelled:
+                reason = "operation cancelled — the output stream ended early"
+            capture_summary = output_sink.finish(error=reason)
         note, cancel_state, error = None, None, None
         # ORDINARY COMPLETION IS GATED ON LOCAL CESSATION (audit F7): this
         # runner gives every command its OWN process group, so the leader's
@@ -684,6 +771,7 @@ class LocalDevRunner(Runner):
         return RunResult(exit_code=124 if timed_out else proc.returncode,
                          output=out, timed_out=timed_out, cancelled=cancelled,
                          op_id=op_id, error=error, note=note,
+                         capture=capture_summary,
                          cancel_state=cancel_state)
 
     def health(self) -> tuple[bool, str]:

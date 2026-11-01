@@ -68,6 +68,7 @@ REQUIRED_LAYER_ENV = {
     "hypervisor": "SR_REQUIRE_HYPERVISOR",
     "access": "SR_REQUIRE_ACCESS",
     "journey": "SR_REQUIRE_JOURNEY",
+    "agent": "SR_REQUIRE_AGENT",
 }
 
 
@@ -162,7 +163,18 @@ def pg_names() -> dict:
     hex8 = uuid.uuid4().hex[:8]
     return {"db": _safe_db_name(f"{DB_NAME_PREFIX}{hex8}"),
             "owner": f"sro_{hex8}", "app": f"sra_{hex8}",
-            "owner_pw": f"o_{uuid.uuid4().hex}", "app_pw": f"a_{uuid.uuid4().hex}"}
+            "secret": f"srs_{hex8}",
+            "owner_pw": f"o_{uuid.uuid4().hex}", "app_pw": f"a_{uuid.uuid4().hex}",
+            "secret_pw": f"s_{uuid.uuid4().hex}"}
+
+
+@pytest.fixture(scope="session")
+def test_db_url_secret(pg_names) -> str:
+    """The dedicated SECRET-role identity (plan 19 review finding 8):
+    grants on exactly one table — model_profile_secrets."""
+    host, port = _admin_endpoint()
+    return (f"postgresql+psycopg2://{pg_names['secret']}:{pg_names['secret_pw']}"
+            f"@{host}:{port}/{pg_names['db']}")
 
 
 @pytest.fixture(scope="session")
@@ -180,7 +192,8 @@ def test_db_url_owner(pg_names) -> str:
 
 
 @pytest.fixture(scope="session")
-def migrated_db(pg_names, test_db_url_owner, test_db_url_app):
+def migrated_db(pg_names, test_db_url_owner, test_db_url_app,
+                test_db_url_secret):
     """Fresh schema in a UNIQUE disposable DB via the real migration path."""
     if not _admin_available():
         pytest.skip("no explicit Postgres admin (set SR_PG_ADMIN_URL or SR_PG_ADMIN_CMD) "
@@ -188,15 +201,19 @@ def migrated_db(pg_names, test_db_url_owner, test_db_url_app):
     n = pg_names
     _admin_sql(f"CREATE ROLE {n['owner']} LOGIN PASSWORD '{n['owner_pw']}'")
     _admin_sql(f"CREATE ROLE {n['app']} LOGIN PASSWORD '{n['app_pw']}'")
+    _admin_sql(f"CREATE ROLE {n['secret']} LOGIN PASSWORD '{n['secret_pw']}'")
     # explicit UTF8: cluster defaults may be SQL_ASCII, which breaks JSONB unicode
     _admin_sql(f"CREATE DATABASE {n['db']} OWNER {n['owner']} ENCODING 'UTF8' "
                f"TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'")
 
     saved = {k: os.environ.get(k) for k in
-             ("POSTGRES_URL", "POSTGRES_URL_OWNER", "DB_APP_ROLE")}
+             ("POSTGRES_URL", "POSTGRES_URL_OWNER", "POSTGRES_URL_SECRET",
+              "DB_APP_ROLE", "DB_SECRET_ROLE")}
     os.environ.update(POSTGRES_URL=test_db_url_app,
                       POSTGRES_URL_OWNER=test_db_url_owner,
-                      DB_APP_ROLE=n["app"])
+                      POSTGRES_URL_SECRET=test_db_url_secret,
+                      DB_APP_ROLE=n["app"],
+                      DB_SECRET_ROLE=n["secret"])
 
     def _clear_app_caches():
         try:
@@ -205,12 +222,15 @@ def migrated_db(pg_names, test_db_url_owner, test_db_url_app):
             from srplatform.db import session as dbs
             dbs.owner_engine.cache_clear()
             dbs.app_engine.cache_clear()
+            from srplatform import secret_store
+            secret_store.dispose()
         except Exception:
             pass
 
     _clear_app_caches()
     try:
-        env = {**os.environ, "POSTGRES_URL_OWNER": test_db_url_owner, "DB_APP_ROLE": n["app"]}
+        env = {**os.environ, "POSTGRES_URL_OWNER": test_db_url_owner,
+               "DB_APP_ROLE": n["app"], "DB_SECRET_ROLE": n["secret"]}
         r = subprocess.run([PY, "-m", "alembic", "upgrade", "head"],
                            cwd=REPO_ROOT, env=env, capture_output=True, text=True)
         assert r.returncode == 0, f"alembic failed:\n{r.stdout}\n{r.stderr}"
@@ -218,11 +238,17 @@ def migrated_db(pg_names, test_db_url_owner, test_db_url_app):
     finally:
         # tear the whole thing down — nothing survives the session
         try:
+            from srplatform import secret_store
+            secret_store.dispose()
+        except Exception:
+            pass
+        try:
             _admin_sql(
                 f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='{n['db']}'")
             _admin_sql(f"DROP DATABASE IF EXISTS {n['db']}")
             _admin_sql(f"DROP ROLE IF EXISTS {n['owner']}")
             _admin_sql(f"DROP ROLE IF EXISTS {n['app']}")
+            _admin_sql(f"DROP ROLE IF EXISTS {n['secret']}")
         except Exception as e:  # noqa: BLE001 — teardown failure must not mask test results
             print(f"[conftest] teardown warning: could not drop {n['db']}: {e}", file=sys.stderr)
         for k, v in saved.items():
@@ -251,6 +277,19 @@ def _reset_singletons() -> None:
         coach_routes.set_coach_llm(None)
     except Exception:
         pass
+    try:
+        # plan 19: the job scheduler thread must not outlive a settings/DB
+        # swap (it polls through the engine that is about to be reset)
+        from srplatform import model_jobs
+        model_jobs.stop_model_jobs()
+    except Exception:
+        pass
+    try:
+        # the secret store has its OWN engine; it must not outlive the DB
+        from srplatform import secret_store
+        secret_store.dispose()
+    except Exception:
+        pass
 
 
 @pytest.fixture
@@ -265,10 +304,11 @@ def clean_singletons():
 # -------------------------------------------------------------------------- #
 
 @pytest.fixture()
-def env_dirs(migrated_db, tmp_path, monkeypatch):
+def env_dirs(migrated_db, tmp_path, monkeypatch, test_db_url_secret):
     """Point ALL filesystem/URL knobs at disposable locations. Env vars beat
     .env for pydantic-settings, so no dotenv games are needed."""
     monkeypatch.setenv("SR_ENV", "dev")
+    monkeypatch.setenv("POSTGRES_URL_SECRET", test_db_url_secret)
     monkeypatch.setenv("SAFETY_STATE_FILE", str(tmp_path / "safety_state.json"))
     monkeypatch.setenv("RECORDINGS_DIR", str(tmp_path / "recordings"))
     monkeypatch.setenv("RUNNER_TRANSPORT", "local-dev")   # fixture-only transport
@@ -323,7 +363,9 @@ def wipe_data(db_url_owner: str) -> None:
     eng = create_engine(db_url_owner)
     tables = ("events", "sessions", "agent_state", "login_tokens", "service_tokens",
               "deployments", "runs", "safety_records", "safety_state", "recordings",
-              "range_lease", "users")
+              "range_lease", "users", "model_jobs", "conversation_revisions",
+              "session_model_pins", "model_role_overrides", "model_profiles",
+              "model_profile_secrets", "coach_messages", "operation_outputs")
     with eng.begin() as c:
         c.execute(text("TRUNCATE " + ", ".join(tables) + " CASCADE"))
     eng.dispose()

@@ -34,27 +34,87 @@ def test_rejected_completion_is_not_retried(monkeypatch):
     assert len(calls) == 1
 
 
+class _StubSession:
+    """The complete route reads the server-authoritative match deadline
+    (round-2 finding 8); this stub answers 'no match row' — no cap."""
+
+    def execute(self, *a, **k):
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(
+            first=lambda: None))
+
+
 def test_internal_model_rejection_is_explicit_bad_gateway(monkeypatch):
+    """A failed DURABLE JOB (here: a rejected completion) is an explicit
+    502 with the truthful error — never a fake success and never a silent
+    substitution of another profile."""
+    from contextlib import contextmanager
+
     from fastapi import HTTPException
+    import srplatform.api.app as app_module
     from srplatform.api.app import ModelCompleteIn, internal_model_complete
-    from srplatform.red_agent.llm import CompletionRejected
-    import srplatform.red_agent.llm as llm_module
-    import srplatform.model_gateway as gateway_module
-    class Rejected:
-        def complete(self, *args):
-            raise CompletionRejected("token budget exhausted")
-    class ImmediateGateway:
-        def submit(self, priority, name, fn, *args):
-            return lambda: fn(*args)
-        def wait(self, pending, timeout):
-            return pending()
-    monkeypatch.setattr(llm_module, "LLM", Rejected)
-    monkeypatch.setattr(gateway_module, "get_model_gateway", ImmediateGateway)
+    import srplatform.model_admin as ma
+    import srplatform.model_jobs as mj
+
+    class _FailedJob:
+        job_id = None
+        state = "failed"
+        result = None
+        error = "model request failed: token budget exhausted"
+
+    _FailedJob.job_id = uuid.uuid4()
+
+    @contextmanager
+    def _fake_db():
+        yield _StubSession()
+
+    monkeypatch.setattr(app_module, "db", _fake_db)
+    monkeypatch.setattr(ma, "bind_for", lambda db, sid, role: (None, None))
+    monkeypatch.setattr(
+        mj, "enqueue",
+        lambda *a, **k: SimpleNamespace(job_id=_FailedJob.job_id, state="queued"))
+    monkeypatch.setattr(mj, "wait",
+                        lambda db, jid, bound: _FailedJob())
     with pytest.raises(HTTPException) as exc:
         internal_model_complete(ModelCompleteIn(system="fixture", user="fixture"),
                                 SimpleNamespace(session_id=uuid.uuid4()))
     assert exc.value.status_code == 502
-    assert exc.value.detail == "token budget exhausted"
+    assert "token budget exhausted" in exc.value.detail
+
+
+def test_internal_model_timeout_requests_cessation_never_silent_replay(monkeypatch):
+    """Exceeding the wait bound must cancel the row (queued: dead; live:
+    cessation requested) and answer 504 — the late answer may never be
+    consumed as if the request were still open."""
+    from contextlib import contextmanager
+
+    from fastapi import HTTPException
+    import srplatform.api.app as app_module
+    from srplatform.api.app import ModelCompleteIn, internal_model_complete
+    import srplatform.model_admin as ma
+    import srplatform.model_jobs as mj
+
+    jid = uuid.uuid4()
+    cancelled = []
+
+    @contextmanager
+    def _fake_db():
+        yield _StubSession()
+
+    def _bound_exceeded(db, id_, bound):
+        raise TimeoutError("bound")
+
+    monkeypatch.setattr(app_module, "db", _fake_db)
+    monkeypatch.setattr(ma, "bind_for", lambda db, sid, role: (None, None))
+    monkeypatch.setattr(mj, "enqueue",
+                        lambda *a, **k: SimpleNamespace(job_id=jid, state="queued"))
+    monkeypatch.setattr(mj, "wait", _bound_exceeded)
+    monkeypatch.setattr(mj, "cancel",
+                        lambda db, id_, *, actor="": cancelled.append(id_))
+    with pytest.raises(HTTPException) as exc:
+        internal_model_complete(ModelCompleteIn(system="fixture", user="fixture"),
+                                SimpleNamespace(session_id=uuid.uuid4()))
+    assert exc.value.status_code == 504
+    assert cancelled == [jid]
 
 
 @pytest.mark.parametrize("sealed", [False, True])

@@ -21,6 +21,7 @@ SR_SSH_DIR="${SR_SSH_DIR:-/etc/sparring-range/ssh}"
 # ssh-keygen mints root-only 0600, which silently denies the entitled
 # service consumer — the group must be explicit, never assumed).
 SR_SSH_GROUP="${SR_SSH_GROUP:-srrange}"
+SR_INGEST_GROUP="${SR_INGEST_GROUP:-sringest}"
 BROKER_HOST="${BROKER_HOST:-broker.range.internal}"   # how the API dials the broker
 API_HOST="${API_HOST:-control-plane}"                 # client-cert identity label
 HTTPS_IP="${HTTPS_IP:-}"                              # control-plane LAN IP
@@ -165,8 +166,27 @@ chown root:"$SR_SSH_GROUP" "$SR_SSH_DIR/bastion_ed25519" \
 chmod 0640 "$SR_SSH_DIR/bastion_ed25519"
 chmod 0644 "$SR_SSH_DIR/bastion_ed25519.pub"
 
-chmod 600 ./*.key ca.key 2>/dev/null || true
-chmod 640 ./*.crt 2>/dev/null || true
+# TLS material per-FILE ownership (plan 18 review): a blanket chmod made
+# the ingest key pair root-only 0640 — the sringest unit could not even
+# read the certificate it serves — and pinned every .crt root:root 0640,
+# so no service identity could read a trust anchor.  Every file has a
+# named consumer now; the private CA key material stays root-only.
+chmod 0600 ./*.key 2>/dev/null || true
+if [ -f ingest-server.key ]; then
+  # The ingest listener (sringest) serves this pair: group-readable,
+  # never world-readable. A missing group fails LOUD at the chown,
+  # never silently (set -e).
+  chown root:"$SR_INGEST_GROUP" \
+    ingest-server.key ingest-server.crt
+  chmod 0640 ingest-server.key ingest-server.crt
+fi
+# Public trust material is world-readable (a certificate carries no
+# secret): api-ca.crt and ca.crt are pinned by API/ingest/bastion,
+# https.crt is the anchor for the surface nginx actually presents.
+chmod 0644 ca.crt api-ca.crt https.crt 2>/dev/null || true
+# Broker-CA artefacts with no local appliance consumer stay root-only:
+chmod 0640 broker-server.crt api-client.crt broker-server.csr \
+    api-client.csr ca.srl 2>/dev/null || true
 echo
 echo "done. Distribute: ca.crt + api-client.* -> control plane; ca.crt +
 broker-server.* -> broker VM; $SR_SSH_DIR/bastion_ed25519 stays on the

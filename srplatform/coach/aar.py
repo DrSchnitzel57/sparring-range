@@ -128,8 +128,15 @@ def build_aar(events: list[dict], scenario: dict, scorecard: dict | None,
     end_note = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
     narrative_block = ""
+    # Review finding 8: citations are valid only against the evidence the
+    # report ACTUALLY shows (the rendered, compressed timeline) — never
+    # against every id that existed in the window but was compressed away.
+    # Plan 20 F5: the set is the compressor's CANONICAL accounting of the
+    # events it rendered, not a regex over the text — a payload that says
+    # ``echo reference #99999999`` adds nothing to what exists.
+    visible_ids = set(idx["shown_ids"])
     if narrative:
-        narrative = validate_narrative(narrative, {e.get("event_id") for e in events})
+        narrative = validate_narrative(narrative, visible_ids)
         if narrative.strip():
             narrative_block = "## Coach narrative (citations validated)\n" + narrative.strip() + "\n"
 
@@ -170,12 +177,18 @@ def build_aar(events: list[dict], scenario: dict, scorecard: dict | None,
 
     cited = [m["event"].get("event_id") for m in idx["misses"] + idx["telemetry_gaps"]
              if isinstance(m, dict)] + [e.get("event_id") for e in idx["wins"]]
+    # The UI may turn #id tokens into ACTIVE links only for this list:
+    # events the report shows, key evidence it names, and the cutoff.
+    # Anything else renders as an honest unverified label.
+    approved_citations = sorted(
+        visible_ids | {c for c in cited if c} | ({cutoff} if cutoff else set()))
     return {"markdown": md, "grade": grade, "score_status": status,
             "earned": earned, "total": total, "pct": pct,
             "misses": [f"{format_citation(m['event'])} — {m['reason']}" for m in idx["misses"]],
             "telemetry_gaps": [f"{format_citation(g['event'])} — {g['reason']}"
                                for g in idx["telemetry_gaps"]],
             "cited_events": sorted(set(filter(None, cited))),
+            "approved_citation_ids": approved_citations,
             "evidence_cutoff_event_id": cutoff,
             "rubric_version": card.get("rubric_version", scenario.get("rubric_version", 1))}
 
@@ -196,20 +209,38 @@ Do NOT give the answer command; ask the question that leads them there, using
 the CONTEXT (timestamps are real; reference them). Keep it under 5 sentences."""
 
 
-def build_hint(events: list[dict], question: str, llm) -> dict:
-    """Socratic hint grounded in the live log, with HONEST state (F12): we say
-    'no correlated response observed', not 'you ignored it'."""
+def hint_prompt(events: list[dict], question: str) -> tuple[str, str, str]:
+    """Build the hint request EXACTLY once (system, user, state_line).
+    The synchronous path AND the durable-async enqueue share this
+    builder — two prompt constructions would drift, and a member's
+    async hint must be grounded in the same evidence view as the sync
+    one."""
     timeline, idx = compress_timeline(events[-200:], max_lines=25)
     n_miss, n_gap = len(idx["misses"]), len(idx["telemetry_gaps"])
     state_line = (f"Status: {n_miss} confirmed red items without a correlated response; "
                   f"{n_gap} with telemetry gaps (visibility unknown).")
     user = (f"DEFENDER QUESTION: {question or '(none — tell me where to look next)'}\n\n"
             f"CONTEXT (live log):\n{timeline}\n\n{state_line}")
+    return HINT_SYSTEM, user, state_line
+
+
+def hint_fallback(reason: str, state_line: str) -> str:
+    return (f"{reason} — deterministic guidance (not an AI-generated hint). "
+            f"{state_line} Which recent event can you corroborate with a second "
+            "log source, and where is visibility still missing? "
+            "No diagnosis or successful remediation is inferred.")
+
+
+def build_hint(events: list[dict], question: str, llm) -> dict:
+    """Socratic hint grounded in the live log, with HONEST state (F12): we say
+    'no correlated response observed', not 'you ignored it'."""
+    system, user, state_line = hint_prompt(events, question)
+    n_tail = [e["event_id"] for e in events[-5:]] if events else []
     fallback_reason = "No model available"
     text = None
     if llm:
         try:
-            text = llm.complete(user=user, system=HINT_SYSTEM)
+            text = llm.complete(user=user, system=system)
         except CompletionRejected:
             fallback_reason = "Model response was empty, incomplete, or rejected"
         # Test doubles/alternative adapters may not enforce the shared client's
@@ -218,8 +249,5 @@ def build_hint(events: list[dict], question: str, llm) -> dict:
             fallback_reason = "Model response was empty, incomplete, or rejected"
             text = None
     if text is None:
-        text = (f"{fallback_reason} — deterministic guidance (not an AI-generated hint). "
-                f"{state_line} Which recent event can you corroborate with a second "
-                "log source, and where is visibility still missing? "
-                "No diagnosis or successful remediation is inferred.")
-    return {"hint": text, "context_events": [e["event_id"] for e in events[-5:]] if events else []}
+        text = hint_fallback(fallback_reason, state_line)
+    return {"hint": text, "context_events": n_tail}

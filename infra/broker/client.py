@@ -106,7 +106,7 @@ class HttpTransport:
     }
     READ_OPS = frozenset({
         "lookup_vm", "lookup_config", "try_lookup_config", "read_config",
-        "vm_status", "inventory", "latch_status",
+        "vm_status", "inventory", "latch_status", "artifact_for_template",
     })
 
     def __init__(self, url: str, ca_file: str = "", cert_file: str = "",
@@ -206,6 +206,13 @@ class BrokerClient:
 
     def vm_status(self, node, vmid):
         return self._call("vm_status", node=node, vmid=int(vmid))
+
+    def artifact_for_template(self, template_vmid):
+        """The clone authority's confirmed artifact identity for this
+        template, or None (honest UNKNOWN). Read-only; no secret and no
+        manifest path crosses this boundary."""
+        return self._call("artifact_for_template",
+                          template_vmid=int(template_vmid))
 
     def inventory(self):
         return self._call("inventory")

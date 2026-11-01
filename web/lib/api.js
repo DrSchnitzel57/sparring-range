@@ -46,6 +46,8 @@ export function saveSession(o) {
 }
 export const currentUser = () =>
   typeof window !== "undefined" ? localStorage.getItem("sr_user") : null;
+export const getRole = () =>
+  typeof window !== "undefined" ? localStorage.getItem("sr_role") : null;
 export const logout = () => {
   ["sr_token", "sr_user", "sr_role"].forEach((k) => localStorage.removeItem(k));
 };

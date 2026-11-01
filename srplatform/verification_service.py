@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from srplatform.db.models import Deployment, Event
 from srplatform.scenario_engine.loader import load_scenario
 from srplatform.settings import get_settings
+from srplatform.ssh_channel import SSH_ALIVE_OPTS
 from verifiers import registry
 from verifiers.base import Context
 
@@ -76,9 +77,14 @@ def _ssh_exec(host: str, command: str) -> tuple[int, str]:
            # maps that to `unknown`, never to a pass.
            "-o", "StrictHostKeyChecking=yes",
            "-o", f"UserKnownHostsFile={s.verifier_ssh_known_hosts}",
+           # bounded channel (plan 18): keepalives so a wedged guest fails
+           # loud and fast instead of hanging the verification round
+           *SSH_ALIVE_OPTS,
            "-i", s.verifier_ssh_key_path, f"{s.verifier_ssh_user}@{host}", command]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=s.verifier_exec_timeout_s)
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL,
+                           timeout=s.verifier_exec_timeout_s)
         return p.returncode, (p.stdout + p.stderr)[:8000]
     except (subprocess.TimeoutExpired, OSError) as e:
         return 124, f"[verifier-exec] {e}"
@@ -266,6 +272,112 @@ def readiness_checks(db: Session, session_id) -> dict:
             "reason": "; ".join(reasons) or None}
 
 
+# --------------------------------------------------------------------------- #
+# trusted cron pins (plan 18)                                                  #
+# --------------------------------------------------------------------------- #
+
+def cron_artifact_map(db: Session, session_id) -> dict[str, dict]:
+    """host -> the artifact identity recorded AT DEPLOY TIME into the
+    immutable deployment resource: role + template VMID + artifact
+    digest CONFIRMED BY THE BROKER for that clone, plus the clean-baseline
+    FROZEN from the pins binding that identity before first use. From the
+    same positively-owned active rows host_map_for trusts — never from
+    YAML, never from a stale generation, and never re-derived from the
+    CURRENT pin file (which may change after the session started; that
+    was the review finding). Resources deployed before the identity or
+    the frozen baseline existed simply carry no baseline: their cron
+    checks stay UNKNOWN."""
+    dep = active_deployment(db, session_id)
+    if not dep:
+        return {}
+    out: dict[str, dict] = {}
+    for r in dep.resources or []:
+        art = r.get("cron_artifact")
+        if (r.get("host") and r.get("state") == "created"
+                and isinstance(art, dict) and art.get("role")
+                and art.get("artifact_sha256") and art.get("template_vmid")):
+            out[r["host"]] = art
+    return out
+
+
+def recorded_cron_artifact(identity, pins: dict) -> dict:
+    """Normalize the identity the BROKER confirmed for a clone and freeze
+    the clean baseline into it (review findings 1+2: the clone authority
+    and the immutable freeze are the only legitimate sources).
+
+    ``identity`` comes from the typed broker boundary — the role, template
+    and image SHA-256 of the manifest the broker ACTUALLY loaded and
+    verified the clone image against; a re-read of the on-disk manifest
+    here would record bytes the broker may never deploy. Missing or
+    malformed identity returns {} — cron checks honestly stay UNKNOWN.
+    The baseline is frozen from the pins binding that identity AT THIS
+    MOMENT; scoring later never re-reads pin content, and a pin whose
+    identity drifts can only revoke."""
+    if not isinstance(identity, dict):
+        return {}
+    from infra.appliance.manifest import validate_identity
+    if not validate_identity(identity):
+        return {}
+    art = {"role": identity["role"],
+           "template_vmid": int(identity["template_vmid"]),
+           "artifact_sha256": identity["artifact_sha256"]}
+    from infra.images import cron_baseline
+    baseline = cron_baseline.freeze_baseline(
+        pins, art["role"], artifact_sha256=art["artifact_sha256"],
+        template_vmid=art["template_vmid"])
+    if baseline:
+        art["baseline"] = baseline
+    return art
+
+
+def load_cron_pins() -> dict:
+    """Read the release pins file; anything unreadable or invalid behaves
+    exactly like an absent file (UNKNOWN stays UNKNOWN)."""
+    s = get_settings()
+    if not s.cron_baseline_file:
+        return {}
+    from infra.images.cron_baseline import load_pins
+    return load_pins(s.cron_baseline_file)
+
+
+def with_cron_baseline(args: dict, *, verifier_id: str, host: str | None,
+                       artifacts: dict[str, dict],
+                       pins: dict) -> dict:
+    """Inject the pinned clean-cron hashes into a cron check — from the
+    baseline FROZEN into the immutable deployment resource at clone time
+    (second review, finding 1: the pin file's CURRENT content hashes must
+    never decide what was clean for an already-running session; an
+    in-place edit of pins[role]["files"] under an unchanged digest would
+    otherwise turn a persisted FAILED into a PASSED on rescore).
+
+    Conditions, all fail-closed to UNKNOWN (never a pass, never a guess):
+    the session's resource must carry the broker-confirmed artifact
+    identity AND a frozen baseline whose integrity reference verifies;
+    and the CURRENT pins must still bind that identity — an identity
+    drift (rebuild, template move, pin removed) REVOKEs trust, while a
+    pin edited in place changes nothing for existing sessions.
+    The scenario snapshot keeps declaring its filename baseline
+    (historical meaning preserved); an explicit baseline_file_sha256 in
+    the snapshot always wins (append-only snapshots stay authoritative)."""
+    if verifier_id != "cron_persistence_present" or not pins:
+        return args
+    if "baseline_file_sha256" in args:
+        return args
+    art = artifacts.get(host or "")
+    if not art:
+        return args
+    from infra.images import cron_baseline
+    if not cron_baseline.artifact_binding_ok(
+            pins, art.get("role"),
+            artifact_sha256=art.get("artifact_sha256"),
+            template_vmid=art.get("template_vmid")):
+        return args                                # revoked → UNKNOWN
+    hashes = cron_baseline.frozen_hashes(art.get("baseline") or {})
+    if not hashes:
+        return args                                # absent/corrupt → UNKNOWN
+    return {**args, "baseline_file_sha256": hashes}
+
+
 def check_objective(db: Session, session_id, objective_id: str) -> dict:
     """Run ONE red objective's verifier and append the trusted event.
     Returns {objective, status, passed, evidence, event_id}."""
@@ -274,10 +386,15 @@ def check_objective(db: Session, session_id, objective_id: str) -> dict:
     if obj is None:
         return {"error": f"unknown objective '{objective_id}'"}
     exec_fn = _exec_override or _ssh_exec
-    ctx = Context(exec=_resolve(exec_fn, host_map_for(db, session_id)),
-                  hosts=host_map_for(db, session_id))
+    hmap = host_map_for(db, session_id)
+    ctx = Context(exec=_resolve(exec_fn, hmap), hosts=hmap)
     v = registry.get(obj["verifier"])
-    outcome = v.evaluate(ctx, **(obj.get("args") or {}))   # typed: passed/failed/unknown
+    args = with_cron_baseline(dict(obj.get("args") or {}),
+                              verifier_id=obj["verifier"],
+                              host=(obj.get("args") or {}).get("host"),
+                              artifacts=cron_artifact_map(db, session_id),
+                              pins=load_cron_pins())
+    outcome = v.evaluate(ctx, **args)   # typed: passed/failed/unknown
     ev = Event(session_id=session_id, ts=datetime.now(timezone.utc), actor="system",
                host=(obj.get("args") or {}).get("host"), action_type="verifier",
                payload={"objective": objective_id, "verifier": obj["verifier"],
@@ -319,6 +436,10 @@ def build_scorecard(db: Session, session_id) -> dict:
                            "live rescore refused (historical score_snapshot remains "
                            "read-only available); no SSH attempted")
     ctx = Context(exec=_resolve(exec_fn, hmap), hosts=hmap)
+    # trusted cron content pins: loaded ONCE per scorecard build so every
+    # cron check in this snapshot sees the same truth (plan 18)
+    cron_artifacts = cron_artifact_map(db, session_id)
+    cron_pins = load_cron_pins()
 
     items, earned, total = [], 0, 0
     status_seen = []
@@ -331,6 +452,9 @@ def build_scorecard(db: Session, session_id) -> dict:
         # reward the vulnerability and penalize its removal (audit R09).
         args = {k: val for k, val in chk.items()
                 if k not in ("verifier", "points", "domain", "description")}
+        args = with_cron_baseline(args, verifier_id=chk["verifier"],
+                                  host=chk.get("host"),
+                                  artifacts=cron_artifacts, pins=cron_pins)
         outcome = v.evaluate(ctx, **args)
         awarded = points if outcome.status == "passed" else 0
         earned += awarded

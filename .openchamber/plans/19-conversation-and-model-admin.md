@@ -3,11 +3,11 @@
 > Workflow normalized 2026-10-28: the [native-workflow decision](../../docs/ARCHITECTURE.md#workflow-decision--native-openchamber-2026-10-28) supersedes old procedural rules in this record, not product requirements or acceptance gates. Retained status is not fresh verification.
 
 ## Steps
-- [ ] Define versioned model profiles, secrets, checkpoints and scoped API protocol.
-- [ ] Implement one-slot jobs, streaming/cancellation and admin model GUI.
-- [ ] Integrate pinned Pydantic AI slim with durable conversation history.
-- [ ] Prove compatibility, isolation, recovery and behavioral regressions.
-- [ ] Record evidence, tick 19 on its gates and update architecture if changed.
+- [x] Define versioned model profiles, secrets, checkpoints and scoped API protocol.
+- [x] Implement one-slot jobs, streaming/cancellation and admin model GUI.
+- [x] Integrate pinned Pydantic AI slim with durable conversation history.
+- [x] Prove compatibility, isolation, recovery and behavioral regressions.
+- [x] Record evidence, tick 19 on its gates and update architecture if changed.
 
 ## Goal and context
 Replace conversation, not execution authority. Depends on 18 software; retain

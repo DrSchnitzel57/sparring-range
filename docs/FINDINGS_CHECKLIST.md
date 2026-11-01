@@ -7,6 +7,2591 @@ commissioning receipts remain authoritative evidence. Earlier migration of 67
 notes is history, not a prohibition on current Project Knowledge. Older agent
 receipts are preserved in [AGENT_HISTORY.md](AGENT_HISTORY.md).
 
+## Work frozen at user request — 2026-11-01
+
+The user requested integration and push **as-is**, with no further repair/review
+loop. This is an unfinished development checkpoint, not release acceptance.
+
+- Latest source: `c398eab870c855ade8d0ba4a647aac6c5723ac44`. It claims fixes
+  for mirror-sequence validation, durable outage reconciliation (including
+  API/CLI recovery), and no-replace forced-build rollback. **No completed
+  independent review or final test receipt exists for this latest commit.**
+- Last completed independent review: **VERDICT: FIX** at `da735cc`, source
+  `2c9cad4`. Three demonstrated defects remained: a nonexistent mirror sequence
+  could override authoritative failure; an outage-only failure remained blocked
+  after the prescribed fresh successful check; forced rollback replaced a newly
+  appeared foreign empty directory. These require independent re-verification
+  against `c398eab`; implementation claims do not close them.
+- That older source independently passed the infrastructure-free pytest command
+  documented below: **741 passed, 529 deselected, 13 warnings**, exit 0,
+  136.36 s; practice passed **12 + 28**, zero skipped, 14.5 s. Focused disposable
+  DB checks passed **23**, 20 deselected, 28.98 s. These are historical results,
+  not fresh results for the frozen HEAD or its integration with `master`.
+- Last independently inspected candidate: local cache
+  `.cache/bundle/sparring-range-appliance-22f`, revision `2c9cad4`, MANIFEST
+  SHA256 `0aeecdaa5948abe12044e5b65a1b5109b621c9d7891e2d502157e0722f87d6d2`.
+  Its 395 listed files, four images and 248 runtime files were inspected;
+  full verification exited 0 in 43.05 s. It is **not bound to the latest fixes**
+  and was not accepted as a release. Cached artifacts/images are not Git payload.
+- Installed appliance remains on the operator-upgraded release
+  `59fb5442fede8814c879d29c61fb88748cabc5b2`, schema `0027`; plan-22 source
+  has not been installed. Reported operator workarounds were model-key access
+  permissions, rebuilding the frontend with its public API URL, and enrolling
+  the current account's public key. No appliance action accompanies this freeze.
+- Milestones 18/19 had prior software acceptance; milestone 21 had local
+  upgrade/artifact acceptance for supervised installed testing. Plan 22 remains
+  unaccepted. Installed provider/systemd/isolation/nested-KVM/member-journey
+  qualification and sustained useful/adversarial AI behavior are not established
+  by the local fixture results. Preserve earlier scoped commissioning receipts.
+- Only the user-approved obsolete `-22`, `-22b`, `-22c` bundles were removed;
+  approximately 19 GiB remained free. Original and newer candidates were retained.
+  The implementation endpoint failed with connection refused when asked to
+  acknowledge the freeze; no restart was requested. No test/build worker was
+  visible in the user-process inventory during checkpointing.
+
+Resume by independently checking the three findings against the frozen source,
+refreshing affected acceptance evidence and building a source-bound candidate.
+Do not deploy merely because this checkpoint is on the default branch.
+
+## Plan-22 review-round-5 receipts — 2026-10-31 (branch `practice-upgrades-18-21`, fix `2c9cad4`)
+
+Independent focused review of `dc5fb27`/source `71c0200` returned
+**VERDICT: FIX**: the ordinary counterexamples passed, but four exact
+boundary defects remained under two EXTENDED owner contracts — (1) DB-
+published safety records are ordered by their authoritative append
+identity across EVERY mirror, a delayed file copy can never become a
+newer observation, and retained outage-only evidence is EXPLICITLY
+UNRECONCILED (never authorizes, never overrides an authoritative FAILED,
+never lost); (2) provenance references resolve the FULL authoritative
+source record (kind, strict outcome, scope), not detail+time. All four
+were root-fixed at `2c9cad4` with real HTTP/PG and tiny-fixture proofs in
+`tests/test_plan22_review_round5.py`:
+
+- **F1 (HIGH) delayed mirror hid a DB failure** — the classification's
+  DB commit was authoritative, but its file mirror (written after the
+  commit) carried no sequence, so the timestamp-ordered merge let that
+  delayed copy become the newest observation (usable TRUE despite the
+  committed FAILED baseline). Now: `_authoritative_publish` returns the
+  committed `record_id` and EVERY mirror envelope (`_mirror_dh` and the
+  durable file ledger) carries it as `seq`; `_latest_records` orders by
+  sequence within the store, an unreconciled line NEVER supersedes an
+  authoritative one, a same-sequence tie keeps the authoritative row's
+  envelope, and a mirror line that POSITIVELY matches an authoritative
+  record (kind + outcome + config identity + detail digest) is that
+  record's copy and inherits its sequence — replayed/delayed duplicates
+  reconcile instead of becoming evidence. Lines that remain sequence-less
+  while an authoritative sequence exists are retained as EXPLICITLY
+  UNRECONCILED: they never authorize, never override, never disappear,
+  an unreconciled FAILED blocks conservatively, and an unreconciled
+  engage/release transition honors the gate rule. The legacy
+  file-only/no-store lane keeps its historical timestamp semantics
+  (N07), and the outage persistence failure stays retained. Proof:
+  deterministic real-uvicorn post-commit/pre-mirror barriers in BOTH
+  orderings (classification parked → FAILED commits AND mirrors →
+  release: rows [legacy, classification, FAILED], ledger really shows the
+  classification LAST, yet the selected record is the authoritative
+  FAILED one, usable FALSE; FAILED parked pre-mirror → classification
+  refuses 409 against committed authority with its mirror not yet
+  written — no DB transaction spans the network wait), normal-read +
+  reconciled-duplicate + fabricated-pass-unreconciled + delayed-other-
+  kind probes, and a fast-lane DB-unavailable→recovered lane proving an
+  unreconciled pass cannot authorize once authority returns while the
+  failure is never lost. The round-4 source-read SQL lock race,
+  six-classifier single winner and store-503 positives stay green.
+- **F2 (MEDIUM) cross-kind/failed chains accepted** — the persisted-chain
+  reader resolved detail+time only, so a persisted baseline_check
+  classification naming a FAILED datapath_proof record with the CORRECT
+  digest and time read as a CURRENT USABLE pass. The resolver now
+  resolves the FULL authoritative row at every hop: same qualification
+  kind, strict `ok is True`, `record_identity_was` == the source row's
+  config identity, `bound_identity` == the carrying row's identity,
+  digest match, marker sanity (unknown contract, flag-without-marker and
+  binding-less persisted rows are malformed — INCOMPATIBLE, never a
+  usable current pass, never a now-fallback). Proven through the real
+  API/DB on persisted forged chains (cross-kind FAILED with correct
+  digest/time, failed same-kind, wrong scope, unknown marker,
+  binding-less row → incompatible with truthful problems) plus the
+  fast-lane resolver matrix (bool/NaN/future carried values, foreign
+  self-binding, cyclic chain); the valid nested chain and immutable
+  original stay the positive (seeded chains carry the true bindings).
+- **F3 (HIGH) missing bundle content verified OK** — `_trustworthy`
+  returned False WITHOUT recording a problem on a missing path, and the
+  caller's `continue` then skipped the missing-file check, so a bundle
+  with a deleted listed file or even the shipped base image verified
+  ok. Every refusal in `_trustworthy` now records its problem
+  (missing / cannot-stat / symlink component / non-regular / escape),
+  and the per-image caller keeps its `missing image:` wording; the
+  upgrade payload guard remains as the separate second layer. Proven on
+  a tiny real-qcow2 bundle for each class: deleted listed file, broken
+  symbolic link in its place, deleted shipped image, the entire images
+  directory, a deleted nested parent directory — each refused — plus a
+  fresh intact positive control.
+- **F4 (MEDIUM) activation destructive and non-exclusive** — after
+  staging the builder unconditionally `rmtree`'d any existing
+  destination (a foreign destination appearing after the preflight was
+  destroyed; a failing forced activation left no previous release).
+  Activation is now a `renameat2(RENAME_NOREPLACE)` primitive (fails
+  closed if unsupported — no destructive fallback): without force, a
+  destination appearing in the preflight→activation window is refused
+  atomically with the foreign bytes AND inode intact; with force, the
+  previous release is moved to a tokenized backup FIRST, the staged
+  build is activated, the backup is restored verbatim if activation
+  fails, and only a SUCCESSFUL replacement removes the superseded
+  release. Callers unchanged (the gates build only when no release
+  exists; no silent force anywhere). Proven with the deterministic
+  activation barrier (foreign sentinel + inode unchanged, no debris) and
+  injected activation-rename fault under force (previous valid bundle
+  verifies, revision intact, no staging/backup debris).
+
+Round-5 verification (real exit statuses, foreground, serialized; lanes
+not listed carry the round-4/3/2/1 receipts with explicit base — the
+model-administration/agent lanes, containment fixtures, install
+sequences, the preserving-upgrade + REAL browser login and the web
+bundle/browser consume nothing whose contract changed: the report shape
+is field-compatible and the new provenance value only appears with
+unreconciled evidence, proven by the rerun DB lanes; the browser/login
+lanes were last rerun at `71c0200`/`034ac0b`):
+
+| Lane | Rerun/carry | Result |
+|---|---|---|
+| fast (exact AGENTS command) | RERAN | exit 0 — **741 passed, 0 failed, 0 skipped**, 529 deselected, 13 warnings, 136.0 s (includes the 4 new fast round-5 proofs and the updated round-4 resolver matrix) |
+| selection | RERAN | PASS 253.0 s |
+| practice | RERAN | PASS 12.8 s — 12 + 28 passed, 0 skipped |
+| db (focused: round-2+3+4+5 files) | RERAN 3× | **22 passed, 0 failed** every run (~20 s) — both real-HTTP mirror barriers, reconciled/forged copies, persisted forged-chain probes, six-barrier winner, provenance matrices |
+| db (FULL gate — shared reader/merge changed) | RERAN | PASS 735.8 s — complete db layer green, owned DB resources verified cleaned |
+| authority | RERAN | PASS 27.8 s — 35 passed |
+| bundle | RERAN | PASS 383.1 s — NEW `.cache/bundle/sparring-range-appliance-22f` (MANIFEST sha256 `0aeecdaa5948abe12044e5b65a1b5109b621c9d7891e2d502157e0722f87d6d2`, revision `2c9cad4fd2d3` = this fix commit, 395 files, 4 images hardlinked via `--link-images`, zero image duplication, no force needed); verify + 248-file runtime binding + manifest render + image boot (overlay, TCG, marker `2026-10-31T19:41:47Z`) + tamper refusal, all under the positively-accounting verifier |
+| upgrade (incl REAL browser login), install, agent, containment, frontend, browser | CARRIED (scoped, `71c0200`/`034ac0b`) | 513.1 s PASS / sequences / 123 / 41 / 0 high+critical / 7 of 7 — inputs unchanged (report shape field-compatible; those lanes exercised at the round-4 base) |
+
+Disk and artifact discipline: 19 GiB free at start (after the
+user-authorized parent cleanup of the three obsolete candidates — that
+deletion is the PARENT's action, acknowledged, not a seal failure), 19
+GiB at end; no image copy existed this round (hardlinks only, the
+shared inodes' nlink 3→4 is the only change — inode, mode and mtime
+identical); the 2 GiB reserve never breached. The three protected
+seals (original `0cfa12f1f48c…`, `-22d` `35e4e9635a86…`, `-22e`
+`71eb837e81ec…`) verified byte-identical before and after. My stale
+round-4 disk-guard loop was killed and confirmed absent; disposable PG
+clusters self-cleaned; only this session's fresh `/tmp` fixtures were
+removed (prefix + owner + mtime); zero `sr-*` containers left; foreign
+`sr-libvirt-*`/`sr-guest-cache` untouched. Roadmap 22 stays unchecked —
+no installed appliance, provider, systemd or nested-KVM acceptance is
+claimed.
+
+## Plan-22 review-round-4 receipts — 2026-10-30 (branch `practice-upgrades-18-21`, fix `71c0200`)
+
+Independent focused review of candidate `034ac0b` returned **VERDICT: FIX**:
+the ordinary counterexamples passed, but five exact boundary defects
+remained under two OWNER CONTRACT DECISIONS — (1) every safety publisher
+that affects the selected qualification shares ONE authoritative
+serialization/publication boundary (a classifier-only lock is
+insufficient); mirrors follow committed authority; no proven publication
+means fail closed; (2) an unmarked original observation's effective time
+is its authoritative record timestamp, and a classification carries a
+derived time only when its contract and immutable id/digest chain resolve
+to that original. All five were root-fixed at `71c0200` with real
+API/PG/HTTP and tiny-fixture proofs in
+`tests/test_plan22_review_round4.py`:
+
+- **F1 (HIGH) concurrent source-failure race** — ordinary writers never
+  took the classifier's advisory lock, so a real HTTP FAILED baseline
+  committed between the classifier's source SELECT and its append, and
+  the classification laundered it (200, usable TRUE). `record()` and
+  `reclassify_qualification()` now share ONE
+  `_authoritative_publish` boundary: advisory lock → newest-by-`record_id`
+  read → validate → append → commit, one transaction, no network waits
+  inside; readers select the newest row by APPEND SEQUENCE within the
+  store, so wall-clock quirks cannot hide a later-committed failure;
+  mirrors write only after a successful (or, for the N07 outage ledger,
+  explicitly recorded) publication, and the classifier's mirror follows
+  its commit. Proof (real uvicorn + real threads + a deterministic hook
+  at the source-read seam): FAILED queued on the lock → committed order
+  [legacy, classification, FAILED] → qualification usable FALSE
+  ("latest baseline_check FAILED"), file-ledger mirror shows exactly one
+  classification + one honest failure; the other ordering and a moved
+  source both yield truthful 409s; the six-barrier single-winner test
+  now also asserts the mirror consumer saw exactly the winner.
+- **F2 (HIGH) future unbound `observed_at` laundering** — an UNMARKED
+  legacy source carrying an injected future `detail.observed_at`
+  classified into a `-24 h` usable observation. The provenance resolver
+  now ignores detail fields on any unmarked (or marked-ordinary) record —
+  its authoritative timestamp is the observation time — and a recognized
+  classification resolves hop-by-hop through `source_record_id` +
+  `original_detail_digest` to the ORIGINAL row, requiring agreement with
+  the carried time; missing/non-finite/bool/string/future/pre-2001
+  values, wrong ids, digest mismatches and cycles raise
+  `SafetyProvenanceError` → HTTP 409 at publication, provenance
+  `incompatible` in reports — never a passed observation, never a
+  `now` fallback, no daily re-commissioning, age advisories unchanged.
+  Proven on API+DB (4000 h + injected future + release → 200 but blocked
+  at age 4000; forged id/digest, future/missing carried → incompatible;
+  marked-ordinary injection ignored) plus a fast-lane resolver matrix
+  including a cyclic chain; the 4000 h, 100 h and 6000 h
+  (now fully resolvable chain) positives stand.
+- **F3 (MEDIUM) alias cleanup deleted a replacement inode** — ownership
+  is now the allocation-time DEVICE+INODE (captured via `lstat` at
+  creation in `_PwAlias`), checked with `lstat` at release; a replacement
+  symlink with the SAME target but a different inode survives and is
+  REPORTED, the owned inode stays removable, and own success cleanup is
+  unchanged. Deterministic rename-aside + same-target-replacement test;
+  the upgrade gate's REAL Chromium login passed through the new handle.
+- **F4 (MEDIUM) failed build destroyed the existing output** — `build()`
+  now validates every input (images present, guest-agent flag) and the
+  OUTPUT policy BEFORE any mutation: an existing destination is refused
+  unless `force=True`/`--force`, and the build happens in a sibling
+  staging directory activated by rename only on success — any failure
+  leaves the destination byte- and inode-identical with no staging
+  debris. Callers reviewed: the bundle gate builds only when no release
+  exists, and the disposable tamper fixture builds into a fresh path —
+  NEITHER needs force (none was added to them); force was exercised for
+  real by the `-22e` rebuild and by a failed-symlink-source rebuild that
+  left the previous bundle verifying.
+- **F5 (MEDIUM) `--link-images` permitted symlink artifacts** — linked
+  sources must now be REGULAR NON-SYMLINK images (checked by `lstat`
+  before linking; nothing chmods/truncates the shared source inode), and
+  `verify()` independently refuses — BEFORE trusting any bytes — symlink
+  components, non-regular files, realpath escapes, and symlinked
+  directories anywhere below the bundle root. Tiny-fixture proofs:
+  symlinked source refused (nothing created), external and internal
+  digest-matching symlinks refused, moved-and-symlinked `deploy/` tree
+  refused, ordinary tamper still refused, and a genuine regular
+  hardlinked build verifies with `nlink == 2`, identical bytes/mode and
+  an untouched source mtime.
+
+Round-4 verification (real exit statuses, foreground; lanes not listed
+carry the round-3/2/1 receipts with explicit base — none of their inputs
+changed: the model-administration/agent lanes, containment fixtures,
+install sequences and the web bundle + browser gate consume nothing
+touched here except report FIELDS that are byte-compatible and proven by
+the DB lane; the browser gate was last rerun at `034ac0b`):
+
+| Lane | Rerun/carry | Result |
+|---|---|---|
+| fast (exact AGENTS command) | RERAN | exit 0 — **737 passed, 0 failed, 0 skipped**, 522 deselected, 13 warnings, 118.7 s (includes the 7 new fast round-4 proofs) |
+| selection | RERAN | PASS 234.2 s |
+| practice | RERAN | PASS 13.2 s — 12 + 28 passed, 0 skipped |
+| db (focused: round-2+3+4 files) | RERAN 3× | **15 passed, 0 failed** every run (interleaved race, 409 orderings, provenance matrix, six-barrier + mirror assertion, persistence 503/recovery, nested chain) |
+| db (FULL gate — `record()` is the central changed writer) | RERAN | PASS 722.0 s — complete db layer green, owned DB resources verified cleaned |
+| authority | RERAN | PASS 26.7 s — 35 passed |
+| upgrade | RERAN (disk-guarded) | PASS 513.1 s — full preserving upgrade + REAL browser login through the new device+inode alias handle; guard never fired |
+| bundle | RERAN | PASS 279.3 s — NEW `.cache/bundle/sparring-range-appliance-22e` (MANIFEST sha256 `71eb837e81ec475a48956ebc5ed609e75ee9cca67f0f6422627527688b874948`, revision `71c0200c079d`, 394 files, 4 images hardlinked via `--link-images --force`, zero image duplication); verify + 248-file runtime binding + manifest render + image boot (overlay, TCG, marker `2026-10-30T14:22:54Z`) + tamper refusal, all under the hardened symlink-aware verifier |
+| agent, containment, install, frontend, browser | CARRIED (scoped, `5c9509f`/`7ed7e0b`/`034ac0b`) | 123 / 41 / sequences / 0 high+critical / 7 of 7 — unchanged inputs |
+
+Disk and artifact discipline: 6 GiB free at start (≥ 2 GiB reserve),
+ended 5 GiB with the reserve never breached; no image copy existed
+anywhere this round (hardlinks only). All FIVE older bundles' MANIFEST
+seals verified byte-identical (`0cfa12f1f48c…`, `8083dd4a9578…`,
+`da639671daa4ea…`, `f49867125ad0…`, `35e4e9635a86…`); the shared source
+images changed only by HARDLINK COUNT (2→3 from `-22e` linking them) —
+inode, mode, size and mtime identical, no write touched them. Only this
+session's fresh fixtures were removed; zero `sr-*` containers left;
+pre-existing `sr-libvirt-*`/`sr-guest-cache` untouched. Roadmap 22 stays
+unchecked — no installed appliance, provider, systemd or nested-KVM
+acceptance is claimed.
+
+## Plan-22 review-round-3 receipts — 2026-10-30 (branch `practice-upgrades-18-21`, final revision `e01ea4e` + builder `3e7956d`)
+
+Independent focused review of candidate `7ed7e0b` returned **VERDICT: FIX**:
+the four round-2 fixes improved but left five concrete gaps, under the
+OWNER SYSTEM CONTRACT: **reclassification time is not observation time** —
+the compatibility decision may append an AUDIT event now, while the
+effective observation time, scope and provenance REMAIN the original
+test's; publication shares one authoritative serialized
+read-validate-append/CAS boundary; no unfenced fallback publish; no DB
+transaction across network waits. All five were fixed at the root in
+`e01ea4e` (builder option in `3e7956d`) with real-boundary proofs in
+`tests/test_plan22_review_round3.py`:
+
+- **F1 (HIGH) transition laundering** — classification previously appended
+  a PASSED record with TODAY's timestamp, laundering a 4000 h legacy into
+  age 0.0 usable. Now every qualification evaluates AGE and engage/release
+  invalidation from the EFFECTIVE OBSERVATION TIME: ordinary records use
+  their own timestamp (unchanged); a classification carries
+  `observed_at` (the source's own effective time — nested chains resolved
+  at publish time) and invalidation runs on it, while
+  `classification_decided_at` keeps the audit's decision time separately.
+  Report entries expose `observed_at` + `classified_at` so the UI can
+  explain the two dates. Proof (API+DB): 4000 h legacy + later release →
+  reclassify 200, but `usable=False`, blocker "predates the last release",
+  `age_h≈4000`, source row byte-identical (`{}`), `source_record_id` and
+  original digest recorded, decision time > observation time; a valid
+  original after the last transition classifies and stays usable AT ITS
+  REAL AGE (advisory only — no daily expiry reintroduced); a nested
+  classification chain evaluates from the oldest original (6000 h, blocked
+  by a release between). 
+- **F2 (MEDIUM) CAS not atomic** — `expect_recorded_at` was checked before
+  an unprotected append, so two real HTTP requests could both win.
+  Publication is now one database transaction that first takes the shared
+  `pg_advisory_xact_lock` (the table grants are deliberately
+  SELECT/INSERT-only — append-only doctrine — so serialization uses an
+  advisory lock, not row `FOR UPDATE`), reads the newest record of the
+  kind AFTER acquiring it, validates, and appends — then commits. Six REAL
+  barrier-released HTTP classifiers: exactly ONE 200, five truthful 409s
+  ("already carries a contract"/"no longer the one"), exactly one new row,
+  original immutable. Persistence failure is a truthful 503 ("the
+  authoritative safety-record store is unavailable…") with ZERO rows
+  published (asserted while the store is back), and a retry after
+  recovery succeeds; a FAILED record appended after an accepted
+  classification still blocks — the CAS never overrides reality. The
+  fast-lane reclassification unit tests were corrected to the new
+  contract (no authoritative store → honest refusal, nothing unfenced
+  published); argument-level refusals still need no store.
+- **F3 (MEDIUM) cache-key security conditions** — a warm REAL-SSH success
+  with a 0600 key then survived `chmod 0644` (bytes unchanged) in the
+  cached verdict while OpenSSH itself now refuses the key. The shared
+  config fact now ALSO checks the private key's MODE (group/other access
+  → refuse "OpenSSH refuses it; tighten to 0600", never loosen) and
+  owner readability, BEFORE any cache or probe; the health memo key is
+  content digest + mode + owner, so any security-attribute change
+  invalidates a cached positive exactly like a byte change (in-place key
+  replacement re-probes and refuses; a trust-file edit forces a fresh
+  probe). Proven on the real asyncssh wire: warm 0600 success → chmod 0644
+  refuses with ZERO new probes → unreadable (0200) refuses → restoring
+  0600 recovers → trust edit re-probes healthy → foreign key swapped in
+  place refuses; no key material in any detail. `/readyz` and
+  `/safety/qualification` keep byte-identical detail (one fact, and it
+  is now also honest about 0644).
+- **F4 (MEDIUM) broker metadata types** — presence was validated but not
+  `reason`/`latched_at`. The real `ledger.get_latch` contract is
+  `reason: TEXT|NULL`, `latched_at: numeric epoch|NULL`; the classifier
+  now refuses `reason` that is not text/None and `latched_at` that is not
+  a finite number/None (dict, list, number reason, string/bool/NaN/
+  Infinity timestamps all BLOCK "reply UNTRUSTED"), while every
+  legitimate representation — including NULL metadata while unlatched —
+  passes. Proven through the stub matrix and over the REAL unix socket +
+  `HttpTransport`/`BrokerClient`, plus the real broker positive and the
+  engaged negative (engaged still blocks as ACTIVE, not UNTRUSTED).
+- **F5 (MEDIUM) harness deleted an unowned alias** — round 2 unlinked the
+  candidate path before creating its own. Allocation is now EXCLUSIVE
+  creation only (`os.symlink`, `FileExistsError` → skip, per-attempt random
+  token): a pre-existing sentinel at the candidate name — directory,
+  regular file, or foreign symlink — is verified UNTOUCHED (same inode,
+  same content, same target) and the next name is used; cleanup removes
+  only the exact owned symlink still pointing at the owned target (a
+  replaced directory or retargeted link is left alone). Deterministic
+  collision and hostile-cleanup tests included; the alias stays < 40
+  chars, and the upgrade gate's REAL browser login passed through the new
+  allocation code path.
+
+Round-3 verification (real exit statuses, foreground; lanes not listed
+carry the round-2/round-1 receipts because none of their inputs changed —
+model administration, containment fixtures, install sequences, web bundle
+and the browser gate consume nothing touched here, and the builder change
+is exercised only by the bundle build):
+
+| Lane | Rerun/carry | Result |
+|---|---|---|
+| fast (exact AGENTS command) | RERAN | exit 0 — **730 passed, 0 failed, 0 skipped**, 516 deselected, 13 warnings, 105.7 s |
+| selection | RERAN | PASS 214.3 s (round-3 proofs classified) |
+| practice | RERAN | PASS 12.5 s — 12 + 28 passed, 0 skipped (incl. the new F3 mode-change wire test) |
+| db (focused: round-2 + round-3 files) | RERAN 5× | **9 passed, 0 failed** every run, incl. the 6-barrier concurrency test (stable across repeats); full 338-test db lane carries round 2 (the reclassify writer contract changed — the three changed API tests were among the focused 9) |
+| authority | RERAN | PASS 27.2 s — 35 passed (broker classifier tightened) |
+| upgrade | RERAN (once, disk-guarded) | PASS 514.1 s — full preserving upgrade incl. the REAL browser login on the exclusive-allocation alias; guard never fired, 5.1 GiB free throughout |
+| bundle | RERAN | PASS 284.6 s — NEW `.cache/bundle/sparring-range-appliance-22d` (MANIFEST sha256 `35e4e9635a86b767219f7b0b84ade79e721d93d58ba006e74126b831ce4dfac9`, revision `3e7956d2264b`, 393 files, 4 images shipped as **hardlinks** to the existing self-contained 0644 images via the new `--link-images` flag — no second copy, 32 s build, disk unchanged); verify + 248-file runtime binding + manifest render + image boot (overlay, TCG, marker `2026-10-30T13:07:14Z`) + tamper refusal |
+| agent, containment, install, frontend, browser | CARRIED (scoped, `5c9509f`/`7ed7e0b`) | 123 / 41 / sequences / 0 high+critical / 7 of 7 — unchanged inputs, stated as carried |
+
+Disk and artifact discipline (round-3 rule): started 5.1 GiB free with a
+2 GiB reserve; no 4.5 GiB copy existed anywhere in this round (the builder
+now hardlinks under `--link-images`); the upgrade run was disk-guarded;
+ended 5.1 GiB free. All four older bundles' MANIFEST seals verified
+byte-identical before and after (`0cfa12f1f48c…`, `8083dd4a9578…`,
+`da639671daa4ea…`, `f49867125ad0…`), the `-22c` image inventory
+(inode/links/mode/mtime) unchanged, and only this session's own fresh
+fixture directories were removed (by explicit prefix + owner + mtime,
+never a blind sweep); the pre-existing `sr-libvirt-*`/`sr-guest-cache`
+stubs were left untouched. Roadmap 22 stays unchecked — no installed
+appliance, provider, systemd or nested-KVM acceptance is claimed.
+
+## Plan-22 review-round-2 receipts — 2026-10-30 (branch `practice-upgrades-18-21`, final revision `c9b3e4f`)
+
+Independent re-review of candidate `5c9509f` returned **VERDICT: FIX**: the
+nine round-1 counterexamples now PASS independently; four residual
+safety/recovery gaps remained. All four were fixed at the root contract in
+`2056e97` (the browser-harness robustness in `c9b3e4f`), each with a proof
+at the real producer/consumer boundary in `tests/test_plan22_review_round2.py`:
+
+- **F1 (HIGH) malformed broker reply released Begin** — the old check only
+  tested truthy `latched`, so `null`/`{}`/`[]`/`{"latched": None}` over the
+  REAL typed client read as "no engagement active". `_broker_check` now
+  validates the broker's latch CONTRACT (`{latched: strict bool, reason,
+  latched_at}` — `ledger.get_latch`'s shape) before reading anything: a
+  non-object, a missing field, or a non-strict-bool `latched` BLOCKS with
+  "reply UNTRUSTED" wording; unreachable still blocks; only the exact shape
+  passes, phrased as contract-answered. Proofs: real `BrokerService` +
+  typed client both ways (unlatched passes, engaged blocks naming the
+  reason), the full malformed matrix, and raw replies on a REAL unix socket
+  through the real `HttpTransport`/`BrokerClient` (null result, empty
+  result, non-bool, truncated JSON, no-result payload, HTTP 503, and a
+  timeout on BOTH read attempts — the typed client's one READ retry is
+  honored). Broker UID policy untouched.
+- **F2 (MEDIUM) runner memo keyed by file paths** — an in-place re-pin of
+  known_hosts at the same path replayed the cached pass for the TTL while
+  the direct probe refused. The memo key is now the trust IDENTITY
+  (`transport, target, sha256(key contents), sha256(trust contents)` —
+  `config_identity`'s `_file_fingerprint`, missing/empty/unreadable are
+  distinct identities, no secret content in the key). Proof rides the REAL
+  asyncssh wire: warm a genuine success (memoized — a second check opens no
+  connection), replace the pin CONTENT in place with a foreign key, the
+  very next check re-probes and refuses; deleting the key then refuses on
+  the deterministic config fact without probing.
+- **F3 (MEDIUM) /readyz contradicted the Begin classifier** —
+  `runner_available()` is now the single DETERMINISTIC config-readiness
+  fact (transport named, private key present, host-trust file present with
+  at least one non-comment pin), and `/readyz` reports exactly it with a
+  `"fact"` field naming itself as config-readiness and pointing health at
+  `/safety/qualification`; no live probe is added, so fresh install/upgrade
+  readiness still requires no attacker or guest. Proof on the REAL API:
+  missing key and EMPTY trust answer `runner.ok FALSE` on BOTH surfaces
+  with byte-identical details and Begin refused; the healthy positive
+  passes /readyz as "configured", never "reachable". (The classifier test
+  `test_production_static_isolation_is_declared_unsupported_not_inapplicable`
+  was corrected to keep BOTH layers: usable config reaches the failing
+  probe, broken config refuses at the shared fact — its fail-open intent
+  is preserved, no assertion weakened.)
+- **F4 (MEDIUM) the recovery command did not exist** — the blocker names
+  `rangectl safety reclassify KIND --reason "..."`, and that command is
+  now REAL: `POST /safety/reclassify-qualification` (operator-only; kind
+  allowlist 422; no record 404; failed/newest-contracted/moved-source 409)
+  behind the typer command, and `reclassify_qualification` accepts
+  `expect_recorded_at` so the classification is bound to the EXACT source
+  record the operator examined — a concurrently replaced newest record is
+  refused, never silently classified. The appended record states what
+  happened (one-time classification, operator, reason, original detail
+  digest, source recorded_at, current bound identity); the original
+  append-only line is untouched. Proof is the full end-to-end: real CLI
+  subprocess → authenticated uvicorn server → the same database → the
+  surfaces read the kind as current usable evidence; role/kind/absent/
+  failed/moved/double-classify all refuse with real statuses and write
+  nothing. Ordinary sessions still carry no 24-hour manual ritual.
+
+The independent review's harness finding was real and is fixed truthfully:
+its FIRST upgrade-gate attempt failed in 49.8 s because Chromium's unix
+socket path exceeded the ~107-char cap under the long disk TMPDIR (it then
+passed via a short owned alias). `pw()` in the upgrade gate now always runs
+the pinned playwright-cli under a short `/tmp/sr-pw-<pid>` ALIAS into the
+run's own disk-backed directory (removed in the harness `finally`) — the
+data stays on disk, only the socket prefix is short. The 514 s PASS at
+`df72a85` stands as evidence of the login itself; this round's upgrade run
+passed on the hardened harness without any alias gymnastics by the runner.
+
+Round-2 verification (real exit statuses, foreground, this tree; lanes not
+listed carry the round-1 receipts above because F1–F4 touch none of their
+inputs — no agent/model-admin, containment fixture, install sequence, web
+bundle or browser-facing behavior changed, and the web UI consumes neither
+`/readyz` nor runner details):
+
+| Lane | Rerun/carry | Result |
+|---|---|---|
+| fast (exact AGENTS command) | RERAN | exit 0 — **727 passed, 0 failed, 0 skipped**, 509 deselected, 13 warnings, 104.57 s |
+| selection | RERAN | PASS 211.1 s (new proofs classified into layers) |
+| practice | RERAN | PASS 19.0 s — 11 + 28 passed, 0 skipped, incl. the F2 real-wire pin-swap |
+| db | RERAN | PASS 731.6 s — **338 passed, 0 failed, 0 skipped** (335 + the 3 new API/CLI/DB proofs); disposable fixture created and removed |
+| authority | RERAN | PASS 26.5 s — 35 passed (safety core changed) |
+| upgrade | RERAN (once) | PASS 513.2 s — full preserving upgrade incl. the REAL browser login on the hardened harness |
+| bundle | RERAN | PASS 432.0 s — NEW `.cache/bundle/sparring-range-appliance-22c` (MANIFEST sha256 `f49867125ad0bcd4bb69b352715f7cf6f2ba267fafa3045dd8d9b1949f0def80`, revision `c9b3e4ff7fd0`, 392 files, 4 images, EXISTING images reused); runtime binding to this checkout (248 files); operator manifest renders; shipped image boots (throwaway overlay, TCG, marker `2026-10-30T11:45:44Z`); digest tamper refused |
+| agent, containment, install, frontend, browser | CARRIED (`5c9509f`) | 123 / 41 / sequences complete / 0 high+critical / 7 of 7 — unaffected inputs, stated as carried, not re-claimed |
+
+Artifacts byte-intact: sealed release MANIFEST `0cfa12f1f48c…`
+(rev `59fb5442fede`), `-22` MANIFEST `8083dd4a9578…`, `-22b` MANIFEST
+`da639671daa4ea…`. Cleanup verified: zero `sr-*` containers, gate run dirs
+and `/tmp/sr-pw-*` aliases removed, `/tmp/sr-broker-ledger-*` orphans swept
+(owned by the fixture convention). Roadmap 22 stays unchecked: no installed
+appliance, provider, systemd, nested-KVM or live-operator acceptance is
+claimed by any row above.
+
+## Plan-22 review-round-1 receipts — 2026-10-30 (branch `practice-upgrades-18-21`, final revision `df72a85`)
+
+Independent review of candidate `9776884` returned **VERDICT: FIX** (nine
+counterexamples + the AC-5 upgraded-browser-login gap). All nine were repaired
+at the root and each is committed with its proof: `cbb6550` items 1+2 (runner
+admission probes the REAL supervisor authority with TTL memoization; broker
+latch authority; three-state isolation — declared-unsupported is ADVISORY,
+never pass; qualifications bound to config identity with recorded one-time
+reclassification), `a831ef8` items 3+4 (ONE rendered enrollment location read
+by both services; cross-process flock), `e6c16a4` items 5+6 (citations from the
+exact final render window; positive audience authorization), `8ff1b0c` item 7
+(pre-cast terminal SUPPRESSED with named start offset, browser-proven including
+the reverse-seek counterexample), `f9718dd` item 8 (`read_ts` adjudicated
+against the OPERATION's server-trusted interval — migration 0028 keeps raw
+claims, idempotence compares claims, the surface names rejections), `fef55d9`
+item 9 (coach context CLASSIFIES never/active/completed/interrupted — the
+completed-run denial is gone). AC-5 closed in `df72a85`: the upgrade gate's
+manifest carries a loopback public URL, and after the real preserving upgrade
+the gate starts the upgraded payload's own venv API against the upgraded DB,
+stands up the installed nginx's one `/api`-strip rule at the baked URL, serves
+the provisioned web build and drives a REAL playwright form login for a member
+seeded with a real scrypt hash; the stored token must answer 200 on
+`/api/sessions` through the public door. Readiness stub and head assertions now
+DERIVE the schema head; head pins followed migration 0028 (`e8ba4b8`).
+
+All seven acceptance criteria were then re-proven on THIS final tree
+(`df72a85`, frontend before browser; real exit statuses, no pipe masking):
+
+| Gate | Result | Receipt |
+|---|---|---|
+| fast (exact AGENTS command) | exit 0 | **723 passed, 0 failed, 0 skipped**, 505 deselected, 13 warnings, 98.11 s |
+| selection | PASS 199.7 s | every test classified; required-mode failure probes pass |
+| practice | PASS 11.0 s | **10 + 28 passed, 0 skipped**, 1225 deselected (LIVE regressions + unchanged/aged vs changed/failed/unknown admission) |
+| db | PASS 688.1 s | **335 passed, 0 failed, 0 skipped**; disposable `sr-acc-pg-0bbb955e` created and removed |
+| agent | PASS 153.9 s | 123 passed, 0 failed/skipped |
+| authority | PASS 26.3 s | 35 passed |
+| containment | PASS 25.6 s | 41 passed, no privilege weakening |
+| install | PASS 8.2 s | real sequences clean=18 files, rerun=0 changed, upgrade=1 changed, drift detected+repaired; managed-service half operator-only |
+| upgrade | PASS 497.9 s, exit 0 | payload revision `df72a85a11cf`; **real browser login against the upgraded appliance** — form login as `p21-login` on the provisioned bundle (baked `http://127.0.0.1:PORT/api`) via the nginx-equivalent `/api` strip, token works on `/api/sessions`; readiness contract at the DERIVED head; 39 PASS lines incl. fence/interruption/restore sequences |
+| frontend | PASS 8.2 s | `npm ci` + `next build`; audit zero high/critical (1 moderate, applicability documented) |
+| browser | PASS 372.8 s | **7 passed, 0 skipped** — plan-22 honesty surfaces incl. the new pre-cast suppression test (two casts, reverse-seek re-suppression, selected-epoch follow) |
+| bundle | PASS 249.1 s | NEW bundle `.cache/bundle/sparring-range-appliance-22b` (MANIFEST sha256 `da639671daa4ea1b139311792c0b6ac69cedcfd17475e9e46ba6268c93c9c450`, revision `df72a85a11cf`, 391 files, 4 images); runtime binding to this checkout; operator manifest renders/validates; shipped image boots through a throwaway overlay (TCG, marker `2026-10-30T09:12:47Z`); digest tamper refused |
+
+Sealed `59fb…` release byte-intact (`MANIFEST.json` sha256
+`0cfa12f1f48cb24e…2052dd3`); previous candidate `-22` untouched (sha256
+`8083dd4a9578b2d0…ff6cd2`, revision `97768844d5cf`); the new bundle reuses the
+four verified images — no cold role build. Resource preflight before the heavy
+lanes (disk/RAM), per-run owned fixtures only; post-run cleanup verified: zero
+`sr-*` containers, zero `sr-broker-ledger-*` orphans, DAC fixture self-cleans.
+
+## Plan-22 implementation receipts — 2026-10-30 (branch `practice-upgrades-18-21`, revision `9776884`)
+
+All gates below ran on the FINAL committed tree `9776884` (the earlier
+`4ef295f`-era lane results were superseded when the LIVE-07 classifier and the
+session Overview props changed afterwards). Commands are the AGENTS fast
+command and `env PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B
+infra/dev/acceptance.py <gate>`; each exit status is the real process status
+(pipes are logged separately). Logs: `/tmp/opencode/ac-final.log`,
+`ac-fast-final2.log`, `ac-browser3.log`, `ac-bundle2.log`.
+
+| Gate | Result | Receipt |
+|---|---|---|
+| fast (exact AGENTS command) | exit 0 | **714 passed, 0 failed, 0 skipped**, 490 deselected, 6 warnings, 94.90 s |
+| selection | PASS 188.4 s | 1204 tests = 714 fast + 490 integration, all classified; required-mode failure probes pass |
+| practice | PASS 8.7 s | 1 real-DAC layer + 19 LIVE-regression/admission matrix, **0 skipped** |
+| db | PASS 680.1 s | **330 passed, 0 skipped**, 874 deselected; disposable `sr-acc-pg-3f79551c` created and removed; zero `srtest_*`/`sr_*` leftovers |
+| agent | PASS 152.7 s | 123 passed, 0 failed/skipped |
+| authority | PASS 26.1 s | 35 passed, 0 skipped |
+| containment | PASS 25.1 s | 41 passed, 0 skipped; no run-owned cgroups leaked |
+| install | PASS 8.1 s | real sequences clean=18 files, rerun=0 changed, upgrade=1 changed, drift detected+repaired; managed-service half explicitly operator-only |
+| upgrade | PASS 441.8 s | payload bundle revision `97768844d5cf`; LIVE-02 journal view, LIVE-04 verified-baseline re-version, LIVE-05 manifest-baked frontend URL all PASS; fence/interruption/restore sequences truthful |
+| frontend | PASS 7.4 s | `npm ci` + `next build`; audit zero high/critical (1 moderate, applicability documented) |
+| browser | PASS 279.1 s | **6 passed, 0 skipped** — includes the plan-22 honesty test (Begin blockers verbatim from a real killswitch engage, enrollment panel/warning, timing provenance) and the stage-5 member loop that caught the Overview crash |
+| bundle | PASS 223.9 s | new bundle `.cache/bundle/sparring-range-appliance-22` (MANIFEST sha256 `8083dd4a9578b2d0614d089b1c12809b520704905950dc501ffa1511d4ff6cd2`, 389 files, 4 images); bidirectional runtime binding 247 files vs checkout; operator manifest renders and validates; shipped image boots through a throwaway overlay (TCG, marker `2026-10-30T04:17:48Z`); digest tamper refused |
+
+The sealed `59fb…` release stays byte-intact (`MANIFEST.json` sha256
+`0cfa12f1f48cb24e…2052dd3`, revision `59fb5442fede8814…`); its four verified
+images were reused for the new bundle — no image rebuild. Reuse is legitimate:
+the gate boots a SHIPPED image from the new bundle and re-verifies every digest.
+
+Gate reruns on this branch also caught two real integration defects, both
+repaired with regression coverage rather than probe weakening: the admission
+probes fabricated a failing `datapath_structure` observation for noop
+datapaths outside production (23 DB-layer regressions; fixed to report
+not-applicable under the same exemption the qualification applies —
+production noop still fails closed), and the session Overview referenced
+`qualBlockers`/`keyEnroll` without props, crashing the whole session page
+client-side (browser lane only; commit `9776884`).
+
+Scope honesty: every receipt above is fixture/sandbox evidence on this host
+(browser = pinned chromium on a run-owned build; images boot under TCG).
+Installed-appliance behavior, real provider coaching, real isolation/stop,
+nested-KVM and the member SSH journey remain the operator's manual gates.
+Nothing here re-opens the 2026-10-23 commissioning receipts.
+
+## Supervised installed-upgrade findings — 2026-10-29 (plan 22 authorized)
+
+User authorized consolidated repair and autonomous Qwen-high implementation /
+independent review after planning. Binding scope:
+[plan 22](../.openchamber/plans/22-installed-practice-repairs.md), including the
+retained plan-20 F5–F9. Historical observations/workarounds below are evidence,
+not claims that permanent repairs already landed. The proposed seven-day manual
+policy override below was not confirmed applied; plan 22 supersedes it with
+explicit qualification versus admission-health semantics.
+
+Fresh planning baseline at `1083f22`, after disk/RAM/process checks:
+`env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1
+.venv/bin/python -m pytest -q -ra -p no:cacheprovider` — exit 0,
+**678 passed, 480 deselected, zero failed/skipped, six warnings, 95.97s**.
+No DB, VM, model, firewall or deployed-appliance operation was run for planning.
+Existing unrelated processes were not cleaned or terminated.
+
+Operator testing is in progress. Keep one running list here and batch permanent
+source fixes after testing, as requested by the user. Only minimal, explicitly
+reported operator recovery steps are used meanwhile; security, containment or
+data-loss concerns stop testing. Do not alter the sealed release being tested.
+
+### LIVE-01 — API cannot read the preserved legacy model credential
+
+- **Observed:** upgrade from schema 0019 reached service restart, then readiness
+  returned HTTP 500. Production settings validation reported permission denied
+  reading the existing model-key file. The attempt remains unfinished and fenced;
+  no successful release stamp was reported.
+- **Metadata evidence:** API runs as `srrange` without supplementary groups; the
+  secrets directory is root-owned, group `sr-secrets`, mode 0750, without named
+  ACLs; the model-key file is root-owned, mode 0600, without named ACLs. Both
+  directory traversal and file read are therefore unavailable to the API.
+- **Recovery instructions supplied:** grant only `srrange` traversal on the
+  secrets directory and read access on this specific key through named ACLs;
+  verify access without displaying the credential, then resume the existing
+  attempt. Never make secrets world-readable, rotate the key, discard obligations
+  or remove the maintenance fence to bypass readiness.
+- **Permanent fix to batch:** fresh-install and preserving-upgrade provisioning
+  must establish and verify API-only access to configured legacy credential
+  files, preserve credential bytes/private ownership, and refuse unsafe or failed
+  permission changes. Add actual identity/ACL tests, including refusal of access
+  by ingest, worker, bastion and web identities and an idempotent upgrade check.
+- **Operator result:** the existing attempt resumed successfully on 2026-10-29;
+  output reports `status: done`, schema 0027, provisioning complete and all six
+  services restarted, at release revision `59fb5442fede`. This confirms successful
+  upgrade recovery, not independent verification of every ACL command or the
+  subsequent browser/SSH/practice journey. Permanent provisioning repair remains
+  pending the consolidated batch. The prematurely dispatched Qwen session ended
+  without a text handoff; Git inspection found no changes from it.
+
+### LIVE-02 — Successful retry retains a stale stage error
+
+- **Observed:** the completed upgrade's restart stage reports `status: done` and
+  a new completion time but still includes the previous readiness HTTP-500 error.
+- **Impact:** confusing recovery diagnostics; the stale text must not be read as
+  a new failed restart when the attempt reports completion. No additional service
+  mutation or retry is warranted solely from this retained field.
+- **Permanent fix to batch:** distinguish historical failed attempts from the
+  current stage outcome, retaining failure evidence without presenting it as an
+  unresolved error after successful recovery. Add failure/resume/success output
+  regression coverage.
+- **Status:** batched; post-upgrade readiness and functional checks pending.
+
+### LIVE-03 — Post-upgrade doctor reports broker unreachable
+
+- **Observed:** operator `/readyz` reports ready, schema 0027, controller held,
+  runner configured, recordings writable and no issues; maintenance fence is
+  absent and all six units are active. `doctor` nevertheless reports broker
+  unreachable without explaining the failure.
+- **Follow-up evidence:** root-run `status` reports inventory HTTP 403, peer UID
+  not allowed. Broker startup reconciliation reports no pending intents, and its
+  listener is active with a restricted UID allowlist. This identifies the failed
+  root diagnostic as peer-identity rejection, not a demonstrated broker outage.
+- **Confirmed:** operator's read-only inventory request as the actual API user
+  succeeded. That user's UID matches the broker allowlist. No inventory contents
+  were disclosed, and no broker permission change was needed.
+- **Status:** broker connectivity confirmed for the API identity; root-run
+  doctor/status reporting remains a diagnostic usability fix for the batch, not
+  a broker-outage repair. Keep root outside the allowlist.
+
+### LIVE-04 — Installed verifier reports five content drifts after upgrade
+
+- **Observed:** content drift in the appliance nftables fragment, derived and
+  bastion environment files, and API/broker unit definitions. Actual differences
+  and whether they are preserved operator configuration are not yet established.
+- **Confirmed:** operator compared all five installed files byte-for-byte with
+  the current release's manifest-derived render; every file matches. No file
+  contents were exposed and no configuration/firewall mutation was performed.
+  `verify_install` compares against `install-receipt.json`; its old receipt is
+  therefore not an adequate post-upgrade baseline for these changed files.
+- **Permanent fix to batch:** update/version the verified installation receipt
+  through successful upgrade finalization, preserving prior receipts and honest
+  failure semantics. Add populated-upgrade followed by `verify` coverage; do not
+  manually replace the receipt just to suppress warnings.
+- **Status:** reported configuration drift classified as stale-baseline
+  diagnostics, not an outstanding on-disk configuration mismatch. This comparison
+  does not validate loaded firewall behavior. Readiness also reports older
+  isolation receipts as stale; that is not a fresh isolation test or proof of
+  changed isolation. Prior commissioning remains historical evidence, not
+  permission to bypass current live safety gates.
+
+### LIVE-05 — Browser login reports a fetch/network failure
+
+- **Observed:** operator reaches the sign-in page, but submitting credentials
+  displays `Failed to fetch`. Account identity is not yet confirmed.
+- **Interpretation:** this message is not evidence of an invalid username or
+  password; browser/API reachability, compiled public API URL, proxy routing,
+  TLS, mixed-content blocking and CORS must be distinguished from authentication.
+- **Next diagnostic:** capture only the browser page origin and failed login
+  request URL/status or console error; never request passwords, authorization
+  headers, tokens, request bodies or an unredacted HAR export.
+- **Status:** unresolved; no account reset, credential changes or source-fix
+  dispatch. Add any confirmed cause and minimum safe recovery to this batch.
+- **Source lead:** `run_upgrade` calls `provision_release` without its
+  `public_url` argument; its default is empty. `ensure_web_build` then supplies
+  no `NEXT_PUBLIC_API_URL`, while `web/lib/api.js` defaults to the browser's
+  localhost port 8000. This can produce a healthy appliance API and frontend
+  HTTP response but a browser that cannot submit login to the appliance.
+  Confirm the installed provision receipt and public proxy route before repair;
+  this is not yet a measured browser request destination.
+- **Confirmed operator checks:** the public `/api/readyz` route reports healthy
+  schema 0027, while the completed attempt's frontend provision receipt reports
+  no `next_public_api_url`. Combined with the inspected build/client defaults,
+  this confirms missing browser API configuration in the upgrade build. No
+  credential rejection or invalid-account conclusion is established.
+- **Recovery plan:** resource-check, then rebuild the installed frontend with
+  the existing manifest's public URL and the selected appliance Node runtime;
+  restart only the web service and confirm browser login connectivity. Keep the
+  sealed payload unchanged. Recovery execution/result not yet confirmed.
+- **Operator recovery result:** capacity checks showed adequate disk and RAM;
+  operator loaded the existing manifest public URL, stopped only the web service,
+  rebuilt the installed frontend using its selected Node binary and the correct
+  `NEXT_PUBLIC_API_URL`, then restarted the web service. Build succeeded and the
+  service reports active. No dependency reinstall or sealed-payload edit was
+  involved. Browser hard-refresh/login result remains pending.
+- **Confirmed functional result:** operator subsequently reported successful
+  browser login. The fetch failure is recovered; the permanent upgrade-build URL
+  fix remains queued for the consolidated batch. No account reset was needed.
+- **Further UI check:** operator can open Admin Models. No finished sessions or
+  old recordings are available for the proposed history checks; operator chose
+  not to pursue those checks. Historical preservation is therefore not newly
+  qualified by this installed test, and absence alone is not classified as
+  upgrade data loss. Continue with current model connectivity and new-run tests.
+- **Model check:** operator reported that the active model profile's explicit
+  probe succeeded. This confirms that particular admitted provider request, not
+  sustained agent usefulness, complete provider compatibility or range isolation.
+  New-run testing still requires the installed release-stage/safety gates.
+- **Safety UI observation:** operator reports install-ready, lab-ready and
+  attack-authorized all yes, supervisor latch clear and broker cessation latch
+  not engaged. This records the displayed state, not a new packet-isolation or
+  emergency-stop test; earlier stale-receipt details remain part of the evidence.
+- **New-run observation:** one existing web-practice lab reached `ready`; UI
+  presents separate attacker/defender bastion connections and a manual Begin
+  control. The match has not yet begun. Uptime is correctly displayed unscored
+  before valid checks. No connection-capability usernames or session identifiers
+  are recorded here. Defender SSH, active agent progress, coaching, cleanup and
+  replay are not yet qualified by this run.
+- **Permanent fix to batch:** pass the manifest public URL through the real
+  upgrade provision stage and require an authenticated browser login regression
+  after an upgrade, not only frontend HTTP-200 readiness.
+
+### LIVE-06 — Defender bastion rejects desktop public-key authentication
+
+- **Observed:** operator used the defender connection instruction from a second
+  desktop terminal; bastion answered `Permission denied (publickey)`.
+- **Scope:** this establishes reachable SSH and failed authentication, not a
+  guest-readiness failure or a proven upgrade regression. Offered desktop key,
+  agent availability and enrollment for the owning application account have not
+  yet been compared. Connection capability usernames are intentionally omitted.
+- **Next diagnostic:** inspect desktop agent fingerprints/public-key filenames
+  and account-bound enrollment without disclosing private keys or weakening
+  bastion authentication. Do not copy appliance management/runner private keys
+  to the desktop or enable password login as a workaround.
+- **Status:** unresolved diagnostic; no permanent fix dispatched.
+- **Follow-up:** desktop agent initially contained no identities. Operator
+  loaded the intended key into the agent with a bounded lifetime and removed
+  the temporary private-key file; SSH still refused while the lab was ready.
+  Appliance inspection found zero enrolled keys for the current browser account.
+  Historical commissioning used a different member account. This points to
+  account-bound onboarding, not an established upgrade key-loss regression;
+  compare enrolled account names before adding the intended public key. No
+  private key or key fingerprint is recorded here.
+- **Confirmed enrollment mismatch:** only the historical member account has
+  enrolled keys, and one of those fingerprints matches the desktop agent's
+  loaded key. The current browser account has none. Recovery can reuse that
+  existing public key for the current account without exporting a private key,
+  removing old entries or changing bastion authentication. Enrollment/reload and
+  successful defender SSH are still pending operator confirmation.
+- **Recovery confirmed:** operator reached the defender guest through the
+  recorded bastion and `whoami` returned the expected defender identity after
+  adding only the matching existing public key for the current browser account
+  and reloading the bastion. No private-key redistribution was needed. Treat
+  this as account onboarding, not an established upgrade key-loss defect.
+
+### LIVE-07 — Begin correctly refuses expired safety evidence; UI is unclear
+
+- **Observed:** new lab is ready and defender SSH works, but Begin refuses
+  baseline verification, datapath proof and killswitch-test receipts older than
+  the configured 24-hour lifetime. Earlier Safety page release stages all showed
+  yes, with both latches clear.
+- **Interpretation:** expired evidence is not evidence of newly broken isolation
+  or cancellation. Begin's freshness refusal is fail-closed and must not be
+  bypassed by extending TTLs, editing timestamps or submitting unobserved passed
+  attestations. Historical commissioning remains completed, but does not refresh
+  these time-bounded records.
+- **Next operator work:** collect fresh actual isolation and stop-test evidence
+  in the disposable lab, then record only observed outcomes through supported
+  operator flows. Do not start model-driven attacks before the required gates.
+- **Permanent batch item:** expose current Begin blockers/freshness clearly in
+  the session and safety UI, distinct from commissioning/release-stage state.
+- **Status:** match not begun; renewed evidence and active-run checks pending.
+- **Operator usability requirement:** user explicitly rejects repeating manual
+  commissioning/SSH/network/stop procedures for ordinary use. The expired-record
+  renewal workflow is a practical deployment blocker, not merely UI polish.
+  Stop repeating ad hoc manual checks. Include a supported, evidence-producing
+  automatic validation/renewal workflow in the consolidated repair proposal;
+  preserve fail-closed behavior for failed/unknown checks and require operator
+  action for genuine configuration changes or failures. Do not satisfy this by
+  silently increasing TTLs, copying old attestations, fabricating outcomes or giving model
+  workers host credentials/firewall authority. Exact design and any privileged
+  operator installation changes require explicit review before implementation.
+- **Fresh defender observations:** external ICMP attempt reported network
+  unreachable; bounded DNS lookup returned no addresses with exit code 2; a
+  repeated IPv6-default-route query returned no routes and exit code 0. An
+  earlier interrupted IPv6 query was inconclusive and is superseded by that
+  successful repeat. These observations cover this defender guest only, not
+  attacker egress, management/same-bridge isolation or emergency-stop behavior.
+- **Current-lab repeat:** operator again confirmed defender identity, noninteractive
+  sudo, unreachable external ICMP, DNS no-resolution exit 2 and no IPv6 default
+  route with exit 0. Do not keep repeating these observations while the same
+  lab/configuration remains in scope. Operator correctly questioned repeated
+  commissioning steps: distinguish completed historical qualification, fresh
+  observations already collected, and the specific expired records blocking
+  Begin. No additional model-driven run or fresh stop-test pass is claimed.
+
+### LIVE-08 — Apparent idle expiry followed by unresponsive web UI
+
+- **Observed:** before Begin succeeded, operator reported SSH stopped responding
+  after the displayed lab idle-expiry time, then the web page also stopped
+  responding. Expiry/cleanup completion and the affected services are not yet
+  confirmed. No model-driven match was started in this test.
+- **Interpretation:** normal idle expiry could close guest SSH, but must not be
+  assumed to explain an unresponsive appliance website. Distinguish browser,
+  frontend, API, cleanup and host resource failures before intervention.
+- **Next diagnostic:** read-only appliance uptime/resource/service checks and
+  bounded local API/frontend HTTP probes from the appliance administrative SSH
+  session, not the expiring guest sessions. Preserve logs; no blind reboot,
+  cleanup deletion or service restart before capturing evidence.
+- **Status:** unresolved incident; add findings to the consolidated batch, not
+  individual speculative source-fix dispatches.
+- **Operator follow-up:** operator reported the broader hypervisor connectivity
+  problem resolved and unrelated to this work. No host command or live
+  intervention was performed by the assistant. Do not classify the outage as an
+  application defect without further evidence; appliance readiness, website
+  responsiveness and expired-lab cleanup still need confirmation after recovery.
+- **Recovery observations:** appliance readiness again reports ready, schema
+  0027, no issues and controller held. Operator reports the original session
+  state is complete. A subsequent operator `recovery status` check confirmed
+  zero pending intents, active claims and open obligations. These are observed
+  broker-ledger counts, not proof that every live libvirt object or model-job
+  obligation has been independently enumerated.
+
+### LIVE-09 — UI offers an attacker bastion connection outside key policy
+
+- **Observed:** desktop's persisted member key matches the enrolled account;
+  attacker connection now passes initial bastion authentication but fails the
+  target hop with `PermissionDenied`. This is distinct from the earlier missing
+  desktop identity and account-enrollment problems.
+- **Source classification:** guest role policy places the member bastion key
+  only in defender guests; attacker accepts the scoped runner principal instead.
+  Bastion target dialing uses the defender user. Recommending the displayed
+  attacker connection for member SSH was therefore an operator-guidance error,
+  not a reason to broaden attacker key policy or redistribute service keys.
+- **Permanent batch item:** do not advertise member SSH connections that cannot
+  authenticate under the role contract; clearly distinguish attacker telemetry
+  from defender interactive access. Add UI/API role-policy compatibility tests.
+- **Next action:** use only the current defender connection for member SSH.
+  Attacker safety observations need the supported operator diagnostic channel;
+  do not improvise privileged access or mark them passed from this refused hop.
+- **Status:** recorded for batch; no key-policy change or source-fix dispatch.
+
+### LIVE-10 — Coach misattributes operator setup to attacker activity
+
+- **Observed:** before a model-driven match could begin, coach described the
+  operator's SSH identity/sudo/connectivity checks as suspicious reconnaissance.
+  When corrected by the operator, it doubled down and described audit events as
+  attacker entries rather than acknowledging uncertain attribution.
+- **Impact:** misleading guidance and poor handling of explicit user correction.
+  Event citations and a host label do not establish authenticated actor identity;
+  host telemetry is not independent proof of attacker activity or intent.
+- **Permanent batch fix:** provide phase/run state and reliable command provenance
+  in coaching context, distinguish member bastion activity from agent operations
+  and background telemetry, preserve unknown attribution, and acknowledge user
+  corrections without treating them as independently verified evidence. Add
+  ready-before-Begin and member-setup/telemetry counterexamples. Subjective
+  coaching must not alter deterministic scoring or verified outcomes.
+- **Status:** batched; no new model-worker invocation or speculative source patch.
+
+### Operator policy proposal — safety-evidence validity interval
+
+- User requested an actionable policy correction after clarifying that elapsed
+  time alone does not falsify earlier observations. A bounded seven-day (168 h)
+  operator validity interval is proposed for supervised practice, explicitly
+  retaining original record timestamps and all configuration-change, failed
+  evidence, latch and unknown-cessation checks. It is not automatic validation or
+  a claim that the old observations were rerun.
+- Local settings parsing confirmed `SR_SAFETY_EVIDENCE_MAX_AGE_H=168` resolves
+  to 168. Operator application/result is pending; no live configuration changed
+  by the assistant. The longer interval does not establish unchanged isolation
+  and is not a substitute for investigating an actual network/control change.
+- Long-term evidence-producing renewal and clearer freshness UI remain batched;
+  do not silently change global defaults or fabricate new passed attestations.
+
+## Milestone 21 review round 6 correction — `deploy/hand_off.sh` launch contract — 2026-10-28 (`82f6eac`)
+
+The audit found the round-6 note's audit claim itself wrong:
+`deploy/hand_off.sh` exists, is tracked, is listed in the release bundle,
+and its five payload-tree Python calls ran with no bytecode suppression
+— a real hand-off (which runs the bundle's CLI from inside the unpacked
+bundle via `cd "$BUNDLE"`) writes `__pycache__/*.pyc` into the sealed
+tree exactly like the §7 bootstrap did. The round-6 text above is
+corrected in place; nothing else in the runtime or the round-6 engine/
+gate fixes changes.
+
+Fix (`82f6eac`, behaviour-preserving): explicit `-B` on each of the
+five calls AND `export PYTHONDONTWRITEBYTECODE=1` for the whole script.
+Child-path audit: `appliance.py`'s `Runner` builds child envs from
+`os.environ` (stripping only credential names) and execs, so the
+exported value reaches every child interpreter including the apply
+chain; `-B` alone could not (not inherited). No installation behaviour
+changes — bytecode caching only. New contract test
+`test_the_hand_off_launches_its_python_bytecode_safe` asserts `-B` on
+exactly the five calls plus the export; both pre-existing hand-off CLI
+tests still pass; `bash -n` clean.
+
+Focused regression (REAL script; NO live install): run inside a
+user+mount namespace with an overlay on `/etc` (the container has no
+root and no `/etc/sparring-range`), against a HARDLINK copy of the
+sealed bundle, with a pass-through `--python` wrapper that logs every
+interpreter call and stubs only `apply` and `firstboot`, bytecode env
+explicitly UNSET outside so the script's own contract did the work.
+Results: all five calls logged `-B` + `PYTHONDONTWRITEBYTECODE=1`
+(including the stubbed apply call's env — proving child-path coverage);
+the OLD §2/§3/§4 steps ran genuinely (verify `ok: true` on the copy,
+real key generation, real manifest render, real plan); script exited 0
+at "hand-off complete" with **ZERO new files, zero `.pyc`** in the
+bundle tree; the OLD unguarded call shape on the same copy then wrote
+**exactly 11 unlisted files** (deploy/infra `__pycache__` — matching
+the reviewer's reproduction), and removing only those 11 restored the
+copy byte-identically (pre/post file lists `cmp`-equal). The sealed
+original (hardlinked throughout) verified intact afterwards: 375 files,
+4 images, zero `.pyc`, MANIFEST sha256 `7e002239ec41…` unchanged. The
+install/firstboot steps stay operator-only; nothing here accepted them.
+
+Final artifact (rebuilt at the correction HEAD; no image was rebuilt —
+digests byte-identical: base `6b1fbcb8b1a7…`, local `97d694851c20…`,
+db `7c6072615646…`, attacker `015aeafe5a5f…`): revision
+**`59fb5442fede8814c879d29c61fb88748cabc5b2`**, MANIFEST.json sha256
+**`0cfa12f1f48cb24e0c37aa4783390f834612023be34ed45f70939ac592052dd3`**,
+375 listed entries / 376 on disk including `MANIFEST.json`, 4 images;
+the gate's runtime-binding comparison re-run standalone (same
+`deploy.bundle` helpers as the `bundle` lane, no TCG boot per scope):
+**242 packaged vs 242 checkout, zero missing/extra/changed**, the
+bundled `deploy/hand_off.sh` digest equals the checkout's. Sealed-
+payload check on this artifact (bytecode env UNSET): `-B` bootstrap
+imports → `-B bundle.py verify .` → `-B appliance.py upgrade --help` →
+`-B appliance.py doctor --help` → verify `ok: true`, **zero new files,
+zero `.pyc`** (pre/post lists `cmp`-equal). Fast suite at this HEAD:
+**678 passed, 0 failed, 0 skipped** (480 deselected, 96.95 s — the
++1 is the new hand-off bytecode-safety contract test). This bundle
+supersedes `4f421b3e1d07…`/`7e002239ec41…` (which lacked the script
+fix); the heavy `upgrade`/`bundle` lanes were NOT rerun (no runtime
+change beyond the tracked script since their accepted 35-probe/TCG
+PASSes at `4f421b3`).
+
+## Milestone 21 review round 6 — sealed-tree launch hygiene — 2026-10-28 (`4f421b3`)
+
+The independent review at `7f01747` accepted ALL runtime/artifact
+blockers (its own reruns: fast 677/480 93.80 s; 34-probe `upgrade` PASS
+449.4 s; in-place `bundle` PASS 226.3 s; DB compat 8 pass 14.72 s;
+ownership CLI PASS 29.1 s; old-52ae355-lock bootstrap imports PASS
+1.5 s — no pydantic-AI requirement) and left ONE documentation/launch
+fix: the §7 bootstrap imports INSIDE the unpacked bundle with a bare
+interpreter and wrote 11 unlisted `__pycache__/*.pyc`; the following
+`bundle.py verify` then failed on the polluted seal (reviewer removed
+only their own 11 files; bundle PASS restored).
+
+Reproduced here exactly (receipts `.cache/`+`/tmp/opencode/sealed_*`):
+unguarded bootstrap in the real sealed bundle → **11 new files**;
+`bundle.py verify` → exit 1 naming
+`unlisted file: deploy/__pycache__/appliance.cpython-313.pyc` …; after
+removing ONLY the 11 owned files the seal was byte-identical
+(pre/post sha256 lists `cmp`-equal).
+
+Fixes (scope kept minimal):
+- **Runbook:** `-B` added to EVERY payload/installed-tree Python
+  invocation (bootstrap, `bundle.py verify`, upgrade dry-run/run,
+  resume/restore shorthand, first-install `verify`/`manifest`/`plan`/
+  `apply`, `firstboot`, `status`/`doctor`/`recovery`, post-upgrade
+  `doctor`/`verify`), with the sealed-tree contract stated; remaining
+  unguarded commands audited and CONFIRMED build-machine-checkout
+  context (bundle packaging excludes `__pycache__` — bundle.py line 60;
+  dev-tree bytecode is normal). HANDOFF-21 commands audited (dev
+  checkout only — no contradiction). CORRECTION (same day, audit
+  follow-up): an earlier draft of this section WRONGLY claimed
+  `deploy/hand_off.sh` does not exist — it DOES exist and is tracked,
+  listed in the bundle, and its five payload-tree interpreter calls
+  (bundle verify, bundle manifest, appliance plan/apply/firstboot) were
+  unguarded; fixed and re-proven in the round-6 correction section
+  below (`82f6eac`).
+- **Engine (one necessary line, probed):** `-B` is a per-interpreter
+  flag; the ONE child that executes payload-tree source is the
+  migration runner (alembic loads the payload's own `env.py`/version
+  scripts via importlib's source loader). Probed against the installed
+  alembic: `load_module_py` **writes** `env.cpython-313.pyc` next to
+  the loaded file without a guard; `PYTHONDONTWRITEBYTECODE=1` or `-B`
+  suppress it. `forward_migrate`'s alembic child env now sets
+  `PYTHONDONTWRITEBYTECODE=1` — the seal holds by construction, not by
+  hoping the operator exported anything. Other children import only the
+  INSTALLED tree (runtime bytecode there is normal). Unlisted-file
+  verification stays STRICT: bytecode is refused, never excused.
+- **Gate:** mirrors the documented launch contract (CLI env) and adds a
+  35th probe — after the REAL 0019→0027 upgrade, the payload bundle is
+  asserted byte-clean of `__pycache__`/`*.pyc`. **`upgrade` PASS 35/35
+  461.6 s** (`.cache/gate_r19_upgrade.log`).
+- **Runbook:** serialized-operator rule — one upgrade CLI at a time;
+  NEVER edit/swap/re-own the maintenance fence while a CLI run is live
+  (any ownership change only ever BLOCKS: no stamp, no unfence,
+  resumable); intervene after the run exits fail-closed.
+
+Focused regression (against the NEW sealed bundle, bytecode env
+explicitly UNSET so `-B` did the work): documented sequence
+`python -B -c 'import deploy.appliance, deploy.upgrade, sqlalchemy,
+alembic'` → `python -B deploy/bundle.py verify .` →
+`python -B deploy/appliance.py upgrade --help` → **verify `ok: true`
+(375 files, 4 images), ZERO new files (pre/post sha256 lists
+identical), help rendered** — no credentials in argv, real CLI surface.
+
+Corrected artifact (runtime line change ⇒ repack; images byte-identical
+— base `6b1fbcb8b1a7…`, local `97d694851c20…`, db `7c6072615646…`,
+attacker `015aeafe5a5f…`): revision **`4f421b3e1d074b59229af739c88823623c472722`**,
+MANIFEST.json sha256
+**`7e002239ec41f924332ad5da2785c7f5d7582bba9fac6f867cfaaada3a482705`**,
+375 listed entries (4 images included) / 376 on disk including
+`MANIFEST.json`, 242 runtime files bound; `bundle` gate PASS 217.3 s
+(includes the TCG boot — marker `2026-10-28T13:17:51Z` — and tamper
+refusal as part of that standard lane); fast **677/0/0** (96.1 s).
+Cleanup: only the 11 self-created bytecode files (then the emptied
+`__pycache__` dirs) were removed from the seal, verified
+byte-identical; no other files touched.
+
+## Milestone 21 review round 5 — fence-ownership acquisition/finalization, deterministic gate revision — 2026-10-28 (`9dcf354`)
+
+The independent review at `85efa92` returned **VERDICT: FIX** with two
+actionable blockers (the other five round-4 counterexamples were
+confirmed repaired). Both fixed at `9dcf354`; the re-forged `upgrade`
+gate passes **34/34 probes in BOTH TMPDIR modes** — default
+(`.cache/gate_r18_upgrade_defaulttmp.log`, PASS 426.2 s) and the
+DOCUMENTED disk-backed `TMPDIR=$PWD/.cache/tmp`
+(`.cache/gate_r18_upgrade_disktmp.log`, PASS 463.4 s) — proving every
+cross-attempt and ownership probe actually executes on a disk-backed
+temp root.
+
+Finding → fix → proof:
+
+1. **HIGH — fence ACQUISITION and FINALIZATION ignored ownership**
+   (reviewer's actual-CLI/PG reproduction at `85efa92`: an existing
+   FOREIGN-owned fence was overwritten and the run stamped done; a
+   fence replaced with `{}` during the readiness window was removed and
+   stamped done — the round-4 fix covered only the RESTORE side).
+   → Acquisition now classifies the fence (absent/owned/anonymous/
+   unreadable) and REFUSES a foreign, anonymous or corrupt fence BEFORE
+   any mutation or journal attempt — kept byte-exact, never adopted, no
+   waiver for the first upgrade; an absent fence is taken with
+   `O_CREAT|O_EXCL` so no operator can be raced between check and write
+   (a concurrent creation stops the attempt without touching the file);
+   FINALIZATION re-requires `owned == attempt` after readiness — a
+   mid-run swap blocks with NO stamp, byte-exact fence, and a truthful
+   in-progress resumable journal; completion clears ONLY its exactly-
+   owned fence (never None/unknown/foreign); a resume proceeds only
+   over its own verified fence identity. → Fast: 5 contract tests
+   (`tests/test_plan21_review_round5.py`). Gate scenario W (actual CLI,
+   deterministic): foreign `manual-op-4242` refusal (fence byte-exact,
+   zero attempts, no stamp); `{}`/corrupt/empty-owner refusals
+   ("cannot be proven"); fresh absent-fence positive records its own
+   attempt; swap-to-`{}` once quiesce completes blocks finalize (no
+   stamp/unfence, bytes kept, journal resumable); verified-own resume
+   completes and clears exactly its own fence. Existing cross-attempt
+   restore (X) unchanged and passing.
+2. **MEDIUM — the required gate FAILED under the documented disk-backed
+   TMPDIR** (reproduced here at the mechanism level AND by the reviewer
+   full-gate run: exit 1, 403.7 s, "cross-attempt fixture needs a second
+   revision — 85efa92…": an extracted tree inside the checkout
+   DISCOVERS the parent repo, so `_revision()` returned the candidate's
+   own HEAD; all cross-attempt and later negatives never ran). → The
+   second payload is now built in a proper ISOLATED git fixture (its own
+   ancestry inside `src2`, so discovery stops at `src2/.git`); the
+   assertion was TIGHTENED (40-hex real revision, ≠ candidate, ≠
+   "unknown") — production git packaging verification untouched, the
+   distinct-revision requirement not relaxed. → Proven by the full gate
+   PASSing under both default and `TMPDIR=$PWD/.cache/tmp`, with the
+   scenario-X revision-independent path and all later negatives
+   executing (34 probes both modes).
+
+Operator-handoff corrections: §7 now runs the payload tree's CLI under
+the INSTALLED dependency-bearing venv `/opt/sparring-range/.venv/bin/
+python` with `cwd = /srv/sr-release` — the tested contract (acceptance
+drives exactly: locked python + payload-tree `deploy/appliance.py` +
+tree cwd) — plus an explicit bootstrap-import preflight
+(`import deploy.appliance, deploy.upgrade, sqlalchemy, alembic`,
+verified to import under the locked dependency set) and the rule that
+an older venv is repaired by the provision stage, never hand-patched.
+File-count claim corrected and derived explicitly: the round-4 bundle
+listed **374 manifest entries** (including the 4 image files) — 375
+files on disk only when counting `MANIFEST.json` itself; the current
+round-5 bundle lists **375 entries / 376 on disk** (+1: the new
+round-5 test file, a manifest-listed tests/ input). Earlier prose
+conflated the two counts.
+
+Round-5 lane receipts (serialized, own resources, cleanup verified):
+fast **677 passed / 0 failed / 0 skipped** (480 deselected, 6 warnings,
+95.8 s); `upgrade` **PASS 426.2 s (default TMP)** and **PASS 463.4 s
+(disk-backed TMP)**; `selection` PASS 181.9 s; `python` 4.6 s,
+`authority` 25.7 s, `containment` 24.9 s, `install` 7.2 s PASS;
+`bundle` **PASS 222.6 s**. `db`/`agent` not re-run — the diff is
+`deploy/upgrade.py` + gate + runbook + tests, zero `srplatform/` change
+(both lanes passed at `8cbe932`; fast suite includes all affected
+boundary tests); `frontend`/`browser` — `web/` still byte-identical;
+`images`/`capture` — verified images reused BYTE-IDENTICALLY (digests
+re-matched), no rebuild authorized; `packet`/`journey`/release remain
+operator-machine PENDING, never simulated.
+
+Artifact refresh (runtime-only; NO image rebuild): bundle revision
+**`9dcf3547cd92f34cec5ad752723e6a53f3b40539`**, MANIFEST.json sha256
+`47b1774a460edb59dab40f977cc52bb305c3c2e3821d3f94b2e55da94a6a0eb4`;
+375 manifest entries (4 images included), 376 files on disk including
+`MANIFEST.json`; 242 runtime files bound to the tested revision; images
+byte-verified unchanged (base `6b1fbcb8b1a7…`, mojang-web-local
+`97d694851c20…`, mojang-web-db `7c6072615646…`, attacker
+`015aeafe5a5f…`); shipped-image TCG boot re-passed (marker
+`2026-10-28T12:19:13Z`), tamper refused.
+
+## Milestone 21 review round 4 — readiness contract, fence ownership, named-env scrub — 2026-10-28 (`2654683`/`8cbe932`)
+
+The independent review at `f6b57b3` returned **VERDICT: FIX** with five
+findings (two HIGH). All five are fixed at `2654683` and re-proven by the
+re-forged `upgrade` gate at `8cbe932` (32 probes, **PASS 407.1 s**,
+`.cache/gate_r16_upgrade.log`) plus 11 new fast tests
+(`tests/test_plan21_review_round4.py`, 11 passed).
+
+Finding → fix → proof:
+
+1. **`/readyz` answers HTTP 200 with `ready:false`; the engine accepted
+   any 200** (HIGH, reviewer-owned real-API reproduction: the CLI stamped
+   0027 while the endpoint reported `schema 0019 behind head 0027`).
+   → `_readiness_probe` PARSES the production contract: exact `ready is
+   True`, `issues == []`, `migration_version ==` the payload's head;
+   non-JSON/HTML, missing fields, non-bool truthiness and
+   ready-with-issues all fail closed, and a stale old process reporting
+   `ready:true` at an OLD head is refused. → Fast: 8 parametrized shapes
+   + a healthy/stale `wait_for_readiness` test against real local servers.
+   Gate: the fixture now answers the REAL shapes (200/ready-false, 200
+   ready-true-0019, healthy 0027 — the fake 503 is gone); the resume
+   refuses both bad shapes naming the violated field, keeps the fence,
+   writes NO stamp, and completes only when the contract holds.
+2. **`--restore-config` of a COMPLETED attempt released a DIFFERENT
+   unfinished attempt's admission fence** (HIGH: reproduced exit 0
+   `maintenance_fence_cleared: true`, services untouched, admission
+   reopened under unresolved work). → The fence JSON records its owning
+   `attempt`; completion clears only its own fence (foreign/unreadable
+   identity → RETAINED + reported). `restore_config` decides against the
+   WHOLE appliance: any other unresolved attempt (corrupt journals count
+   as unresolved) or an unknown/foreign fence identity keeps admission
+   refused. → Gate scenario X (own sandbox + DB `srupg5`): A completes;
+   B — a second VALID payload (same source, different revision stamp) —
+   fails at the admission stop owning the fence; restoring A keeps B's
+   fence BYTE-IDENTICAL with zero service commands; B's own completion
+   releases exactly its own fence; unreadable and foreign fence
+   identities are kept; only with everything resolved does a restore of
+   the done attempt report admission clear.
+3. **`--db-url-env ANYNAME` leaked the selected credential into
+   `pg_dump`/provision children** (MEDIUM: fixed-name filter only;
+   reproduced `REVIEW_PRIVATE_OWNER` present in child envs). → The CLI
+   registers the SELECTED name (`note_credential_env_names`); every
+   scrubber uses `credential_env_names()` — an explicit name set, never
+   a pattern. → Gate: scenario A runs end-to-end with
+   `--db-url-env REVIEW_PRIVATE_OWNER`; the pg_dump wrapper aborts
+   (exit 48) if that name ever reaches a child env, and the su-shim
+   captures every installer-channel child's environment keys — 54 keys
+   captured, zero credential names. Fast: Runner ambient-scrub for a
+   registered custom name.
+4. **REQUIRED_RUNTIME_CONTRACT was incomplete** (MEDIUM: dropping
+   `srplatform/db/migrations/env.py` or `srplatform/worker_supervisor.py`
+   from disk AND inventory passed). → The contract is derived from the
+   actual EXECUTION SURFACE: locks + `alembic.ini` + migrations `env.py`
+   + every unit ExecStart module (`srplatform/api/app.py`,
+   `srplatform/worker_supervisor.py`, `srplatform/bastion/proxy.py`,
+   `infra/appliance/brokerd.py`) + engine files; `srplatform/model_jobs.py`
+   (not an ExecStart module) dropped. → Gate negatives loop all three
+   representative files (lock, env.py, worker_supervisor): refused
+   preflight, zero side effects.
+5. **Runbook journal pipeline mapped retrieval failure to "clean boot"**
+   (MEDIUM: reproduced exit 0 + "clean boot" when journalctl fails). →
+   Retrieval is separated from interpretation: `journalctl` writes to a
+   private `mktemp` file (trap-removed); only a SUCCESSFUL retrieval with
+   no error lines prints `clean boot`; a retrieval failure prints JOURNAL
+   RETRIEVAL FAILED and exits 1. → Fast test extracts the documented
+   pipeline VERBATIM from `docs/OPERATOR_RUNBOOK.md` and executes it
+   against fakes: clean→0/"clean boot"; retrieval-fail→≠0/no clean;
+   error lines→investigate/no clean; missing unit→hard fail first.
+
+Round-4 lane receipts (all at `8cbe932`, serialized, own fixtures):
+fast **672 passed / 0 failed / 0 skipped** (480 deselected, 6 warnings,
+93.9 s); `upgrade` **PASS 407.1 s** (32 probes, +7 round-4 probes);
+`selection` PASS 177.9 s; `db` **PASS 322/0/0** (685.8 s); `install`
+PASS 6.9 s; `agent` PASS 153.6 s; `python` 6.2 s / `authority` 27.9 s /
+`containment` 24.9 s PASS; `bundle` **PASS 252.8 s**. `frontend`/
+`browser` not re-run — `git diff 86323f0..HEAD -- web/` is EMPTY (byte-
+identical tree that passed both at round 3). `images`/`capture`
+intentionally NOT re-run: the verified images are reused BYTE-IDENTICALLY
+(digests re-matched below) and no rebuild was authorized. `hypervisor`/
+`access` not re-run: no change to brokerd/bastion/render paths (the
+`deploy/appliance.py` diff is the Runner scrub + CLI passthrough only).
+`packet`/`journey`/release stay operator-machine PENDING, never simulated.
+
+Artifact refresh (runtime-only repackage; NO image rebuild): release
+bundle at revision **`8cbe932d1c20fa3574dc943313a21942a41d79c0`**, 374
+manifest-listed file entries (the 4 image files included; 375 files on
+disk only counting `MANIFEST.json` itself — wording corrected after
+review round 5), MANIFEST.json sha256 `cb5e4712e1754506ca86449089e219235a77ff93351588ad29b827b2318e6eb9`;
+242 runtime files bound to the tested revision; images carried UNCHANGED
+and byte-verified against the independently verified set — appliance-base
+`6b1fbcb8b1a7…`, mojang-web-local `97d694851c20…`, mojang-web-db
+`7c6072615646…`, attacker `015aeafe5a5f…` (malformed TEST_KEYS blobs
+remain supervised-practice identity only). Shipped-image TCG boot from
+the bundle re-passed (marker `2026-10-28T10:59:12Z`), tamper refused.
+Cleanup verified: zero `sr-*` containers, no gate tmp dirs, no competing
+jobs were displaced.
+
+## Milestone 21 review round 2 — reproduced FIX and superseding proofs — 2026-10-27 (`0a169e9`)
+
+The second release-focused review at `2ba575e` returned **VERDICT: FIX**
+with seven blockers; the reviewer's upgrade-gate FAIL (19.4 s, `backup
+digest mismatch upgrade/.../journal.json`) was independently REPRODUCED
+here before fixing (`.cache/gate_r10_upgrade_repro.log` shows the earlier
+engine still passing only because the journal-exclusion parameter existed
+unwired — flaky passes, not proof; they are retracted). Every fix is
+proven at the REAL CLI level by the re-forged `upgrade` gate; claim
+discipline: the gate was run three consecutive times (93.8 s, 94.6 s,
+93.5 s — `.cache/gate_r11_upgrade.log`, `.cache/gate_r12_upgrade_{1,2}.log`),
+all PASS, all fixtures self-removed (`NO_SR_CONTAINERS`, no gate tmp).
+
+Finding → fix → proof (all at `0a169e9`; fix commits `431f2c1`/`0a169e9`,
+gate `a2ee8c9`):
+
+1. **Production CLI did not provision the runtime** → provisioning is a
+   real journaled stage between activation and migration running the
+   SAME service helpers as install (locked `requirements.lock` venv
+   install, selected Node, per-UID runtime verification on the real
+   appliance, locked frontend build) with the installed venv required to
+   import every unit entrypoint; migrations default to the installed
+   venv python, never the invoking interpreter. Proof: positive (receipt
+   + independent import probe of `srplatform.api.app`/`infra.appliance.brokerd`
+   with the created venv), negative (impossible lockfile → provision
+   failed, fence up, no stamp, resumable), both through the real CLI.
+2. **Quiescence false / no admission fence** → durable work now read
+   from every authority (runs, model jobs incl. `cessation_unknown`,
+   dispatched-command inventory, ledger — a MISSING ledger refuses unless
+   `--allow-fresh-install` is truth); an admission fence file is held
+   from preflight through verified restart and the API answers 503 to
+   NEW work while login/internal-callbacks/health flow; quiescence is
+   RE-proved under the fence. Proof: dry-run refusal for queued AND
+   cessation_unknown jobs with zero side effects; missing-ledger
+   refusal; fence survives SIGKILL, released only on completion;
+   TestClient 503/admit matrix against the real app.
+3. **Config backup contained its own mutable journal; restore was not
+   atomic** → the backup excludes the journal tree entirely; restore is
+   TWO-PASS (complete inventory + digests + metadata + path safety
+   validated BEFORE any write). Proof: no `upgrade*` entries in any
+   backup manifest; corrupting a LATE backup file changes ZERO files;
+   the attempt journal is never restored over.
+4. **Restore destroyed original permissions/ownership** → backups record
+   ORIGINAL mode/uid/gid separately from the private copy; restore
+   applies them (root restores fully; a non-root restore may only touch
+   its own files — never privilege guessing). Proof: 0640 service file
+   and 0644 file corrupted+chmodded, restored byte-exact with original
+   modes.
+5. **Restart failure looked like success; resume could be no-op'd away**
+   → version stamp only after a CHECKED restart (restart + `is-active`
+   per unit); an unfinished attempt outranks every no-op answer; failed
+   restart/provision keep the fence up and the attempt in progress.
+   Proof: against a `systemctl` service double — failing restart → exit
+   ≠0, journal restart failed, NO stamp, fence up → resume completes →
+   stamp then; unfinished+resume never answers no-op.
+6. **DB owner secret in argv** → `--db-url` REMOVED (the CLI refuses
+   it); the URL arrives by named environment variable and pg_dump
+   receives endpoint flags + private 0600 `PGPASSFILE` only. Proof: the
+   gate's pg_dump wrapper exits 47 if the synthetic fixture secret ever
+   appears in its argv and 46 without the PGPASSFILE channel — the
+   passing gate IS the inspection.
+7. **Preflight skipped payload verification** → `verify()` (bytes +
+   contract + path/duplicate safety) runs before ANY qualification,
+   dry-run/no-op included; contract must match manifest revision/version/
+   inventory. Proof: tampered bytes REFUSED where a no-op would have
+   answered; contract revision lie refused; duplicate manifest keys
+   refused; pre-21 refused — all before side effects.
+
+Supporting fixes (build-fix class, reported per instruction):
+`run_operations.state` (not `status`) in the durable check; the sandbox's
+venv creation gained `_create_venv` (`python3 -m venv` = appliance
+contract, `uv venv --seed` for uv-served dev hosts — production call
+unchanged) and the broker libvirt-binding exposure became an explicit
+broker-role step (a sandbox has no broker/libvirt; the appliance keeps
+it required). Gate plumbing: wrapper arg parsing, tar-stream bad-lock
+payload (hardlinks cannot cross tmpfs), import path.
+
+Milestone 21 status: local software lanes now cover the corrected
+engine; `images`/`capture` role artifacts were built at `2ba575e`
+(role INPUTS unchanged since — see artifact receipt below) and the
+release bundle must be (and will be) rebuilt from the corrected HEAD so
+its `upgrade` contract matches the fixed engine. `packet`/`journey`/
+installed-systemd/Strata/nested-KVM remain operator-machine pending —
+never passed here.
+
+### Role-artifact receipt (supervised-practice candidate) — built 2026-10-27
+
+Self-contained flattened qcow2 artifacts (`qemu-img info` shows NO
+backing file), built through the production builders with the repaired
+pins; the resolved package versions below were RECORDED FROM THE BUILD
+GUEST's own serial output, proving the artifacts match the repaired pin
+file (`pins_sha256 2c284ee217f3…`, git input `2ba575e62…` — role INPUTS
+unchanged through the review fixes; input hashes `b468a1840bf5c669` /
+`b3eb3947c5bb8fb2` / `f5330fa551f3604c` are what the `images` gate
+cache-keys on, so its rebuild reuses them honestly as BUILD-CACHED):
+
+| Artifact (`.cache/images/`) | sha256 (prefix) | disk |
+|---|---|---|
+| `mojang-web-local.qcow2` | `97d694851c20…` | 2728 MiB |
+| `mojang-web-db.qcow2` | `7c6072615646…` | 2724 MiB |
+| `attacker.qcow2` | `015aeafe5a5f…` | 2249 MiB |
+
+Guest-resolved versions: nginx `1.24.0-2ubuntu7.19`, openssh
+`1:9.6p1-3ubuntu13.20`, curl `8.5.0-2ubuntu10.16`, qemu-guest-agent
+`1:8.2.2+ds-0ubuntu1.18`, auditd `1:3.1.2-2.1ubuntu0.1`, mysql
+`8.0.46-0ubuntu0.24.04.4`. Full machine-readable receipt:
+`.cache/images/role-artifacts.json`. **Identity limit, stated plainly:**
+the attacker artifact carries the gate's SYNTHETIC keys (TEST_KEYS), so
+this set is the supervised-practice candidate; the production contract
+remains the operator's key-bearing template rebuild per the runbook.
+
+`sha256(base)` = `6b1fbcb8b1a7cec2d4aa…` (2357 MiB) — the appliance
+guest base carried into the bundle (its MANIFEST image digests match the
+four artifacts above and verify green).
+
+### Final local-software lane receipts — 2026-10-27/28 at `44ccdc8` (serialized, logs `.cache/gate_r13_*.log`, `.cache/gate_r14_bundle.log`)
+
+* `fast` **PASS** — 661 passed, 0 failed, 0 skipped, 480 deselected (86.8 s).
+* `selection` **PASS** (174.1 s); `db` **PASS** (667.8 s — 322/0/0, 819
+  deselected, owned fixture removed); `agent` **PASS** (150.3 s —
+  123/0/0); `install` **PASS** (7.3 s — real sandbox sequences; the
+  managed-service half stays the operator's).
+* `upgrade` **PASS ×3** (93.5–94.6 s) — see the round-2 table above.
+* `images` **PASS** (323.8 s) — 19 passed, 0 skipped: real builds
+  (cache-BUILD-CACHED on the input hashes above, verify batteries boot
+  the chains under labelled TCG, seeds/flaws/fixes/readiness), owned DB
+  and QEMU run dirs cleaned.
+* `capture` **PASS** (228.4 s).
+* `bundle` **PASS ×2** — build+verify (266.7 s) and then the gate
+  **verifying the persistent release in place** (219.1 s): 373 files,
+  4 images, revision `44ccdc89588d`; bound to the checkout under test
+  (242 runtime files compared); operator manifest renders and
+  validates; the SHIPPED role image boots from the bundle (TCG, serial
+  marker); tampered bundle refused for digest drift.
+* **Persistent release artifact:** `.cache/bundle/sparring-range-appliance`
+  (4.5 GiB, BUNDLE_VERSION 2, revision `44ccdc89588d8ea8a4bf9ccef7182dea928de293`),
+  images `appliance-base 6b1fbcb8b1a7…`, `mojang-web-local 97d694851c20…`,
+  `mojang-web-db 7c6072615646…`, `attacker 015aeafe5a5f…`. Verify with
+  `python3 deploy/bundle.py verify .cache/bundle/sparring-range-appliance`.
+* **Capacity lesson recorded (caused one externally-killed run, not a
+  test failure):** bundle building on `/tmp` here means tmpfs = 16 GiB
+  RAM; the gate now runs with `TMPDIR=$PWD/.cache/tmp` (disk-backed).
+  The OOM-risky killed run's owned tmp (9.9 G) was removed; the builder
+  and gate self-clean everything else (verified: no `sr-bundle-gate-*`,
+  no `sr-*` containers, `.cache/tmp` empty).
+* Operator-machine gates (`packet`, `journey`, `release`,
+  installed-systemd/Strata/nested-KVM, the managed-service install half)
+  remain explicitly PENDING — never passed, never simulated here.
+
+**Final-HEAD confirmation (`52ce377`, docs-only delta over the built
+bundle's `44ccdc89588d`):** `upgrade` gate PASS again (116.1 s,
+`.cache/gate_r14_upgrade.log` — fourth consecutive deterministic pass of
+the corrected engine), fast suite 661/0/0 (88.3 s), zero owned
+containers or gate tmp directories remaining. The bundle's MANIFEST
+revision remains `44ccdc89588d` (recorded honestly; runtime files are
+byte-identical — the gate's candidate-binding check passed against the
+same tree).
+
+## Milestone 21 implementation round 1 — 2026-10-27 (branch `practice-upgrades-18-21`)
+
+Scope executed: preserving in-place upgrade (engine + real CLI + required
+gate), bundle upgrade contract, and the four pulled release blockers.
+Milestone 20 remains UNACCEPTED; nothing below re-runs or claims its gates.
+
+| Commit | Delivered |
+|---|---|
+| `3000361` | drifted guest package pins repaired (verified by live mirror dry-runs) + labeled-TCG build ceilings |
+| `463e408` | second plan-20 review + user reprioritization + full F5–F9 repository backlog |
+| `b3df934` | F1 forward 0027 + runtime fence; F2 always-on quota, reserved marker budget, no-500 duplicate marker; F3 supported prerequisite in the engine + legacy-safe forward guard; F4 absolute delivery budget + process-wide delivery bound |
+| `b504a76` | real proofs (8/8 on disposable PostgreSQL): naive 0025→head still fails on 0026 (defect shown); engine reaches 0027 with the prerequisite recorded; legacy duplicate markers survive unmodified; sealed row fail-closed `legacy`; fence 503-at-0026; HTTP audience separation; second marker never 500; null-gap row cap; dribbling endpoint bounded; consumer retires with counted drops |
+| `fc025e7` | `appliance.py upgrade` drives the real engine (backup→stage→activate→migrate→finalize, journal, resume, restore); bundles carry the MANIFEST `upgrade` contract (BUNDLE_VERSION 2; pre-21 refused) |
+| `3a4d927` | required-mode `acceptance.py upgrade` + backup-snapshot integrity hardening |
+
+Gate receipts (exact commands, this environment, revision `3a4d927`):
+
+- `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD ... pytest -q -p no:cacheprovider`
+  — **661 passed, 0 failed, 0 skipped**, 480 deselected, 87.7s.
+- `... infra/dev/acceptance.py upgrade` — **PASS ×2** (20.6s, 20.7s): real
+  preserving upgrade through the real CLI (journal complete, heads 0027
+  exactly once, users/keys/state byte-preserved, restore-listable
+  pg_dump, fail-closed legacy relabel via the installer); truthful no-op
+  rerun; deterministic SIGKILL interruption → new work REFUSED → `--resume`
+  completes, drift repaired; config-only restore with ZERO service
+  actions; tampered payload refused; pre-21 bundle refused. Fixture:
+  run-owned `sr-upg-pg-<run>` postgres:16, removed in `finally`.
+- Sweep at HEAD (serialized, receipts `.cache/gate_r8_*.log`):
+  `selection` **PASS** (173.0s — 1141 tests all classified = 661 fast +
+  480 integration, including the 8 new plan-21 proofs; empty-selection
+  negative passes); `db` **PASS** (671.3s — **322 passed, 0 failed, 0
+  skipped**, 819 deselected, disposable PostgreSQL 16, owned-resource
+  cleanup proven); `agent` **PASS** (154.9s — 123/0/0); `containment`
+  **PASS** (25.0s — 41/0, no leaked cgroups). All sweep fixtures removed;
+  zero `sr-*` containers remain.
+- Aggregate now ATTEMPTS `agent` and `upgrade` (criterion 3 list change).
+
+Honest PENDING (not simulated, not waived): `images`/`capture`/`bundle`
+need the role artifacts — the pin repair removed the mirror blocker, but
+cold TCG role builds exceed this round's budget; the `bundle` lane was
+ATTEMPTED and failed closed truthfully (8.6s, receipt
+`.cache/gate_r8_bundle.log`): the only role images on disk
+(`/tmp/sr-guest-cache`, 3.4 GB, left by the checkpoint aggregate's images
+lane) are qcow2 chains whose transient backing bases
+(`/tmp/sr-qemu-c4fcda2e`) no longer exist, and the gate correctly refuses
+non-self-contained artifacts. The `images` gate rebuild produces the
+flattened artifacts the bundle requires; those stale chains belong to the
+shared guest cache (possibly reused by other checkouts) and were left in
+place rather than guessed-into cleanup. `packet` needs root + `nft`;
+`journey`/`release` need the installed appliance. Per plan 21,
+missing mandatory evidence prevents PASS: **21 stays unticked**; the
+operator's supervised-practice deployment is the next owner.
+
+## Plan-20 SECOND independent review + user reprioritization — 2026-10-27
+
+The parent review completed at `adc10d4` (**VERDICT: FIX**, nine findings
+with reproductions) and the user explicitly reprioritized: **milestone 21
+proceeds now** (same branch) so a deployable release can be operated and
+tested; milestone 20 stays **unchecked and unaccepted**; the fixes below
+are split into (a) MINIMUM release blockers folded into 21 and (b) the
+repository backlog. The reviewer separately observed the five-file pin
+commit `3000361` and did not review or accept it. The prior round's gate
+receipts remain valid **checkpoint-scoped receipts, not acceptance**.
+Independently PASSED positives of that round (recorded truthfully): new
+audience threads separate, child deadline unblocked, correct cast positive
+offsets, attacker actor-query excludes non-red, legacy orphan HTTP 200,
+durable lifecycle flags, compressed-away citation refused, real ack-loss
+persists exact bytes, short-write timing measured, 450-noise raw-cursor
+pagination with lazy output, foreign/sealed authorization surfaces pass;
+applied 0020–0025 byte-unchanged vs `28b1f8b`.
+
+### (a) Release blockers — pulled into milestone 21 (fix here, prove here)
+
+| # | Sev | Defect (reproduced) | Status / impact |
+|---|---|---|---|
+| F1 | HIGH | 0026 `audience` backfill (0026:32–36 `server_default="member"`) silently labels ALL pre-0026 coach history member-visible although operator history may carry sealed context; legacy pending jobs without `chat_meta` audience also default member (`coach_routes.py:619,664`). Repro: populated PRE-0026 schema → forward upgrade discloses `PRE0026_SEALED_OPERATOR_BACKDOOR` in member GET and the next provider wire | **IN FIX (21)**: forward migration re-labels every migrated row to fail-closed `legacy` audience (raw rows preserved, visible only at privileged/unknown scope, never in member threads or provider prompts); runtime fence refuses coach history while schema head == 0026 (API can never serve mid-upgrade); metadata-less jobs resolve `legacy`, never member; real populated-upgrade + provider-wire tests |
+| F2 | HIGH | Capture quota admission (`app.py:1880–1905,1979–2012`): all checks sit inside `if body.text:` → 5-row cap but 20 null-text gap rows persist (cap 201); server truncation marker is 63 bytes against a 10-byte reserved budget (op AND session); second explicit marker raises 500 | **IN FIX (21, minimal release-safety guard)**: bounds always enforced atomically for ALL payload kinds (output/gap/marker) including null text; marker fits a reserved budget inside the total (or honest compact/zero form); duplicate marker answers the idempotent protocol, never 500. Not the full 20 replay polish |
+| F3 | HIGH | Valid 0025 history BREAKS migration 0026 (0026:51–55 `uq_operation_outputs_truncated_once`): 0025 permitted two truncation markers per operation (pre-fix race), so `CREATE UNIQUE INDEX` raises UniqueViolation — a populated 0025 database cannot upgrade at all. This is 21's core preserving-upgrade scope, not backlog-able | **IN FIX (21)**: applied 0026 stays byte-identical, no row is ever deleted or modified. Upgrade design = explicit SUPPORTED prerequisite + forward catch-up (see ARCHITECTURE "Plan-21 upgrade-compatibility decisions"): engine detects the duplicate-marker condition before migrating; the documented path skips only 0026's data-dependent INDEX statement (columns are re-applied idempotently by forward 0027 with `IF NOT EXISTS`, legacy rows untouched) and forward 0027 installs the future-proof uniqueness guard that legacy rows still satisfy; real 0025-populated → head proven through the actual installer, plus schema comparison against the clean path. No manual SQL, no evidence deletion |
+| F4 | MEDIUM | Capture consumer resource leak (`capture.py:193–201,295–355`, `transport.py:108–113`): six completed operations leave six consumer threads alive 11.58 s against an endpoint dribbling bytes; inactivity timeout does not bound absolute request age; `finish()` join cannot cancel; idle exit unreachable inside `_deliver` | **IN FIX (21, bounded functional guard)**: process-wide consumer concurrency bound; absolute per-delivery budget; `finish()` drains with bounded deadline and counts honest dropped gaps; command deadline/drain paths stay independent. Full 20 replay polish not attempted |
+
+### (b) Repository backlog (milestone 20 remains unaccepted; these stay open, none silently dropped)
+
+| # | Sev | Defect (reproduced) | Priority / deployment impact |
+|---|---|---|---|
+| B1=F5 | MEDIUM | Citation payload forgery: a command payload containing `echo reference #99999999` adds the non-existent id to the APPROVED set (`coach/chat.py:110–113`, `coach/aar.py:131–136`); browser shows 2 active links. Approval must match canonical AUTHORIZED EVENT RECORD ids, not regex over payload text | Before any "citations verified" claim; no data leak, UI trust issue. Backlog unless naturally fixed while touching that code |
+| B2=F6 | MEDIUM | Replay seek-back before cast start leaves the player at the last in-cast frame (30) instead of following the session clock; changing the actor filter shifts cast offset (100→50). Canonical session clock, filter-independent | UX correctness; operator testing can proceed with the labeled limitation |
+| B3=F7 | MEDIUM | Generic model-job audience (`coach_routes.py:332–433`): a member enumerates operator coach jobs and fetches job detail/SSE (HTTP 200). Reproduced STATE/TIMING only — answer text was not observed to leak; fresh coach pending path is isolated | Fix minimally as part of F1's audience filter where natural; precise impact recorded; do not overclaim a secret-answer leak, do not claim solved until re-verified |
+| B4=F8 | MEDIUM | Idempotence gaps (`app.py:1965–1977,2023–2031`): same seq+same text but different `read_ts`/`dropped_bytes` persists a duplicate; changed text classifies CONFLICT but answers HTTP 200 instead of 409 | Evidence-integrity polish; claim only "duplicate suppression by seq+content" until fixed |
+| B5=F9 | MEDIUM | Worker-claimed `read_ts` trusted for new operations (`app.py:1872–1877,1949–1954,2014–2018`): accepts `read_ts=1`, replay renders without lifetime/provenance labels | Timing-claim honesty; server-side sanity window + explicit "worker-claimed" label; timing display is advisory until then |
+| B6 | — | Everything else the second review judged "polish": not reopened in 21 by design; 20 acceptance stays with the parent | Roadmap 20 stays unchecked |
+
+Claim discipline while these are open: do NOT claim verified citations
+(F5), full idempotence (F8), deterministic-timing provenance (F9),
+filter-independent replay (F6), or complete audience/job isolation (F7)
+until re-verified. F1's fail-closed re-labeling plus runtime fence,
+F2's always-on quota guard and F4's bounded consumer ARE 21's release
+minimum, proven with real DB/subprocess tests in this milestone.
+
+## Plan-20 independent review fix round — 2026-10-27, branch `practice-upgrades-18-21`
+
+Independent review (VERDICT: FIX) at `28b1f8b` reproduced eleven
+defects. All eleven received root fixes with counterexample regressions;
+no applied migration was edited (0020–0025 byte-unchanged; 0026 is the
+only addition). Fix commits on the branch:
+
+| Finding (severity, reproduced) | Root fix | Counterexample proof |
+|---|---|---|
+| 1 (HIGH) operator sealed-coach answer leaked the member follow-up prompt / shared thread | Migration 0026 `coach_messages.audience` + thread partitioning: history, send and pending list are audience-filtered server-side (pending via payload `chat_meta`) | db: two-thread isolation matrix incl. `SEALED_ATTACK_PLAN_BACKDOOR` string asserted absent from the OTHER audience's list, GET and POST paths (updated `test_plan20_coach` + agent wire test) |
+| 2 (HIGH) a hung capture endpoint stalled the pipe reader and the command deadline | `srplatform/red_agent/capture.py` rewritten: bounded queue + one lazily-started daemon consumer; reader only enqueues; `finish()` bounded join with `budget_exceeded` accounting | containment: subprocess test against a REAL socket that never answers — deadline path keeps ticking, chunks land as counted gaps (`test_plan20_capture`, 27 capture+api tests) |
+| 3 (HIGH) quota race: concurrent writers each passed the byte/row check | session-row `SELECT … FOR UPDATE` admission; ALL payload bytes (output/gap/marker) charged vs per-op and per-session caps; row cap 1000 + reserved marker; `dropped_bytes` clamped | db: real concurrent HTTP POSTers against the endpoint — total stored bytes never exceed the budget; the one-time `truncated` marker is unique-index-backed (uq_operation_outputs_truncated_once) |
+| 4 (MEDIUM) defender player assumed cast epoch == session start | `ReplayPanel` tracks `castRel = epoch − t0`: seeks/drift-corrects only inside the cast; exposes `data-player-at` from `getCurrentTime()` | browser: attacker evidence 100 s BEFORE a 40 s cast; seek 105 → player's own reported time ≈5 (and ≈30 at 130); conflating the epochs cannot pass (`test_browser_replay_cast_epoch_and_read_time`) |
+| 5 (MEDIUM) any event mentioning an `op_uuid` entered the attacker track | operations track query filters `actor='red'` (server-set provenance) at the QUERY level; `registered` reported from `run_operations` | db: same-op_uuid system/verifier pairs and NESTED spoof payloads stay out; red positive control still pairs |
+| 6 (MEDIUM) a lone historical `action_result` 500'd | results without intent render INCOMPLETE (`orphan_result`, no invented command/start); chunk requests answer | db: orphan/intent-only/duplicate evidence fixtures over real rows; HTTP 200 + honest shape |
+| 7 (MEDIUM) dashboard hid warnings (prose LIKE-probe) | flags derive ONLY from durable facts: session status/outcome, `matches.state`, `runs.status='cancel-unknown'`, unresolved ops; the LIKE probe is deleted | db+api: the reviewer's interrupted-match repro shows `interrupted`+`cleanup_pending`; finalizing→retry and resolved transitions flip honestly; prose alone never flags |
+| 8 (MEDIUM) citations validated against compressed-away ids; UI linked every `#id` | server validates against ids parsed from the RENDERED compressed timeline; AAR emits `approved_citation_ids`; `md.js` renders non-approved ids as `span.md-cite-unverified` — never an anchor; user-authored rows get an empty allow-list | browser: approved id links and deep-links; `#999999` stays visible, unverified, unlinked; report links all match `?tab=activity&event=<approved>` |
+| 9 (MEDIUM) lost-ack retries renumbered chunks | producer-side monotonic `seq`; retries reuse seq+content; endpoint idempotence protocol `stored/duplicate/conflict/quota` | db: replayed ack-loss sequence yields exactly one row per chunk; same seq + different text = 409 conflict |
+| 10 (MEDIUM) chunks placed at PERSIST time | reader stamps `read_ts` (`sink.feed(chunk, at=time.time())`); UI renders `read_ts ?? ts`; honesty fields `read_timed`/`timing_precision_s` | browser: chunk persisted +620 s read +660 s is ABSENT at clock 630 and PRESENT at 670 — persist-based placement fails this |
+| 11 (MEDIUM) replay pages read ALL casts+operations; client cursor re-consumed collapsed runs | `/replay` returns counts only; new paged `/casts` (recording-id cursor) and `/operations` (raw event cursor); `next_after_event_id` is the RAW last consumed row; chunk rows carry `read_ts` | db: mid-noise-run raw-cursor proof; browser: 450 folded noise events — page cursor is the raw 200th id and the next page ADVANCES; lazy per-command output (0 op outputs fetched at load, 1 at approach) |
+
+### Gate receipts at HEAD `bd6167e` (this fix round; disposable PG fixture owned and removed; libvirt session + labeled TCG where noted)
+
+| gate | result |
+| --- | --- |
+| fast | exit 0 — **661 passed, 0 failed, 0 skipped, 472 deselected**, 6 warnings, 85.3 s |
+| selection | **PASS** 169.1 s |
+| python | **PASS** 4.6 s (registry reachable again after the DNS outage; lock verified) |
+| authority | **PASS** — 35 passed, 0 skipped |
+| containment | **PASS** (incl. the rewritten capture subprocess suite) |
+| agent | **PASS** — 123 passed, 0 failed, 0 skipped |
+| pve-contract | **PASS** — 22 passed, 0 skipped |
+| db | **PASS** — 314 passed, 0 failed, 0 skipped, 819 deselected, 654.3 s; owned resources cleaned |
+| frontend | **PASS** — build + ONLINE `npm audit --omit=dev` **zero high/critical (moderate=0 low=0)**; the previous round's DNS-blocked PENDING is cleared |
+| browser (after frontend) | **PASS** — 5 passed, 0 skipped, 248.8 s (stage5 member loop, plan19 admin, 3× plan20 incl. the new epoch/read-time counterexample) |
+| compose | **PASS** 179.1 s |
+| install | **PASS** — real clean/rerun/upgrade/drift sequences; managed-service half stays the operator's (not accepted from any flag) |
+| hypervisor | **PASS** — 2 passed, 0 skipped, accelerator=explicit-TCG (LABELED software emulation; NOT nested-KVM acceptance) |
+| access | **PASS** — 1 passed: real guest SSH, pinned key, qga marker, recorded `.cast` replay |
+| capture | **FAILED (environment — 21 blocker)**: `test_capture_installed_negatives_on_real_guest` errors at guest build: serial shows `E: Version '1.24.0-2ubuntu7.18' for 'nginx' was not found` → `SR-GUEST-BUILD-APT-FAIL`. Identical root cause to the pinned-nginx mirror drift already carried as milestone 21's supply-chain repair; `git diff 28b1f8b..HEAD -- infra/images/ infra/dev/ srplatform/guest/` touches only the journey client (no image/manifest change) |
+| images | **FAILED (environment — same 21 blocker)** this fix round at 06:58 (revision within `28b1f8b..HEAD`, image build code identical to `bd6167e`): 15 passed, 4 ERRORS, all `SR-GUEST-BUILD-APT-FAIL` on the same missing pinned nginx version |
+| bundle | **FAILED (prerequisite)** — role images come from the images gate (blocked above); with `SR_APPLIANCE_BASE_IMAGE` set the bundle verifies the base but refuses placeholder role bytes |
+| packet | **FAILED (environment, fail-closed)** — needs root + `nft` (approved CI job only; never host namespaces) |
+| journey | **FAILED (prerequisite, fail-closed)** — needs the INSTALLED appliance + operator/member tokens; refused by design |
+| appliance (aggregate) | RUNNING at this receipt's commit — it re-runs the individual gates in order (each already receipted above) and will stop at the images blocker (deterministic pin failure); nothing the individual gates refuse can pass here. Log: `.cache/gate_r6_appliance.log` |
+| release | **FAILED (prerequisite, fail-closed)** — `SR_LIVE_BASE_URL` live job; "nothing about a release is accepted from a sandbox" |
+
+Carried, unchanged by this round and NOT reopened by it: the nginx/package
+mirror pin reproducibility repair is milestone 21's explicit software
+blocker; installed Strata/UID/proc/systemd/nested-KVM/operator
+qualifications remain NOT PROVEN from this sandbox; hypervisor/access
+receipts are labeled-TCG software emulation. `git status` is clean at
+this commit; this operator's own PG fixture (`sr-r6pg`) was removed
+after the final gate runs, and only the libvirt session daemon backing
+the in-flight appliance aggregate (plus that aggregate's own `sr-acc-*`
+fixtures) is still intentionally running — it belongs to the in-flight
+job, not to accepted evidence.
+
+## Plan-20 implementation — 2026-10-27, branch `practice-upgrades-18-21`
+
+Conversational coach, bounded timed output capture, replay v2 and the
+modernized web review surface. Implementation commits `76b6cd7`
+(migration 0025 + append-only artifacts), `1b30d96` (coach chat over
+durable jobs), `096691f` (timed capture plane), `569bd81` (replay v2 +
+sessions envelope), `86fd86f` (web redesign), `7b03388` (real-browser
+acceptance; stage5/plan19 updated for the new UI). Applied migrations
+0020–0024 are byte-unchanged against `8e77567`; `0025` is the only
+addition, and `/readyz` reports head 0025.
+
+Plan-20 test surface (32 tests): `test_plan20_artifacts` (2 db),
+`test_plan20_coach` (8 db), `test_plan20_coach_agent` (2 agent),
+`test_plan20_capture` (7 containment), `test_plan20_capture_api`
+(5 db, incl. the real loop → transport → internal endpoint path),
+`test_plan20_replay_api` (6 db), `test_plan20_browser` (2 browser+db).
+
+### Gate receipts at HEAD `7b03388` (same day, disposable PG on
+run-owned port 5446; the gate's own fixture starts/stops its own
+container for the db run)
+
+| gate | command | result |
+| --- | --- | --- |
+| fast | `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -p no:cacheprovider` | exit 0 — **661 passed, 0 failed, 0 skipped, 444 deselected**, 6 warnings, 85.26 s |
+| selection | `acceptance.py selection` | **PASS** (165.7 s) |
+| python | `acceptance.py python` | **PASS** (4.5 s) — with `UV_OFFLINE=1`: this sandbox lost DNS mid-session (`registry.npmjs.org` and `pypi.org` unresolvable), and the offline mode installs the identical exact-pin lock into a fresh venv, verifies `uv pip check` and the four entrypoint imports |
+| authority | `acceptance.py authority` | **PASS** (25.5 s) |
+| containment | `acceptance.py containment` | **PASS** (21.7 s; 33 tests incl. the 7 new capture regressions) |
+| agent | `acceptance.py agent` | **PASS** — 122 passed, 0 failed, 0 skipped, 983 deselected (149.6 s), incl. the 2 plan-20 full-loop coach tests against the pinned fake provider |
+| db | `acceptance.py db` | **PASS** — 295 passed, 0 skipped, 810 deselected (651.5 s); owned DB resources cleaned, fixture container removed |
+| frontend | `acceptance.py frontend` | build **PASS**; `npm audit --omit=dev --json` **PENDING (environment)** — errors with empty JSON while the registry is unreachable (DNS failure above). `npm audit --omit=dev --json --offline` (cached advisory snapshot from the same day) reports **zero vulnerabilities**, and the online command passed **zero high/critical** at `86fd86f` the same day; `git diff 86fd86f..HEAD -- web/package.json web/package-lock.json` is empty. Online re-run required before milestone 21 promotion |
+| browser | `acceptance.py browser` (run AFTER frontend) | **PASS** — 4 passed (stage5 member loop, plan19 admin GUI, 2× plan20), 0 skipped (188.6 s) |
+
+Not attempted here (unchanged operator gates): `packet` (root+`nft`),
+`journey` (installed appliance), installed UID/proc/systemd/Strata/KVM
+rechecks. The pinned-nginx mirror-drift blocker recorded under
+plan-19 round 5 (images/capture/bundle reproducibility) stays carried
+for milestone 21; the DNS/registry outage above is a sandbox egress
+condition, not evidence about package pins.
+
+### Boundaries proven by the new tests (not by this prose)
+
+* Coach answers ride durable `coach-chat` jobs (one inference slot);
+  the member message persists first; reload shows pending from the job
+  row; the evidence cutoff and allowed citation ids freeze at enqueue;
+  citations outside the window are dropped, prose stays verbatim;
+  unavailable/failed model persists the honest fallback, never an
+  invented answer (browser test proves the DOM, agent tests prove the
+  wire). No chat path mints scores or audit events.
+* Timed capture is a second, independently-quota'd consumer of the
+  command stream: bounded chunks, exactly one truncated marker, gaps
+  counted, emit failures never break the run or the stop path, and
+  the SERVER re-enforces the quota with idempotent
+  `(run_id, op_id, seq)`. Pre-capture history renders command-only —
+  historical first-4000-char results are never reconstructed.
+* The replay operations track pairs ONLY the red worker's own
+  intent/result events; verifier, telemetry and bastion/MOTD traffic
+  never becomes attacker attribution (db test). A sealed competition
+  member gets no commands, chunks or phases through replay, the
+  chunk endpoint or the coach (db tests), and the browser gate proves
+  the operator/member dashboard difference.
+* Playback never scores: the UNSCORED honesty notice survives AAR
+  generation with no scorecard (browser test); trusted scores come
+  only from verifier scorecards.
+
+## Plan-19 review ROUND 5 — 2026-10-27, branch `practice-upgrades-18-21`
+
+**Accepted (SOFTWARE) 2026-10-27:** independent review at `1348b10` →
+**VERDICT: SHIP**, all six plan criteria PASS on the reviewer's own
+re-runs (matching receipts in `docs/ROADMAP.md`); manual/operator and
+installed-system qualifications stay open, and the pinned-package
+supply-chain blocker stays carried for milestone 21. Historical
+constraint: nothing below is reopened by that acceptance.
+
+The FIFTH independent review (complete controls at `e07c52a`: every
+prior concurrency/upgrade/compaction/outcome/pin blocker PASSED the
+reviewer's own barriers; 0020–0022 byte-unchanged against `e311ff9`,
+0023 against `b7ea7cd`, 0024 untouched) returned **VERDICT: FIX** with
+ONE remaining reproduced blocker — a MEDIUM secret leak inside the
+repair-obligation audit itself. Fixed at root in `db36809`; no
+migration touched (0020–0024 unchanged).
+
+### Reproduced defect and fix→proof map
+
+- **R5-F1 MEDIUM — the compensation-failure audit leaked the
+  credential.** `_record_compensation_failure` persisted
+  `str(exc)[:200]` into the append-only
+  `model_admin.profile.secret_compensation_failed` event. The reviewer
+  injected the fault on a real disposable PostgreSQL (deliberate fixture
+  CHECK constraint refusing the credential value — not a production
+  constraint): the rolled-back tracked delete re-inserted the secret,
+  the constraint raised `IntegrityError`, and PostgreSQL's own
+  diagnostic — `DETAIL: Failing row contains (..., <secret>, ...)` —
+  landed in an **app-role-readable** event verbatim.
+  Fix (honest obligation, zero secret):
+  `model_admin.safe_error_shape()` records only library class names
+  plus 5-character SQLSTATE codes along the bounded, cycle-safe
+  cause/`orig` chain — raw text, `args`, `params`, statements, row
+  details, provider bodies and tracebacks are never READ, and no
+  pattern-based "redaction" is trusted (short opaque keys defeat every
+  pattern). The obligation keeps everything an operator needs: op,
+  profile id, structure (`IntegrityError[23514]`), action_needed. The
+  obligation WRITE's own failure is no longer `except: pass` — the
+  last-resort log line carries safe shapes only and states in words
+  that the durable record is missing. The sibling audit fallback
+  (`_persist_logical_outcome`'s handler-failure note, job evidence an
+  API caller reads) moved to the same structural convention.
+  Provider-call normalization (`redact_error` on job errors) stays as
+  previously accepted — it is not a compensation/audit path.
+
+  Proof (`tests/test_plan19_review_round5.py`, 3 agent tests, real PG
+  fault injection, no mocks of the leaking mechanism): obligation
+  present exactly once with `IntegrityError[23514]`; store stays
+  honestly divergent (no silent success); the credential appears in NO
+  app-role surface — raw `to_jsonb(events)` read through the app
+  identity, obligation payloads, every log record; when even the
+  obligation write is refused (second fixture constraint), the bounded
+  last-resort log names structure only and says `NOT recorded`.
+  Positive controls unchanged and still green inside the gates:
+  legitimate rollback restores; the locked restore cannot undo a
+  committed revocation.
+
+### Round-5 gate receipts — all personally run at `db36809` (tree clean), serialized, logs `.cache/gate_r5_*.log`
+
+Fast default at the final code commit: **661 passed, 0 failed, 0
+skipped, 412 deselected** (85.01 s).
+
+| Gate | Result | Exact receipt |
+|---|---|---|
+| selection | PASS 168.0 s | every test classified; fast default **661 passed, 0 skipped, 412 deselected** |
+| python | PASS 5.5 s | locked install + deps + imports |
+| authority | PASS 26.6 s | **35 passed, 0 skipped** |
+| containment | PASS 20.8 s | **26 passed, 0 skipped**; no leaked run-owned cgroups |
+| db | PASS 634.3 s | **272 passed, 0 skipped, 801 deselected**; fixture container removed; no `srtest_*`/`sr_*` databases or roles remain |
+| agent | PASS 150.2 s | **120 passed, 0 failed, 0 skipped** — incl. the 3 round-5 fault-injection tests plus all round-3/4 deterministic barriers |
+| frontend | PASS 7.3 s | production audit: zero high/critical |
+| browser | PASS 112.6 s | **2 passed, 0 skipped** — serialized immediately after frontend |
+
+Not re-run for this small correction per operator instruction:
+pve-contract, install, compose, hypervisor, access (unchanged domains,
+receipts at `12ecbcb`); images/capture/bundle stay blocked by the
+recorded pin-drift supply-chain item — **now carried forward in the
+ROADMAP under milestone 21 as a release-blocking reproducibility
+defect, not an environmental waiver**; operator gates
+(packet/journey/release) and installed UID/proc/systemd/Strata/KVM
+qualifications remain NOT PROVEN — sandbox fixtures are not
+installed-system proof.
+
+## Plan-19 review ROUND 4 — 2026-10-27, branch `practice-upgrades-18-21`
+
+The FOURTH independent review (SOURCE-ONLY — no reviewer tests ran)
+returned **VERDICT: FIX** at `b7ea7cd` with three source findings (one
+HIGH TOCTOU in the round-3 rollback compensation itself, two MEDIUM:
+the 0023 fence could not reach pre-0023 escaped chains, and a
+cessation RESOLUTION was being accepted as compaction SUCCESS) plus two
+test-quality gaps (the claim-race `is_alive()` guess; a pin "proof" that
+created its session after the edits). Every one was reproduced at root
+and fixed; commits `069491f` (fixes) and `12ecbcb` (tests). Applied
+migrations 0020–0023 verified BYTE-UNCHANGED (`git diff` over those
+files empty in both round-3 and round-4 ranges); the new schema work is
+forward, data-only migration **0024** (head → 0024; `downgrade` is a
+deliberate no-op — erasing the fence would re-arm the dispatch it
+closes).
+
+### Reproduced defects and fix→proof map (pre-fix behavior, exact)
+
+- **R4-F1 HIGH — rollback compensation could resurrect a revoked key.**
+  The round-3 restore read the profile's COMMITTED status through a
+  fresh session, **closed it**, and only then called `set_key`: a revoke
+  committing in that check→write window deleted the credential, and the
+  compensation recreated it for a profile an operator had just killed
+  (a status check alone is not serialization). Fix: the restore now
+  takes **FOR UPDATE on the same profile row a revocation locks to
+  change status** and holds it across check + secret write + commit
+  (bounded `SET LOCAL lock_timeout='10s'`; a timeout is a recorded
+  durable repair obligation, never a silent success). Proof: the TOCTOU
+  test forces the revocation to arrive while the restore is INSIDE the
+  write, and `pg_stat_activity` **shows** the revoke backend parked on
+  a lock wait before the write is released — ordering becomes total;
+  final state: credential stays deleted, profile stays revoked. A
+  positive control proves a legitimate rolled-back delete still
+  restores (the fence is not a silent refusal).
+- **R4-F2 MEDIUM — migration 0023 left pre-0023 escaped chains
+  dispatchable.** 0023 could only stamp `cancel_intent = false` on rows
+  that already existed and backfill chain identity; a `cancelled` root
+  with `queued` retry children — the exact state the old defect
+  produced — survived the upgrade with clean flags, and admission and
+  execution consulted only the candidate's own flags. Fix (forward,
+  never editing applied migrations): **0024** reconciles populated
+  pre-0023 databases — every row of a chain CONTAINING a cancelled row
+  gets the durable intent, `queued` members become `cancelled` with an
+  honest reconciliation note, while `running`/`cessation_unknown` rows
+  KEEP their state (an uncertain cessation is an obligation; the slot
+  stays held). The claim statement and the executor gained the same
+  chain-level fence (`COALESCE(chain_root, job_id)` containing a
+  cancelled row) — fail-closed reconciliation BEFORE any dispatch. An
+  ordinary FAILED parent with a queued retry child is explicitly NOT
+  fenced (a failed attempt is not a cancelled logical request). Proof:
+  a second disposable database migrated to **0022 by the real Alembic
+  CLI**, populated using ONLY old-schema columns, upgraded to head; the
+  **production `_CLAIM_SQL` itself** then verifies escaped chains are
+  unfetchable, the ordinary retry is admitted once the slot is free,
+  and running rows survive via `reconcile_startup` as
+  `cessation_unknown` obligations. Runtime half: an escaped child never
+  claims; a forced legacy claim reconciles to `cancelled` (fence note)
+  with **zero provider requests**, and the grandchild settles too.
+- **R4-F3 MEDIUM — cessation resolution is not compaction success.**
+  `_dep_chain_state` accepted `cessation_resolved` as prerequisite
+  success, but `resolve_cessation` is an operator slot-release
+  ATTESTATION — it creates no summary and no checkpoint — so after an
+  uncertain summary was audited away the gated turn could dispatch the
+  uncompacted, over-budget context. Fix: dependency success requires
+  the chain-final attempt to be genuinely `succeeded`, AND (for a
+  summarize prerequisite) its coverage-bounded checkpoint row with the
+  exact `covers_through` must exist (`_checkpoint_persisted`; a new
+  `no-checkpoint` verdict otherwise). `cessation_resolved` is now an
+  honest `failed-final`. Proof: client-timeout summary → audited
+  `resolve_cessation` → gated turn **refuses** (error names
+  `cessation_resolved`, nothing was sent to the provider);
+  succeeded-without-checkpoint refuses likewise naming the missing
+  checkpoint; the positive control 500 → bounded retry → checkpoint →
+  dispatch runs the native turn **exactly once**, and the FIFO shape
+  proves admission correctly skipped the gated turn while the chain
+  could recover.
+- **Test quality (reviewer items):** the round-3 claim-race
+  `t.join(timeout); is_alive()` guess is replaced by the same explicit
+  `_await_lock_wait` barrier (PostgreSQL itself reports the victim
+  backend on a lock wait) — no test anywhere now assumes thread
+  scheduling. The pin proof now FREEZES the pin at the session's first
+  served turn while v1 is live, then points v2 at a dead URL and
+  same-key-resaves v3 — the pinned session's next call is still served
+  by v1 over the real wire (the pre-fix form failed exactly this way,
+  which is what made it a real proof). Round-3's positive dependency
+  test was updated to carry the real `persist`/`covers_through` range
+  so its summarize lands a genuine checkpoint under the reworked logic.
+
+### Round-4 gate receipts — all personally run at `12ecbcb` (tree clean), serialized, logs under `.cache/gate_r4_*.log`
+
+Fast default: `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -ra -p
+no:cacheprovider` → exit 0: **661 passed, 0 failed, 0 skipped, 409
+deselected**, 6 warnings, 84.32 s. Combined disposable-PG sweep
+`-m "agent or db"` (tree identical to `12ecbcb`, run-owned container):
+**311 passed, 0 failed**, 759 deselected, 747.84 s (`.cache/r4_sweep.log`).
+
+Environment for the libvirt/QEMU gates (this runner has **no
+`/dev/kvm`**; boots are explicitly labeled TCG, never claimed as
+nested-KVM acceptance): `. .cache/libvirt-debs/env.sh` + `PATH` incl.
+`.cache/libvirt-debs/root/usr/sbin` + `SR_APPLIANCE_BASE_IMAGE` = the
+base **rebuilt at this checkpoint** by the documented no-root path
+(`infra/images/appliance_base.py`, pinned checksum-verified Ubuntu
+cloud image, sha256 `6b1fbc…d2b2f`) + `TMPDIR=/var/tmp/sr-gate`.
+
+| Gate | Result | Exact receipt |
+|---|---|---|
+| selection | PASS 162.3 s | every test classified; fast default **661 passed, 0 skipped, 409 deselected** (required mode) |
+| python | PASS 5.1 s | locked install + deps + entrypoint imports, Python 3.13 |
+| pve-contract | PASS 27.1 s | legacy contract **22 passed, 0 skipped** (required mode) |
+| authority | PASS 26.6 s | broker boundary/durability/cessation **35 passed, 0 skipped** |
+| containment | PASS 20.5 s | execution/cessation boundaries **26 passed, 0 skipped**; no leaked run-owned cgroups |
+| install | PASS 6.6 s | REAL sandbox install sequences; managed-service VM half stays operator-run |
+| db | PASS 633.2 s | disposable PostgreSQL 16: **270 passed, 0 skipped, 800 deselected** — incl. both real-Alembic 0022→head populated-upgrade tests; fixture container removed, `no srtest_*/sr_* databases or roles remain` |
+| agent | PASS 146.9 s | real wire + disposable PG: **117 passed, 0 failed, 0 skipped, 953 deselected** — includes all 8 round-4 deterministic-barrier/wire tests |
+| frontend | PASS 9.5 s | production audit: zero high/critical |
+| browser | PASS 107.0 s | isolated real-browser workflows **2 passed, 0 skipped** — serialized immediately after frontend |
+| compose | PASS 71.6 s | compose project boots, serves, fully removed |
+| hypervisor | PASS 268.6 s | real libvirt clone/start/QGA/host-key/ownership/stop/destroy, accelerator **explicit TCG** (labeled) |
+| access | PASS 142.5 s | real Ubuntu guest SSH + recording bastion flows on the freshly rebuilt base |
+| images | **FAILED (environment) — NOT accepted** | 1770.6 s: 15 passed, 4 setup ERRORS. Root cause chain, exactly: the warm role-image cache was destroyed by a host disk cleanup, and the pinned guest package versions in `infra/images/packages-24.04.txt` have since **drifted out of the Ubuntu mirrors** — the build guest's own apt reported `E: Version '1.24.0-2ubuntu7.18' for 'nginx' was not found` → `SR-GUEST-BUILD-APT-FAIL` (serial preserved at `/tmp/opencode/sr-gate-debug/guest.serial.serial.log`). Deterministic mirror version removal (successful index fetch, package found, pinned version gone), ~6 days after milestone 15 built the identical list. Repair requires a documented package-pin refresh — a release-engineering/supply-chain decision that does NOT belong inside a model-jobs review round and changes artifact identity under the reviewer's feet. Milestone 15 also recorded that a COLD role-image build under TCG (no `/dev/kvm`) exceeds the built-in 1500 s serial-marker timeout even when apt works, so a pin refresh on THIS host is not a guaranteed pass either. |
+| capture | **PENDING (environment)** | the capture overlay's own `guest_build.build_overlay` step installs the SAME `packages-24.04.txt` pins through the SAME guest-apt path (see `infra/images/guest_userdata.py` install line) — it deterministically reproduces the images failure above before any capture assertion runs; deliberately not re-run to burn a known-failing 30-minute boot. No PASS claimed. |
+| bundle | **FAILED (fail-closed prerequisite) — PENDING on images** | 0.0 s: `release bundle role artifacts — no mojang-web-local image found …build the role images first (the images gate)` — the gate refuses placeholder bytes exactly as designed. No PASS claimed at this checkpoint. |
+| appliance (aggregate) | not re-run by design | it re-runs every individual software gate; each already received a fresh receipt above at `12ecbcb` (its compose-build half is the passed `compose` gate). Re-running the aggregate would duplicate compute, not add evidence. |
+| packet | PENDING (operator) | needs root + `nft`; fails closed naming them (round-3 receipt). Not re-run — recorded pending per operator instruction. |
+| journey | PENDING (operator) | needs the INSTALLED appliance + the eight `SR_JOURNEY_*` operator inputs; fails closed by design. Not re-run. |
+| release | PENDING (operator) | needs `SR_LIVE_BASE_URL` on the deployed lab; nothing is accepted from a sandbox. Not re-run. |
+
+Scope note for the images/capture/bundle situation: the round-4 diff
+(`git diff b7ea7cd..HEAD`) touches ONLY `srplatform/model_jobs.py`,
+`srplatform/model_admin.py`, migration 0024, and plan-19 tests — zero
+`infra/images`, deployment, or appliance paths. Milestone 19's own
+acceptance criteria (plan §Acceptance 1–6) are fully covered by the
+PASS rows above; the heavy image lane belongs to the images/release
+milestones and its blocker is recorded truthfully rather than forced
+green or papered over with silent pin edits.
+
+## Plan-19 review ROUND 3 — 2026-10-26, branch `practice-upgrades-18-21`
+
+The THIRD independent review returned **VERDICT: FIX** at `e311ff9` with
+six findings (two HIGH races against the one-slot contract, two MEDIUM
+lifecycle gaps, one MEDIUM admin self-sabotage, one HIGH deployment
+identity boundary). Every one was reproduced at root and fixed with
+DETERMINISTIC concurrency regressions — uncommitted production claims
+held open, event-gated provider responses, hand-driven
+claim/execute/terminal — never sleeps hoping a window opens
+(`tests/test_plan19_review_round3.py`, 18 agent tests;
+`tests/test_plan19_review_round3_deploy.py`, 8 fast tests). Commits
+`b7885c1` (jobs fence + migration 0023), `09ed2b2` (admin outcome
+unification + guard audit), `f6f9014` (OS identity/secret boundary),
+`dfa9f39` (tests). Applied migrations 0020/0021/0022 verified
+BYTE-UNCHANGED (`git diff e311ff9..HEAD` over those files empty); all
+schema work is forward migration **0023** (`cancel_intent` +
+`chain_root` indexed/backfilled, NULL chain = unknown = conservatively
+blocks gating).
+
+### Reproduced defects and fix→proof map (pre-fix behavior, exact)
+
+- **F1 HIGH cancel/claim race released a live slot.** Production claim
+  (`_CLAIM_SQL`, row lock) left uncommitted while a real `cancel()` ran:
+  cancellation did NOT wait, wrote its stale queued snapshot over the
+  committed `running` row — `cancelled_row_state=cancelled`,
+  `second_claimed=True`, provider still generating
+  (`provider_max_concurrent=2`). Fix: `cancel()` locks the WHOLE chain
+  FOR UPDATE root-first (deterministic order, re-enumerating) then acts
+  on the committed truth; live rows get only `cancel_requested`; the
+  claim carries the outer `state/intent` CAS. Proof:
+  `test_cancel_blocked_by_open_claim_acts_on_the_committed_truth`
+  thread-proves the cancellation BLOCKS at the claim fence, then honors
+  `running`+requested; `test_live_call_cancel_requests_cessation_and_
+  holds_the_slot` (event-gated real HTTP) shows the slot is never
+  released while live and at most one provider request exists;
+  `test_cancel_before_claim_never_claims_or_dispatches`.
+- **F2 HIGH retry creation escaped root cancellation.** Attempt 1 live
+  (event-gated), provider answered 500 (definite, retryable) WHILE
+  `cancel()` committed against the old chain snapshot: the executor
+  birthed a fresh queued backoff child — the "cancelled" request
+  re-spawned. Fix: durable `cancel_intent` stamped on EVERY chain row
+  under the lock (migration 0023); the terminal write takes the row
+  lock FIRST and treats `cancel_requested OR cancel_intent` as cessation,
+  ending the chain with no child; claim skips intent rows; children born
+  before the cancel are found by the locked re-enumeration and killed.
+  Proof: `test_retry_cannot_be_born_after_the_root_was_cancelled`
+  (no child, no second request, exactly one outcome — with F4),
+  `test_cancel_after_child_born_kills_it_during_the_race_window`.
+- **F3 MEDIUM dependency gating was attempt-bound.** A gated turn was
+  admitted after the summary's FIRST failed attempt despite the queued
+  retry: executor failed the caller `prerequisite job did not succeed
+  (failed)` (502) while the summary retry later succeeded — three
+  provider requests, wrong verdict. Fix: the claim gate is chain-aware
+  via `chain_root` (wait while ANY attempt may dispatch, admit once
+  quiescent), and the EXECUTOR under its lock decides: requeue if the
+  prereq is in-flight again (race won after admission), truthful
+  `prerequisite logical request did not succeed (final attempt N:
+  state)` on genuine exhaustion. Proof:
+  `test_gated_turn_waits_for_summary_recovery_then_dispatches_once`
+  (request bodies `[_SUM, _SUM, _GATE_MSG]` — dispatched once, only
+  after the chain's final attempt succeeded),
+  `test_gated_turn_fails_only_after_the_summary_chain_is_truly_done`,
+  `test_gated_turn_reports_the_summary_cancellation_truthfully`.
+- **F4 MEDIUM revocation skipped durable outcomes.** Async hint AND AAR
+  revoked before dispatch: `cancelled`, `outcome_persisted=false`,
+  ZERO events — the member's honest fallback vanished; the same bypass
+  existed for restart/recovery and the profile-unavailable branch. Fix:
+  ALL terminal paths route through the ONE protocol —
+  `model_admin._cancel_jobs_for`/`revoke()` call `model_jobs.cancel()`
+  (intent + locked cascade + one guarded outcome claim);
+  `reconcile_startup` and `resolve_cessation` persist the logical
+  outcome; profile-unavailable cascades and persists. Proof:
+  `test_revocation_of_a_queued_hint_persists_the_outcome_once`,
+  `test_lineage_replacement_of_backoff_chain_persists_once`,
+  `test_live_call_revocation_ceases_and_persists_exactly_once` —
+  queued, chain-with-queued-child, and live revocation each yield
+  exactly ONE event, never two.
+- **F5 MEDIUM resaving the SAME key revoked the NEW profile.** The
+  parent's own credential value resubmitted via revise: the sibling
+  sweep (finding the replaced digest AFTER create) matched the
+  brand-NEW version — revoked it and deleted its secret seconds after
+  writing; a 200 for an unusable profile. Fix: same-VALUE detection
+  (digest or plaintext match against the current secret) BEFORE any
+  effect demotes the rotation to a non-secret edit (lineage stays,
+  nothing revoked); the sweep additionally skips `new.profile_id`
+  structurally. Proof (real API): `test_same_key_resave_never_revokes_
+  the_version_it_created` (+ with-other-fields/multiple-superseded,
+  genuine-replacement-still-invalidates-lineage, and failed-revision-
+  changes-nothing variants).
+- **F6 HIGH the API-only secret file was readable by ingest's
+  identity.** `sr-api-ingest.service` ran `User=srrange` — the same uid
+  as the API — and `db-secret.env` was 0640 root:srrange: the ingest
+  process could open the credential-store URL directly (same uid also
+  implies `/proc/PID/environ` and ptrace). EnvironmentFile scoping is
+  not OS access control. Fix (all three halves): ingest runs as its own
+  `sringest` identity (shipped unit + `install.sh` provisions it, gives
+  it `ingest-server.key` and `ingest-listener.env`; the appliance
+  renderer was already `sringest`); `ensure_database` creates the file
+  ATOMICALLY at 0600 (`_write_secret_file_securely`:
+  O_CREAT|O_EXCL, fsync, link-publish — never replaces, no permissive
+  window) and verifies toward 0600 root:root, FAILING CLOSED (the old
+  `write_text` + `chmod check=False` is gone); the service contract now
+  FAILS if two units share a uid or any non-API unit references the
+  file, and `secret_file_boundary_problems()` runs exact POSIX
+  readability math for every appliance identity. Proof:
+  `test_no_two_installed_units_share_an_os_identity`,
+  `test_posix_math_uses_exact_access_semantics_for_service_uids` (the
+  OLD 0640 shape proves readable — the check is not vacuous),
+  `test_secret_file_is_created_restrictive_from_the_first_byte`,
+  `test_verification_fails_closed_when_the_file_cannot_be_secured`.
+  Installed-OS qualification (real uid switch on the appliance) stays
+  an OPERATOR gate — not claimed here.
+- **Audit (parent-directed, now pinned):** the rollback guard lacked
+  after-COMMIT cleanup — session reuse turned compensation into
+  vandalism of a committed profile's live secret; a restore re-checking
+  status on the ROLLING-BACK session hit SQLAlchemy 2.1's inactive-state
+  refusal (proven by debug at the hook) and silently skipped restores;
+  and a FAILED compensation vanished. Fix: `_settled` (after_commit)
+  clears pending entries, restore reads the row's COMMITTED status via
+  a FRESH session (concurrent revocation is never resurrected), and any
+  failing compensation records a durable
+  `model_admin.profile.secret_compensation_failed` admin event. The
+  guard is now documented — honestly — as in-process compensation, NOT
+  crash atomicity. Proof: `test_committed_secret_survives_a_later_
+  rollback_on_the_same_session`,
+  `test_rollback_never_resurrects_a_credential_revoked_concurrently`,
+  `test_failing_compensation_records_a_durable_repair_obligation`;
+  round-2's `test_mid_effect_and_route_level_failures_compensate`
+  (the guard's earlier contract) passes unchanged.
+
+### Round-3 gate receipts
+
+All run at commit `dfa9f39` (tree clean; docs commit follows), serialized,
+each via `.venv/bin/python infra/dev/acceptance.py <gate>` unless noted.
+Environment for the libvirt gates: `. .cache/libvirt-debs/env.sh` +
+`SR_APPLIANCE_BASE_IMAGE=../15/.cache/bundle/sparring-range-appliance/images/appliance-base.qcow2`
++ `SR_APPLIANCE_ROLE_IMAGE_DIR=../15/.cache/bundle/sparring-range-appliance/images`
++ `TMPDIR=/var/tmp/sr-gate` (this runner has no /dev/kvm; guest boots are
+explicitly labeled TCG, never claimed as nested-KVM acceptance).
+
+| Gate | Result | Exact receipt |
+|---|---|---|
+| selection | PASS 133.8 s | fast default **661 passed, 0 skipped, 399 deselected** (83.78 s run) — required mode; empty-selection probe fails loudly |
+| python | PASS 4.4 s | fresh locked install + deps check + 4 entrypoint imports on Python 3.13.5 |
+| pve-contract | PASS 25.5 s | real-proxmoxer legacy contract **22 passed, 0 skipped** (required mode) |
+| authority | PASS 24.3 s | broker boundary/durability/cessation **35 passed, 0 skipped** (required mode) |
+| containment | PASS 20.2 s | namespace/recursive-membership/cancellation **26 passed, 0 skipped**; no run-owned cgroups leaked |
+| db | PASS 628.1 s | disposable PostgreSQL 16 (run-owned container/volume): **260 passed, 0 skipped, 800 deselected** |
+| agent | PASS 140.3 s | real wire + disposable PG (SR_REQUIRE_AGENT=1): **109 passed, 0 failed, 0 skipped, 951 deselected** — includes all 18 round-3 deterministic-race tests |
+| frontend | PASS 27.7 s | production audit: zero high/critical (moderate 0, low 0) |
+| browser | PASS 122.5 s | isolated real-browser workflows **2 passed, 0 skipped** (required mode) — serialized immediately after frontend |
+| install | PASS 10.3 s | REAL sandbox install sequences (dry-run idempotence, key preservation, invalid-manifest refusal, per-service TLS ownership, derived env, ingest plane, dial-key bootstrap); managed-service VM half stays operator-run and is NOT accepted from any flag |
+| compose | PASS 184.6 s | compose project boots, serves, and is **fully removed** (run-owned resources cleaned exactly) |
+| hypervisor | PASS 261.4 s | real libvirt clone/start/QGA-readiness/host-key/ownership/stop/destroy — accelerator **explicit TCG** (labeled, not nested-KVM acceptance); no QEMU owned-run-dir leaks |
+| packet | FAILED (environment) — operator gate, PENDING | missing prerequisites `['root', 'nft']` — fails closed naming the exact missing pieces; rules apply only in disposable netns on an approved CI job; never simulated |
+| journey | FAILED (prerequisite) — operator gate, PENDING | missing `SR_JOURNEY_BASE_URL`, operator/member tokens, SSH key, bastion known-hosts, browser URL/user/password — needs the INSTALLED appliance; fails closed by design |
+| release | FAILED (live layer) — operator gate, PENDING | requires `SR_LIVE_BASE_URL` (deployed lab); nothing about a release is accepted from a sandbox; never executed here |
+
+*(The five heavy-lane rows this section left as "running/queued" —
+appliance, bundle, access, images, capture — became moot at this
+revision before settling: the host disk cleanup destroyed the warm
+role-image/base cache mid-lane and the `/tmp` rotation lost those early
+run logs. Fresh receipts for every heavy gate at the current checkpoint
+`12ecbcb` are in the ROUND 4 section above; nothing here claims a result
+the round-4 table does not repeat.)*
+
+## Plan-19 review ROUND 2 — 2026-10-25, branch `practice-upgrades-18-21`
+
+The SECOND independent review returned **VERDICT: FIX** at `1d19c16` with
+thirteen findings against the round-1 repairs. Every one was reproduced,
+then re-fixed at the behavior level; commits `e38c1b5` (wire/compaction/
+thinking/classifier), `21f9f55` (migration 0022 + digests + guard),
+`fb433ac` (chain-unit jobs), `add5223` (surfaces/streams/rollbacks),
+`bdad5c8` (secret-URL provisioning), `4764127` (tests), `bb0fec6` (GUI).
+Applied migrations 0020 AND 0021 are byte-unchanged (the round-1 lesson
+held): all schema work is forward 0022.
+
+### Reproduced defects (pre-fix, exact behavior)
+
+- **F1 compaction split a tool pair:** with a strict-checking provider,
+  compaction covered the assistant tool CALL while the RESULT arrived
+  later; the next replay opened with an orphan tool result and the
+  provider 400'd (the fake provider's strict mode now records exactly
+  that violation class).
+- **F2 rotation left the credential alive:** session pinned v1/K1; three
+  non-secret edits copied K1 to v2–v4; replacing the key revoked only
+  v4 — the pinned session kept calling with the "replaced" credential
+  (the pre-fix run failed asserting `v1.status == 'revoked'`).
+- **F3 short-key leak + post-delete redaction:** the reviewer saved
+  synthetic `uvxyz`; a leaky 500 echo put it in the worker 502 AND the
+  admin job row; re-fetching the key after mid-failure revocation lost
+  the value entirely (round-1 `redact_secrets` had a 6-char floor).
+- **F4 member leak:** a provider 400 echoing the sealed conversation
+  surfaced verbatim through `GET /sessions/{id}/model-jobs` to the
+  owning member — sealed match included.
+- **F5 root cancel:** cancelling the submitted id returned 200 while the
+  backoff-queued retry child stayed queued and then dispatched (the
+  provider received the "cancelled" call).
+- **F6 stale finality:** polling the submitted id reported attempt 1's
+  `failed` after the retry had already succeeded; the admin detail
+  showed the same.
+- **F7 double outcome:** a hint whose attempt 1 failed and attempt 2
+  succeeded persisted TWO hint events (fallback + real).
+- **F8 deadline bypass:** `/internal/model/complete` for an already
+  EXPIRED match contacted the provider (queue-expiry checked only at
+  dispatch; the text route never carried the match deadline).
+- **F9 thinking collapse:** running the round-1 function, `none/low/
+  medium/high` produced FOUR IDENTICAL llama.cpp request bodies.
+- **F10 env-name:** `SR_PG_SECRET_URL` alone resolved
+  `postgres_url_secret` to `''`; on compose, migrate died at 0021's
+  GRANT — `role "sr_secret" does not exist` (reproduced this round).
+- **F11 rotation destroyed a working key:** an invalid rotation
+  (422) left the old secret DELETED and the status rolled back —
+  pinned sessions then failed with no credential. Root cause found
+  empirically: SQLAlchemy 2.1 dispatches `after_rollback` with ONE
+  argument, so the two-argument guard made `Session.rollback()` itself
+  raise before compensating.
+- **F12 false slot index:** raw SQL inserted one `running` PLUS one
+  `cessation_unknown` — `UNIQUE(state) WHERE state IN (...)` does not
+  make DIFFERENT values conflict.
+- **F13 no streams:** status was poll-only; no bounded stream, no
+  reconnect semantics, and no member-safe variant existed.
+
+### Corrected proofs (personally run at the committed HEAD)
+
+All in `tests/test_plan19_review_round2.py` (25 tests, agent layer) +
+`tests/test_plan19_review_round2_deploy.py` (6 fast) — disposable
+PostgreSQL + the strict fake provider; browser-level lineage behavior in
+`tests/test_plan19_browser_admin.py` (real browser). Highlights exactly
+as run: strict-provider violation list stays `[]` across compaction and
+three post-checkpoint turns; lineage revoke asserts v1–v4 revoked with
+secrets deleted and a queued v2 child cancelled, while explicit
+per-version revoke keeps its sibling `superseded`; `uvxyz`/`SEALED-PLAN`
+absent from the 502, every job row, the admin list and the member
+surfaces; root cancel of a queued child leaves it `cancelled` past its
+backoff instant with provider request count frozen at 1; a watcher-closed
+live child lands `cessation_unknown` and holds the slot until operator
+resolution; the hint event count is exactly 1 under retry-success,
+exhaustion, cancel, and a direct double-claim of the outcome claim;
+the expired-match text route returns without any provider request; the
+four thinking levels produce four distinct wire bodies (and an unknown
+preset is refused before the request); invalid rotations leave the key
+byte-identical and the version list unchanged, at mid-effect AND at
+route level; raw SQL running+unknown now raises `IntegrityError` while
+five non-occupying states coexist; worker stream progress + durable
+reconnect result, member stream state-only (`text` never present) and
+sealed-job 404; `SR_PG_SECRET_URL` drives the real secret store.
+
+### Gate receipts for round 2 — all personally run at this revision, serialized, heavy gates one at a time
+
+| Gate | Result | Detail |
+|---|---|---|
+| fast default | PASS | 653 passed, 0 failed, 0 skipped, 381 deselected (83 s) |
+| selection | PASS | every test classified; required-mode negatives proven (132 s) |
+| python | PASS | fresh locked install + 4 entrypoint imports, Python 3.13.5 (4 s) |
+| db | PASS | 242 passed, 0 skipped in required mode (599 s; disposable PG 16) |
+| agent | PASS | 91 passed, 0 failed, 0 skipped — includes all 25 round-2 wire/DB regressions (116 s) |
+| authority | PASS | 35 passed, 0 skipped (24 s) |
+| containment | PASS | 26 passed, 0 skipped (19 s) |
+| pve-contract | PASS | 22 passed, 0 skipped (25 s) |
+| frontend | PASS | npm ci + build + audit: zero high/critical (7 s) |
+| browser | PASS | 2 passed, 0 skipped (105 s). FIRST ATTEMPT FAILED and was kept honest: the model-admin GUI test still asserted round-1 rotation semantics ("a superseded row survives"); the agreed lineage fix legitimately revokes it — the test now asserts `superseded NOT in rows` as the lineage guard, then passed |
+| compose | PASS | full bootstrap/migrate/API/browser flows (179 s). Required the round-2 provisioning fix: migrate died at 0021's GRANT (`role "sr_secret" does not exist`) — fixed in `bdad5c8`, then green |
+| install | PASS | real sandboxed install sequences incl. rerun/TLS-rotation/partial-recovery; managed-service half explicitly stays operator (7 s) |
+| hypervisor | PASS | 2 passed — real libvirt clone/start/QGA/host-key/ownership/destroy, accelerator labeled **explicit-TCG** (no /dev/kvm here; NOT nested-KVM acceptance) (262 s) |
+| access | PASS | 1 passed — real Ubuntu guest SSH, pinned key, recorded bastion replay (138 s) |
+| images | PASS | 19 passed, 0 skipped — mojang builds/boots/services/seeds/flaws/fixes/readiness under isolated QEMU (1740 s) |
+| capture | PASS | 11 passed, 0 skipped — installed auditd/srshipper negatives/recovery/replay (205 s) |
+| bundle | PASS | 345 files, 4 images; bound to THIS checkout (228 runtime files compared); shipped image boots from a throwaway overlay; tampered bundle refused (245 s) |
+| packet | FAILED (environment) — as designed | `PENDING: missing ['root','nft']` — fails closed naming the exact prerequisite; nothing simulated |
+| journey | FAILED (prerequisite) — as designed | `PENDING: missing SR_JOURNEY_*` — needs the installed appliance + member tokens; first promotion gate remains open |
+| release | FAILED (prerequisite) — as designed | `requires SR_LIVE_BASE_URL (deployed lab)` |
+
+After every gate: owned fixtures removed (no `sr-*` containers/volumes, no
+`/tmp/sr-bundle-gate-*` or QEMU run-dirs left; a mid-round SIGKILLed bundle
+attempt left one owned temp dir which was deleted — receipt above is the
+completed retry). Manual checks (milestone plans' operator sections —
+Strata wire, nested KVM, installed-appliance journey) are the operator's.
+
+### Manual / operator-only limits (unchanged by this round)
+
+Strata thinking-wire compatibility, nested-KVM accelerator acceptance,
+packet (root+nft), the installed-appliance journey, and the live release
+journey remain operator/CI-jobs — each fails closed naming its exact
+prerequisite; none was simulated or waived.
+
+## Plan-19 independent review round — 2026-10-25, branch `practice-upgrades-18-21`
+
+The independent review of plan 19 returned **VERDICT: FIX** at `2bb5305`
+with eleven findings. Every finding was reproduced, then repaired at root
+with real-HTTP / real-DB regressions in commits `8660a49` (conversation
+wire), `8b8ab87` (jobs/secrets/gating/freeze), `e41f9ce` (routes/finalization),
+`de3ea24` (db regressions), `ed24173` (GUI + browser). Applied migration
+0020 was NOT touched; all schema work is forward-only in 0021.
+
+### Reproduced original failures (before the repair, exact output)
+
+- **Dead endpoint misclassified as uncertain (findings 2/3 classifier):**
+  against `http://127.0.0.1:1/v1` the pre-fix chain classified the
+  never-opened connect as an uncertain cessation — the rewritten
+  hint-chain test failed with
+  `expected the full bounded attempt chain, got [('cessation_unknown', 1)]`.
+  Root cause: the pinned openai client rides **httpx2/httpcore2**;
+  `isinstance(x, httpx.ConnectError)` never matches, so the definite
+  branch was unreachable. Post-fix the same probe reports
+  `retryable: True uncertain: False` and the 1→2→3 attempt chain is
+  visible, all failed, none retry-worthy past the bound.
+- **App role could read the new secret table (finding 8):** the real
+  role probe failed with `AssertionError: app role CAN read the secret
+  table` — migrations 0016/0017 established owner DEFAULT PRIVILEGES
+  that auto-grant `SELECT, INSERT` on every new table to the app role,
+  so `CREATE TABLE model_profile_secrets` alone handed the keys to the
+  ingestion plane. 0021 now issues an explicit per-table
+  `REVOKE ALL … FROM <app role>`; the probe passes in both directions
+  (app role denied on secrets; the secret role denied on
+  events/sessions/model_jobs).
+- **Cancellation never reached the wire (finding 2):** the old suite's
+  `"discarded" in error or "returned" in error` assertions encoded the
+  OBSOLETE semantics (flag the row, wait out the call, discard the
+  answer). With the watcher closing the live SDK call, a cancel of a
+  3 s scripted hang now terminates in <2 s as `cessation_unknown`
+  ("provider-side cessation cannot be confirmed"), HOLDS the slot
+  (the blocked job provably stays queued; the fake provider records
+  `max_concurrent == 1` throughout), and only the audited
+  `POST /admin/model/jobs/{id}/resolve-cessation` releases the queue.
+- **Obsolete assertions rewritten as the semantics moved (proof the old
+  tests were testing the wrong contract):** status `retired` vs the new
+  secret-axis `superseded`/`revoked` split (finding 9); the
+  system-absent assertion (`not any(role == "system")` on turn 2) that
+  ENCODED the durable-replay defect finding 1 repaired — rewritten to
+  demand the permanent framing be replayed exactly once as system with
+  tool returns paired by call id; the post-hoc compaction/coverage
+  assertions (finding 4) rewritten to demand pre-request evaluation,
+  enqueue-time coverage capture, `depends_on` gating and an execution-
+  time-reconstructed (compacted) wire request; the head-0020 chain and
+  readyz assertions (now 0021).
+
+### Corrected proofs (all personally run at the committed HEAD)
+
+| Finding | Where proven |
+|---|---|
+| 1 replay/wire fidelity | `test_three_turn_thread_replays_system_and_tool_returns_on_wire` (≥3 real turns: system once, call ids paired, 6 ledger rows) + rewritten multi-turn ledger test |
+| 2 obligations hold the slot | `test_cancellation_reaches_the_live_call_and_obligation_blocks_then_releases`, `test_timeout_holds_the_slot_and_never_admits_a_second_request`, `test_restart_reconcile_blocks_claims_until_resolved` + migration-0021 partial unique slot index |
+| 3 credential non-observability | `test_leaky_provider_401_never_shows_the_key_on_any_surface` (fake 401 echoes Authorization; key absent from worker 502, job.error, admin/member lists; exactly one request) + source redaction + secret-store role probes |
+| 4 pre-request compaction | rewritten `test_compaction_covers_a_range_and_history_survives_it` (gated turn, enqueue coverage, compacted reconstruction, checkpoint-only summarize output, labeled digest never system authority) |
+| 5 concurrency at the provider | slot test asserting `srv.max_concurrent == 1` while five jobs queue through one slot |
+| 6 thinking encoding | wire tests asserting `chat_template_kwargs.thinking` for standard levels and the custom-level mapping limited to `reasoning_effort`/`chat_template_kwargs`; broken `settings["thinking"]` no-op deleted |
+| 7 strict terminal state | `_StrictFinishOpenAIChatModel` refusals: missing finish reason, text ≠ `stop`, abnormal finish answers ALL call ids, args validated pre-execution, >4000-char command refused not truncated |
+| 8 secret isolation | real role probes (both directions) in the db suite; `api_key` column dropped; `secret_store` own engine, fail closed; masked `api_key_set` None = honest unknown |
+| 9 whole-session freeze | `test_first_use_pins_the_whole_role_set_and_later_overrides_are_ignored`, `test_profile_lifecycle_respects_the_pinned_whole_session_freeze` (supersede vs revoke, rebind fenced by queued work) |
+| 10 no silent truncation | `test_long_final_answer_survives_the_durable_turn` (>7000-char answer end to end) + removed `text[:4000]` |
+| 11 durable async + deadlines | `test_async_turn_submit_and_status_follow_the_durable_job`, `test_match_deadline_caps_admission_and_kills_stale_queue_items`, `test_run_finalization_cancels_the_sessions_queued_model_work`, `test_async_hint_completes_after_the_request_and_persists_once` + the rewritten browser test for the resolve UI |
+
+### Gate receipts for this round (all run personally, serialized)
+
+- Fast default (infrastructure-free): exit 0 — **647 passed, 0 failed,
+  0 skipped, 356 deselected, 6 warnings**, 83.09 s.
+- `acceptance.py selection` — **PASS** (146.2 s);
+  `acceptance.py python` — **PASS** (4.0 s).
+- `acceptance.py agent` — **PASS**: 66 passed, 0 failed, 0 skipped,
+  937 deselected (80.8 s).
+- `acceptance.py db` — **PASS**: **219 passed, 0 skipped, 784
+  deselected** on disposable PostgreSQL 16, fixture container and all
+  `srtest_*`/`sr_*` databases and roles cleaned (578.5 s).
+- `acceptance.py authority` — **PASS** (35 passed, 23.9 s);
+  `acceptance.py containment` — **PASS** (19.7 s).
+- `acceptance.py frontend` — **PASS** (production build; audit
+  moderate=0 low=0, zero high/critical, 6.6 s).
+- `acceptance.py browser` — **PASS**: 2 passed, 0 skipped (106.5 s) —
+  supersede-vs-revoke statuses, catalog discovery, mapping-less custom
+  refusal, and cancel → `cessation_unknown` → GUI resolve → 
+  `cessation_resolved` across reloads on the real Next build.
+
+### Deployment note and limits of this evidence
+
+- **Operator prerequisite:** the owner must create the dedicated secret
+  role (migration env `DB_SECRET_ROLE`, default `sr_secret`) and set
+  `SR_PG_SECRET_URL` BEFORE applying migration 0021 (it grants at
+  migration time; conftest models this ordering). With the store
+  unconfigured the env bootstrap refuses (audited reason, no fallback
+  to the app role) and every credential read fails closed.
+- The wire fixtures are the scripted fake OpenAI server: they prove OUR
+  side of the protocol (payloads, headers, terminal-state handling,
+  redaction), not that a real Strata endpoint behaves identically —
+  that stays a supervised live check.
+- DB-role isolation is not encryption at rest; it removes the
+  application plane's read path, which is the documented threat model.
+- `packet`, `journey`, and every installed-appliance check remain the
+  operator's manual gates; nothing in this round simulates them.
+
+## Plan-19 implementation evidence — 2026-10-25, branch `practice-upgrades-18-21`
+
+Conversational agent on the pinned Pydantic AI layer + model administration.
+Commits (this branch, nothing pushed): `f4cfad3` pin
+`pydantic-ai-slim[openai]==2.61.0` · `14d37d3` migration 0020 (profiles,
+pins, jobs, conversation history) · `0cfb5e1` conversation core +
+model-admin service · `2dc54b9` durable one-slot jobs, turn/complete
+routes, admin API, loop on typed turns, shutdown lock release ·
+`51236c9` required-mode agent gate + compaction/flood proofs ·
+`eefdbdc` operator admin GUI + browser acceptance · `54d883e` waiters
+release sessions between polls + GUI advanced limits · (fixes) bootstrap
+on every start / head-agnostic app-role assertion / r01 env order ·
+per-lifespan CORS origins + browser-gate generalization.
+
+Receipts (each personally run on this final code, revision at commit
+`HEAD` at writing; disposable PostgreSQL 16 containers, run-owned):
+
+- Fast default: `env -u SR_PG_ADMIN_URL -u SR_PG_ADMIN_CMD
+  PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -ra -p
+  no:cacheprovider` — exit 0: **647 passed, 0 failed, 0 skipped,
+  325 deselected, 6 warnings** (~83 s). The 4→6 warning increase is the
+  new `on_event("shutdown")` handler and its framework wrapper — both
+  `on_event` DeprecationWarnings; the stack-wide lifespan migration is
+  out of plan-19 scope and harmless.
+- `agent` gate: `…/acceptance.py agent` — **PASS**, 35 passed / 0 failed
+  / 0 skipped / 937 deselected (32.6 s). New required-mode layer
+  (marker + exclusion + `SR_REQUIRE_AGENT` + selection coverage): real
+  SDK wire against the scripted OpenAI-compatible server, one-slot
+  serialization proven AT THE PROVIDER (max_concurrent==1), auth-header-
+  only credentials, rotation→visible 503→explicit rebind, unique-running
+  index, priority/FIFO claims, cancellation obligations (queued un-run;
+  running keeps the slot until return), cessation_unknown reconcile,
+  bounded visible retries, compaction checkpoint covering a range (next
+  request resumes from the summary; raw bulk never resent), 200k flood
+  bounded on the wire, probe-is-a-queue-member.
+- `db` gate: **PASS** — 209 passed / 0 failed / 0 skipped, 763
+  deselected (514.8 s) including all plan-19 db-layer suites plus the
+  previously-green stage5/r01/app-role regressions on the jobs path.
+- `authority` **PASS** 35/0/0 (25 s); `containment` **PASS** 26/0/0
+  (20 s); `python` **PASS** (fresh locked env, 4 entrypoint imports);
+  `selection` **PASS** (972 tests classified incl. new `agent` layer);
+  `frontend` **PASS** (next build + zero high/critical audit).
+- `browser` gate generalized to the whole layer: **PASS** — 2 passed / 0
+  skipped (99.6 s): the stage5 workflow+replay AND the plan-19 admin GUI
+  (members refused; created credential never reappears in DOM or rendered
+  text; rotation v2-active/v1-retired; probe job row SURVIVES reloads;
+  GUI cancellation resolves as a visible obligation).
+
+Full-run gate passes exposed three real defects, each repaired at the
+source, never by weakening an invariant:
+
+1. **Bootstrap behind the controller lock** — a process that lost the
+   advisory-lock race (or started while a predecessor's shutdown still
+   held it) served NO model profiles (red turns 503, hints queued
+   nothing). Profile bootstrap is idempotent and race-safe (unique
+   indexes pick winners; losing first-start rolls back) and now runs on
+   EVERY start; crashed-live reconciliation stays controller-only.
+   (`tests/test_app_role_live.py`'s migration-head literal became
+   head-agnostic; the chain guard still pins the exact head. `r01`'s
+   env must precede the settings build that bootstraps — the
+   frozen-at-bootstrap contract production relies on.)
+2. **Middleware stack (CORS origins) built once per process** — the
+   second lifespan silently refused the new web origin (login "Failed
+   to fetch" only when two real-browser tests shared a process).
+   Startup now rebuilds the stack per lifespan; production reads at
+   boot unchanged.
+3. **Controller advisory lock leaked on graceful exit** — it previously
+   lingered on the pooled connection until process exit, which had been
+   silently skipping startup duties/bootstrap on the 2nd+ TestClient in
+   a process. `_shutdown` now releases it (crash safety unchanged).
+
+Not claimed: the deployed-Strata compatibility check (operator Manual
+check); the scripted fake proves protocol shape, not a live provider;
+gateway-era `test_pilot_sustained_attacker` covers the in-process
+gateway class (retained untouched) — the HTTP admission path is covered
+by the agent gate instead.
+
+## Plan-18 second review round — 2026-10-25, branch `practice-upgrades-18-21`
+
+The independent re-review at `41d8df9` returned **FIX** with six
+findings. The reviewer independently reproduced the round-1 totals
+(fast 625/0, install/authority/containment/images/db green, the original
+wrong-digest probe UNKNOWN, 73 hostile pin cases refused) — those
+receipts stand — but showed the existing gates did not cover six real
+defects, so plan-18 criteria 5 and 7 were FAIL at that base:
+
+1. **HIGH — same-digest pin edits rewrote an existing session's
+   verified score.** Scoring re-read the CURRENT pin file's content
+   hashes each build; editing only `pins[role]['files']` (role/template/
+   digest untouched) turned the persisted FAILED 0-point verdict into
+   PASSED 10 points when re-scoring the same stored guest bytes.
+   Repaired (`e20604a`): the clean baseline (files + integrity reference
+   + version) is FROZEN into the immutable deployment resource at clone
+   time, before any scoring uses it; scoring reads only that frozen,
+   integrity-gated version. A post-launch pin document can only REVOKE
+   (identity drift or absence ⇒ UNKNOWN — trust degraded, never
+   redefined); it can never adopt new hashes for an existing session.
+   Historical/absent/corrupt freezes stay UNKNOWN; baselines are
+   per-session isolated.
+2. **MEDIUM — artifact identity was not confirmed by the clone
+   authority.** The API re-read the on-disk manifest at deploy time
+   while the broker verified images against its own separately loaded
+   manifest; the reviewer made the backend verify A while the API
+   recorded B. Repaired (`e20604a`): `artifact_for_template` answers
+   over the typed broker boundary from the broker's own loaded manifest
+   (whose SHA-256 the clone-image verification enforces), the service
+   validates the shape, and no manifest path, secret or libvirt access
+   crosses. Adapters without artifact manifests answer None — honest
+   UNKNOWN, never a guess.
+3. **LOW — schema `true`/`1.0` accepted as version 1** (Python
+   equality). Repaired (`e20604a`): explicit non-bool integer schema
+   required at the document top level AND per pin; hostile matrix
+   extended; every such document behaves exactly like an absent one.
+4. **HIGH — the supervisor's required directory was never
+   provisioned.** `sr-worker-supervisor.service` requires
+   `ReadWritePaths=<state>/worker` (no `-` marker, no `StateDirectory=`)
+   while `_ensure_dirs` never created it; the parent 0751 is traversal
+   only. Repaired (`cd19b1d`): dedicated 0750 `srworker:srworker` entry
+   provisioned exactly once (drift-repairing), and the unit is rendered
+   with `ReadWritePaths` bound to the configured state path
+   (byte-identical for the default layout).
+5. **HIGH — the provisioned Node binary was not the unit binary.**
+   `ensure_node_runtime` installed the pinned 22 under
+   `/usr/local/lib/nodejs` while `sr-web.service` exec'd `/usr/bin/node`
+   — fresh Ubuntu's Node 18 stayed the production runtime behind green
+   provisioning/probe checks. Repaired (`cd19b1d`): `node_runtime_plan`
+   selects ONE binary; the build (front of PATH), the actual
+   `ExecStart` and the per-UID verification name that exact path;
+   provisioning never clobbers a foreign `/usr/local/bin/node`.
+6. **HIGH — the artifact-resolver setting was never supplied to the
+   API.** `render_control_env` emitted no `SR_APPLIANCE_MANIFEST_FILE`,
+   and the existing db tests monkeypatched the missing setting away.
+   Repaired (`e20604a`) at the root: the setting and the on-disk
+   resolver are DELETED (finding 2 makes them unnecessary — the API
+   needs no manifest access); tests drive renderer → real Settings →
+   real deploy flow with no patch of a nonexistent knob.
+
+Quality: `tls_readiness_problems` is now documented as POSIX
+permission-bit math (not installed-service access proof); installed-
+systemd/TLS/AppArmor/KVM limits stay explicit.
+
+Exact automated attempts on the corrected tree (same container: Debian
+13, **no `/dev/kvm`**, no root, docker available; warm image cache):
+
+- `.venv/bin/python -m pytest -q -ra -p no:cacheprovider` (no DB admin)
+  — exit 0: **646 passed / 289 deselected / 0 failed / 0 skipped /
+  4 warnings**, 75.7 s (+21 tests: frozen-baseline, boundary, worker-
+  dir, node-runtime regressions).
+- `infra/dev/acceptance.py install` — **PASS after 7.4 s**: real
+  sequences (clean=18 files, rerun=0 changed, upgrade=1, drift repaired)
+  with the worker directory and the selected-runtime unit render.
+- `infra/dev/acceptance.py authority` — **PASS: 35 passed / 0 skipped**,
+  25.4 s. `containment` — **PASS: 26 passed / 0 skipped**, 21.1 s.
+- `infra/dev/acceptance.py selection` — **PASS after 164.1 s**, every
+  test classified (new files/marks included).
+- `infra/dev/acceptance.py db` — **PASS**: exit 0, **190 passed /
+  745 deselected / 0 skipped** in required mode (disposable PostgreSQL
+  16), 511.4 s; owned DB resources and the fixture container/volume
+  removed by the gate (re-verified: no `sr-acc*` resources remain).
+  Includes the six rewritten broker-identity/frozen-baseline db-layer
+  regressions plus every pre-existing DB scenario.
+- `infra/dev/acceptance.py images` — **PASS after 312.3 s**: **19
+  passed / 0 skipped** (software emulation, warm cache — not nested-KVM
+  acceptance), DB fixture removed, no QEMU run-dir leaks. The web-local
+  verify test exercises the PRODUCTION frozen-baseline injection against
+  the deploy-recorded identity, including the same-digest pin-edit case
+  (its pre-fix shallow-copy text made that assertion vacuous — one gate
+  attempt failed on it before `89d38c0` made it real; this receipt is
+  the committed tree).
+- Reviewer reproductions now proven by test: at the fast layer
+  (`test_plan18_cron_pins.py`) and through the REAL persisted
+  `build_scorecard` with synthetic guest replies on disposable
+  PostgreSQL (`test_plan18_deploy_artifact.py`) — same-digest pin edits
+  never turn bad content clean (absent pins then degrade to UNKNOWN);
+  config drift records the broker's manifest A, not the replaced
+  on-disk B; absent/corrupt/historical baselines and unknown templates
+  stay UNKNOWN; per-session frozen baselines are isolated; hostile
+  identities at the boundary are refused without crash; selection,
+  ExecStart, build and probe name ONE Node binary, foreign symlinks
+  survive, and the worker directory is provisioned, identity-bound and
+  drift-repaired.
+
+Open gates unchanged (operator, NOT claimed): `packet` (root+`nft`),
+`journey` (installed appliance), installed UID/TLS/boot/KVM rechecks,
+AppArmor `9e03696` adversarial qualification, and — in THIS worktree —
+the libvirt-debs-backed `hypervisor`/`access` rechecks are **NOT PASS:
+the fixture is absent**, so the changed broker/identity surfaces have
+no hypervisor-level re-execution receipt here.
+
+### Independent acceptance (2026-10-25): SOFTWARE acceptance at `c58ef6a`
+
+The parent independently RE-RAN everything at `c58ef6a` (source
+remained `c58ef6a`; all owned fixtures cleaned) and returned **VERDICT:
+SHIP — milestone-18 SOFTWARE acceptance passed all 7 criteria**: fast
+**646 passed / 289 deselected / 0 skipped / 4 warnings**, 76.40 s;
+install **PASS** 11.2 s (fresh=18 files, rerun=0, drift repaired);
+authority **35 passed / 0 skipped** (27.8 s); containment **26 passed /
+0 skipped** (23.5 s); images **19 passed / 0 skipped**, 315.5 s TCG warm;
+db **190 passed / 745 deselected / 0 skipped**, 496.0 s. Additional
+independent probes: persisted file-backed scoring **2 passed / 7.35 s**
+(same-digest malicious baseline edits remain FAILED 0 points; frozen
+clean stays 10; absent/corrupt/revoked/late pins UNKNOWN 0); real
+peer-UID Unix artifact RPC returned broker manifest A after the on-disk
+B swap; 77 hostile parser cases refused; worker-directory 0777→0750
+drift repaired; Node unit/build/probe congruent; actual installed wheel
+migrate/status/rerun at 0019-head passed.
+
+This is **SOFTWARE acceptance ONLY**: installed systemd/UID/TLS reality,
+AppArmor `9e03696` adversarial qualification, the libvirt-fixture
+hypervisor/access rechecks, `packet`, `journey`, and the real
+appliance/model gates stay explicit pending limitations. Milestone 18
+is ticked for its software gates with those limitations retained.
+
+
+## Plan-18 review round — 2026-10-24, branch `practice-upgrades-18-21`
+
+The independent review of the section below (at base `168a9e1`) returned
+**FIX with seven findings**. Two were substantive: the firewall loader's
+`ExecStop` deleted `inet sr_appliance` on unit stop while guests were
+alive (HIGH — removing the isolation the unit exists to guarantee), and
+cron-pin trust keyed on template ID alone, which let a wrong-digest pin
+PASS the real verifier (the criterion-5 gate had therefore passed for
+the wrong artifact; its old claim of "digest + template binding" in the
+runtime was an overclaim — only the pure helper was digest-aware).
+The five others: malformed pin values crashed scoring (TypeError);
+shared-temp predictability (Node tarball fetched through `/tmp` as root;
+`$TMPDIR` alembic-config cache trusting planted content); blanket TLS
+chmods left every service identity unable to read what its own unit
+served, the bastion anchored on a CA that never signs the API surface,
+and `_ensure_dirs` fought twice over the shared state directory while
+0750 blocked the pin readers it documented; plus the firstboot report's
+JSON claimed `ok` while pending, and a module-import key leak in tests.
+
+All seven repaired with behavioral regressions in `806d239` `71812ea`
+`d33dccd` `e6bf1b9` `fe55f0d` `6dfe245` `57ff8f7` `dfaa954` — decisions
+superseded and corrected are recorded in the architecture ("Plan 18
+review-round decisions"). Cancellation of the first correction attempt
+was the user's action, not an independent failure; this section records
+the completed pass.
+
+Exact automated attempts on the final tree (same container: Debian 13,
+**no `/dev/kvm`**, no root, docker available; image cache warm):
+
+- `.venv/bin/python -m pytest -q -ra -p no:cacheprovider` (no DB admin)
+  — exit 0: **625 passed / 286 deselected / 0 failed / 0 skipped /
+  4 warnings**, 72.3 s (same four pre-existing warnings; +21 tests over
+  the pre-review count, all review-round regressions and pins).
+- `infra/dev/acceptance.py install` — **PASS**: the real sequences with
+  the corrected per-file TLS bootstrap (ingest pair `root:sringest 0640`,
+  group default fails loud at chown), single-owner state directory, and
+  bootstrap-reissue/rotation preservation checks.
+- `infra/dev/acceptance.py authority` — **PASS: 35 passed / 0 skipped**
+  (was 32; +3 real-service shutdown-drain regressions: drain with active
+  claims stops-with-read-back and latches, idle drain never latches,
+  cessation blow-up never propagates).
+- `infra/dev/acceptance.py containment` — **PASS: 26 passed / 0 skipped**,
+  no leaked run-owned cgroups.
+- `infra/dev/acceptance.py images` — **PASS: 19 passed / 0 skipped**,
+  309.3 s warm-cache (software emulation, **no `/dev/kvm`** — not
+  nested-KVM acceptance). The web-local verify test now exercises the
+  PRODUCTION injection (`with_cron_baseline` against the deploy-recorded
+  artifact identity) instead of the digest-aware helper alone.
+- `infra/dev/acceptance.py selection` — **PASS**, every test classified.
+- `infra/dev/acceptance.py db` — **PASS**: exit 0, **187 passed / 724
+  deselected / 0 skipped** in required mode (disposable PostgreSQL 16),
+  489.3 s; owned DB resources and the fixture container/volume were
+  removed by the gate. Includes the three new deploy-recorded-artifact
+  regressions plus every pre-existing DB-layer scenario.
+- Reviewer reproductions now proven by test: wrong-digest pin through the
+  REAL verifier ⇒ UNKNOWN (was PASS); hostile pin documents (int/null/
+  nested digests, bogus types) behave exactly like an absent pin, never
+  crash; planted shared-temp content and a planted symlink at the old
+  alembic cache path are ignored and left untouched; private staging
+  cleaned on success and on digest failure.
+- CORRECTION (second review, 2026-10-25): this section's claim that
+  "post-launch pin replacement can only revoke, never forge" held ONLY
+  for identity-drift replacements.  Scoring still read the CURRENT pin
+  file's content hashes, so editing `pins[role]['files']` IN PLACE under
+  an unchanged role/template/digest rewrote what counted as clean and
+  turned a persisted FAILED (0 points) into a PASSED (10 points) on
+  rescore.  Reproduced by the reviewer through the real
+  `build_scorecard`, and repaired as described in the second-round
+  section above.
+
+Unchanged open gates (operator, NOT claimed): `packet` (root+`nft`),
+`journey` (installed appliance), the installed UID/TLS/boot/KVM rechecks
+— now additionally including the bootstrap per-file ownership and the
+`ensure_tls` per-identity readability validation on the real appliance —
+and independent adversarial qualification of the broader AppArmor
+profile `9e03696`. Milestone 18 remains UNTICKED pending independent
+re-review of this correction pass.
+
+
+## Plan-18 implementation evidence — 2026-10-24, branch `practice-upgrades-18-21`
+
+Source repairs for the retained live-practice defects (installer/bootstrap,
+latched teardown/recovery, bounded SSH, firewall persistence + headroom,
+trusted cron pins, installed `rangectl`). Commits `2a162d9` `923f4ff`
+`20d8d46` `d70762b` `d6723ee` `d7b8d5b` `9885f87` on top of the separately
+committed memory fix `0fac623`. No live appliance, model endpoint, outer
+Proxmox or global firewall/AppArmor change was touched; no commissioning
+receipt was rerun.
+
+Exact automated attempts in this container (Debian 13, **no `/dev/kvm`**,
+no root, docker available):
+
+- `.venv/bin/python -m pytest -q -ra -p no:cacheprovider` (no DB admin,
+  `SR_PG_ADMIN_*` unset) — exit 0: **604 passed / 280 deselected / 0 failed
+  / 0 skipped / 4 warnings**, 73.7 s (same four pre-existing warnings).
+- `infra/dev/acceptance.py install` — **PASS**: real sandbox sequences
+  (clean 18 files, rerun 0 changed, upgrade, drift+repair) plus identity
+  contracts including the new root netrules loader unit, and the install
+  gate's managed-service note stays the operator's.
+- `infra/dev/acceptance.py authority` — **PASS**: 32 passed / 0 skipped,
+  including the seven new cessation/resolve regressions (latched positive
+  identity destroy, foreign/unknown retention, audited
+  `brokerctl resolve` read-back refusals and proofs).
+- `infra/dev/acceptance.py containment` — **PASS**: 26 passed / 0 skipped,
+  no leaked run-owned cgroups; adds five adversarial negatives driven from
+  INSIDE the real boundary (cross-op discovery, cross-op signalling with
+  the known host PID, supervisor survival, state-mask and cgroup-reroot
+  visibility).
+- `infra/dev/acceptance.py db` — **PASS**: 184 passed / 0 skipped against
+  the run-owned disposable PostgreSQL 16, including the new installed-CLI
+  test (real `rangectl db migrate` then `status` reaching `(head)` from a
+  site-packages-style copy executed OUTSIDE the checkout, plus idempotent
+  rerun); owned DB resources and the fixture container verified removed.
+- `infra/dev/acceptance.py selection` — **PASS** (every test classified;
+  fast default infrastructure-free).
+- Installed-package criterion additionally shown by the fast
+  `tests/test_plan18_installed_cli.py` tree-copy/pure-installed layouts
+  running real `alembic history` from a foreign CWD (fails against the
+  pre-repair config with the historical path error).
+- Recovery read-back acceptance: `test_recovery_resolve_requires_rechecked_backend_absence`
+  (stale/mismatched evidence cannot release; backend re-read decides) plus
+  the new authority resolve regressions (presence, uncertainty and
+  non-foreign identity each REFUSE and stay open, audited). No SQL or
+  ledger editing path exists or was added.
+- `infra/dev/acceptance.py images` — **PASS** (2026-10-24): 19 passed /
+  0 skipped, 1729 s, run-owned disk-backed cache (base image downloaded in
+  that run; **no `/dev/kvm`** — all boots are software emulation and are
+  labelled as such, not nested-KVM acceptance). The extended web-local
+  verify test captured the cron pin from the clean verify boot's serial
+  marker and asserted digest + template binding (wrong template, wrong
+  role, rebuilt digest and tampered documents all yield NO trust) plus the
+  pin-document round-trip; absent/tampered-pins-never-pass is proven by
+  *(corrected by the review round above: that run's RUNTIME honoured pins
+  on template ID alone — digest awareness existed only in the unused
+  helper, so the wrong-artifact PASS was real; fixed in `e6bf1b9`.)*
+  `tests/test_plan18_cron_pins.py` against the real verifier v3 (clean +
+  matching pin → passed; content-tampered file → failed deterministically;
+  no pin → UNKNOWN).
+- `infra/dev/acceptance.py packet` — **NOT RUN here (prerequisite)**: needs
+  root and `nft`; fails closed naming them. Operator gate, unchanged.
+- `infra/dev/acceptance.py journey` — **NOT RUN here (prerequisite)**:
+  needs the INSTALLED appliance with the member SSH key and browser login.
+  Operator gate, unchanged.
+- Installed adversarial AppArmor profile qualification for the broader
+  profile `9e03696`, the installed UID/TLS/boot/KVM rechecks affected by
+  these changes and any reboot rehearsal stay **Manual checks** (operator).
+  Software negatives above are NOT certification of that profile.
+
+Cron pins have no effect until the release build places
+`/var/lib/sparring-range/cron-baselines.json`
+(`python3 -m infra.images.cron_baseline capture --role ROLE --tree TREE
+--image IMAGE --template-id ID --out ...` per rebuilt role, or the
+verify-boot marker path); absent pins the cron check stays UNKNOWN, which
+the new fast tests prove is still never a pass.
+
+
 ## Upgrade planning baseline — 2026-10-24, branch `15`
 
 The user approved plans 18–21. The existing memory repair was subsequently
@@ -205,14 +2790,18 @@ Agreed future model/admin/session UX requirements are in the architecture.
 ### Legacy reconciliation and note coverage
 
 The 2026-10-16 direct-PVE fix list is historical, not appliance instructions.
-Non-editable `rangectl db migrate/status` root/config lookup still needs installed
-acceptance (`_alembic_root` now exists; not rerun here). Runbook conflict markers
-are absent on inspection. Separate-ingest-unit wording still needs reconciliation
-for the applicable legacy deployment. Ref-only recovery is obsolete: 9100/9101
-destroyed, lease disarmed; do not resume them. `Ledger.resolve_obligation` still
-has no caller found under `infra`: audited resolution for destroy-confirmed/absent
-claims with open obligations remains a tooling gap; zero-obligation recovery
-passes do not close it. Deferred local pin fallback, source-text test replacement,
+Non-editable `rangectl db migrate/status` root/config lookup: REPAIRED and
+installed-accepted 2026-10-24 (`_alembic_config` absolute-path materialization;
+fast + db-layer acceptance in `tests/test_plan18_installed_cli.py`). Runbook
+conflict markers are absent on inspection. Separate-ingest-unit wording:
+reconciled by inspection 2026-10-24 — the appliance has always rendered its own
+`sr-appliance-ingest.service` (installer UNITS + runbook §install); the legacy
+wording belongs to the superseded 2026-10-16 direct-PVE notes only. Ref-only
+recovery is obsolete: 9100/9101 destroyed, lease disarmed; do not resume them.
+`Ledger.resolve_obligation` tooling gap: CLOSED 2026-10-24 — confirmed latched
+destroy resolves cessation-class obligations in `infra/broker/service.py`, and
+`brokerctl resolve` (`infra/broker/tools.py`) resolves foreign/recycled
+obligations only on independent backend read-back, audited either way. Deferred local pin fallback, source-text test replacement,
 install-layout policy and PVE ACL cron suggestions are not approved new appliance
 scope; never silently weaken pinning. Existing historical plan checkboxes are not
 advanced by this cleanup.
@@ -1982,3 +4571,61 @@ Evidence at `00571e9`: fast suite exit 0, **365 passed, 0 failed,
 Open (operator Manual check): deploy `00571e9` to the service VMs (201
 API / 202 broker / 203 bastion), relaunch/resume the existing deployment once
 so `host_key_pin` backfills, then re-test the recorded SSH login.
+
+## Plan-21 review round 3 (2026-10-28) — reproduced findings, fixes, proofs
+
+Parent independent review of `a2501c8`: **VERDICT: FIX**, seven
+binding findings; bundle independently verified (373 files / 4 images,
+242/242 runtime bytes match, no world-writable, pin hash matches); no
+role-image rebuild needed (inputs unchanged). Each finding below was
+reproduced by the review at `a2501c8` and is now gate-proven at the REAL
+CLI against a REAL old deployment (`ba6a4af`/`849066b`):
+
+| # | Reproduced blocker | Fix | Real proof (upgrade gate, 25 probes, PASS 260.8 s) |
+|---|---|---|---|
+| 1 | 0019-era schema: quiescence died `relation model_jobs does not exist`; 0021 died `role sr_secret does not exist`; gate hid both by starting at 0025 and pre-creating the role | Table-aware quiescence (authority checked per introducing revision; missing table below it = truth, at/above = refusal); engine-side `secrets` stage bootstraps role + API-only 0600 `secrets/db-secret.env` via the installer-equivalent `su postgres` channel before migration (honor existing file/env; generate+ALTER only when missing) | Scenario A starts at REAL 0019 with app role only (fixture no longer creates `sr_usecret`; gate asserts its ABSENCE pre-run): upgrade to 0027 green, role count 1, file 0600 + correct URL, `secrets`+`quiesce` stages journalled; 0019-schema dry-run REFUSES a queued run and never mentions `model_jobs`, passes once empty |
+| 2 | Fence not a barrier: old API queued work under it; `/internal/model/complete` under fence returned 200 + NEW job | Journaled `quiesce` stage stops `sr-api`+`sr-worker-supervisor` and proves `inactive` before the authoritative recheck; middleware exemption split (terminality only); `model_jobs.enqueue`/`runs.start_run` raise `AdmissionFenced` at the transaction boundary → 503 handler | Stateful systemctl double: gate asserts stop-of-admission-units precedes `daemon-reload` precedes restart; stop-refusal → refused+fenced+zero mutation+resumable; `POST /internal/model/complete` fenced → 503 (body-checked), `/internal/worker/claim` exempt (its own non-fence 503 proven distinct); enqueue with a tripwire DB refuses BEFORE any DB use; SIGKILL barrier persistence preserved (round-2 probe kept) |
+| 3 | Restart was active-only, no daemon-reload, zero HTTP probes | `systemctl daemon-reload` after unit rewrites; bounded REAL-HTTP readiness (`/readyz` + frontend 200) before stamp/fence-clear | Gate runs a real HTTP fixture: 503-forever → CLI fails naming READY, fence UP, NO stamp; 503→200 resume completes, stamps, then unfences; readyz binds schema head to installed package |
+| 4 | `--restore-config` unconditionally dropped the fence on an unfinished attempt | Fence kept unless the attempt is done; restore still issues zero service actions | After the readiness-failed attempt: restore returns `maintenance_fence_cleared: false`, fence file remains, control log byte-identical across the restore (zero service commands) |
+| 5 | `postgresql+psycopg2://` (the installer's OWN format) rejected at backup, after fence; owner URL inherited by child env | `make_url` normalization + PREFLIGHT credential validation; `OWNER_ONLY_ENV` stripped from Runner/alembic/pg_dump inherited environments (explicit channel wins) | Unit-proven parse matrix (driver suffix, percent-encoded password/db, IPv6, rejects DSN/socket/wrong-scheme); pg_dump wrapper now FAILS (exit 48) if any owner var appears in its env — gate passes ⇒ clean |
+| 6 | Removing `requirements.lock` from BOTH disk and manifest passed verify | `REQUIRED_RUNTIME_CONTRACT` (lock, alembic config, migrations, unit entrypoints, frontend inputs) enforced against the payload itself before anything qualifies | Gate builds a payload with the lock deleted from disk AND manifest → refused at preflight naming the file, zero journals/fence; complete payload positive unaffected |
+| 7 | Runbook: wrong manifest filename, wrong unit names, journalctl pipeline could print "clean boot" for missing units, member history check implied members see sealed legacy | Commands corrected to shipped `appliance-manifest.json` and real `sr-*` units; explicit `is-active` loop fails the pipeline on any missing/inactive unit; member check states sealed legacy is operator-only (member seeing none is CORRECT) | Documentation itself; commands re-verified against `--help`, `deploy/hand_off.sh` and `UNITS` in `deploy/appliance.py` |
+
+Parent-recorded artifact truths also documented (no code change):
+the bundle's attacker-image `TEST_KEYS` entries are MALFORMED synthetic
+blobs (`ssh-keygen -l` rejects them) — they are NOT usable keys, this
+image set remains the supervised-practice candidate, and NO rebuild is
+justified for them; the upgrade copies RUNTIME ONLY and never replaces
+role images (stated in the runbook activation paragraph).
+
+Round-3 lane receipts (serialized, logs `.cache/gate_r15_*.log`):
+`upgrade` PASS 25 probes 260.8 s; fast 661/0/0 (87.1 s); `selection`
+PASS (179.0 s); `db` PASS (322/0/0, 677.9 s, owned fixture removed).
+**Gate lesson recorded:** running the selection gate with
+`TMPDIR=$PWD/.cache/tmp` fails 3 unrelated tests (AF_UNIX 108-char path
+limit; "outside checkout" fixtures resolving inside the repo) — TMPDIR
+override belongs to bundle/gate builds only, never to selection/fast.
+
+### Round-3 refreshed release artifact and final confirmations
+
+* **Bundle REPACKAGED runtime-only** against the corrected code at
+  `86323f0` — `.cache/bundle/sparring-range-appliance` (4.5 GiB,
+  BUNDLE_VERSION 2, **revision `86323f0f34fbb6b81b4a563a3c7ef60c9de3eb97`**,
+  MANIFEST sha256 `727e7b236217234c…`), carrying the SAME four verified
+  images (base `6b1fbcb8b1a7…`, mojang-web-local `97d694851c20…`,
+  mojang-web-db `7c6072615646…`, attacker `015aeafe5a5f…` — role inputs
+  unchanged, so no image rebuild was performed or justified).
+* `bundle` gate **PASS** (231.3 s, `.cache/gate_r15_bundle.log`): the
+  release verifies (373 files / 4 images), the candidate binding
+  re-compares **242 runtime files** against this checkout, the operator
+  manifest renders, the SHIPPED role image boots from the bundle (TCG,
+  labelled), and a tampered copy is refused for digest drift.
+* Deterministic second pass at this HEAD: `upgrade` gate **PASS** again
+  (266.6 s, `.cache/gate_r15_upgrade2.log`), fast **661/0/0** (99.7 s).
+* **Cleanup verified at handoff:** no `sr-*` containers, no
+  `sr-upgrade-gate-*`/`sr-bundle-gate-*` directories, `.cache/tmp` empty
+  (residue sub-5K synthetic fixture dirs created by this session's
+  TMPDIR-redirected runs were removed), 27 G free on the workspace
+  filesystem; persistent artifacts kept: `.cache/bundle/…`,
+  `.cache/images/…` + `role-artifacts.json`, `.cache/appliance/…`, all
+  `.cache/gate_r15_*.log` receipts.

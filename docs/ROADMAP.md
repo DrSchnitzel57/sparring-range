@@ -86,6 +86,60 @@ practice product and a qualified release. These product dependencies remain;
 they do not prescribe branches, model roles or a future milestone process.
 Any requirement not met stays open, regardless of plan ticks.
 
+### Installed-practice repair batch — authorized 2026-10-29
+
+- [ ] **22 — Installed practice repairs and usable safety admission.**
+  [Plan](../.openchamber/plans/22-installed-practice-repairs.md).
+  Consolidates LIVE-01–10 and retained plan-20 F5–F9: permanent credential/client
+  routing fixes, truthful upgrade diagnostics/receipts, account-bound SSH
+  onboarding, configuration-bound commissioning with automatic non-disruptive
+  admission checks, grounded coach/citations and remaining replay/output repairs.
+  LIVE-08's operator-resolved external outage is not a product regression.
+  Implementation complete 2026-10-30 at `9776884`; review round 1 (FIX) — all
+  nine counterexamples plus the upgraded-browser-login AC-5 gap repaired with
+  root fixes and re-proven on final revision `df72a85` (all seven acceptance
+  criteria, receipts in `FINDINGS_CHECKLIST.md`; new bundle
+  `sparring-range-appliance-22b`). Review round 2 (FIX) closed the same day:
+  four residual gaps (malformed-broker-reply release, path-keyed runner memo,
+  /readyz-vs-Begin runner fact, missing reclassify command) root-fixed and
+  re-proven at `c9b3e4f` with bundle `-22c`; rerun/carried lane table in
+  `FINDINGS_CHECKLIST.md`. The box stays unchecked until independent
+  re-review accepts. Review round 3 (FIX) closed the same day under the
+  owner system contract "reclassification time is not observation time":
+  five gaps (transition laundering, non-atomic reclassification CAS, a
+  health cache surviving a key-permission change, untyped broker
+  metadata, a browser-alias harness deleting an unowned path) root-fixed
+  at `e01ea4e` (builder `--link-images` at `3e7956d`) with real
+  API/PG/SSH/unix-wire/alias-collision proofs and bundle `-22d` verified
+  while all older seals stayed byte-identical; round-3 lane table in
+  `FINDINGS_CHECKLIST.md`. The box stays unchecked until that
+  independent re-review accepts. Review round 4 (FIX) closed the same
+  day under the owner publication/provenance contracts: five boundary
+  defects (classifier-vs-observation interleaving, future unbound
+  observed_at laundering, alias cleanup deleting a replacement inode,
+  build destroying its output before validation, --link-images accepting
+  symlink artifacts) root-fixed at `71c0200` with real HTTP/PG race,
+  provenance-matrix and tiny-fixture proofs, full db gate green, and
+  bundle `-22e` built by the new staging builder while all older seals
+  stayed byte-identical; round-4 lane table in `FINDINGS_CHECKLIST.md`.
+  The box stays unchecked until that independent re-review accepts.
+  Review round 5 (FIX) closed the same day under the extended owner
+  contracts: four boundary defects (a delayed mirror copy hiding a
+  committed DB failure, cross-kind/failed persisted provenance chains,
+  missing bundle content verifying OK, and a destructive non-exclusive
+  activation) root-fixed at `2c9cad4` with deterministic real-HTTP
+  mirror-barrier, persisted-forgery and tiny-fixture proofs, the full
+  db gate green, and bundle `-22f` built with regular hardlinks while
+  the three protected seals stayed byte-identical; round-5 lane table
+  in `FINDINGS_CHECKLIST.md`. The box stays unchecked until that
+  independent re-review accepts.
+  User authorized plan creation followed directly by Qwen Flash Next high
+  implementation and autonomous independent review on the existing branch.
+  No push, merge, automatic deployment or repeated unchanged live commissioning.
+  Current baseline: 678 fast passed, 480 deselected, zero failed/skipped, six
+  warnings, 95.97s at `1083f22`. Manual installed/provider qualification remains
+  distinct; milestones 20/21 are not retroactively marked accepted by this batch.
+
 ### Post-commissioning backlog — 2026-10-23
 
 Commissioning for the supervised AI run is complete: readiness, SSH/sudo/replay,
@@ -121,23 +175,163 @@ The user approved all four plans on 2026-10-24 after full-sequence planning here
 The whole backlog remains in scope; these supplement, not falsely complete,
 historical 14–17. Implementation waits for the user's new worktree:
 
-- [ ] **18 — Permanent appliance and recovery repairs.**
+- [x] **18 — Permanent appliance and recovery repairs.**
   [Plan](../.openchamber/plans/18-permanent-appliance-repairs.md). Installer/native/UID/
   TLS/config/firewall reproducibility, packaged CLI migrations, cessation-safe
   teardown/obligation tooling, trusted cron image pins and adversarial containment
   regression fixtures. Preserve completed commissioning evidence.
-- [ ] **19 — Conversational agent and model administration.**
+  *Status 2026-10-24 (branch `practice-upgrades-18-21`, implementation +
+  review round — independent RE-REVIEW pending):* implementation `2a162d9`
+  …`9885f87` passed its own gates, but the independent review at `168a9e1`
+  returned **FIX** with seven findings — including a HIGH (the firewall
+  loader's `ExecStop` deleted range isolation on unit stop while guests
+  were alive) and a scoring-integrity defect (cron pins trusted on
+  template ID alone let a wrong-digest pin PASS the real verifier). Every
+  finding was repaired with lifecycle regressions (`806d239`…`dfaa954`);
+  the superseded decisions and the corrections are recorded in the
+  architecture. Milestone stays unticked until the parent re-review
+  accepts the correction pass. Operator gates still open and NOT claimed:
+  `packet` (root+`nft`), `journey` (installed appliance), the installed
+  UID/TLS/boot/KVM rechecks (now including the new bootstrap ownership and
+  per-identity TLS-readability validation), and independent adversarial
+  qualification of the broader AppArmor profile `9e03696`.
+  *Status 2026-10-25 (second review round):* the independent re-review at
+  `41d8df9` again returned **FIX** — six findings, all root-dataflow or
+  installation-wiring: same-digest pin edits could rewrite an existing
+  session's verified score (HIGH — the round-1 freeze stopped at the
+  identity); artifact identity came from an API-side manifest re-read
+  instead of the clone authority (MEDIUM — config drift recorded bytes
+  the broker would not deploy); the resolver setting was never rendered
+  into the API env (HIGH — wiring only real under monkeypatch); the
+  supervisor's required `worker` directory was never provisioned (HIGH);
+  the web unit exec'd the distro Node while provisioning installed the
+  pinned one (HIGH); schema accepted `true`/`1.0` as version 1 (LOW).
+  All six repaired in `e20604a`/`cd19b1d` with reproductions at both
+  test layers (see FINDINGS "second review round" and the architecture's
+  second-round table). Milestone stays UNTICKED pending the parent's
+  next independent review; the same operator gates remain open and the
+  missing libvirt-fixture hypervisor/access recheck stays an explicit
+  promotion limitation (NOT PASS — no env attestation substitutes).
+  *Accepted 2026-10-25:* independent review at `c58ef6a` → **SHIP**,
+  all seven criteria passed on re-run (fast 646/0, install, authority
+  35/0, containment 26/0, images 19/0 warm TCG, db 190/0, persisted
+  file-backed scoring probes, peer-UID artifact RPC drift probe, wheel
+  migration). **Software acceptance only** — the operator gates and
+  installed-system qualifications above remain open and are carried
+  into milestone 21's promotion checks. Milestone 19 implementation
+  starts from this base.
+- [x] **19 — Conversational agent and model administration.**
   [Plan](../.openchamber/plans/19-conversation-and-model-admin.md). Pydantic AI slim,
   protected versioned profiles/role overrides/thinking mappings, context-aware
   history/checkpoints, one-slot async scheduling/cancellation and admin GUI.
+  *Accepted 2026-10-27 (SOFTWARE):* after five reproduced-defect review
+  rounds, the independent review at `1348b10` returned **SHIP**; the
+  reviewer personally re-ran the evidence (fast 661 passed/412 deselected
+  6 warnings 98.81 s; agent 120/953 160.4 s; db 272/801 663.5 s;
+  authority 35/1038 33.4 s; containment 26/1047 29.2 s; frontend build +
+  audit zero high/critical 18.8 s THEN browser 2/1071 113.1 s — all zero
+  failed/skipped) plus an independent real-PG fault-injection
+  confidentiality suite (7 passed/8 deselected, 7.38 s) confirming the
+  compensation audit records only `IntegrityError[23514]`-shaped
+  structure with no credential/row/SQL in app-role events, APIs or
+  logs, honest non-recording when the obligation write itself fails,
+  bounded cause cycles/invalid codes, legitimate rollback restore,
+  DB-observed concurrent-revoke lock and pre-edit same-key pins.
+  Applied migrations 0020–0024 byte-unchanged versus `e07c52a`.
+  **Software acceptance only** — operator gates (packet/journey/release),
+  installed UID/proc/systemd/Strata/nested-KVM qualifications and the
+  pinned-package supply-chain repair above remain open and are carried
+  into milestone 21's promotion checks.
 - [ ] **20 — Conversational coach and session review.**
   [Plan](../.openchamber/plans/20-coach-dashboard-and-replay.md). Grounded coach/AAR,
   modern home/history/session navigation, filtered audit and synchronized new-run
   timed attacker/defender replay with honest historical fallback.
+  *Status 2026-10-27 (branch `practice-upgrades-18-21`, independent
+  review fix round):* the review at `28b1f8b` (VERDICT FIX) reproduced
+  eleven defects; all eleven are root-fixed in `f8d3e3c` (audience-
+  separated coach threads, migration 0026), `e2cb098` (non-blocking
+  sequenced timed capture, atomic all-payload quotas, read-time
+  stamping), `5eb442d` (provenance-bound paged replay,
+  orphan-honest operations, durable-only lifecycle flags) and
+  `bd6167e` (validated-citation UI: only server-approved ids link;
+  epoch-true defender player; read-time chunk placement; fully lazy
+  server-cursor replay paging). Every fix carries a real HTTP /
+  subprocess / disposable-PG / browser counterexample. This round's
+  receipts at `bd6167e`: fast 661/0/0, selection, python, authority
+  35/0, containment, agent 123/0, pve-contract 22/0, db 314/0/0,
+  frontend with the ONLINE audit zero high/critical (the DNS-blocked
+  PENDING cleared), browser 5/0 serialized after frontend, compose,
+  install, hypervisor (labeled TCG) and access — all recorded in
+  [findings](FINDINGS_CHECKLIST.md). capture/images/bundle are blocked
+  solely by the carried pinned-nginx mirror-drift 21 blocker (exact
+  serial evidence there), and packet/journey/release fail closed by
+  design. Ticked when the parent's independent re-review accepts 20;
+  SECOND review at `adc10d4` (2026-10-27, VERDICT FIX, nine findings)
+  KEPT 20 UNACCEPTED and the user reprioritized milestone 21 to proceed
+  now on this branch; release blockers F1–F4 are being fixed inside 21,
+  polish F5–F9 are backlog entries in
+  [findings](FINDINGS_CHECKLIST.md) — nothing dropped.
+  Milestone 21 implementation round 1 landed 2026-10-27 (`3a4d927`):
+  preserving-upgrade engine + real CLI + required `upgrade` gate, bundle
+  upgrade contract, pulled blockers F1–F4 fixed with real proofs. The
+  release review at `2ba575e` returned VERDICT: FIX (seven engine/CLI
+  blockers); round 2 (`431f2c1`/`a2ee8c9`/`0a169e9`) fixed all seven with
+  the re-forged `upgrade` gate PASS ×3 deterministically (93.5–94.6 s).
+  All local-software lanes then passed at `44ccdc8`: `images` 19/0/0,
+  `capture`, `bundle` ×2 (persistent release bundle built and verified
+  at `.cache/bundle/sparring-range-appliance`, revision `44ccdc89588d`,
+  shipped-image boot from the bundle, tamper refused), plus
+  selection/db/agent/install/fast green. Round 3 (`ba6a4af`/`849066b`)
+  then closed the seven round-3 compatibility/safety blockers found by
+  independent review at `a2501c8`: the gate now begins at the REAL 0019
+  deployment (engine-side secret bootstrap, table-aware quiescence), the
+  admission barrier actually stops old admitting services and refuses
+  new generations at the transaction boundary, restart gained
+  daemon-reload + bounded real-HTTP readiness before the stamp,
+  restore-config keeps the fence while unfinished, installer URL formats
+  and child-env secrets are fixed, and the payload inventory is a
+  trusted contract — upgrade gate 25/25, fast/selection/db re-passed,
+  and the bundle runtime re-rebuilt against the corrected HEAD. The
+  round-4 review at `f6b57b3` (VERDICT FIX, five findings) is closed at
+  `2654683`/`8cbe932`: readiness parses the real `/readyz` contract
+  (200-with-ready-false and stale-head refusals), the fence records
+  attempt ownership across restores and completions, the selected
+  `--db-url-env` credential name is scrubbed by registration, the
+  runtime contract covers the unit ExecStart surface, and the runbook
+  journal check cannot false-clean — upgrade gate 32/32 407.1 s, fast
+  672/0/0, db 322/0/0, selection/install/agent/python/authority/
+  containment PASS, and the bundle runtime re-repacked at revision
+  `8cbe932d1c20` (MANIFEST sha256 `cb5e4712e175`, images byte-identical
+  to the verified set). The round-5 review at `85efa92` (VERDICT FIX,
+  two blockers) is closed at `9dcf354`: the admission fence is an
+  identity-bearing mutex token validated at acquisition (refused and
+  kept byte-exact against foreign/anonymous/corrupt fences; exclusive
+  create, no check→write race), at finalization (mid-run ownership swap
+  blocks without stamp or unfence, resumable) and at completion (only
+  exactly-own fence cleared), and the gate is deterministic under the
+  documented disk-backed TMPDIR via an isolated-git second payload —
+  upgrade gate 34/34 in BOTH TMPDIR modes (426.2 s / 463.4 s), fast
+  677/0/0, selection/python/authority/containment/install PASS, bundle
+  re-repacked at `9dcf3547cd92` (MANIFEST sha256 `47b1774a460e`, images
+  byte-identical). 21
+  stays UNTICKED — its operator-machine gates (packet/journey/release,
+  installed systemd/Strata/nested-KVM) remain pending. Exact receipts in
+  [findings](FINDINGS_CHECKLIST.md).
 - [ ] **21 — Upgrade and qualified integrated release.**
   [Plan](../.openchamber/plans/21-upgrade-and-integrated-release.md). Supported preserving
   in-place upgrade, corrected fresh-install bundle, changed-artifact rebuilds,
   installed/aggregate proofs and explicit real-Strata/manual acceptance.
+  *Carry-forward scoped limitation (2026-10-27, recorded at plan-19 round-5
+  review):* ~~the pinned guest package set has drifted out of the Ubuntu
+  mirrors~~ — REPAIRED 2026-10-27 (`3000361` + artifact build): pins
+  re-resolved against the live mirrors (`apt-get -s` SIM_OK) and the
+  three role images built and flattened from them with guest-recorded
+  resolved versions (FINDINGS artifact receipt). Reproducible as pinned;
+  final `images`/`capture`/`bundle` gate receipts still land with 21.
+  Also unproven and carried:
+  installed UID/proc/systemd boundaries, Strata/KVM nested virtualization
+  and all operator gates (packet/journey/release) — sandbox fixtures are
+  not installed-system proof.
 
 Architecture section K records choices/defaults. Do not restart cancelled
 DB/selection runs as though they failed; future acceptance may run them when needed.

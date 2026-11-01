@@ -3,7 +3,7 @@ the harness only needs an OpenAI-compatible chat endpoint.
 """
 from __future__ import annotations
 
-from srplatform.settings import get_settings
+from srplatform.settings import get_settings, model_api_key
 
 
 class CompletionRejected(ValueError):
@@ -30,11 +30,25 @@ class LLM:
         # the gateway remains the single bounded retry authority.
         self.max_tokens = getattr(s, f"llm_max_tokens_{role}",
                                   3072 if role == "coach" else 2048)
+        # The credential (plan 18): an explicit argument wins (tests and the
+        # API-only gateway), otherwise the API-only FILE is the authority and
+        # an unreadable/empty file fails loudly at construction, naming the
+        # file — never a silent fall back to the placeholder literal while
+        # every completion dies with an auth error.
+        if api_key is not None:
+            key = api_key
+        elif getattr(s, "llm_api_key_file", ""):
+            key = model_api_key(s)
+            if not key:
+                raise ValueError(
+                    f"model credential unreadable or empty: {s.llm_api_key_file}")
+        else:
+            key = s.llm_api_key
         # Bounded call timeout (60 s default per the gateway policy); the SDK's
         # own implicit retries are DISABLED so the single bounded retry policy
         # lives in the model gateway (no hidden multiplication of attempts).
         self.client = OpenAI(base_url=base_url or s.llm_base_url,
-                             api_key=api_key or s.llm_api_key,
+                             api_key=key,
                              timeout=s.llm_timeout_s, max_retries=0)
 
     def complete(self, system: str, user: str, temperature: float = 0.2,

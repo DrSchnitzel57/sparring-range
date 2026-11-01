@@ -11,16 +11,20 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
     SmallInteger,
     Text,
     UniqueConstraint,
+    case,
     func,
     text,
 )
+from sqlalchemy import text as sa_text  # alias: class attrs shadow `text`
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -447,3 +451,353 @@ class Recording(Base):
     status: Mapped[str] = mapped_column(Text, nullable=False, default="recording")
     bytes: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ModelProfile(Base):
+    """Versioned named model profile (plan 19). An edit creates a NEW
+    version and demotes the old one (partial unique index: one ACTIVE
+    per name); sessions pin a specific version and keep it for their
+    whole life.
+
+    THE PROVIDER CREDENTIAL DOES NOT LIVE HERE. Since migration 0021
+    the key lives only in ``model_profile_secrets``, readable solely
+    through the dedicated secret-role identity (review finding 8): the
+    application/ingestion DB role never receives it, so a compromised
+    ingest plane cannot read provider credentials. Lifecycle statuses:
+    ``active`` (serves new work), ``superseded`` (a NON-secret edit
+    replaced it — sessions already pinned to it keep working, which is
+    what makes thinking/timeout edits safe), ``revoked`` (credential
+    compromise/replacement — pinned work FAILS visibly until an
+    operator rebinds), ``retired`` (taken out of service)."""
+
+    __tablename__ = "model_profiles"
+
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="active")
+    base_url: Mapped[str] = mapped_column(Text, nullable=False)
+    model_name: Mapped[str] = mapped_column(Text, nullable=False)
+    thinking_level: Mapped[str] = mapped_column(Text, nullable=False, default="none")
+    thinking_map: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    generation_kwargs: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    context_window: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="262144")
+    max_completion_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="32768")
+    compaction_ratio: Mapped[float] = mapped_column(
+        Float, nullable=False, server_default="0.8")
+    timeout_s: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="900")
+    capabilities: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    note: Mapped[str | None] = mapped_column(Text)
+    # one-way identity of the credential VALUE (round-2 finding 2): a
+    # rotation invalidates EVERY version carrying the replaced digest,
+    # not just the version active at rotation time. NULL = predates
+    # digests (never matches, never false-revokes).
+    credential_digest: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("name", "version", name="uq_model_profiles_name_version"),
+        Index("uq_model_profiles_one_active", "name", unique=True,
+              postgresql_where=text("status = 'active'")),
+    )
+
+    def masked(self, *, key_present: bool | None = None) -> dict:
+        """The ONLY serialization shape: presence, never value.
+        ``key_present`` is supplied by the caller from the secret store;
+        ``None`` honestly reports "unknown" rather than a guess."""
+        return {
+            "profile_id": str(self.profile_id), "name": self.name,
+            "version": self.version, "status": self.status,
+            "base_url": self.base_url, "model_name": self.model_name,
+            "api_key_set": key_present,
+            "thinking_level": self.thinking_level,
+            "thinking_map": self.thinking_map,
+            "generation_kwargs": self.generation_kwargs,
+            "context_window": self.context_window,
+            "max_completion_tokens": self.max_completion_tokens,
+            "compaction_ratio": self.compaction_ratio,
+            "timeout_s": self.timeout_s, "capabilities": self.capabilities,
+            "note": self.note,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "retired_at": self.retired_at.isoformat() if self.retired_at else None,
+        }
+
+    def public_config(self) -> dict:
+        """The exact non-secret configuration a session pin freezes."""
+        return {
+            "name": self.name, "version": self.version,
+            "base_url": self.base_url, "model_name": self.model_name,
+            "thinking_level": self.thinking_level,
+            "thinking_map": self.thinking_map,
+            "generation_kwargs": self.generation_kwargs,
+            "context_window": self.context_window,
+            "max_completion_tokens": self.max_completion_tokens,
+            "compaction_ratio": self.compaction_ratio,
+            "timeout_s": self.timeout_s,
+            "capabilities": self.capabilities,
+        }
+
+
+class ModelProfileSecret(Base):
+    """Provider credential storage behind a SEPARATE minimal DB identity
+    (review finding 8). The app role has no grant here — not a revoked
+    one, none — so ingestion/worker/bastion DB access cannot read a
+    provider key even though the API plane shares the app role. Only
+    the API-side secret store (its own engine and role) touches this
+    table; values never travel over HTTP, into logs, or into events."""
+
+    __tablename__ = "model_profile_secrets"
+
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True)
+    api_key: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ModelRoleOverride(Base):
+    """Role → profile-name selection (plan 19). Roles are exactly
+    attacker/coach/summarizer; a missing row means the bootstrap
+    profile. Selecting a profile never changes global environment
+    configuration — overrides live only here."""
+
+    __tablename__ = "model_role_overrides"
+
+    role: Mapped[str] = mapped_column(Text, primary_key=True)
+    profile_name: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_by: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class SessionModelPin(Base):
+    """The version a session RUNS ON (plan 19): created when the session
+    first uses a role, honored for the session's whole life. ``config``
+    freezes the exact masked configuration so a generation can state
+    what it ran on without re-reading mutable profile state. Replacing
+    a pin is an explicit operator rebind (the old version was revoked),
+    never an automatic substitution."""
+
+    __tablename__ = "session_model_pins"
+
+    pin_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.session_id"), nullable=False)
+    role: Mapped[str] = mapped_column(Text, nullable=False)
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("model_profiles.profile_id"),
+        nullable=False)
+    config: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    bound_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("session_id", "role",
+                         name="uq_session_model_pins_session_role"),
+    )
+
+
+class ModelJob(Base):
+    """Durable record of every model admission (plan 19): primary turns,
+    hints, AAR narratives, compaction, probes, tests and visible retry
+    attempts are ALL rows, so the ONE slot, the queue state, and the
+    obligations of a cancelled-but-possibly-live call survive reloads
+    and restarts. The partial unique index on state='running' is the
+    database-enforced single admission slot."""
+
+    __tablename__ = "model_jobs"
+
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.session_id"))
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False)
+    # queued | running | succeeded | failed | cancelled |
+    # cessation_unknown | cessation_resolved
+    state: Mapped[str] = mapped_column(Text, nullable=False, default="queued")
+    profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    profile_name: Mapped[str | None] = mapped_column(Text)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    parent_job: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    depends_on: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    deadline_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True))
+    payload: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    result: Mapped[dict | None] = mapped_column(JSONB)
+    error: Mapped[str | None] = mapped_column(Text)
+    cancel_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false"))
+    # round-3 finding 2: DURABLE cancellation intent stamped on EVERY
+    # row of a logical request when it is cancelled. Retry-child
+    # creation and admission must consult it under the row lock —
+    # "cancelled" means no future attempt may ever be born or
+    # dispatched, whichever row grows the chain next.
+    cancel_intent: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false"))
+    # attempt-1 job id of the logical request this row belongs to
+    # (round-3): the chain is one index lookup for SQL-side admission
+    # and dependency gates. NULL (raw-SQL writers) is UNKNOWN — gated
+    # jobs on an unknown dependency are conservatively refused.
+    chain_root: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    resolved_by: Mapped[str | None] = mapped_column(Text)
+    resolution: Mapped[str | None] = mapped_column(Text)
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True))
+    actor: Mapped[str | None] = mapped_column(Text)
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # round-2 finding 7: the member-visible OUTCOME (coach hint / AAR
+    # event) is claimed once per logical request by whichever writer
+    # closes the chain — never per attempt row.
+    outcome_persisted: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false")
+
+    __table_args__ = (
+        # ONE admission slot, and an UNCERTAIN cessation holds it too
+        # (review finding 2 + round-2 finding 12). The key is the
+        # CONSTANT 0 for every occupying state and NULL otherwise —
+        # indexing ``state`` itself let one ``running`` plus one
+        # ``cessation_unknown`` coexist, because two DIFFERENT values
+        # are unique against each other. NULLs never conflict, so this
+        # index enforces the actually-advertised invariant: at most ONE
+        # occupying row (migration 0022).
+        Index("uq_model_jobs_occupied",
+              case((text("state IN ('running', 'cessation_unknown')"), 0)),
+              unique=True),
+        Index("ix_model_jobs_queue", "state", "priority", "requested_at"),
+        Index("ix_model_jobs_chain_root", "chain_root"),
+        Index("ix_model_jobs_session", "session_id"),
+        Index("ix_model_jobs_parent", "parent_job"),
+    )
+
+
+class ConversationRevision(Base):
+    """Append-only structured conversation history (plan 19). ``kind``
+    is ``messages`` (a serialized pydantic-AI ModelMessage list — the
+    structured turn, tool calls, returns, usage, finish reasons) or
+    ``checkpoint`` (a compaction summary that COVERS a revision range —
+    it never replaces or deletes history). The DB trigger and grants
+    make mutation impossible; a checkpoint therefore cannot hide what
+    it compacted, and replay can reconstruct what the model saw."""
+
+    __tablename__ = "conversation_revisions"
+
+    revision_id: Mapped[int] = mapped_column(BigInteger, primary_key=True,
+                                             autoincrement=True)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.session_id"), nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    usage: Mapped[dict | None] = mapped_column(JSONB)
+    finish_reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_conversation_revisions_session", "session_id", "revision_id"),
+    )
+
+
+class CoachMessage(Base):
+    """Append-only per-session coach conversation (plan 20). ``role`` is
+    ``user`` (the authenticated member) or ``coach`` (a durable-job
+    answer; ``model_job`` names it, ``model_ok`` distinguishes a genuine
+    model answer from the honest recorded fallback). A coach row keeps
+    the evidence CUTOFF it was generated under and its validated event
+    citations. Conversation, never audit — and never a score."""
+
+    __tablename__ = "coach_messages"
+
+    message_id: Mapped[int] = mapped_column(BigInteger, primary_key=True,
+                                            autoincrement=True)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.session_id"), nullable=False)
+    role: Mapped[str] = mapped_column(Text, nullable=False)
+    audience: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="member", default="member",
+        comment="immutable conversation audience: 'member' | 'operator' "
+                "(review finding 1); operator context never renders or "
+                "prompts into the member thread")
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    citations: Mapped[list | None] = mapped_column(JSONB)
+    model_job: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    model_ok: Mapped[bool | None] = mapped_column(Boolean)
+    context_cutoff_event_id: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_coach_messages_session", "session_id", "message_id"),
+        Index("ix_coach_messages_session_audience", "session_id",
+              "audience"),
+    )
+
+
+class OperationOutput(Base):
+    """Sequence-numbered, timestamped bounded output chunk for a red
+    command operation (plan 20 timed replay). Additive evidence: exit,
+    timeout, truncation and containment facts stay on ``run_operations``
+    and the ``action_result`` event even if capture fails. ``kind``:
+    ``output`` real bytes; ``gap`` capture failure/dropped bytes
+    (``dropped_bytes`` counted); ``truncated`` quota reached. Unique
+    ``(run_id, op_id, seq)`` makes worker re-delivery idempotent.
+    Operations predating this table simply have no rows — command-only
+    fallback, never a reconstructed fake cast."""
+
+    __tablename__ = "operation_outputs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True,
+                                    autoincrement=True)
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("runs.run_id"), nullable=False)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.session_id"), nullable=False)
+    op_id: Mapped[str] = mapped_column(Text, nullable=False)
+    seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False,
+                                      server_default="output")
+    text: Mapped[str | None] = mapped_column(Text)
+    dropped_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    read_ts: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="wall-clock seconds (time.time) at pipe-read time; NULL = "
+                "not observed — never silently equal to persist time "
+                "(review finding 10). Only a claim INSIDE the operation's "
+                "server-trusted interval is ever stored here (plan 22)")
+    read_ts_claim: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="the worker's RAW timing claim, kept even when rejected — "
+                "idempotence compares the claim, never the normalized "
+                "column, so retries never rewrite timing history")
+    read_ts_status: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+        comment="accepted | rejected-out-of-interval | absent for rows "
+                "written after migration 0028; legacy rows are "
+                "legacy-window-accepted | legacy-unknown (the weak "
+                "400-day window cannot be re-adjudicated retroactively)")
+
+    __table_args__ = (
+        Index("uq_operation_outputs_op_seq", "run_id", "op_id", "seq",
+              unique=True),
+        Index("ix_operation_outputs_session", "session_id", "op_id", "seq"),
+        Index("uq_operation_outputs_truncated_once", "run_id", "op_id",
+              unique=True, postgresql_where=sa_text("kind = 'truncated'")),
+    )

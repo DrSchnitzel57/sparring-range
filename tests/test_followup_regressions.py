@@ -1282,6 +1282,10 @@ def test_r01_real_worker_end_to_end_over_http(migrated_db, test_db_url_owner, tm
     fake_model.start()
     monkeypatch.setenv("LLM_BASE_URL", f"http://127.0.0.1:{fake_model.port}/v1")
     monkeypatch.setenv("LLM_API_KEY", "fake")
+    # plan 19: the model profile is bootstrapped (and frozen) at API
+    # startup — the environment must be final BEFORE the settings build
+    # _startup performs, exactly as in production
+    get_settings.cache_clear()
 
     port = _free_port()
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))

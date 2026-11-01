@@ -213,7 +213,7 @@ def test_live_competition_visibility_is_api_enforced(live):
             r = c.get(path, headers=b)
             assert r.status_code in (403, 404), (path, r.status_code)
         assert c.get(f"/sessions/{sid}", headers=live["op"]).status_code == 200
-        mine = c.get("/sessions", params={"mine": True}, headers=b).json()
+        mine = c.get("/sessions", params={"mine": True}, headers=b).json()["sessions"]
         assert all(s["session_id"] != sid for s in mine), mine
     finally:
         _end(live, a, sid)
