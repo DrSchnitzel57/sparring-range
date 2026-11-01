@@ -1091,3 +1091,46 @@ verification failed` on a first contact is unknown-key refusal, not
 evidence of compromise — `ssh-keyscan` the presented key, compare its
 fingerprint against the host's public half out-of-band, and only then
 pin it with `UserKnownHostsFile` (no TOFU).
+
+## Underpressure replica: operator prerequisites before any build (2026-10-21)
+
+The `underpressure-range` environment (10 real-service Windows guests behind
+OPNsense) cannot be built until the operator supplies the media and entitlements
+its fidelity ledger names as *not held*. Nothing here is destructive to the
+outer host; all steps happen on the appliance or on the operator's workstation.
+
+1. **Licensing path**: Microsoft licensing for this scenario is the operator's
+   explicit responsibility. Confirm the agreement covers evaluation-enterprise
+   Windows runs and per-seat Windows 11 use for the participating teams, or
+   record the operator's accepted basis, before provisioning guests.
+2. **Windows 11 SECDISARM ISO**: download from the vendor's evaluation centre,
+   record the SHA-256 next to the file, and verify the CPU supports
+   Nested Virtualization and AVX-512 on the exact appliance node *before* the
+   first install attempt — AMD EPYC Rome and newer meet both; Intel client CPUs
+   before Sapphire Rapids do not meet AVX-512, and no hypervisor setting fixes
+   that. On an unsupported CPU the workstation guest stays unprovisioned and
+   the blueprint records it honestly rather than substituting.
+3. **Windows Server 2022 evaluation ISO**: vendor evaluation centre; same
+   hash-then-record step. Guest keys are lab-generated (the blueprint refuses
+   `owner_key: *` values); activation stays on evaluation keys.
+4. **SQL Server 2022 Developer**: vendor download (free for the developer
+   use-case, not for competition prize money or production). This is the
+   declared *reconstruction* install from the original configuration guide,
+   not a re-imaged original.
+5. **OPNsense 25.x**: live installer image from the project site; verify the
+   published checksum. It substitutes the original's third-party firewall
+   distribution: capture the original's exported configuration, translate it
+   into OPNsense aliases and rules, and keep the export with the run records.
+6. **Winamp**: the original is third-party proprietary media and is *not*
+   redistributed or re-downloaded by this project. The replica provisions the
+   Windows 11 substitute; if the operator holds a licensed copy, its installer
+   can be staged like any other guest software after the guest exists.
+7. **Guest images**: builds happen only as the appliance's isolated build VMs
+   (no shares to the outer host, no domain join during build). The DC holds the
+   only domain-controller role; the domain is the lab's own, generated at
+   build time from the blueprint — the original organization's names and
+   credentials never enter the appliance.
+
+Until items 1-5 are on the appliance, `sr` environment commands and the broker's
+environment deploy path stay correctly blocked (no template VMs exist); fixture
+tests remain the only proof of the control plane.
