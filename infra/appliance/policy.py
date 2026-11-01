@@ -337,6 +337,18 @@ class AppliancePolicy:
             "heartbeat_interval_s": 5,
         }
         if seg_list:
+            # Once a segment lane exists, check_ipconfig binds EVERY address
+            # (including the flat lane's ipconfig0) to that closed vocabulary
+            # — so the range network itself must be declared as a segment,
+            # or the appliance would deploy blueprints but refuse its own v1
+            # flat guests. Refuse at derivation, name the exact fix.
+            rng = str(manifest.network.range_cidr)
+            if not any(s["cidr"] == rng for s in seg_list):
+                raise PolicyViolation(
+                    "network.segments declared but none equals the range "
+                    f"network {rng}: add a segment named 'range' with bridge "
+                    f"{manifest.network.range_bridge!r} and cidr {rng!r} to "
+                    "network.segments so flat-lane guests keep deploying")
             raw["segments"] = seg_list
             raw["max_nics"] = getattr(manifest.network, "max_nics", 1)
         policy = cls.from_dict(raw, source="derived from manifest")
@@ -361,6 +373,19 @@ class AppliancePolicy:
             raise PolicyViolation("policy provision network does not match manifest range_cidr")
         if self.gateway != manifest.network.range_gateway:
             raise PolicyViolation("policy gateway does not match manifest range_gateway")
+        exp_segs = tuple(sorted((s.name, s.bridge, str(s.cidr))
+                                for s in getattr(manifest.network, "segments", ())))
+        got_segs = tuple(sorted((s.name, s.bridge, str(s.network))
+                                for s in (self.segments or ())))
+        if exp_segs != got_segs:
+            raise PolicyViolation(
+                f"policy segment lane {got_segs or '(none)'} does not match "
+                f"manifest networks.segments {exp_segs or '(none)'} — "
+                "re-render the broker policy (a manifest edit is never silently ignored)")
+        if self.max_nics != getattr(manifest.network, "max_nics", 1):
+            raise PolicyViolation(
+                f"policy max_nics {self.max_nics} does not match manifest "
+                f"networks.max_nics {getattr(manifest.network, 'max_nics', 1)}")
         image_ids = {image.template_id for image in manifest.images.values()}
         if set(self.templates) != image_ids:
             raise PolicyViolation(

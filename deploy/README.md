@@ -1,5 +1,12 @@
 # Pilot deployment — operator runbook (pilot plan step 7)
 
+> **RETIRED KIT (2026-11-01).** This is the historical direct-PVE pilot
+> runbook, kept for provenance. `sr-brokerd.service` starts
+> `infra.broker.__main__`, which no longer exists; the current appliance
+> installs via `deploy/appliance.py` and runs the broker as
+> `sr-appliance-broker.service` (rendered at install). Do not enable
+> anything below on a current appliance.
+
 The agent builds the artifacts; the OPERATOR executes them. Nothing here
 contacts Proxmox or configures host networking automatically — isolation is
 operator-owned (project boundary), and attacks stay latched until the

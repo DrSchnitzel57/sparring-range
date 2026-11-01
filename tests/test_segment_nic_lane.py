@@ -185,26 +185,29 @@ def test_manifest_segment_validation(tmp_path):
     from tests.test_appliance_contract import _manifest
     raw = _manifest(tmp_path, verify_files=True)
     raw["network"]["segments"] = [
+        {"name": "range", "cidr": "10.66.0.0/24", "bridge": "srlab0"},
         {"name": "inside-lan", "cidr": "172.20.240.0/24", "bridge": "sr-inside"},
         {"name": "transit", "cidr": "172.16.0.0/24", "bridge": "sr-transit"},
     ]
-    raw["network"]["max_nics"] = 2
+    raw["network"]["max_nics"] = 3
     m = ApplianceManifest.from_dict(raw, verify_images=True, verify_model_key=False)
-    assert {s.name for s in m.network.segments} == {"inside-lan", "transit"}
+    assert {s.name for s in m.network.segments} == \
+        {"range", "inside-lan", "transit"}
     assert "sr-inside" in str(m.redacted())
 
-    # appliance policy derives from the manifest
+    # appliance policy derives from the manifest (range segment present —
+    # without it from_manifest refuses; see segment-lane-render tests)
     pol = AppliancePolicy.from_manifest(m)
-    assert pol.segments and pol.max_nics == 2
+    assert pol.segments and pol.max_nics == 3
 
     for mutate, needle in [
         (lambda d: d["network"]["segments"].append(
             {"name": "dup", "cidr": "172.20.240.128/25", "bridge": "sr-x"}),
          "overlaps"),
         (lambda d: d["network"]["segments"].append(
-            {"name": "same", "cidr": "10.66.0.0/24", "bridge": "srlab0"}),
+            {"name": "sneak", "cidr": "172.30.0.0/24", "bridge": "srlab0"}),
          "range_bridge"),
-        (lambda d: d["network"].__setitem__("max_nics", 3), "cannot exceed"),
+        (lambda d: d["network"].__setitem__("max_nics", 4), "cannot exceed"),
         (lambda d: d["network"]["segments"].append(
             {"name": "Inside", "cidr": "10.9.0.0/24", "bridge": "sr-y"}),
          "safe segment name"),

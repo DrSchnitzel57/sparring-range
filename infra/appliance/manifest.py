@@ -350,15 +350,20 @@ class ApplianceManifest:
                 raise _bad(f"{where}.name must be a unique safe segment name")
             seen_seg_names.add(sname)
             sbridge = _str(item, "bridge", where)
-            if (not _BRIDGE_RE.fullmatch(sbridge) or sbridge == "lo"
-                    or sbridge == bridge or sbridge in seen_seg_bridges):
-                raise _bad(f"{where}.bridge must be a unique safe bridge and "
-                           f"differ from range_bridge")
-            seen_seg_bridges.add(sbridge)
             try:
                 snet = ipaddress.ip_network(_str(item, "cidr", where), strict=True)
             except ValueError as exc:
                 raise _bad(f"{where}.cidr invalid: {exc}") from exc
+            if (not _BRIDGE_RE.fullmatch(sbridge) or sbridge == "lo"
+                    or sbridge in seen_seg_bridges
+                    or (sbridge == bridge and snet != rng)):
+                # The range bridge may only be named by the range network
+                # itself (the segment that keeps the flat lane inside the
+                # closed address vocabulary).
+                raise _bad(f"{where}.bridge must be a unique safe bridge; "
+                           f"range_bridge {bridge!r} may only carry the range "
+                           "network itself")
+            seen_seg_bridges.add(sbridge)
             if not isinstance(snet, ipaddress.IPv4Network) or snet.prefixlen > 30:
                 raise _bad(f"{where}.cidr must be a strict IPv4 /<=30 network")
             if snet.is_loopback:

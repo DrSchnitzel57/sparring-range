@@ -447,6 +447,13 @@ def render_policy(m: ApplianceManifest) -> str:
         "lease_ttl_s": policy.lease_ttl_s,
         "heartbeat_interval_s": policy.heartbeat_interval_s,
     }
+    if policy.segments:
+        # The segment lane is the env-deploy contract: dropping it here is
+        # how a segment-declaring manifest boots a v1-only broker and then
+        # refuses its own blueprint deploys after the first clone.
+        raw["segments"] = [{"name": s.name, "bridge": s.bridge,
+                            "cidr": str(s.network)} for s in policy.segments]
+        raw["max_nics"] = policy.max_nics
     return json.dumps(raw, indent=2, sort_keys=True) + "\n"
 
 

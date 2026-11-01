@@ -52,8 +52,6 @@ def parse_segments(raw_segments, *, provision_bridge: str,
                 or not re.fullmatch(r"[A-Za-z0-9._-]{1,15}", sbridge)
                 or sbridge == "lo"):
             raise bad(f"segments[{i}].bridge must be one exact safe bridge name")
-        if sbridge == provision_bridge:
-            raise bad(f"segments[{i}].bridge repeats the provision bridge")
         if sbridge in seen_bridges:
             raise bad(f"segments[{i}].bridge {sbridge!r} duplicated")
         seen_bridges.add(sbridge)
@@ -61,6 +59,13 @@ def parse_segments(raw_segments, *, provision_bridge: str,
             snet = ipaddress.ip_network(s["cidr"], strict=True)
         except ValueError as e:
             raise bad(f"segments[{i}].cidr invalid: {e}") from e
+        # The provision bridge may only ever be named by the range network
+        # itself: declaring the range as a segment is what keeps the v1 flat
+        # lane's addresses inside the closed vocabulary once a lane exists.
+        # Any OTHER segment on the provision bridge is still a duplicate.
+        if sbridge == provision_bridge and snet != provision_net:
+            raise bad(f"segments[{i}].bridge repeats the provision bridge "
+                      f"without being the range network itself")
         if not isinstance(snet, ipaddress.IPv4Network) or snet.prefixlen > 30:
             raise bad(f"segments[{i}].cidr must be a strict IPv4 /<=30")
         for other, onet in seen_nets:
