@@ -49,6 +49,8 @@ class SegmentPurpose(str, Enum):
 
 class OsKind(str, Enum):
     LINUX = "linux"
+    FREEBSD = "freebsd"    # OPNsense-class appliances: FreeBSD userland, not
+                           # Linux — bootstrap/readiness paths differ materially
     WINDOWS = "windows"
     ROUTER = "router"
 
@@ -86,7 +88,10 @@ class GuestRole(str, Enum):
     WINDOWS_SQL = "windows-sql"
     LINUX_DESKTOP = "linux-desktop"
     WINDOWS_DESKTOP = "windows-desktop"
-    ATTACKER = "attacker"
+    ATTACKER = "attacker"            # privileged platform attacker template
+    TEAM_TOOLING = "team-tooling"    # defender/member tooling VM (e.g. team
+                                     # Kali): member-accessible, NEVER the
+                                     # platform attacker role
     RED_ENTRY = "red-entry"
     SCORING = "scoring"
 

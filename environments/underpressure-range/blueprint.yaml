@@ -28,9 +28,15 @@ description: >-
 
 resource_policy:
   # 64 GiB / 16 vCPU candidate profile (plan input, NOT measured capacity;
-  # preflight must prove it on the actual appliance). Guest memory is never
-  # oversubscribed; vCPU oversubscription is explicit with an aggregate CPU
-  # limit so controller/broker/scoring keep headroom.
+  # preflight must prove it on the actual appliance — nothing here is
+  # "qualified" until measured there). Guest memory is never oversubscribed;
+  # vCPU oversubscription is explicit with an aggregate CPU cap expressed as
+  # percent of the OUTER vCPU count (350% of 16 vCPU = 56 vCPU-seconds/s of
+  # summed guest limits), leaving headroom for controller/broker/scoring.
+  # Disk: guest disks alone total ~568 GiB; bases, immutable templates,
+  # reset scratch, evidence and reserve sit ON TOP of that. A ~600 GB pool
+  # does NOT fit: preflight must either prove a larger pool or select the
+  # compact image profiles — silent overcommit is refused, not validated.
   outer_memory_mb: 65536
   outer_vcpus: 16
   controller_reserve_mb: 8192
@@ -89,7 +95,8 @@ guests:
   - name: opnsense-fw
     display_name: "Perimeter firewall (OPNsense substitute for PA-VM2)"
     role: firewall
-    os: linux
+    os: freebsd  # OPNsense is FreeBSD; treating it as Linux breaks
+                 # bootstrap/readiness assumptions materially
     interfaces:
       - segment: transit
         ipv4: {mode: static, address: 172.16.0.1}
@@ -183,10 +190,12 @@ guests:
     display_name: "WIN11-WKST (Windows 11 Enterprise evaluation substitute)"
     role: windows-desktop
     os: windows
+    # disk: 64 GiB — the published Windows 11 requirement (64 GB); a 60 GB
+    # guest silently bypasses that check and cannot be qualified.
     interfaces:
       - segment: inside-lan
         ipv4: {mode: dhcp, address: 172.20.240.113}
-    resources: {vcpus: 2, memory_mb: 6144, disk_gb: 60}
+    resources: {vcpus: 2, memory_mb: 6144, disk_gb: 64}
     boot: {firmware: efi-tpm, bootstrap: qga-winrm, image_profile: win11-ent-eval}
     depends_on: [ad-dns]
     services: []
@@ -194,7 +203,10 @@ guests:
 
   - name: team-kali
     display_name: "Team Kali (competition team tooling VM)"
-    role: attacker
+    # team-tooling, NOT the privileged platform attacker role: this is the
+    # defenders' own box, member-accessible; the AI attacker lives on
+    # red-entry only.
+    role: team-tooling
     os: linux
     interfaces:
       - segment: team

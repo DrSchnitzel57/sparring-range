@@ -76,24 +76,47 @@ about targets, what worked, what failed, what is in flight, current phase.
 Plain text, no JSON."""
 
 
-def render_environment_context(scenario: dict) -> str | None:
+class EnvironmentContextError(RuntimeError):
+    """An environment-bound run cannot obtain its authorized context.
+    Callers must FAIL the run; falling back to generic inventory would
+    launch a blind attacker with the wrong (or no) authorized scope."""
+
+
+def render_environment_context(scenario: dict, environment=None) -> str | None:
     """Authorized-scope inventory text for an ENVIRONMENT scenario.
 
     Built from the private attack view only: entry position, target
     guests, service context and the tactic guide. Never scorer
     expectations, credentials, defender telemetry or platform
-    management material. Returns None (caller falls back / aborts)
-    when the environment cannot be loaded — a broken contract must
-    not degrade into a blind loop.
+    management material.
+
+    `environment` is the IMMUTABLE Environment snapshot the exercise was
+    created with (content-digest-pinned at creation). Exercise-bound
+    callers MUST pass it: reloading the live library document here would
+    let an edited on-disk environment silently change an existing
+    exercise's authorized scope. If no snapshot is passed the caller is
+    starting a NEW run and loading the library is correct. Returns None
+    only for non-environment scenarios; an environment that fails to
+    load raises EnvironmentContextError — a broken contract must not
+    degrade into a blind loop.
     """
     from srplatform import environment_specs as envspecs
     env_id = scenario.get("environment")
     if not env_id:
         return None
-    try:
-        env = envspecs.load_environment(env_id)
-    except envspecs.EnvironmentError:
-        return None
+    if environment is None:
+        try:
+            env = envspecs.load_environment(env_id)
+        except envspecs.EnvironmentError as exc:
+            raise EnvironmentContextError(
+                f"environment {env_id!r} failed to load for this run: {exc}"
+            ) from exc
+    else:
+        env = environment
+        if getattr(env, "id", env_id) != env_id:
+            raise EnvironmentContextError(
+                f"environment snapshot {getattr(env, 'id', '?')!r}"
+                f" does not match the exercise's {env_id!r}")
     view = env.attack_view()
     scope = view["scope"]
     bp = env.blueprint
@@ -236,9 +259,13 @@ class RedAgentLoop:
 
     def _topology_text(self) -> str:
         if self.scenario.get("environment"):
-            text = render_environment_context(self.scenario)
-            if text is not None:
-                return text
+            # Environment-bound runs render ONLY from the authorized
+            # environment context (pass self._environment once the session
+            # carries a pinned snapshot). A load/contract failure raises —
+            # it must NOT fall through to generic host inventory, which
+            # would run an attacker against the wrong scope.
+            return render_environment_context(
+                self.scenario, getattr(self, "_environment", None))
         hosts = (self.scenario.get("topology") or {}).get("hosts") or []
         lines = [f"- {h.get('name')}: ip {h.get('ip')} services {h.get('services', [])}"
                  for h in hosts]

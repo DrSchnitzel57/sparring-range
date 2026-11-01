@@ -18,7 +18,23 @@ from __future__ import annotations
 
 from .environment_specs.blueprint import EnvironmentBlueprint, GuestRole
 
-RESET_PLAN_VERSION = 1
+RESET_PLAN_VERSION = 2
+
+# Inventory-state policy (fail-closed). ONLY these states are resettable on
+# their own merits. Anything else — transitional, foreign, destroyed, or a
+# string this build does not recognize — is a blocker; a `failed` guest is
+# eligible only when the executing path positively reconciled ownership of
+# the exact generation (reconciled_guests). Unknown-ownership rule: an
+# unrecognized state is never evidence of eligibility.
+RESET_ELIGIBLE_STATES = frozenset({"ready", "stopped"})
+TRANSITIONAL_STATES = frozenset({"pending", "creating", "provisioning",
+                                 "destroying"})
+FOREIGN_STATES = frozenset({"foreign", "destroyed-foreign"})
+DESTROYED_STATES = frozenset({"destroyed"})
+RECONCILABLE_STATES = frozenset({"failed"})
+_KNOWN_GUEST_STATES = (RESET_ELIGIBLE_STATES | TRANSITIONAL_STATES
+                       | FOREIGN_STATES | DESTROYED_STATES
+                       | RECONCILABLE_STATES | {"unknown"})
 
 # Guests whose domain membership is established by AD join / SSSD realm.
 # Rebuilding the DC invalidates their machine identity; rebuilding a member
@@ -51,13 +67,20 @@ def _dependents_index(bp: EnvironmentBlueprint) -> dict[str, set[str]]:
 
 def compute_reset_plan(bp: EnvironmentBlueprint, selected: list[str],
                        guest_states: dict[str, str] | None = None,
-                       full: bool = False) -> dict:
+                       full: bool = False,
+                       reconciled_guests: frozenset[str] = frozenset(),
+                       ) -> dict:
     """Versioned dependency plan for a destructive reset.
 
-    guest_states: current LabGuest states (from durable inventory). Any
-    selected/affected guest whose state is unknown (missing) or `failed`
-    mid-provision does NOT silently proceed — it becomes a blocker with
-    recovery instructions.
+    guest_states: current LabGuest states (from durable inventory). Only
+    explicitly eligible states (ready/stopped) plan as resettable; missing,
+    transitional, foreign, unrecognized or failed states become blockers
+    with recovery instructions. `reconciled_guests` names guests whose
+    OWNERSHIP of the current generation was positively reconciled by the
+    executing path (broker-ledger read-back); only those failed guests may
+    plan the supported recovery reset. The pure planner never invents
+    ownership: string state alone is not proof, and the executor must
+    re-check identity/generation/ownership before destroying anything.
     """
     issues: list[str] = []
     known = {g.name for g in bp.guests}
@@ -129,16 +152,41 @@ def compute_reset_plan(bp: EnvironmentBlueprint, selected: list[str],
         advisories.append("router/firewall rebuild interrupts ALL segments "
                           "(transit/NAT/DHCP) until read-back confirms")
 
-    # durable inventory honesty: unknown or mid-creation states block
+    # durable inventory honesty: ONLY explicitly eligible states reset.
+    # Fail-closed for unknown ownership, transitional and foreign states —
+    # a string we do not recognize is not evidence of anything, and a
+    # FAILED guest resets only with positive reconciled ownership supplied
+    # by the executing path (see reconciled_guests).
     for g in sorted(rebuild):
         st = states.get(g)
         if st is None:
             blockers.append(f"no durable inventory for guest {g} — reset "
                             f"refused until ownership is reconciled "
                             f"(recovery: reconcile broker ledger, then retry)")
-        elif st in ("pending", "creating"):
+        elif st in RESET_ELIGIBLE_STATES:
+            continue
+        elif st == "failed":
+            if g not in reconciled_guests:
+                blockers.append(
+                    f"guest {g} is failed; reset requires positive "
+                    "reconciled ownership/read-back (reconcile the broker "
+                    "ledger for this exact generation, then retry)")
+        elif st in TRANSITIONAL_STATES:
             blockers.append(f"guest {g} is mid-provision (state {st!r}); "
                             f"finish or fail the provisioning attempt first")
+        elif st in FOREIGN_STATES:
+            blockers.append(f"guest {g} is state {st!r}: ownership is not "
+                            f"ours (or not proven); never reset what we do "
+                            f"not provably own")
+        elif st not in _KNOWN_GUEST_STATES:
+            blockers.append(f"guest {g} has unrecognized inventory state "
+                            f"{st!r}; refusing to plan against a state we "
+                            f"cannot interpret")
+        # remaining known non-eligible states (e.g. destroyed) fall through
+        # to the explicit blocker below
+        else:
+            blockers.append(f"guest {g} is state {st!r}, which is not a "
+                            f"resettable state")
 
     return {
         "plan_version": RESET_PLAN_VERSION,

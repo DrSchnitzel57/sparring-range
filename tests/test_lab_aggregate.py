@@ -86,6 +86,33 @@ def test_unknown_inventory_blocks_never_guesses(bp):
     assert any("mid-provision" in b for b in plan2["blockers"])
 
 
+def test_reset_state_policy_fails_closed(bp):
+    """Only ready/stopped reset on their own; transitional, foreign,
+    destroyed, unrecognized and un-reconciled-failed states NEVER plan ok
+    (unknown-ownership rule), with ready/stopped controls passing."""
+    base = _states(bp)
+    for bad in ("unknown", "foreign", "destroying", "failed", "provisioning",
+                "pending", "creating", "destroyed", "not-a-real-state"):
+        states = dict(base, ecomm=bad)
+        plan = compute_reset_plan(bp, ["ecomm"], states)
+        assert not plan["ok"], f"state {bad!r} must block, got {plan['blockers']}"
+        assert any("ecomm" in b for b in plan["blockers"])
+    for good in ("ready", "stopped"):
+        states = dict(base, ecomm=good)
+        assert compute_reset_plan(bp, ["ecomm"], states)["ok"], good
+    # failed resets ONLY with positive reconciled ownership of the generation
+    states = dict(base, ecomm="failed")
+    assert not compute_reset_plan(bp, ["ecomm"], states)["ok"]
+    rec = compute_reset_plan(bp, ["ecomm"], states,
+                             reconciled_guests=frozenset({"ecomm"}))
+    assert rec["ok"], rec["blockers"]
+    # reconciling one guest never whitewashes another failing guest
+    states2 = dict(states, webmail="failed")
+    p2 = compute_reset_plan(bp, ["ecomm", "webmail"], states2,
+                            reconciled_guests=frozenset({"ecomm"}))
+    assert not p2["ok"] and any("webmail" in b for b in p2["blockers"])
+
+
 def test_empty_and_unknown_selections_refused(bp):
     plan = compute_reset_plan(bp, [], _states(bp))
     assert not plan["ok"] and any("at least one guest" in b for b in plan["blockers"])

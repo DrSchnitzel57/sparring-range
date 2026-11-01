@@ -81,7 +81,9 @@ entries:
             Basic, TrustedHosts *, relaxed CBT) are reported opening
             weaknesses, pinned deliberately. Fresh lab-only CA material
             (ca_priv.pem et al. under C:\\Users\\Administrator\\ca) is
-            regenerated; the original CA key is never used."}
+            regenerated; the original CA key is never used. CA material is
+            a LOCAL FILE SET on the DC only: no CA distribution service or
+            network fileshare is claimed by it, and none is checked."}
   - {path: /guests/6, classification: substituted, source: plan-defaults,
      note: "SQL Server 2022 Developer on Server 2019 is the approved
             reconstruction; original edition/version/auth were unrecorded. It

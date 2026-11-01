@@ -352,6 +352,43 @@ def test_loop_environment_context_is_scope_only():
     assert "credential:" not in text             # no scorer material
     assert "seed_expectation" not in text
     assert "success_text" not in text
-    # broken/unknown environment => None (loop must not go blind)
-    assert render_environment_context({"environment": "nope"}) is None
-    assert render_environment_context({}) is None
+    # broken/unknown environment must RAISE (loop fails; no blind fallback)
+    from srplatform.red_agent.loop import EnvironmentContextError
+    with pytest.raises(EnvironmentContextError):
+        render_environment_context({"environment": "nope"})
+    assert render_environment_context({}) is None  # not an env scenario
+
+
+def test_loop_context_consumes_frozen_snapshot_not_live_library(monkeypatch):
+    """An exercise-bound run renders from the snapshot pinned at creation:
+    library-document edits after creation cannot change its scope."""
+    from srplatform import environment_specs as envspecs
+    from srplatform.red_agent import loop as red_loop
+    snapshot = envspecs.load_environment("underpressure-range")
+
+    def boom(*a, **k):
+        raise AssertionError("live library must not be reloaded when a "
+                             "snapshot is bound")
+    monkeypatch.setattr(envspecs, "load_environment", boom)
+    text = red_loop.render_environment_context(
+        {"environment": "underpressure-range"}, environment=snapshot)
+    assert text and "red-entry" in text
+
+    # mismatched snapshot id is refused, never silently accepted
+    class Other:
+        id = "other-env"
+    with pytest.raises(red_loop.EnvironmentContextError):
+        red_loop.render_environment_context(
+            {"environment": "underpressure-range"}, environment=Other())
+
+
+def test_os_and_role_fidelity():
+    env = load_environment("underpressure-range")
+    bp = env.blueprint
+    # OPNsense is FreeBSD: Linux-classified bootstrap would be a lie
+    assert bp.guest("opnsense-fw").os.value == "freebsd"
+    # team Kali is member tooling, never the privileged platform attacker
+    assert bp.guest("team-kali").role.value == "team-tooling"
+    assert bp.guest("red-entry").role.value == "red-entry"
+    # published Windows 11 requirement, not a silent 60 GB bypass
+    assert bp.guest("win11-wkst").resources.disk_gb >= 64
