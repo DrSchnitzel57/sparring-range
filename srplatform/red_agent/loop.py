@@ -136,10 +136,14 @@ def render_environment_context(scenario: dict, environment=None) -> str | None:
                 addrs.append(f"{iface.ipv4.address}/{iface.segment}")
         lines.append(f"- {name} [{', '.join(addrs) or 'dhcp'}] "
                      f"os={g.os.value} services={', '.join(s.value for s in g.services) or '-'}")
-    lines.append("Public paths (via the edge NAT):")
-    for e in bp.edges:
-        if e.kind.value == "nat":
-            lines.append(f"- {e.detail}")
+    lines.append("Public paths (via the edge NAT; declared service paths — "
+                 "anything not listed has no path):")
+    for f in bp.public_forwards:
+        tgt = bp.guest(f.target_guest)
+        taddr = next((i.ipv4.address for i in tgt.interfaces
+                      if i.ipv4.address), "?")
+        lines.append(f"- DNAT {f.vip}:{f.vip_port}/{f.protocol} -> "
+                     f"{taddr}:{f.target_port} ({f.label})")
     lines.append("Service context:")
     lines += [f"- {c}" for c in view["service_context"]]
     lines.append("Tactic guide (advisory; scope and rules are enforced "

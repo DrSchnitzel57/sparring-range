@@ -23,7 +23,9 @@ scope:
     - team-kali
     - vyos-edge
     - opnsense-fw
-  allowed_segments: [public-nat]
+  allowed_segments: [wan, public-nat]   # upstream vantage segment + the
+                                        # routed VIP prefix it may reach via
+                                        # the edge DNAT
   deny_destructive_wiping: true
   deny_real_secret_collection: true
   deny_external_targets: true

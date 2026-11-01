@@ -256,6 +256,61 @@ class ServiceEdge(Strict):
     protocol: Literal["tcp", "udp"] | None = None
 
 
+class PublicForward(Strict):
+    """ONE EXECUTABLE public service path: the simulated upstream routes the
+    public VIP prefix to the edge guest, which DNATs VIP:port to the target
+    guest's segment address. Free-text edge details document intent; THIS is
+    the contract provisioning, routing proofs and scoring bind to."""
+    label: str = Field(min_length=1, max_length=80)
+    protocol: Literal["tcp", "udp"]
+    vip: str
+    vip_port: int = Field(ge=1, le=65535)
+    on_guest: str          # the edge (router/firewall role) that owns the DNAT
+    target_guest: str
+    target_port: int = Field(ge=1, le=65535)
+
+    @field_validator("vip")
+    @classmethod
+    def _vip(cls, v: str) -> str:
+        ipaddress.ip_address(v)
+        return v
+
+
+class GuestRoute(Strict):
+    """Typed static route: `guest` sends `prefix` to next hop `via`.
+    `via` MUST be on-link for the guest and MUST be a declared guest
+    interface address — no free-text gateways, no invented next hops.
+    A default route (0.0.0.0/0) is refused: containment means every
+    reachable prefix is named. (Guests on a segment with a default_gateway
+    get that gateway from the segment; this is for explicit prefix routes.)"""
+    guest: str
+    prefix: str
+    via: str
+
+    @field_validator("prefix")
+    @classmethod
+    def _prefix(cls, v: str) -> str:
+        net = ipaddress.ip_network(v, strict=True)
+        if net.version != 4 or net.prefixlen > 32 or net.prefixlen == 0:
+            raise ValueError("route prefix must be a non-default IPv4 network")
+        return str(net)
+
+    @field_validator("via")
+    @classmethod
+    def _via(cls, v: str) -> str:
+        ipaddress.ip_address(v)
+        return v
+
+
+class AccessDeny(Strict):
+    """Appliance-owned deny rule inside the simulation: even where routing
+    would allow a path, defenders must never reach platform machines.
+    `src`/`dst` name a guest or a segment."""
+    src: str
+    dst: str
+    reason: str = Field(min_length=1, max_length=200)
+
+
 class DnsRecord(Strict):
     name: str = Field(min_length=1, max_length=253)
     type: Literal["A", "CNAME", "MX", "SRV"]
@@ -291,6 +346,12 @@ class EnvironmentBlueprint(Strict):
     guests: list[Guest] = Field(min_length=1)
     edges: list[ServiceEdge] = []
     dns_records: list[DnsRecord] = []
+    # EXECUTABLE routing contracts (typed; edges stay descriptive docs):
+    # public service paths via the edge DNAT, typed prefix routes, and
+    # appliance deny rules inside the simulation.
+    public_forwards: list[PublicForward] = []
+    routes: list[GuestRoute] = []
+    access_denies: list[AccessDeny] = []
 
     # ------------------------------------------------------------ validate --
     @model_validator(mode="after")
@@ -433,6 +494,129 @@ class EnvironmentBlueprint(Strict):
                     issues.append(f"{where}: dns_records[{r}]: A value "
                                   f"{rec.value!r} is not an address")
 
+        # ---------------------------------------- typed routing contracts --
+        # The public VIP prefix is ROUTED, never on-link: no guest interface
+        # may claim an address inside a public-nat segment, or clients would
+        # ARP the VIPs directly and never traverse the edge DNAT path.
+        public_segs = [s for s in self.segments
+                       if s.purpose == SegmentPurpose.PUBLIC_NAT]
+        for name, addr in used_addresses:
+            for seg in public_segs:
+                if addr in ipaddress.ip_network(seg.cidr):
+                    issues.append(
+                        f"{where}: guest {name} binds VIP-prefix address "
+                        f"{addr} on segment {seg.name} — the public prefix "
+                        f"is routed by the upstream, never bound to an "
+                        f"interface")
+        if self.public_forwards and not public_segs:
+            issues.append(f"{where}: public_forwards exist but no segment "
+                          f"has purpose public-nat (where would the VIPs live?)")
+
+        # External vantages (red entry, scoring) attach on the SIMULATED
+        # UPSTREAM segment — genuinely separate from the VIP prefix — and
+        # reach every public VIP only through their own typed routes.
+        vantage_roles = {GuestRole.RED_ENTRY, GuestRole.SCORING}
+        for g in self.guests:
+            if g.role not in vantage_roles:
+                continue
+            attached = [segments[i.segment] for i in g.interfaces
+                        if i.segment in segments]
+            purposes = {s.purpose for s in attached}
+            if SegmentPurpose.PUBLIC_NAT in purposes:
+                issues.append(
+                    f"{where}: guest {g.name} (role {g.role.value}) attaches "
+                    f"on-link to the public-nat segment — clients there ARP "
+                    f"the VIPs directly and bypass the edge DNAT; attach the "
+                    f"vantage to the simulated upstream segment instead")
+            if SegmentPurpose.SIMULATED_WAN not in purposes:
+                issues.append(
+                    f"{where}: guest {g.name} (role {g.role.value}) must "
+                    f"attach to a simulated-wan (upstream) segment — external "
+                    f"entry is proven through the replica's routed path")
+            for f in self.public_forwards:
+                vip = ipaddress.ip_address(f.vip)
+                if not any(r.guest == g.name and vip in ipaddress.ip_network(
+                        r.prefix, strict=True) for r in self.routes):
+                    issues.append(
+                        f"{where}: vantage {g.name} has no typed route "
+                        f"covering public VIP {f.vip} (forward {f.label!r}) "
+                        f"— the routed path is declared, never assumed")
+
+        for i, r in enumerate(self.routes):
+            g = guests.get(r.guest)
+            if g is None:
+                issues.append(f"{where}: routes[{i}]: guest {r.guest!r} "
+                              f"unknown")
+                continue
+            via = ipaddress.ip_address(r.via)
+            if not any(s.segment in segments and via in ipaddress.ip_network(
+                    segments[s.segment].cidr) for s in g.interfaces):
+                issues.append(f"{where}: routes[{i}]: next hop {r.via} is "
+                              f"not on-link for guest {r.guest} on any of "
+                              f"its segments")
+            if all(addr != via for _, addr in used_addresses):
+                issues.append(f"{where}: routes[{i}]: next hop {r.via} is "
+                              f"not a declared guest interface address — "
+                              f"routing contracts name owned routers, not "
+                              f"free-text gateways")
+
+        seen_fwd: set[tuple] = set()
+        for i, f in enumerate(self.public_forwards):
+            key = (f.vip, f.vip_port, f.protocol)
+            if key in seen_fwd:
+                issues.append(f"{where}: public_forwards[{i}] duplicates "
+                              f"service path {f.vip}:{f.vip_port}/{f.protocol}")
+            seen_fwd.add(key)
+            if public_segs and not any(
+                    ipaddress.ip_address(f.vip) in ipaddress.ip_network(s.cidr)
+                    for s in public_segs):
+                issues.append(f"{where}: public_forwards[{i}] ({f.label}): "
+                              f"vip {f.vip} outside every public-nat segment")
+            on_g = guests.get(f.on_guest)
+            if on_g is None:
+                issues.append(f"{where}: public_forwards[{i}]: on_guest "
+                              f"{f.on_guest!r} unknown")
+            elif on_g.role not in (GuestRole.ROUTER, GuestRole.FIREWALL):
+                issues.append(f"{where}: public_forwards[{i}]: on_guest "
+                              f"{f.on_guest!r} must have role router or "
+                              f"firewall (it owns the DNAT)")
+            tgt = guests.get(f.target_guest)
+            if tgt is None:
+                issues.append(f"{where}: public_forwards[{i}]: target_guest "
+                              f"{f.target_guest!r} unknown")
+            else:
+                taddr = next((ipaddress.ip_address(iface.ipv4.address)
+                              for iface in tgt.interfaces
+                              if iface.ipv4.address), None)
+                if taddr is None:
+                    issues.append(f"{where}: public_forwards[{i}]: target "
+                                  f"guest {f.target_guest} has no static "
+                                  f"address to DNAT toward")
+                elif on_g is not None:
+                    reachable = any(
+                        s.segment in segments and taddr in ipaddress.ip_network(
+                            segments[s.segment].cidr)
+                        for s in on_g.interfaces)
+                    if not reachable:
+                        reachable = any(r.guest == on_g.name and taddr in
+                                        ipaddress.ip_network(r.prefix,
+                                                             strict=True)
+                                        for r in self.routes)
+                    if not reachable:
+                        issues.append(
+                            f"{where}: public_forwards[{i}]: executor "
+                            f"{on_g.name} has neither an interface nor a "
+                            f"typed route reaching {taddr} — the DNAT would "
+                            f"blackhole toward {f.target_guest}")
+
+        for i, d in enumerate(self.access_denies):
+            for side in ("src", "dst"):
+                val = getattr(d, side)
+                if val not in guests and val not in segments:
+                    issues.append(f"{where}: access_denies[{i}]: {side} "
+                                  f"{val!r} names neither a guest nor a "
+                                  f"segment")
+
         # aggregate reservation must fit the declared policy
         rp = self.resource_policy
         total_mem = sum(g.resources.memory_mb for g in self.guests)
@@ -485,6 +669,27 @@ class EnvironmentBlueprint(Strict):
             "aggregate_cpu_limit_percent":
                 self.resource_policy.aggregate_cpu_limit_percent,
         }
+
+    def segment_containing(self, addr: str | ipaddress.IPv4Address) -> Segment | None:
+        """The declared segment whose CIDR contains addr (public VIP prefix
+        included), or None — meaning the address lives outside the whole
+        simulation and is containment-denied."""
+        a = ipaddress.ip_address(addr)
+        for s in self.segments:
+            if a in ipaddress.ip_network(s.cidr):
+                return s
+        return None
+
+    def guest_owning(self, addr: str | ipaddress.IPv4Address) -> Guest | None:
+        """The guest declaring addr as an interface address (static or DHCP
+        reservation), or None (e.g. a VIP — routed, owned by no interface)."""
+        a = ipaddress.ip_address(addr)
+        for g in self.guests:
+            for iface in g.interfaces:
+                if iface.ipv4.address and ipaddress.ip_address(
+                        iface.ipv4.address) == a:
+                    return g
+        return None
 
     def provision_order(self) -> list[str]:
         """Dependency order: guests appear only after all guests they depend

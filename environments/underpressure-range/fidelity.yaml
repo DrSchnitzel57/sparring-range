@@ -116,10 +116,22 @@ entries:
   - {path: /guests/11, classification: synthetic, source: plan-defaults,
      note: "Trusted external scoring vantage; never attacker-controlled,
             never a management shortcut."}
-  - {path: /edges/2, classification: reported, source: replication-spec,
+  - {path: /public_forwards/0, classification: reported, source: replication-spec,
      note: "DNAT destinations 172.25.31.{10,15,20,100,120} -> 172.20.240.same,
-            on the VyOS edge."}
-  - {path: /edges/10, classification: inferred, source: replication-spec,
+            on the VyOS edge. Which SERVICE PORTS ride each VIP was never
+             recorded; the declared port set is a labeled practice choice
+             matching the checks the vantage runs, not an observed rule."}
+  - {path: /routes, classification: synthetic, source: plan-defaults,
+     note: "Executable routing contract for the reported behavior: vantages
+            route ONLY the public VIP prefix via VyOS WAN 172.31.31.2, and
+            the edge routes the LAN prefix via the perimeter firewall. The
+            report gives the behavior; the typed prefixes/next-hops are the
+            reconstruction that makes it testable."}
+  - {path: /access_denies, classification: synthetic, source: plan-defaults,
+     note: "Appliance rule set keeping the platform attacker and scoring
+            vantage unreachable from defender-side machines; a plan
+            requirement, not an observed competition rule."}
+  - {path: /edges/6, classification: inferred, source: replication-spec,
      note: "Ubuntu workstation Universal Forwarder reported; 9997 is the
             standard receiver port, inferred (not observed)."}
   - {path: /dns_records, classification: reported, source: replication-spec,

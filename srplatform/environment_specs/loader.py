@@ -202,6 +202,15 @@ def _validate_attack(env_id: str, blueprint: EnvironmentBlueprint,
         issues.append("attack: entry_guest must carry role red-entry — external "
                       "entry is proven through the replica's routed/NAT path, "
                       "never a foothold handed to the AI")
+    if entry is not None:
+        allowed = set(scope.allowed_segments)
+        for iface in entry.interfaces:
+            if iface.segment not in allowed:
+                issues.append(
+                    f"attack: entry_guest {entry.name} attaches to segment "
+                    f"{iface.segment!r}, which scope.allowed_segments does "
+                    f"not cover — the attacker's own position must be inside "
+                    f"its declared scope")
     for i, t in enumerate(attack.tactics):
         for c in t.concerns:
             if c not in guest_names and c not in segment_names:

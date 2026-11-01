@@ -65,13 +65,19 @@ segments:
   - name: wan
     purpose: simulated-wan
     cidr: 172.31.31.0/29
+    # The SIMULATED UPSTREAM segment: VyOS WAN (.2), the appliance-owned
+    # upstream-router namespace (.1, installer-managed, not a guest), and
+    # the external vantages (red entry .4, scoring .5). No default gateway:
+    # vantages reach the public VIP prefix ONLY through the typed routes
+    # below, via the edge. Real egress stays appliance-denied.
     egress_denied: true
   - name: public-nat
     purpose: public-nat
     cidr: 172.25.31.0/24
-    # VIP prefix routed by the simulated upstream; never bound to an inner
-    # guest interface. The red entry and scoring vantage are upstream
-    # clients; real egress stays appliance-denied.
+    # The VIP prefix is ROUTED by the simulated upstream toward the VyOS
+    # WAN and DNAT'd there — never bound to an inner guest interface, and
+    # never on-link for the vantages (they would ARP the VIPs directly and
+    # bypass the whole DNAT/firewall path). Validation enforces both.
     egress_denied: true
 
 guests:
@@ -221,9 +227,13 @@ guests:
     display_name: "Infrastructure attacker (AI offense; separate from team Kali)"
     role: red-entry
     os: linux
+    # Upstream vantage: on the SIMULATED WAN segment (the competition-WAN
+    # side of the edge), NOT on-link to the VIP prefix. Reaching any public
+    # service means routing through 172.31.31.2 into the edge DNAT — the
+    # same path a real external team traverses.
     interfaces:
-      - segment: public-nat
-        ipv4: {mode: static, address: 172.25.31.250}
+      - segment: wan
+        ipv4: {mode: static, address: 172.31.31.4}
     resources: {vcpus: 2, memory_mb: 2048, disk_gb: 20}
     boot: {firmware: efi, bootstrap: qga-ssh, image_profile: attacker-debian}
     depends_on: []
@@ -234,9 +244,11 @@ guests:
     display_name: "Trusted scoring vantage (external observer; not attacker-controlled)"
     role: scoring
     os: linux
+    # Upstream vantage like red-entry; never a management shortcut — its
+    # checks traverse the replica's own routed/DNAT path like any client.
     interfaces:
-      - segment: public-nat
-        ipv4: {mode: static, address: 172.25.31.240}
+      - segment: wan
+        ipv4: {mode: static, address: 172.31.31.5}
     resources: {vcpus: 1, memory_mb: 2048, disk_gb: 20}
     boot: {firmware: efi, bootstrap: qga-ssh, image_profile: scoring-debian}
     depends_on: []
@@ -244,21 +256,14 @@ guests:
     lab_only_defaults: false
 
 edges:
+  # Descriptive dependency/routing documentation only. The EXECUTABLE public
+  # path contracts are `public_forwards` / `routes` / `access_denies` below —
+  # free-text details here never stand in for them.
   # --- routing / NAT (VyOS per spec: DNAT lives on the edge, not the firewall)
   - {kind: routes, src: vyos-edge, dst: wan, protocol: tcp,
-     detail: "Masquerade 172.16.0.0/12 out eth2; static route 172.20.240.0/24 via 172.16.0.1"}
+     detail: "Masquerade 172.16.0.0/12 out eth2; static route 172.20.240.0/24 via 172.16.0.1 (typed in routes below)"}
   - {kind: ntp, src: vyos-edge, dst: wan, protocol: udp, port: 123,
      detail: "NTP names from the spec become simulated/offline build inputs; never real egress"}
-  - {kind: nat, src: vyos-edge, dst: ecomm,
-     detail: "DNAT 172.25.31.10 -> 172.20.240.10 (public store VIP)"}
-  - {kind: nat, src: vyos-edge, dst: webmail,
-     detail: "DNAT 172.25.31.15 -> 172.20.240.15 (public mail VIP)"}
-  - {kind: nat, src: vyos-edge, dst: splunk,
-     detail: "DNAT 172.25.31.20 -> 172.20.240.20 (public splunk VIP)"}
-  - {kind: nat, src: vyos-edge, dst: ad-dns,
-     detail: "DNAT 172.25.31.100 -> 172.20.240.100 (public directory VIP)"}
-  - {kind: nat, src: vyos-edge, dst: mssql,
-     detail: "DNAT 172.25.31.120 -> 172.20.240.120 (public database VIP)"}
   # --- perimeter substitute: documented permissive inner starting behavior
   - {kind: dhcp, src: opnsense-fw, dst: inside-lan, port: 67, protocol: udp,
      detail: "DHCP from the perimeter firewall; deterministic reservations for the two workstations"}
@@ -287,6 +292,56 @@ edges:
   - {kind: dns, src: win11-wkst, dst: ad-dns, port: 53, protocol: udp, detail: "Domain member DNS"}
   - {kind: kerberos, src: win11-wkst, dst: ad-dns, port: 88, protocol: tcp, detail: "Domain member authentication"}
   - {kind: smb, src: win11-wkst, dst: ad-dns, port: 445, protocol: tcp, detail: "Domain member SMB/DC traffic"}
+
+# ------------------------------------------------- executable routing ------
+# Public service paths: the simulated upstream routes the VIP prefix toward
+# VyOS WAN 172.31.31.2; the edge DNATs each declared VIP:port to the target.
+# Exact protocol/port matches only — anything else toward a VIP blackholes by
+# contract (proven in tests, later enforced by installer-rendered NAT rules).
+public_forwards:
+  - {label: store-https, protocol: tcp, vip: 172.25.31.10, vip_port: 443,
+     on_guest: vyos-edge, target_guest: ecomm, target_port: 443}
+  - {label: store-http, protocol: tcp, vip: 172.25.31.10, vip_port: 80,
+     on_guest: vyos-edge, target_guest: ecomm, target_port: 80}
+  - {label: mail-smtp, protocol: tcp, vip: 172.25.31.15, vip_port: 25,
+     on_guest: vyos-edge, target_guest: webmail, target_port: 25}
+  - {label: mail-imaps, protocol: tcp, vip: 172.25.31.15, vip_port: 993,
+     on_guest: vyos-edge, target_guest: webmail, target_port: 993}
+  - {label: mail-pop3s, protocol: tcp, vip: 172.25.31.15, vip_port: 995,
+     on_guest: vyos-edge, target_guest: webmail, target_port: 995}
+  - {label: webmail-https, protocol: tcp, vip: 172.25.31.15, vip_port: 443,
+     on_guest: vyos-edge, target_guest: webmail, target_port: 443}
+  - {label: directory-dns-tcp, protocol: tcp, vip: 172.25.31.100, vip_port: 53,
+     on_guest: vyos-edge, target_guest: ad-dns, target_port: 53}
+  - {label: directory-dns-udp, protocol: udp, vip: 172.25.31.100, vip_port: 53,
+     on_guest: vyos-edge, target_guest: ad-dns, target_port: 53}
+  - {label: directory-ldap, protocol: tcp, vip: 172.25.31.100, vip_port: 389,
+     on_guest: vyos-edge, target_guest: ad-dns, target_port: 389}
+  - {label: database-sql, protocol: tcp, vip: 172.25.31.120, vip_port: 1433,
+     on_guest: vyos-edge, target_guest: mssql, target_port: 1433}
+  - {label: splunk-api, protocol: tcp, vip: 172.25.31.20, vip_port: 8089,
+     on_guest: vyos-edge, target_guest: splunk, target_port: 8089}
+
+# Typed prefix routes. The vantages have exactly ONE route each — the public
+# VIP prefix via the edge — and their segment declares NO default gateway,
+# so an upstream client cannot ARP or shortcut its way around the DNAT path.
+routes:
+  - {guest: vyos-edge, prefix: 172.20.240.0/24, via: 172.16.0.1}
+  - {guest: red-entry, prefix: 172.25.31.0/24, via: 172.31.31.2}
+  - {guest: scoring-vantage, prefix: 172.25.31.0/24, via: 172.31.31.2}
+
+# Appliance-owned deny rules inside the simulation: routing alone must never
+# let defender-side machines reach the platform attacker or the trusted
+# scoring vantage.
+access_denies:
+  - {src: team, dst: red-entry,
+     reason: "defender tooling never reaches the platform attacker VM"}
+  - {src: team, dst: scoring-vantage,
+     reason: "defender tooling never reaches the trusted scoring vantage"}
+  - {src: inside-lan, dst: red-entry,
+     reason: "compromised targets never reach the platform attacker VM"}
+  - {src: inside-lan, dst: scoring-vantage,
+     reason: "compromised targets never reach the trusted scoring vantage"}
 
 dns_records:
   - {name: underpressure.local, type: A, value: 172.20.240.100}
