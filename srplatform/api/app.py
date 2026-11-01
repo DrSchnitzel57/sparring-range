@@ -2664,6 +2664,43 @@ def safety_reclassify_qualification(body: ReclassifyIn,
         raise HTTPException(409, msg) from None
 
 
+class ReconcileOutageIn(BaseModel):
+    kind: str = Field(min_length=1, max_length=64)
+    reason: str = Field(min_length=3, max_length=500)
+
+
+@app.post("/safety/reconcile-outage")
+def safety_reconcile_outage(body: ReconcileOutageIn,
+                            p: Principal = Depends(operator)):
+    """AUDITED recovery over retained outage evidence (plan 22 review
+    round 6, contract 2) — the endpoint behind the recovery instruction
+    the safety surfaces print for UNTRUSTED or recovery-window failures.
+
+    The automatic path needs nothing here: recording a fresh pass with
+    working storage supersedes older order-unprovable failed
+    observations at once. This call closes what auto-supersession must
+    never touch: it REQUIRES the newest authoritative record of that
+    kind to be PASSED under the current configuration (refused while a
+    failure is current), appends an audit event through the same CAS
+    boundary (actor, reason, the record it vouches for), and deletes
+    NOTHING — failed ledger lines stay forever, and only evidence
+    stamped earlier than the audit is superseded."""
+    from srplatform.safety import QUALIFICATION_KINDS, SafetyStoreUnavailable
+    if body.kind not in QUALIFICATION_KINDS:
+        raise HTTPException(422, f"{body.kind} is not a qualification kind "
+                                 f"(allowed: {', '.join(sorted(QUALIFICATION_KINDS))})")
+    try:
+        return get_supervisor().reconcile_outage(
+            body.kind, reason=body.reason, actor=p.username)
+    except SafetyStoreUnavailable as exc:
+        raise HTTPException(503, str(exc)) from None
+    except ValueError as exc:
+        msg = str(exc)
+        if "no " in msg and "record exists" in msg:
+            raise HTTPException(404, msg) from None
+        raise HTTPException(409, msg) from None
+
+
 # --- agent_state (worker-scoped working memory) ---------------------------------
 class AgentStateIn(BaseModel):
     summary: str | None = None

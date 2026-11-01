@@ -66,3 +66,19 @@ def reclassify(kind: str, reason: str = typer.Option(..., "--reason"),
         body["expect_recorded_at"] = expect_recorded_at
     r = c.call("POST", "/safety/reclassify-qualification", json=body).json()
     typer.echo(json.dumps(r, indent=2))
+
+
+@app.command("reconcile-outage")
+def reconcile_outage(kind: str, reason: str = typer.Option(..., "--reason")):
+    """AUDITED recovery over retained outage evidence (the instruction the
+    safety surfaces print). Requires the newest authoritative record of
+    that kind to be PASSING under the current configuration; records an
+    audit event (actor + reason + the record it vouches for) through the
+    authoritative boundary and deletes NOTHING. Older failed ledger
+    evidence stays forever; only evidence stamped earlier than this
+    audit stops blocking. A fresh passing check supersedes ordinary
+    outage failures by itself — this closes untrusted or recovery-window
+    failures it must not touch."""
+    r = c.call("POST", "/safety/reconcile-outage",
+               json={"kind": kind, "reason": reason}).json()
+    typer.echo(json.dumps(r, indent=2))

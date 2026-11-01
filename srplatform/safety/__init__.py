@@ -133,6 +133,41 @@ def _is_recognized_classification(det) -> bool:
     return (isinstance(det, dict)
             and det.get("qualification_contract") == QUALIFICATION_CONTRACT
             and det.get("one_time_reclassification") is True)
+
+
+def _pending_failure_blocker(kind: str, untrusted: bool, pts: float,
+                             pass_ts: float, audit_ts: float | None,
+                             recon_pass: bool) -> str:
+    """TRUTHFUL, actionable blocker for a retained failed observation
+    that no reconciliation supersedes (plan 22 review round 6). The text
+    must never send an operator to a command that cannot work: what
+    clears the block is named exactly, and a failure that cannot be
+    superseded says so."""
+    if untrusted:
+        return (
+            f"an UNTRUSTED FAILED {kind} record exists (its claimed "
+            "authoritative sequence resolves to nothing) — the failure is "
+            "never lost; once the check holds authoritatively, close it "
+            "with the audited recovery: `rangectl safety reconcile-outage "
+            f"{kind} --reason \"...\"`")
+    if recon_pass and pts >= pass_ts:
+        return (
+            f"an unreconciled FAILED {kind} record is envelope-stamped at "
+            f"{pts:.0f}, NOT older than the newest authoritative pass "
+            f"({pass_ts:.0f}) — it may be a NEWER failure or a clock "
+            "defect and cannot be superseded by that pass; investigate "
+            "it, then re-run the check so a fresh committed observation "
+            "orders the truth")
+    if audit_ts is not None:
+        return (
+            f"an unreconciled FAILED {kind} record is newer than the last "
+            f"audited reconciliation ({audit_ts:.0f}) — investigate that "
+            "failure; only a fresh authoritative observation or a newer "
+            "audited reconciliation can order it")
+    return (
+        f"an unreconciled FAILED {kind} record exists whose order against "
+        "the current evidence cannot be proven — re-run the check with "
+        "working storage; the fresh committed pass supersedes it")
 # Bounded freshness for the real runner health probe (SSHRunner.health through
 # the transport the dispatcher itself uses): one probe per TTL window, never a
 # connection storm behind the safety-page poll.
@@ -737,6 +772,96 @@ class Supervisor:
                 "observed_at": resolved["effective"],
                 "source_record_id": resolved["src_id"]}
 
+    OUTAGE_AUDIT_KIND = "outage_reconciliation"
+
+    def reconcile_outage(self, kind: str, *, reason: str,
+                         actor: str) -> dict:
+        """AUDITED operator reconciliation of retained outage evidence
+        (plan 22 review round 6, owner contract 2). A fresh committed
+        pass of a kind ALREADY supersedes older order-unprovable failed
+        observations automatically; this is the supported surface for
+        the remainder — UNTRUSTED failed evidence (whose sequence claim
+        resolves to nothing) and failures stamped during the recovery
+        window. It launders nothing:
+
+        * the newest AUTHORITATIVE record of that kind must be a PASSED
+          observation under the CURRENT configuration identity — refused
+          while a failure is current, after a configuration change, or
+          with no resolvable record;
+        * the append runs through the SAME shared CAS boundary
+          (`_authoritative_publish`): advisory lock, validation, append,
+          commit — and REFUSES outright when the store is unavailable
+          (no unfenced audit exists);
+        * it records an AUDIT event, never a new observation: actor,
+          reason, and the passing record it vouches for are persisted;
+        * failures are NEVER deleted or forgotten — ledger lines stay
+          byte-identical; readers supersede only evidence stamped
+          EARLIER than this audit, so a failure observed afterwards
+          (or on a future clock) keeps blocking, truthfully."""
+        if kind not in QUALIFICATION_KINDS:
+            raise ValueError(f"{kind} is not a qualification kind")
+        if not str(reason or "").strip():
+            raise ValueError("an audited reconciliation requires the "
+                             "operator's reason")
+        identity = config_identity(self.settings)
+
+        def _validate(row, s) -> dict:
+            from sqlalchemy import text
+            t = s.execute(text(_SAFETY_NEWEST_SQL), {"k": kind}).first()
+            if t is None:
+                raise ValueError(f"no {kind} record exists — there is "
+                                 "nothing to reconcile; record the check "
+                                 "with working storage first")
+            if t[1] is not True:
+                raise ValueError(
+                    f"the newest authoritative {kind} record FAILED — an "
+                    "outage reconciliation cannot launder a current "
+                    "failure; make the check pass first")
+            if t[3] != identity:
+                raise ValueError(
+                    f"the newest authoritative {kind} record carries a "
+                    "different configuration identity — reconcile a "
+                    "passing CURRENT observation, not one from another "
+                    "scope")
+            detail["vouched_record_id"] = int(t[0])
+            detail["vouched_record_at"] = float(t[4])
+            return detail
+
+        detail = {"target_kind": kind, "reason": str(reason)[:500],
+                  "operator": actor, "bound_identity": identity}
+        published, seq = self._authoritative_publish(
+            self.OUTAGE_AUDIT_KIND, True, identity, detail,
+            validate=_validate)
+        if not published:
+            raise SafetyStoreUnavailable(
+                "the authoritative safety-record store is unavailable — "
+                "an audited reconciliation without it would be an "
+                "unfenced append (refused; nothing was recorded)")
+        # this committed audit demonstrates the store works — the
+        # process-local outage debts for it must not outlive the proof
+        self._record_failures = [
+            f for f in getattr(self, "_record_failures", [])
+            if not f.startswith("db record ")]
+        barrier = getattr(self, "_test_after_commit_before_mirror", None)
+        if barrier is not None:
+            barrier(self.OUTAGE_AUDIT_KIND)
+        if self._mirror_dh is not None:
+            self._mirror_dh.append({"kind": self.OUTAGE_AUDIT_KIND,
+                                    "ok": True, "config_identity": identity,
+                                    "detail": detail, "seq": seq,
+                                    "recorded_at": time.time()})
+        ferr = self._append_file_record(self.OUTAGE_AUDIT_KIND, True,
+                                        identity, detail, seq=seq)
+        if ferr:
+            self._record_failures = list(
+                getattr(self, "_record_failures", [])) + [ferr]
+        return {"ok": True, "kind": kind, "audit_record_id": seq,
+                "bound_identity": identity,
+                "vouched_record_id": detail.get("vouched_record_id"),
+                "note": "audit recorded under the authoritative CAS "
+                        "boundary; retained failure evidence is kept and "
+                        "only evidence stamped earlier is superseded"}
+
     def record(self, kind: str, ok: bool, detail: dict | None = None) -> None:
         """Append a safety record (baseline_check|datapath_proof|killswitch_test|
         engage|release). Records are never rewritten; validity is derived from
@@ -768,6 +893,16 @@ class Supervisor:
             self._record_failures.append(
                 f"db record '{kind}': authoritative safety-record store "
                 "unavailable — recorded to the durable file ledger only")
+        elif any(f.startswith("db record ")
+                 for f in self._record_failures):
+            # ROUND 6 CONTRACT 2: a COMMITTED append demonstrates the
+            # authoritative store is working again — the stale outage
+            # debts ("store unavailable") must not keep denying starts
+            # after the very observation that proved storage restored.
+            # File-write debts stay until the write actually succeeds.
+            self._record_failures = [
+                f for f in self._record_failures
+                if not f.startswith("db record ")]
         # ROUND 5: the mirror envelope carries the authoritative sequence
         # when publication committed (None = EXPLICITLY UNRECONCILED
         # outage-only record, conservative-only for readers). The test
@@ -782,6 +917,47 @@ class Supervisor:
         ferr = self._append_file_record(kind, ok, identity, detail, seq=seq)
         if ferr:
             self._record_failures.append(ferr)
+        if published and ok and seq is not None:
+            self._append_reconcile_audit(kind, seq, identity)
+
+    def _append_reconcile_audit(self, kind: str, via_seq: int,
+                                identity: str) -> None:
+        """Durable LINK (round 6, contract 2): when an authoritative PASS
+        commits while the file ledger still holds same-kind outage-window
+        failures (sequence-less), record what that commit reconciles —
+        same kind, same config scope, the passing sequence, and a count.
+        This is an audit line, NEVER an observation: readers skip it, it
+        authorizes nothing on its own, and it changes no retained
+        failure; the committed pass is the authority, the failure lines
+        stay byte-identical."""
+        try:
+            p = self.state_file.parent / (self.state_file.name + ".records")
+            stale = 0
+            linked = 0
+            for line in p.read_text().splitlines():
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict) or rec.get("kind") != kind:
+                    continue
+                if rec.get("audit"):
+                    n = rec.get("superseded_unreconciled")
+                    if isinstance(n, int) and not isinstance(n, bool):
+                        linked = max(linked, n)
+                elif (rec.get("seq") is None and rec.get("ok")
+                      is not True):
+                    stale += 1
+            if stale <= linked:
+                return  # already linked durably (this or an earlier process)
+            with p.open("a") as f:
+                f.write(json.dumps({"audit": "outage_reconciliation",
+                                    "kind": kind, "via_seq": via_seq,
+                                    "config_identity": identity,
+                                    "superseded_unreconciled": stale,
+                                    "recorded_at": time.time()}) + "\n")
+        except OSError:
+            pass  # audit link only; the committed pass is the authority
 
     def _append_file_record(self, kind, ok, identity, detail,
                             seq: int | None = None) -> str | None:
@@ -820,12 +996,22 @@ class Supervisor:
         ``__unreconciled__`` key; selection itself never mixes it in.
         A mirror line that POSITIVELY MATCHES an authoritative record
         (kind + outcome + config identity + detail digest — never a
-        timestamp guess) IS that record's copy: it inherits the
-        authoritative sequence, so replayed or delayed duplicates can
-        neither reorder history nor masquerade as outage evidence."""
+        timestamp guess) IS that record's copy: the committed row wins
+        its data and order, so replayed or delayed duplicates can
+        neither reorder history nor masquerade as outage evidence.
+
+        ROUND 6 CONTRACT 1 — a claimed sequence is a REFERENCE, never
+        authority: every non-authoritative line claiming a ``seq`` must
+        resolve to an actual committed record whose content POSITIVELY
+        matches it. An unknown, bool, negative or mismatched claim
+        becomes EXPLICIT UNTRUSTED evidence: never a pass that
+        authorizes, never an ordering advantage, never silently lost.
+        A reconciliation audit line (top-level ``audit`` key) is a
+        durable link, never an observation: readers skip it."""
         out: dict[str, dict] = {}
         pending: list[dict] = []
         authority = {"seen": False}
+        untrusted = {"seen": False}
 
         def content_key(rec: dict):
             det = rec.get("detail")
@@ -862,22 +1048,61 @@ class Supervisor:
                 pass
         else:
             authoritative = db_records()
-        # POSITIVE reconciliation map: content → authoritative sequence.
+        # POSITIVE reconciliation maps: content → authoritative sequence,
+        # and sequence → the committed row itself (the ONLY thing a
+        # claimed reference may resolve against).
         seq_by_content: dict = {}
+        seq_rows: dict[int, dict] = {}
         for r in authoritative:
-            if r.get("seq") is not None:
-                key = content_key(r)
-                if key is not None:
-                    prev = seq_by_content.get(key)
-                    if prev is None or int(r["seq"]) >= prev:
-                        seq_by_content[key] = int(r["seq"])
+            raw = r.get("seq")
+            if raw is None or isinstance(raw, bool):
+                continue
+            try:
+                s = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if s < 0:
+                continue
+            seq_rows[s] = r
+            key = content_key(r)
+            if key is not None:
+                prev = seq_by_content.get(key)
+                if prev is None or s >= prev:
+                    seq_by_content[key] = s
 
-        def consider(rec: dict) -> None:
+        def consider(rec: dict, *, authoritative_src: bool = False) -> None:
             kind = rec.get("kind")
             if not kind:
                 return
             rec = dict(rec)
-            if rec.get("seq") is None:
+            if rec.get("audit"):
+                return  # durable reconciliation link, never an observation
+            claimed = rec.get("seq")
+            if authoritative_src:
+                # A row read from the authoritative store IS the authority;
+                # nothing validates it here — it validates everything else.
+                if claimed is not None:
+                    authority["seen"] = True
+            elif claimed is not None:
+                # ROUND 6 CONTRACT 1: a mirror/file line CLAIMING a
+                # sequence must resolve to that committed row of matching
+                # content — the row's data and order win, never the
+                # line's envelope. Anything else (unknown id, bool or
+                # negative claim, foreign kind, mismatched outcome/
+                # identity/detail) is UNTRUSTED: stripped of its ordering
+                # advantage, retained, and never able to authorize.
+                row = None
+                if isinstance(claimed, int) and not isinstance(claimed, bool) \
+                        and claimed >= 0:
+                    row = seq_rows.get(claimed)
+                if row is not None:
+                    key = content_key(rec)
+                    if key is not None and content_key(row) == key:
+                        return  # THIS is that row's delayed copy; row won
+                rec["untrusted"] = True
+                rec["seq"] = None
+                untrusted["seen"] = True
+            else:
                 key = content_key(rec)
                 if key is not None and key in seq_by_content:
                     rec["seq"] = seq_by_content[key]  # that record's copy
@@ -910,7 +1135,7 @@ class Supervisor:
                 out[kind] = rec
 
         for r in authoritative:
-            consider(r)
+            consider(r, authoritative_src=True)
         if self._mirror_dh is not None:
             for r in self._mirror_dh:
                 consider(r)
@@ -925,12 +1150,18 @@ class Supervisor:
         # sequence-less record become "unreconciled" — an outage-only
         # mirror/copy that may NEVER authorize a pass on its own clock.
         # Where no authority has ever been seen (legacy file-only installs)
-        # the historical timestamp semantics simply continue.
+        # the historical timestamp semantics simply continue. An UNTRUSTED
+        # line (round 6) is corrupt/forged evidence wherever it appeared —
+        # it is exposed even on a legacy install, where a sequence claim
+        # resolves to nothing by definition.
         if authority["seen"]:
             for rec in out.values():
-                if rec.get("seq") is None:
+                if rec.get("seq") is None and not rec.get("untrusted"):
                     rec["unreconciled"] = True
             out["__unreconciled__"] = pending
+        elif untrusted["seen"]:
+            out["__unreconciled__"] = [p for p in pending
+                                       if p.get("untrusted")]
         return out
 
     def _qualification(self, kind: str,
@@ -954,20 +1185,41 @@ class Supervisor:
         if not rec:
             out["problems"] = [f"no {kind} record"]
             return out
+        if rec.get("untrusted"):
+            # ROUND 6 CONTRACT 1: the newest line for this kind CLAIMED an
+            # authoritative sequence that resolves to no matching
+            # committed record — unknown id, forged reference or
+            # content-mismatched copy. Such evidence never authorizes
+            # admission and never gains an ordering advantage; it stays
+            # visible until an authoritative record supersedes it.
+            problems = [
+                f"{kind} evidence is UNTRUSTED: the authoritative sequence "
+                "it claims resolves to no matching committed record "
+                "(unknown, forged or content-mismatched) — it cannot "
+                "authorize admission; record a fresh authoritative check"]
+            if not rec.get("ok"):
+                problems.insert(0, f"latest {kind} FAILED (untrusted "
+                                   "record) — the failure stands")
+            out["provenance"] = "untrusted"
+            out["problems"] = problems
+            return out
         if rec.get("unreconciled"):
             # Round 5, owner contract: the newest selected line for this
             # kind exists only in a mirror WITHOUT an authoritative
             # sequence while the authoritative store is demonstrably in
             # use. It is retained and honored CONSERVATIVELY — never a
             # pass that authorizes admission, never a lost failure — and
-            # it reconciles only by a fresh authoritative record (re-run
-            # the check with working storage), never by a timestamp.
+            # it reconciles only by a fresh authoritative record, never
+            # by a timestamp. Round 6 contract 2: that fresh record is
+            # now actually the recovery — once it commits, it supersedes
+            # this unreconciled evidence for ordering.
             problems = [
                 f"{kind} evidence is UNRECONCILED: it has no authoritative "
                 "append sequence (a delayed mirror copy or an outage-only "
                 "observation), so it cannot be ordered against committed "
                 "records and cannot authorize admission — re-run the "
-                "check with working storage"]
+                "check with working storage; the fresh committed pass "
+                "supersedes this unreconciled evidence"]
             if not rec.get("ok"):
                 problems.insert(0, f"latest {kind} FAILED (unreconciled "
                                    "record) — the failure stands")
@@ -1054,20 +1306,56 @@ class Supervisor:
                     out.setdefault("problems", []).append(
                         f"{kind} record predates the last {gate} — "
                         "evidence invalidated, re-run the check")
-        # CONSERVATIVE pending-row handling (round 5): an unreconciled
-        # same-kind FAILED is never lost — it cannot be proven older than
-        # the authoritative newest-pass, so it blocks until reconciled.
-        # An unreconciled engage/release transition is honored under the
-        # same gate rule as a selected one. Mirror copies that match an
-        # authoritative record inherit its true sequence, so only
-        # genuinely order-unprovable rows can block here.
+        # CONSERVATIVE pending-row handling (rounds 5-6, owner contract
+        # 2): an unreconciled or UNTRUSTED same-kind FAILED is never lost.
+        # It is superseded ONLY by a durable reconciliation, never by a
+        # timestamp guess or a restart:
+        #  * AUTO — the selected record is itself a genuine authoritative
+        #    PASSED observation of THIS kind under the CURRENT identity
+        #    (a classification never reconciles: an old classification
+        #    cannot clear a fresh failure), and the pending failure's
+        #    envelope time is strictly older than that pass. A committed
+        #    pass IS the publication/CAS-boundary reconciliation; the
+        #    decision is derived from durable state, so it survives
+        #    restarts unchanged and never needs a ledger edit.
+        #  * AUDIT — an operator reconciled this kind through the audited
+        #    authority (`reconcile_outage`, appended under the same CAS
+        #    boundary, current identity); pending failures envelope-stamped
+        #    before that audit record are superseded.
+        # A failure newer than every reconciliation — or carrying a
+        # future/unprovable envelope clock nothing precedes — keeps
+        # blocking, truthfully. An unreconciled engage/release transition
+        # is honored under the same gate rule as a selected one.
+        recon_pass = (rec.get("seq") is not None
+                      and not rec.get("untrusted")
+                      and not rec.get("unreconciled")
+                      and rec.get("ok") is True
+                      and rec.get("config_identity") == identity
+                      and not _is_recognized_classification(det))
+        audit_ts: float | None = None
+        aud = recs.get("outage_reconciliation")
+        if (aud is not None and not aud.get("untrusted")
+                and not aud.get("unreconciled") and aud.get("ok") is True
+                and aud.get("seq") is not None
+                and aud.get("config_identity") == identity):
+            adet = aud.get("detail") if isinstance(aud.get("detail"),
+                                                   dict) else {}
+            if adet.get("target_kind") == kind:
+                at = float(aud.get("recorded_at", 0))
+                if at > 0:
+                    audit_ts = at
         for p in recs.get("__unreconciled__") or ():
             pk = p.get("kind")
             if pk == kind and not p.get("ok"):
+                p_untr = bool(p.get("untrusted"))
+                pts = float(p.get("recorded_at", 0))
+                if audit_ts is not None and 0 < pts < audit_ts:
+                    continue  # the audited reconciliation supersedes this
+                if recon_pass and not p_untr and 0 < pts < rec_ts:
+                    continue  # the committed pass supersedes this
                 out.setdefault("problems", []).append(
-                    f"an unreconciled FAILED {kind} record exists whose "
-                    "order against the current evidence cannot be proven "
-                    "— re-run the check with working storage")
+                    _pending_failure_blocker(kind, p_untr, pts, rec_ts,
+                                             audit_ts, recon_pass))
             elif kind not in ("engage", "release") and pk in (
                     "engage", "release") and float(
                         p.get("recorded_at", 0)) >= rec_ts:

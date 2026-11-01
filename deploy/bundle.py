@@ -303,8 +303,11 @@ def _activate_bundle(staged: pathlib.Path, output: pathlib.Path, *,
     untouched. With force: the existing release is FIRST moved aside
     atomically to a tokenized backup, the staged build is activated, and
     ONLY THEN the superseded release is removed; if activation fails the
-    backup is renamed straight back, so a failed forced rebuild never
-    destroys the previous release."""
+    backup is renamed straight back — under NOREPLACE, so a foreign
+    destination that appeared meanwhile is never replaced (round 6,
+    owner contract 3: force grants no ownership of anything that was
+    not ours; the previous valid release stays retained at its known
+    backup path with a durable rollback obligation)."""
     if _test_before_activation is not None:
         _test_before_activation(output)
     backup: pathlib.Path | None = None
@@ -334,9 +337,25 @@ def _activate_bundle(staged: pathlib.Path, output: pathlib.Path, *,
                 "appeared at the destination after the preflight — its "
                 "bytes were NOT touched; pass --force only when replacing "
                 "it is genuinely intended") from None
-    except BaseException:
+    except BaseException as exc:
         if backup is not None:
-            os.rename(backup, output)       # the previous release survives
+            try:
+                # ROUND 6 CONTRACT 3: rollback uses the SAME no-replace
+                # primitive. Nothing that is not ours may be overwritten
+                # on the way back, and the previous release is never
+                # discarded on the way out.
+                _renameat2_noreplace(backup, output)
+            except (FileExistsError, BundleError) as rb_exc:
+                raise BundleError(
+                    f"ROLLBACK OBLIGATION — activation failed ({exc}) and "
+                    f"the previous release could NOT be restored to "
+                    f"{output}: something that is not ours appeared there "
+                    f"and was left untouched ({rb_exc}). The previous "
+                    f"VALID release is RETAINED at {backup} — resolve the "
+                    "foreign destination and move it back (it verifies "
+                    "with `bundle.py verify`), or deliberately activate a "
+                    "replacement. Nothing was deleted or overwritten; "
+                    "this obligation stays until honoured.") from None
         raise
     if backup is not None:
         shutil.rmtree(backup, ignore_errors=True)
