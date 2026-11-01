@@ -78,6 +78,21 @@ def _mac(seed: str) -> str:
     return "52:54:00:%02x:%02x:%02x" % (raw[0], raw[1], raw[2])
 
 
+def _nic_mac(node: str, vmid: int, index: int) -> str:
+    """Per-NIC deterministic MAC. Index 0 keeps the historical
+    node:vmid seed so existing v1 domains are byte-identical; additional
+    NICs are indexed, never reusing another NIC's MAC."""
+    seed = f"{node}:{vmid}" if int(index) == 0 else f"{node}:{vmid}:{index}"
+    return _mac(seed)
+
+
+def _parse_bridge(net_spec: str) -> str:
+    """'virtio,bridge=X' -> 'X' (the closed NIC spec shape; anything else
+    carries no bridge this layer understands)."""
+    m = re.search(r"(?:^|,)bridge=([A-Za-z0-9._-]+)", net_spec or "")
+    return m.group(1) if m else ""
+
+
 @dataclass(frozen=True)
 class BackendConfig:
     uri: str = "qemu:///session"
@@ -215,19 +230,68 @@ class LibvirtBackend:
         except Exception as exc:  # noqa: BLE001
             raise BackendUnavailable(f"cannot read config for VMID "
                                      f"{desc.get('vmid')}: {exc}") from exc
-        bridge = re.search(r'<source bridge=["\']([^"\']+)["\']', xml)
-        ifdesc = re.search(r"<interface\b.*?</interface>", xml, re.S)
-        net0 = desc.get("net0") or (
-            f"virtio,bridge={bridge.group(1)}" if bridge else "")
-        cfg = {"name": desc.get("name") or name, "net0": net0,
+        nics = self._nics_from_xml(xml)
+        cfg = {"name": desc.get("name") or name,
                "ipconfig0": desc.get("ipconfig0", ""),
                "tags": desc.get("tags", ""), "vmid": int(desc["vmid"]),
                "role": desc.get("role", ""), "generation": desc.get("generation"),
                "session_id": desc.get("session_id"),
-               "domain_uuid": self._domain_uuid(dom)}
-        if ifdesc is None:
+               "domain_uuid": self._domain_uuid(dom),
+               "nics": nics}
+        # NIC state comes from the ACTUAL domain XML, never from the claimed
+        # description: per-index bridge and MAC as the hypervisor reports
+        # them. The description is used only where XML cannot speak (the
+        # fixture user-net NIC has no bridge), and disagreement between a
+        # recorded multi-NIC intent and XML is surfaced as drift, not
+        # silently reconciled.
+        for entry in nics:
+            idx = int(entry["index"])
+            bridge = entry.get("bridge") or ""
+            if bridge:
+                cfg[f"net{idx}"] = f"virtio,bridge={bridge}"
+            else:
+                cfg[f"net{idx}"] = (desc.get(f"net{idx}")
+                                    or (desc.get("net0", "") if idx == 0 else ""))
+        if not nics:
+            bridge = re.search(r'<source bridge=["\']([^"\']+)["\']', xml)
+            cfg["net0"] = desc.get("net0") or (
+                f"virtio,bridge={bridge.group(1)}" if bridge else "")
             cfg["_unavailable"] = "domain has no network interface"
+        elif not cfg.get("net0"):
+            cfg["_unavailable"] = "domain NIC carries no readable bridge"
+        intent = desc.get("nics")
+        if isinstance(intent, list) and intent:
+            want = [(str(n.get("bridge")), str(n.get("mac", "")).lower())
+                    for n in intent]
+            got = [(str(n.get("bridge")), str(n.get("mac", "")).lower())
+                   for n in nics]
+            if want != got:
+                cfg["_nic_drift"] = (f"recorded intent {want} != domain XML "
+                                     f"{got}")
         return cfg
+
+    @staticmethod
+    def _nics_from_xml(xml: str) -> list[dict]:
+        """EVERY <interface> element, in document order, as the hypervisor
+        defines it. Index order IS the domain NIC order; extra, foreign or
+        reordered interfaces are REPORTED here (policy refuses them), never
+        normalized away."""
+        import xml.etree.ElementTree as ET
+        try:
+            root = ET.fromstring(xml)
+        except ET.ParseError:
+            return []
+        out: list[dict] = []
+        for idx, iface in enumerate(root.findall("./devices/interface")):
+            source = iface.find("source")
+            bridge = source.get("bridge") if source is not None else ""
+            if not bridge and (iface.get("type") or "") == "user":
+                bridge = ""  # fixture user-net: no bridge by construction
+            mac_el = iface.find("mac")
+            mac = (mac_el.get("address", "").lower() if mac_el is not None
+                   else "")
+            out.append({"index": idx, "bridge": bridge or "", "mac": mac})
+        return out
 
     def vm_status(self, node: str, vmid: int) -> str:
         dom, _ = self._find(int(vmid), node)
@@ -269,6 +333,14 @@ class LibvirtBackend:
         finding: a separately re-read manifest is not proof of deployed
         bytes). Unknown template: None, i.e. honestly UNKNOWN."""
         return self.manifest.artifact_identity(int(template_id))
+
+    def template_catalog(self) -> list[dict]:
+        """Profile -> approved template pairs from the manifest this daemon
+        started with. It is the only way an environment deploy turns a
+        blueprint's `boot.image_profile` into a template id: the blueprint
+        names an artifact, the operator manifest pins its bytes, and nothing
+        on the control-plane side may supply a path, URL or vmid."""
+        return self.manifest.template_catalog()
 
     def _verify_image(self, image: ImageSpec) -> None:
         p = pathlib.Path(image.path)
@@ -396,20 +468,110 @@ class LibvirtBackend:
             addr, prefix, gateway = FIXTURE_ADDRESS, 24, FIXTURE_GATEWAY
         else:
             gateway = None
+        # Per-NIC identity + address for the seed: netplan binds each
+        # address to its NIC by MAC, so a guest can never quietly move an
+        # address onto the wrong segment. Only when a vector was recorded;
+        # single-NIC guests keep the historical one-interface seed exactly.
+        nics_seed: list[dict] = []
+        intent = desc.get("nics")
+        if isinstance(intent, list) and len(intent) > 1 and not self.cfg.fixture_mode:
+            for entry in intent:
+                idx = int(entry["index"])
+                m_n = re.fullmatch(fmt, desc.get(f"ipconfig{idx}") or "")
+                nics_seed.append({
+                    "index": idx,
+                    "mac": str(entry["mac"]),
+                    "bridge": str(entry["bridge"]),
+                    "address": m_n.group(1) if m_n else "",
+                    "prefix": int(m_n.group(2)) if m_n else prefix,
+                })
         build_seed(seed, SeedInputs(
             manifest=self.manifest, image=image, vmid=vmid,
             session_id=str(desc.get("session_id") or ""), hostname=hostname,
-            address=addr, prefix=prefix, gateway=gateway))
+            address=addr, prefix=prefix, gateway=gateway,
+            nics=tuple(nics_seed) or None))
 
     def set_config(self, node: str, vmid: int, **cfg) -> None:
         self._require_node(node)
         dom, desc = self._find(int(vmid), node)
         if dom is None or desc is None:
             raise BackendUnavailable(f"VMID {vmid} has no appliance domain")
+        nic_indices = sorted({
+            int(m.group(2)) for key in cfg
+            if (m := re.fullmatch(r"(?:net|ipconfig)(\d+)", key))})
+        nic_change = any(re.fullmatch(r"net\d+", k) for k in cfg)
         changed = False
+        nic_converged = False
         for key in ("name", "net0", "ipconfig0", "tags"):
             if key in cfg and cfg[key] is not None:
                 desc[key] = str(cfg[key])
+                changed = True
+        if nic_indices:
+            # The full effective vector (net0..net{max}) is rewritten from
+            # THIS config; every NIC's address binds to the segment bridge
+            # the broker policy already validated at its own index. The
+            # whole plan is validated BEFORE the description is rewritten.
+            nics: list[dict] = []
+            for idx in range(max(nic_indices) + 1):
+                net_key = f"net{idx}"
+                if net_key in cfg:
+                    bridge = _parse_bridge(str(cfg[net_key]))
+                    if not bridge:
+                        raise BackendUnavailable(
+                            f"{net_key} is not a closed 'virtio,bridge=X' "
+                            "NIC spec")
+                else:
+                    prev = str(desc.get(net_key) or "")
+                    bridge = _parse_bridge(prev)
+                    if not bridge:
+                        raise BackendUnavailable(
+                            f"nic[{idx}] missing from the vector and unknown "
+                            "from recorded state — the FULL effective NIC "
+                            "vector must be applied, never a single leg")
+                nics.append({"index": idx, "bridge": bridge,
+                             "mac": _nic_mac(desc["node"], int(vmid), idx),
+                             "ipconfig": str(cfg.get(f"ipconfig{idx}")
+                                             or desc.get(f"ipconfig{idx}")
+                                             or "")})
+            if len(nics) > 1:
+                for n in nics:
+                    if not re.fullmatch(r"ip=([0-9.]+)/(\d+)", n["ipconfig"]):
+                        raise BackendUnavailable(
+                            f"multi-NIC leg {n['index']} carries no parsable "
+                            "ipconfig ('ip=<addr>/<prefix>') — the seed "
+                            "binds an address for EVERY leg and never "
+                            "renders an empty one")
+            if len({n["bridge"] for n in nics}) != len(nics):
+                raise BackendUnavailable(
+                    "duplicate bridge across the NIC vector — one guest "
+                    "never attaches twice to the same segment via one NIC")
+            if dom.isActive():
+                # A NIC layout CHANGE cannot take effect on a running
+                # domain (redefine waits for a reboot — never claim it
+                # did). But when the domain XML ALREADY matches the wanted
+                # vector exactly there is nothing to change: this is the
+                # crash-resume case where an earlier pass applied the
+                # vector (or a read-back parked it) before the intent was
+                # committed. Reconcile against reality; never re-render the
+                # seed that the applied boot already consumed.
+                live = self._nics_from_xml(dom.XMLDesc(0))
+                want = [(n["bridge"], n["mac"]) for n in nics]
+                got = [(str(n["bridge"]), str(n["mac"]).lower())
+                       for n in live]
+                if want != got:
+                    raise BackendUnavailable(
+                        f"VMID {vmid} domain is running and its NIC vector "
+                        f"{got} is not the wanted {want}: NIC layout "
+                        "changes require a stopped domain (redefine would "
+                        "not take effect until reboot — never claim it did)")
+                nic_converged = True
+            for n in nics:
+                desc[f"net{n['index']}"] = f"virtio,bridge={n['bridge']}"
+                desc[f"ipconfig{n['index']}"] = n["ipconfig"]
+                n.pop("ipconfig")
+            desc["nics"] = nics
+            desc["net0"] = f"virtio,bridge={nics[0]['bridge']}"
+            if not nic_converged:
                 changed = True
         image = self._image(int(desc["template_id"]))
         if "ipconfig0" in cfg:
@@ -417,23 +579,44 @@ class LibvirtBackend:
             if not m:
                 raise BackendUnavailable("ipconfig0 must be ip=<addr>/<prefix>")
             self._write_seed(desc, image, int(vmid), desc["name"], m.group(1))
+        elif nic_indices and desc.get("ipconfig0") and not nic_converged:
+            # The vector changed but the primary address did not: the seed's
+            # per-NIC binding must still match the NEW domain XML, never the
+            # seed left over from the previous layout. A converged
+            # (already-applied) vector skips this: its seed bytes are what
+            # the running boot already consumed.
+            self._write_seed(desc, image, int(vmid), desc["name"], None)
         if changed:
+            xml = self._domain_xml(desc, image)
             try:
-                dom.setMetadata(0, _desc_json(desc), None, None, 0)
-            except Exception:
-                # Older bindings/metadata namespaces: redefine the domain
-                # with the same identity and updated description.
-                xml = self._domain_xml(desc, image)
-                try:
-                    self.connect().defineXML(xml)
-                except Exception as exc:  # noqa: BLE001
-                    raise BackendUnavailable(
-                        f"cannot update config for VMID {vmid}: {exc}") from exc
-        # read-back metadata (name and NIC are policy-relevant)
+                self.connect().defineXML(xml)
+            except Exception as exc:  # noqa: BLE001
+                raise BackendUnavailable(
+                    f"cannot update config for VMID {vmid}: {exc}") from exc
+        # read-back: identity, and — whenever a NIC vector was applied —
+        # EVERY interface from the domain XML (never the description).
         dom2, got = self._find(int(vmid), node)
         if dom2 is None or (got or {}).get("name") != desc["name"]:
             raise BackendReadBackFailed(
                 f"config read-back for VMID {vmid} lost its identity")
+        if nic_change:
+            actual = self._config_from(dom2, got)
+            if "_nic_drift" in actual:
+                raise BackendReadBackFailed(
+                    f"NIC read-back for VMID {vmid}: {actual['_nic_drift']}")
+            intended = desc.get("nics") or []
+            seen = actual.get("nics") or []
+            if len(seen) != len(intended):
+                raise BackendReadBackFailed(
+                    f"NIC read-back for VMID {vmid}: domain shows "
+                    f"{len(seen)} interfaces, intent has {len(intended)}")
+            for want, have in zip(intended, seen):
+                if (str(want["bridge"]), str(want["mac"])) != \
+                        (str(have.get("bridge")), str(have.get("mac", "")).lower()):
+                    raise BackendReadBackFailed(
+                        f"NIC read-back for VMID {vmid}: nic[{want['index']}] "
+                        f"intent ({want['bridge']}, {want['mac']}) != domain "
+                        f"({have.get('bridge')}, {have.get('mac')})")
 
     def start_and_wait(self, node: str, vmid: int, timeout: int = 90) -> None:
         self._require_node(node)
@@ -669,11 +852,27 @@ class LibvirtBackend:
                      f'        <mac address="{_mac(desc["node"] + ":" + str(desc["vmid"]))}"/>\n'
                      '      </interface>')
         else:
-            iface = ('      <interface type="bridge">\n'
-                     f'        <source bridge="{escape(bridge)}"/>\n'
-                     '        <model type="virtio"/>\n'
-                     f'        <mac address="{_mac(desc["node"] + ":" + str(desc["vmid"]))}"/>\n'
-                     '      </interface>')
+            # One <interface> per recorded NIC vector entry, in index order,
+            # each with its OWN deterministic MAC. A domain without a
+            # recorded vector keeps the historical single-leg shape
+            # (byte-identical XML for every existing v1 guest).
+            nics = desc.get("nics")
+            if isinstance(nics, list) and nics:
+                legs = []
+                for entry in nics:
+                    legs.append(
+                        '      <interface type="bridge">\n'
+                        f'        <source bridge="{escape(str(entry["bridge"]))}"/>\n'
+                        '        <model type="virtio"/>\n'
+                        f'        <mac address="{escape(str(entry["mac"]))}"/>\n'
+                        '      </interface>')
+                iface = "\n".join(legs)
+            else:
+                iface = ('      <interface type="bridge">\n'
+                         f'        <source bridge="{escape(bridge)}"/>\n'
+                         '        <model type="virtio"/>\n'
+                         f'        <mac address="{_mac(desc["node"] + ":" + str(desc["vmid"]))}"/>\n'
+                         '      </interface>')
         cpu = ("  <cpu mode=\"host-passthrough\" check=\"none\"/>\n"
                if dtype == "kvm" else "")
         return f"""<domain type="{dtype}">

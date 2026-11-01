@@ -107,6 +107,7 @@ class HttpTransport:
     READ_OPS = frozenset({
         "lookup_vm", "lookup_config", "try_lookup_config", "read_config",
         "vm_status", "inventory", "latch_status", "artifact_for_template",
+        "template_catalog",
     })
 
     def __init__(self, url: str, ca_file: str = "", cert_file: str = "",
@@ -213,6 +214,12 @@ class BrokerClient:
         manifest path crosses this boundary."""
         return self._call("artifact_for_template",
                           template_vmid=int(template_vmid))
+
+    def template_catalog(self):
+        """Profile -> approved template pairs known to the clone authority.
+        Read-only; the only sanctioned way to resolve a blueprint image
+        profile to a template id. [] means this adapter has no catalog."""
+        return self._call("template_catalog")
 
     def inventory(self):
         return self._call("inventory")

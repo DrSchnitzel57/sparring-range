@@ -52,6 +52,12 @@ class SeedInputs:
     instance_id: str | None = None
     fixture_http_port: int | None = None
     api_ingest_url: str | None = None
+    # Multi-NIC vector: ({index, mac, bridge, address, prefix}, ...). When
+    # present with more than one entry, netplan binds each address by MAC
+    # (the hypervisor's interface order is the vector order), and the guest
+    # carries a readable nic-binding file the operator can audit. Single-NIC
+    # guests pass None and render EXACTLY the historical seed.
+    nics: tuple[dict, ...] | None = None
 
 
 def _authorized_keys(manifest: ApplianceManifest, role: str) -> dict[str, list[str]]:
@@ -87,6 +93,21 @@ def render_network_config(inp: SeedInputs) -> str:
         # The isolated fixture network needs a route to its own gateway; the
         # production range deliberately has none.
         nic["routes"] = [{"to": "default", "via": inp.gateway}]
+    if inp.nics and len(inp.nics) > 1:
+        # One ethernet per planned NIC, matched by the MAC the domain XML
+        # will carry. Matching by MAC (not name) is what makes the binding
+        # authoritative: an interface the hypervisor did not plan cannot
+        # claim a planned address, and a planned address cannot drift onto
+        # the wrong bridge.
+        ethernets: dict[str, dict] = {}
+        for entry in inp.nics:
+            ethernets[f"range-nic-{entry['index']}"] = {
+                "match": {"macaddress": str(entry["mac"]).lower()},
+                "dhcp4": False, "dhcp6": False, "optional": True,
+                "addresses": [f"{entry['address']}/{entry['prefix']}"],
+            }
+        return yaml.safe_dump({"version": 2, "ethernets": ethernets},
+                              sort_keys=False)
     return yaml.safe_dump({"version": 2, "ethernets": {"range-nic": nic}},
                           sort_keys=False)
 
@@ -115,6 +136,19 @@ def render_user_data(inp: SeedInputs) -> str:
             "'unshare --user --map-root-user --mount --cgroup --pid --fork "
             "--mount-proc /bin/true'\n"
         )
+    write_files = [
+        {"path": "/etc/sparring-range/role", "content": inp.image.role + "\n"},
+    ]
+    if inp.nics and len(inp.nics) > 1:
+        # The planned per-NIC identity, readable inside the guest: which MAC
+        # owns which segment/address. Auditable ground truth for operator
+        # checks and for a later in-guest attestation lane.
+        write_files.append({
+            "path": "/etc/sparring-range/nic-bindings",
+            "permissions": "0644",
+            "content": "".join(
+                f"{e['index']}\t{str(e['mac']).lower()}\t{e['bridge']}\t"
+                f"{e['address']}/{e['prefix']}\n" for e in inp.nics)})
     doc: dict = {
         "hostname": inp.hostname,
         "manage_etc_hosts": True,
@@ -123,9 +157,7 @@ def render_user_data(inp: SeedInputs) -> str:
         "package_update": False,
         "package_upgrade": False,
         "users": users,
-        "write_files": [
-            {"path": "/etc/sparring-range/role",
-             "content": inp.image.role + "\n"},
+        "write_files": write_files + [
             # A dedicated late unit makes readiness independent of whether a
             # long-running cloud-init runcmd (package/service work) finishes.
             # It is ordered after cloud-final, so users/keys/network are

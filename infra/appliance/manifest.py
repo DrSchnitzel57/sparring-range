@@ -167,6 +167,12 @@ class ImageSpec:
     disk_gb: int
     memory_mb: int
     vcpus: int
+    # Pinned artifact PROFILE name an environment blueprint's
+    # boot.image_profile resolves against (defaults to the manifest image
+    # key). The blueprint names the artifact; this table (operator-owned)
+    # is the only place that maps it to bytes — never a path or URL from
+    # scenario/model data.
+    profile: str = ""
 
     def verify_file(self) -> None:
         p = pathlib.Path(self.path)
@@ -405,12 +411,14 @@ class ApplianceManifest:
         if not isinstance(images_raw, dict) or not images_raw:
             raise _bad("images must be a non-empty object")
         images: dict[str, ImageSpec] = {}
+        profiles: dict[str, str] = {}
         ids: set[int] = set()
         for role, item in images_raw.items():
             if not _ROLE_RE.fullmatch(str(role)) or not isinstance(item, dict):
                 raise _bad(f"images.{role} must be a role object")
             _closed(item, {"template_id", "path", "sha256", "size_bytes",
-                           "disk_gb", "memory_mb", "vcpus"}, f"images.{role}")
+                           "disk_gb", "memory_mb", "vcpus", "profile"},
+                    f"images.{role}")
             tid = _int(item, "template_id", f"images.{role}", low=1, high=999999)
             if tid in ids:
                 raise _bad(f"duplicate template_id {tid}")
@@ -424,9 +432,15 @@ class ApplianceManifest:
                 disk_gb=_int(item, "disk_gb", f"images.{role}", low=1, high=512),
                 memory_mb=_int(item, "memory_mb", f"images.{role}", low=256, high=65536),
                 vcpus=_int(item, "vcpus", f"images.{role}", low=1, high=64),
+                profile=str(item.get("profile") or role),
             )
             if not re.fullmatch(r"[0-9a-f]{64}", image.sha256):
                 raise _bad(f"images.{role}.sha256 must be 64 lowercase hex chars")
+            if not _ROLE_RE.fullmatch(image.profile):
+                raise _bad(f"images.{role}.profile is not a safe profile name")
+            if image.profile in profiles:
+                raise _bad(f"duplicate image profile {image.profile!r}")
+            profiles[image.profile] = str(role)
             if verify_images:
                 image.verify_file()
             images[str(role)] = image
@@ -582,6 +596,23 @@ class ApplianceManifest:
             if image.template_id == template_id:
                 return image
         return None
+
+    def image_for_profile(self, profile: str) -> ImageSpec | None:
+        """Resolve a blueprint boot.image_profile to its pinned artifact."""
+        for image in self.images.values():
+            if image.profile == profile:
+                return image
+        return None
+
+    def template_catalog(self) -> list[dict]:
+        """Profile/template pairs this appliance can clone from — the ONLY
+        way an environment deploy resolves blueprint image profiles to
+        broker template ids (no paths, no guesses, no model input)."""
+        return sorted(
+            ({"profile": image.profile, "template_id": int(image.template_id),
+              "role": image.role}
+             for image in self.images.values()),
+            key=lambda d: d["template_id"])
 
     def artifact_identity(self, template_id: int) -> dict | None:
         """The deployable-artifact identity the broker confirmed TEMPLATE

@@ -33,7 +33,8 @@ from .errors import (BrokerConflict, BrokerLatched, BrokerRefused,
                      BrokerUnavailable, PolicyViolation)
 from ..proxmox_client import ProxmoxError
 from .ledger import Ledger, args_hash
-from .policy import BrokerPolicy
+from .policy import (BrokerPolicy, check_effective_nics,
+                     check_nic_vector)
 
 MUTATING_OPS = frozenset({"next_vmid", "clone_and_wait", "set_config",
                           "start_and_wait", "destroy_and_wait", "enroll",
@@ -290,6 +291,17 @@ class BrokerService:
                 "template_vmid": int(ident["template_vmid"]),
                 "artifact_sha256": ident["artifact_sha256"]}
 
+    def template_catalog(self) -> list[dict]:
+        """Profile -> approved template pairs known to the clone authority
+        (from ITS loaded manifest, never from caller input). Adapters with
+        no artifact manifests answer [] — an environment deploy then fails
+        closed instead of guessing a template id."""
+        fn = getattr(self.pve, "template_catalog", None)
+        if fn is None:
+            return []
+        catalog = fn()
+        return list(catalog) if isinstance(catalog, list) else []
+
     def inventory(self) -> dict:
         return {"claims": self.ledger.all_claims(),
                 "obligations": self.ledger.open_obligations(),
@@ -420,9 +432,38 @@ class BrokerService:
 
     # ------------------------------------------------------------------ config ---
     def set_config(self, node: str, vmid: int, session_id: str | None = None,
-                   **cfg) -> None:
+                   expected_nics: list | None = None, **cfg) -> None:
+        """Apply config; with EXPECTED_NICS the WHOLE effective NIC vector is
+        bound ([{segment, address}, ...] in domain NIC order):
+
+          * before the effect — vector validation against policy (exact
+            bridge per index, address bound to the SAME index's segment,
+            no extra/duplicate/foreign entries), so a patched-on-existing
+            config cannot smuggle an unplanned NIC through;
+          * after the effect — read-back of every interface from the
+            backend's XML-derived state (never the claimed description);
+            any mismatch retains an obligation and refuses the claim.
+        """
         self._require_unlatched("set_config")
         self._node(node)
+        if expected_nics is not None:
+            # Bridge names are operator-owned: the caller plans SEGMENTS and
+            # addresses; the broker's own segment lane resolves each leg to
+            # its approved bridge. Explicit net/ipconfig keys are still
+            # allowed but must match the derived vector EXACTLY (checked
+            # below), never silently override it.
+            if not isinstance(expected_nics, list) or not expected_nics:
+                raise PolicyViolation("expected_nics must be a non-empty list "
+                                      "of {segment, address} entries")
+            for idx, plan in enumerate(expected_nics):
+                if not isinstance(plan, dict):
+                    raise PolicyViolation("expected_nics entries must be "
+                                          "{segment, address} objects")
+                seg = self.policy.segment(str(plan.get("segment")))
+                cfg.setdefault(f"net{idx}", f"virtio,bridge={seg.bridge}")
+                cfg.setdefault(f"ipconfig{idx}",
+                               f"ip={plan.get('address')}/"
+                               f"{seg.network.prefixlen}")
         self.policy.check_config_keys(cfg)
         if "net0" in cfg:
             self.policy.check_net0(cfg["net0"])
@@ -441,11 +482,30 @@ class BrokerService:
             self.policy.check_tags(cfg["tags"])
         if "name" in cfg:
             self.policy.check_name(cfg["name"])
+        if expected_nics is not None:
+            check_nic_vector(self.policy, cfg, expected_nics)
         with self._op_lock:
             self._active_claim(int(vmid), session_id)
             self.pve.set_config(node, int(vmid), **cfg)
-            self.ledger.audit("set-config", {"vmid": int(vmid),
-                                             "keys": sorted(cfg)})
+            audit_detail: dict = {"vmid": int(vmid), "keys": sorted(cfg)}
+            if expected_nics is not None:
+                audit_detail["nics"] = [
+                    {"segment": str(n.get("segment")),
+                     "address": str(n.get("address"))}
+                    for n in expected_nics]
+                actual = self.pve.try_lookup_config(node, int(vmid))
+                try:
+                    check_effective_nics(self.policy, actual or {},
+                                         expected_nics)
+                except PolicyViolation as exc:
+                    self.ledger.add_obligation("nic-vector-readback-mismatch",
+                                               int(vmid), str(exc))
+                    self.ledger.audit("set-config-nic-readback-mismatch",
+                                      {**audit_detail, "error": str(exc)})
+                    raise BrokerUnavailable(
+                        f"NIC read-back for VMID {vmid} does not match the "
+                        f"approved vector: {exc} — obligation retained") from exc
+            self.ledger.audit("set-config", audit_detail)
 
     # ------------------------------------------------------------- start/stop ---
     def start_and_wait(self, node: str, vmid: int, timeout: int = 90,

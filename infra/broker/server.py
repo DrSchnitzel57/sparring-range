@@ -24,7 +24,7 @@ CONTROL_OPS = frozenset({
     "lookup_vm", "lookup_config", "try_lookup_config", "read_config",
     "read_host_key",
     "vm_status", "inventory", "latch_status", "next_vmid", "clone_and_wait",
-    "artifact_for_template",
+    "artifact_for_template", "template_catalog",
     "set_config", "start_and_wait", "stop", "stop_and_confirm",
     "destroy_and_wait", "disown", "hard_stop_all", "renew_lease",
     # Idle-range lifecycle: disarming is safe while latched (it can never

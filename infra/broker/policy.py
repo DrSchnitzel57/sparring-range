@@ -80,6 +80,114 @@ _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 _TAG_RE_DEFAULT = re.compile(r"^srsess-[0-9a-f]{32}$")
 
 
+def check_nic_vector(policy, cfg: dict, nics: list) -> None:
+    """Validate the COMPLETE effective NIC vector for one guest.
+
+    `nics` is the expected per-index plan: [{"segment": name, "address": a},
+    ...] — index order IS the domain NIC order. This is stricter than the
+    per-field checks: it binds EACH address to the segment of the bridge at
+    the SAME index (bridge A + segment-B address is refused), pins the
+    exact count (extra or missing NIC entries are refused — including on
+    configs being PATCHED onto an existing VM), forbids two NICs on the
+    same segment, duplicate addresses and any net/ipconfig key beyond the
+    declared vector. Values are compared byte-exact; there is no fuzzy
+    segment matching.
+    """
+    bad = lambda why: (_ for _ in ()).throw(  # noqa: E731
+        PolicyViolation(f"NIC vector refused: {why}"))
+    if not policy.segments:
+        bad("policy has no segment lane; multi-NIC vectors are unrepresentable")
+    if not isinstance(nics, list) or not 1 <= len(nics) <= policy.max_nics:
+        bad(f"expected 1..{policy.max_nics} NIC entries, got "
+            f"{nics if isinstance(nics, list) else type(nics).__name__}")
+    seen_segments: set[str] = set()
+    seen_addresses: set[str] = set()
+    for idx, spec in enumerate(nics):
+        if not isinstance(spec, dict) or set(spec) != {"segment", "address"}:
+            bad(f"nic[{idx}] must be exactly {{segment, address}}")
+        try:
+            seg = policy.segment(str(spec["segment"]))
+        except PolicyViolation as exc:
+            bad(f"nic[{idx}]: {exc}")
+        if seg.name in seen_segments:
+            bad(f"segment {seg.name} appears twice in the NIC vector")
+        seen_segments.add(seg.name)
+        addr = str(spec["address"])
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            bad(f"nic[{idx}] address {addr!r} is not an IPv4 address")
+        if ip in (seg.network.network_address, seg.network.broadcast_address):
+            bad(f"nic[{idx}] address {ip} is a network/broadcast address of "
+                f"{seg.name}")
+        if addr in seen_addresses:
+            bad(f"duplicate address {addr} in the NIC vector")
+        seen_addresses.add(addr)
+        net_key, ip_key = f"net{idx}", f"ipconfig{idx}"
+        want_net = f"virtio,bridge={seg.bridge}"
+        if cfg.get(net_key) != want_net:
+            bad(f"{net_key} {cfg.get(net_key)!r} does not equal the exact "
+                f"approved bridge spec for segment {seg.name} ({want_net!r})")
+        want_ip = f"ip={ip}/{seg.network.prefixlen}"
+        if cfg.get(ip_key) != want_ip:
+            bad(f"{ip_key} {cfg.get(ip_key)!r} does not bind nic[{idx}] "
+                f"address to segment {seg.name} (expected {want_ip!r} — an "
+                f"approved bridge carrying a DIFFERENT segment's address is "
+                f"refused)")
+    for key in cfg:
+        m = re.fullmatch(r"(net|ipconfig)(\d+)", key)
+        if m and int(m.group(2)) >= len(nics):
+            bad(f"{key} exceeds the declared NIC count {len(nics)} — an "
+                f"unplanned NIC is never patched onto a managed guest")
+
+
+def check_effective_nics(policy, actual: dict, nics: list) -> None:
+    """Compare a NIC vector read back from REALITY (the backend's
+    XML-derived `nics` list: index/bridge/mac per actual interface) with
+    the expected plan. Extra interfaces, missing interfaces, foreign or
+    swapped bridges and duplicated MACs all refuse the guest. The claimed
+    description is not consulted here — `actual` must come from the
+    backend's XML read-back path."""
+    bad = lambda why: (_ for _ in ()).throw(  # noqa: E731
+        PolicyViolation(f"NIC read-back mismatch: {why}"))
+    if not isinstance(actual, dict):
+        bad("backend returned no readable NIC state")
+    if "_unavailable" in actual:
+        bad(f"backend read uncertain: {actual['_unavailable']}")
+    if "_nic_drift" in actual:
+        bad(f"domain XML disagrees with the recorded intent: {actual['_nic_drift']}")
+    observed = actual.get("nics")
+    if not isinstance(observed, list):
+        bad("backend did not read NICs back from the domain XML")
+    if len(observed) != len(nics):
+        bad(f"domain has {len(observed)} interfaces, the plan has {len(nics)}")
+    seen_mac: set[str] = set()
+    for idx, spec in enumerate(nics):
+        seg = policy.segment(str(spec["segment"]))
+        want_bridge = seg.bridge
+        entry = observed[idx]
+        if int(entry.get("index", -1)) != idx:
+            bad(f"interface order: expected index {idx} at position {idx}, "
+                f"found {entry.get('index')!r}")
+        got = str(entry.get("bridge", ""))
+        if got != want_bridge:
+            other = [s.name for s in (policy.segments or ()) if s.bridge == got]
+            bad(f"nic[{idx}] bridge {got!r} is not segment {seg.name!r}'s "
+                f"approved bridge "
+                f"{want_bridge!r}"
+                + (f" (it belongs to segment {other[0]!r} — index swap?)"
+                   if other else " (foreign bridge)"))
+        mac = str(entry.get("mac", ""))
+        if not _MAC_RE.fullmatch(mac):
+            bad(f"nic[{idx}] mac {mac!r} is malformed")
+        if mac in seen_mac:
+            bad(f"duplicate mac {mac} across interfaces")
+        seen_mac.add(mac)
+
+
+_MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
+
+
 @dataclass(frozen=True)
 class SegmentSpec:
     """One APPROVED lab segment (Underpressure multi-NIC lane). The broker
