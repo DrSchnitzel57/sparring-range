@@ -207,11 +207,6 @@ class Settings(BaseSettings):
     # general API/web/auth/scoring/model/operator endpoint from there.
     api_ingest_only: bool = False
     ingest_max_body_bytes: int = 262_144
-    # Admission fence (plan 21 preserving upgrade): while this file exists,
-    # NEW work is refused with 503 — the upgrade window between quiescence
-    # and verified restart must admit no race. Existing-work callbacks are
-    # never blocked (they must still reach terminal states).
-    maintenance_flag: str = "/var/lib/sparring-range/maintenance"
     # Explicit operator authorization (plan 13 phase 4 stage ladder):
     # attack-authorized requires lab-ready PLUS this flag, set only after
     # isolation and emergency-stop verification. Default off; never implied

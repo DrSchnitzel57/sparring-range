@@ -437,37 +437,16 @@ def ensure_venv(run, *, prefix: pathlib.Path, source: pathlib.Path,
 #: Environment variables that carry OWNER/SECRET database credentials.
 #: They are stripped from the INHERITED environment of every privileged
 #: child (round-3 finding 5: the owner URL an operator exported in the
-#: upgrade shell was inherited by venv-build, frontend and native helper
+#: installer shell was inherited by venv-build, frontend and native helper
 #: processes for no reason). A call site that AUTHORIZES a channel passes
 #: the variable explicitly in ``env=`` — explicit wins, ambient never.
 OWNER_ONLY_ENV = frozenset({
     "POSTGRES_URL_OWNER",
     "SR_POSTGRES_URL_OWNER",
-    "SR_PG_UPGRADE_URL",
     "SR_PG_SECRET_URL",
     "PGPASSWORD",
     "PGPASSFILE",
 })
-
-#: Round-4 finding 3: ``--db-url-env`` accepts ANY variable name, so the
-#: fixed set above is not enough. The CLI registers the SELECTED name(s)
-#: for this process before any privileged child spawns; every scrubber
-#: uses ``credential_env_names()`` — an explicit, name-specific list, not
-#: a pattern guess. Append-only and process-local (the deploy CLI is
-#: single-purpose; nothing here runs inside the API).
-_CREDENTIAL_ENV_EXTRA: set[str] = set()
-
-
-def note_credential_env_names(names) -> None:
-    for n in names:
-        if n:
-            if not n.replace("_", "").isalnum() or n[0].isdigit():
-                raise RuntimeError(f"not an environment variable name: {n!r}")
-            _CREDENTIAL_ENV_EXTRA.add(n)
-
-
-def credential_env_names() -> frozenset[str]:
-    return OWNER_ONLY_ENV | frozenset(_CREDENTIAL_ENV_EXTRA)
 
 
 def _read_env_file(path: pathlib.Path) -> dict[str, str]:

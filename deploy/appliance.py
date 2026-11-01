@@ -26,10 +26,6 @@ Usage::
     python deploy/appliance.py apply    --manifest M [--prefix PREFIX] [--dry-run]
     python deploy/appliance.py status   --manifest M [--json]
     python deploy/appliance.py doctor   --manifest M [--json]
-    python deploy/appliance.py upgrade  --manifest M --payload BUNDLE
-        # owner URL via the environment ONLY (default $SR_PG_UPGRADE_URL):
-        # SR_PG_UPGRADE_URL=... appliance.py upgrade --manifest M --payload B
-    python deploy/appliance.py upgrade  --manifest M --restore-config ATTEMPT
     python deploy/appliance.py recovery status --manifest M
     python deploy/appliance.py recovery reconcile --manifest M
 """
@@ -860,7 +856,7 @@ class Runner:
         # children. A call site that authorizes a channel passes it
         # explicitly in env= — explicit wins, ambient never.
         environ = {**{k: v for k, v in os.environ.items()
-                      if k not in svc.credential_env_names()},
+                      if k not in svc.OWNER_ONLY_ENV},
                    **(env or {})}
         # subprocess requires every environment value to be a str; an
         # IPv4Address (live find 2026-10-23: HTTPS_IP reached the TLS
@@ -1680,11 +1676,11 @@ def _layout(args) -> Layout:
 
 
 def _load(args) -> tuple[ApplianceManifest, AppliancePolicy]:
-    # Applying or upgrading the appliance ALWAYS verifies the base image
+    # Applying the appliance ALWAYS verifies the base image
     # digests: a drifted image must be refused before any effect, not
     # discovered later when a guest is cloned from it.
     verify = bool(getattr(args, "verify_images", False)) or \
-        getattr(args, "cmd", "") in ("apply", "upgrade")
+        getattr(args, "cmd", "") == "apply"
     m = ApplianceManifest.load(args.manifest, verify_images=verify)
     if args.policy:
         p = AppliancePolicy.load(args.policy)
@@ -1741,61 +1737,6 @@ def main(argv: list[str] | None = None) -> int:
     common(pd)
     pd.add_argument("--json", action="store_true")
 
-    pu = sub.add_parser("upgrade")
-    common(pu)
-    pu.add_argument("--prefix", default=str(DEFAULT_PREFIX))
-    pu.add_argument("--etc", default=str(DEFAULT_ETC))
-    pu.add_argument("--payload",
-                    help="the release bundle to upgrade to (built by "
-                         "deploy/bundle.py; carries the MANIFEST upgrade "
-                         "contract and forward migrations)")
-    pu.add_argument("--db-url-env", metavar="NAME", default=None,
-                    help="NAME of an environment variable holding the "
-                         "database owner URL (default: $SR_PG_UPGRADE_URL, "
-                         "then $POSTGRES_URL_OWNER). The URL is deliberately "
-                         "NOT a command-line argument: argv is world-readable "
-                         "in the process table for the whole upgrade, and a "
-                         "URL there leaks the owner credential. Run it as "
-                         "`SR_PG_UPGRADE_URL=... appliance.py upgrade ...` "
-                         "(inline environment, never shown by ps auxww)")
-    pu.add_argument("--resume", metavar="ATTEMPT",
-                    help="resume one specific journaled attempt instead of "
-                         "starting new work")
-    pu.add_argument("--restore-config", metavar="ATTEMPT",
-                    help="config-only restore from an attempt's verified "
-                         "backup; issues NO service action — nothing is "
-                         "started or resumed")
-    pu.add_argument("--pg-dump-bin", help="pg_dump binary or wrapper for the "
-                                          "preserving database backup "
-                                          "(reads PGPASSFILE from its "
-                                          "environment; no URL in argv)")
-    pu.add_argument("--python-exe", help="interpreter used for alembic "
-                                         "(default: the INSTALLED venv at "
-                                         "<prefix>/.venv/bin/python)")
-    pu.add_argument("--skip-provision", action="store_true",
-                    help="explicit exception only: skip installing the "
-                         "locked dependencies / frontend build for the "
-                         "activated payload (an externally maintained "
-                         "runtime is then the operator's claim)")
-    pu.add_argument("--skip-frontend", action="store_true",
-                    help="provision everything except the frontend build "
-                         "(a pre-built web release is then the operator's "
-                         "claim)")
-    pu.add_argument("--allow-fresh-install", action="store_true",
-                    help="attest that this installation provably never "
-                         "claimed work (a missing broker ledger then "
-                         "qualifies; NEVER set this to work around a "
-                         "refusal)")
-    pu.add_argument("--maintenance-flag", help="path of the admission-fence "
-                                               "file (default: "
-                                               "<state-dir>/maintenance)")
-    pu.add_argument("--web-url", default="http://127.0.0.1:3000/",
-                    help="frontend readiness URL probed after restart "
-                         "(default: the sr-web bind address); the version "
-                         "stamp is written only after this AND /readyz "
-                         "answer 200")
-    pu.add_argument("--dry-run", action="store_true")
-
     pr = sub.add_parser("recovery")
     pr.add_argument("action", choices=("status", "reconcile", "resolve"))
     pr.add_argument("--manifest", required=True)
@@ -1836,55 +1777,6 @@ def main(argv: list[str] | None = None) -> int:
             sm = sandbox_manifest(m, lay.root)
             plan = render_files(sm, layout=lay)
             out = apply_plan(sm, plan, layout=lay, dry_run=args.dry_run)
-            print(json.dumps(out, indent=2, sort_keys=True))
-        elif args.cmd == "upgrade":
-            # The preserving in-place upgrade runs through the release
-            # engine: journal first, private config + database backups,
-            # verified staged payload, per-file atomic activation, proven
-            # forward-only migrations, config re-render, version stamp,
-            # ordered service reload. Data, keys and the ledger are never
-            # deleted or recreated, and unknown in-flight work is refused
-            # until it is resolved — never silently.
-            from deploy import upgrade as engine
-            lay = _layout(args)
-            if args.restore_config:
-                out = engine.restore_config(m, lay, args.restore_config,
-                                            dry_run=args.dry_run)
-                print(json.dumps(out, indent=2, sort_keys=True))
-                return 0
-            if not args.payload:
-                ap.error(
-                    "upgrade requires --payload (a built release bundle): "
-                    "the preserving upgrade backs up, verifies and migrates "
-                    "against that artifact; config re-rendering alone is "
-                    "`apply`, and calling that an upgrade would be a lie")
-            payload = engine.ReleasePayload(pathlib.Path(args.payload))
-            # The owner URL arrives via the ENVIRONMENT only: the name of
-            # the variable is a safe argument, its value never touches any
-            # argv (the process table would show the credential for the
-            # whole upgrade).  The engine additionally keeps it out of the
-            # pg_dump child's argv via a private PGPASSFILE.
-            url_name = args.db_url_env or "SR_PG_UPGRADE_URL"
-            db_url = os.environ.get(url_name) or os.environ.get(
-                "POSTGRES_URL_OWNER")
-            if not db_url:
-                ap.error(
-                    "no database owner URL: export it as $SR_PG_UPGRADE_URL "
-                    "(or the named --db-url-env variable) — passing a "
-                    "credential as a command-line argument is refused, it "
-                    "would be visible in the process table")
-            out = engine.run_upgrade(
-                m, lay, payload, db_url=db_url, resume=args.resume,
-                dry_run=args.dry_run, python_exe=args.python_exe,
-                pg_dump_bin=args.pg_dump_bin,
-                skip_provision=args.skip_provision,
-                skip_frontend=args.skip_frontend,
-                allow_fresh_install=args.allow_fresh_install,
-                maintenance_flag=(pathlib.Path(args.maintenance_flag)
-                                  if args.maintenance_flag else None),
-                web_url=args.web_url,
-                credential_env_names=(
-                    tuple(n for n in (args.db_url_env,) if n)))
             print(json.dumps(out, indent=2, sort_keys=True))
         elif args.cmd == "firstboot":
             lay = _layout(args)

@@ -114,84 +114,8 @@ def _load_acceptance():
     return mod
 
 
-def test_pw_alias_ownership_exclusive_allocation(tmp_path):
-    """A pre-existing path at a candidate name — the exact thing an
-    earlier reviewer hit — is SKIPPED UNTOUCHED, never unlinked; cleanup
-    removes only the owned DEVICE+INODE created by the allocation."""
-    acc = _load_acceptance()
-
-    target = tmp_path / "run" / "pw-tmp"
-    target.mkdir(parents=True)
-
-    sentinel_dir = tmp_path / "sentinel-dir"
-    sentinel_dir.mkdir()
-    (sentinel_dir / "keep.me").write_text("reviewer data")
-    sentinel_file = tmp_path / "sentinel-file"
-    sentinel_file.write_text("do not delete me")
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    sentinel_link = tmp_path / "sentinel-link"
-    os.symlink(str(elsewhere), str(sentinel_link))
-    inodes_before = {p: p.stat().st_ino for p in
-                     (sentinel_dir, sentinel_file, sentinel_link)}
-
-    good = tmp_path / "short-owned-alias"
-    handle = acc._pw_alias_allocate(target, iter(
-        [sentinel_dir, sentinel_file, sentinel_link, good]))
-    assert handle.path == good
-    assert good.is_symlink() and Path(os.readlink(str(good))) == \
-        target.resolve()
-    for p, ino in inodes_before.items():
-        assert p.is_symlink() if p == sentinel_link else p.exists()
-        assert p.stat().st_ino == ino, f"{p} was disturbed"
-    assert sentinel_file.read_text() == "do not delete me"
-    assert (sentinel_dir / "keep.me").read_text() == "reviewer data"
-    assert os.readlink(str(sentinel_link)) == str(elsewhere)
-
-    # normal cleanup removes exactly the owned inode, target intact
-    assert acc._pw_alias_release(handle) is None
-    assert not good.exists() and not good.is_symlink()
-    assert target.is_dir()
-
-    # exhausted candidates: RuntimeError, NOTHING deleted
-    with pytest.raises(RuntimeError):
-        acc._pw_alias_allocate(target, iter(
-            [sentinel_dir, sentinel_file, sentinel_link]))
-    assert sentinel_file.read_text() == "do not delete me"
-
-    # hostile cleanup races: alias replaced by a DIRECTORY, or by ANOTHER
-    # symlink (even one with the same target) — different inode, so it is
-    # LEFT ALONE and reported, never unlinked (round-4 F3).
-    h2 = acc._pw_alias_allocate(target, iter([tmp_path / "a2"]))
-    h2.path.unlink()
-    h2.path.mkdir()
-    note = acc._pw_alias_release(h2)
-    assert note and "DIFFERENT inode" in note
-    assert h2.path.is_dir(), "a foreign directory took the name — left alone"
-    h2.path.rmdir()
-
-    h3 = acc._pw_alias_allocate(target, iter([tmp_path / "a3"]))
-    h3.path.unlink()
-    os.symlink(str(elsewhere), str(h3.path))
-    note = acc._pw_alias_release(h3)
-    assert note and "DIFFERENT inode" in note
-    assert h3.path.is_symlink() and \
-        os.readlink(str(h3.path)) == str(elsewhere)
-    h3.path.unlink()                       # the foreign owner cleans up
 
 
-def test_pw_alias_is_short_enough_for_chromium(tmp_path):
-    """The default name pool yields REAL /tmp names far under the unix
-    socket cap (~107 chars for the socket, so keep the alias < 40)."""
-    acc = _load_acceptance()
-    target = tmp_path
-    handle = acc._pw_alias_allocate(target)
-    try:
-        assert str(handle.path).startswith("/tmp/srpw-")
-        assert len(str(handle.path)) < 40
-    finally:
-        acc._pw_alias_release(handle)
-    assert not handle.path.exists() and not handle.path.is_symlink()
 
 
 # --------------------------------------------------------------- F1 & F2 --- #

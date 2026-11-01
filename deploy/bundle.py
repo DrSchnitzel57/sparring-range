@@ -465,25 +465,6 @@ def _build_into(output: pathlib.Path, *, base_image: pathlib.Path,
             "notes": "render the operator manifest with: "
                      "python deploy/bundle.py manifest <bundle> --out manifest.json ...",
         },
-        "upgrade": {
-            "engine": "deploy/upgrade.py",
-            "migrations": "srplatform/db/migrations/versions",
-            "bundle_version": BUNDLE_VERSION,
-            "revision": manifest_revision,
-            "command": "SR_PG_UPGRADE_URL=... python deploy/appliance.py "
-                       "upgrade --manifest manifest.json --payload <this "
-                       "bundle>  # owner URL via environment ONLY: a URL "
-                       "with a credential must never be a process argument",
-            "notes": "preserving in-place upgrade: journal first, admission "
-                     "fence, private config + database backups (password "
-                     "via private PGPASSFILE, never argv), digest-verified "
-                     "staging, per-file atomic activation, provisioning of "
-                     "the locked runtime + frontend BEFORE migration, "
-                     "forward-only migrations, checked service restart with "
-                     "readiness, version stamp last; data, keys and the "
-                     "ledger are never deleted, and unknown in-flight work "
-                     "is refused until resolved",
-        },
     }
     (output / MANIFEST_NAME).write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n")
@@ -558,38 +539,6 @@ def verify(bundle: pathlib.Path) -> dict:
         secret = _scan_for_secrets(rel, path.read_bytes())
         if secret:
             problems.append(secret)
-    # the upgrade payload contract: a bundle that cannot drive the
-    # preserving upgrade is not a release artifact (milestone 21)
-    upgrade = manifest.get("upgrade") or {}
-    if not upgrade:
-        problems.append("no `upgrade` contract in the manifest: pre-21 "
-                        "bundles must be rebuilt before they can upgrade "
-                        "an appliance")
-    else:
-        engine_rel = str(upgrade.get("engine") or "")
-        if not engine_rel:
-            problems.append("upgrade contract missing 'engine'")
-        elif engine_rel not in files:
-            problems.append(f"upgrade contract names {engine_rel} which the "
-                            "bundle does not carry")
-        if "revision" not in upgrade or upgrade.get("revision") != \
-                manifest.get("revision"):
-            problems.append("upgrade contract revision does not match the "
-                            "bundle revision")
-        mig_dir = str(upgrade.get("migrations") or "").rstrip("/")
-        if not mig_dir:
-            problems.append("upgrade contract missing 'migrations'")
-        elif not any(rel.startswith(mig_dir + "/") and
-                     rel.endswith(".py") for rel in files):
-            problems.append(f"upgrade contract names {mig_dir} but the "
-                            "bundle carries no migrations there")
-        elif (bundle / mig_dir).is_dir():
-            from deploy.upgrade import migration_heads
-            heads = migration_heads(bundle / mig_dir)
-            if len(heads) != 1:
-                problems.append(
-                    f"upgrade payload migration graph has {len(heads)} "
-                    f"heads ({sorted(heads)}); refusing")
     # the shipped images must stand alone: an image that depends on a file
     # outside the bundle cannot be installed on the operator's machine.
     for rel, meta in sorted((manifest.get("images") or {}).items()):

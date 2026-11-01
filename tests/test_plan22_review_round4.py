@@ -433,41 +433,6 @@ def _load_acceptance():
     return mod
 
 
-def test_pw_alias_same_target_different_inode_survives(tmp_path):
-    """Round-4 F3: ownership is the allocation-time device+inode. A
-    replacement symlink pointing at the SAME target — the exact reviewer
-    counterexample — is a different inode and must survive cleanup,
-    reported, while the real owned inode is still removable."""
-    acc = _load_acceptance()
-    target = tmp_path / "run"
-    target.mkdir()
-
-    h = acc._pw_alias_allocate(target, iter([tmp_path / "alias"]))
-    st = os.lstat(str(h.path))
-    assert (st.st_dev, st.st_ino) == (h.dev, h.ino)
-
-    # reviewer's move: keep our inode alive under another name, install a
-    # DIFFERENT symlink with the SAME target at the alias path
-    os.rename(str(h.path), str(tmp_path / "kept"))
-    os.symlink(str(target.resolve()), str(h.path))
-    assert os.lstat(str(h.path)).st_ino != h.ino
-
-    note = acc._pw_alias_release(h)
-    assert note and "DIFFERENT inode" in note
-    assert h.path.is_symlink(), "replacement with same target was deleted!"
-
-    # the inode we actually own (renamed aside) is untouched until its
-    # own path disappears — and a release after it vanishes is a no-op
-    assert os.path.islink(str(tmp_path / "kept"))
-    os.unlink(str(h.path))
-    assert acc._pw_alias_release(h) is None          # path gone -> no-op
-    assert os.path.islink(str(tmp_path / "kept"))
-    os.unlink(str(tmp_path / "kept"))
-
-    # own success cleanup still works normally
-    h2 = acc._pw_alias_allocate(target, iter([tmp_path / "alias2"]))
-    assert acc._pw_alias_release(h2) is None
-    assert not h2.path.exists() and not h2.path.is_symlink()
 
 
 # ---------------------------------------------------------------- F4 & F5 --

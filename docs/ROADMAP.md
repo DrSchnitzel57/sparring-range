@@ -45,7 +45,9 @@ acceptance.
   (receipts: `git log -- docs/ROADMAP.md docs/FINDINGS_CHECKLIST.md`).
 - [ ] **16 — Installable appliance and qualified release.**
   [Plan](../.openchamber/plans/16-appliance-release.md).
-  Finish the checksummed release bundle, upgrade/history-import/recovery tooling
+  Finish the checksummed release bundle, history-import/recovery tooling
+  (the preserving in-place upgrade was retired 2026-11-01: releases arrive
+  by fresh reinstall, data is not carried across)
   and operator guide; prove the complete software matrix at a pinned candidate,
   then collect operator/human acceptance. Backup destination/live restore remain
   optional. Runtime practice features and their tests are delivered in 15.
@@ -147,8 +149,12 @@ historical 14–17.
   *Status 2026-10-28:* the preserving-upgrade engine and five review rounds
   landed (engine contracts in the runbook §7; per-round receipts in Git
   history); pinned guest package images rebuilt from live mirrors (`3000361`).
-  21 stays UNTICKED — its operator-machine gates (packet/journey/release,
-  installed systemd/Strata/nested-KVM) remain pending.
+  *2026-11-01:* the appliance is fresh-replacement — the preserving-upgrade
+  engine, its admission fence, journal, CLI/API surface and acceptance gate
+  are retired; new releases arrive by fresh install from a new bundle, and
+  no data crosses from an older installation. 21 stays UNTICKED — its
+  operator-machine gates (packet/journey/release, installed
+  systemd/Strata/nested-KVM) remain pending.
 
 Architecture section K records the upgrade/conversation choices and defaults.
 No deployment or feature implementation is implied by this roadmap alone.
