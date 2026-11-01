@@ -17,6 +17,15 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 #: Read directly from os.environ by design, never Settings fields.
 NON_SETTINGS_KEYS = {"SR_PROCESS_ROLE", "SR_DATA_DIR"}
 
+#: Keys of the retired direct-PVE deploy kit. The shipped deploy/env.*.example
+#: files are kept as historical kit documentation; the matching Settings
+#: fields are gone and only the retired kit's own installer rendered them.
+LEGACY_KIT_KEYS = {"PROXMOX_HOST", "PROXMOX_NODE", "PROXMOX_USER",
+                   "PROXMOX_TOKEN_ID", "PROXMOX_TOKEN_SECRET",
+                   "PROXMOX_TLS_VERIFY", "PROXMOX_TLS_CA_FILE",
+                   "PROXMOX_INSECURE_LAB_OVERRIDE",
+                   "PROXMOX_TASK_TIMEOUT_S"}
+
 
 def _example_keys():
     out = []
@@ -52,6 +61,9 @@ def test_shipped_example_key_is_honored(fname, key, monkeypatch):
     if key in NON_SETTINGS_KEYS:
         assert key in NON_SETTINGS_KEYS  # explicit whitelist, not a skip
         return
+    if key in LEGACY_KIT_KEYS:
+        assert key in LEGACY_KIT_KEYS  # historical kit, not a silent skip
+        return
     field = _field_for(key)
     assert field is not None, \
         f"{key} in {fname} matches no Settings field — a shipped example " \
@@ -83,11 +95,11 @@ def test_documented_match_settings_probe_now_resolves():
 
 def test_bare_names_still_resolve_for_backward_compatibility():
     import os
-    os.environ["PROXMOX_NODE"] = "barename-node"
+    os.environ["DEPLOY_NODE"] = "barename-node"
     try:
-        assert Settings(_env_file=None).proxmox_node == "barename-node"
+        assert Settings(_env_file=None).deploy_node == "barename-node"
     finally:
-        del os.environ["PROXMOX_NODE"]
+        del os.environ["DEPLOY_NODE"]
 
 
 def test_sr_env_still_resolves():

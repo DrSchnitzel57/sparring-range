@@ -1,6 +1,6 @@
 """M6 acceptance — the loop closes for a real user: one terminal, only CLI
 commands and HTTP. The nine-line story from Part 0.5 with Drew's hardware
-(Proxmox/GPU/range VMs) replaced by its doubles — but the REAL uvicorn server,
+(hypervisor/GPU/range VMs) replaced by its doubles — but the REAL uvicorn server,
 the REAL Typer CLI speaking real HTTP (auth tokens included), the REAL loop
 over the REAL front door.
 """
@@ -44,9 +44,9 @@ def _free_port() -> int:
 @pytest.fixture()
 def live_api(migrated_db, test_db_url_owner, tmp_path, monkeypatch):
     """Real uvicorn on a free port; doubles injected into the in-process app."""
-    from infra.proxmox_client import FakePVEHttp
-    httpd = FakePVEHttp()
-    for vmid in (9001, 9002, 9003, 9004):
+    from infra.broker.testing import FakeBackend
+    httpd = FakeBackend()
+    for vmid in (9001, 9002, 9003, 9004, 9005, 9011, 9012):
         httpd.vms[vmid] = {"name": f"tpl{vmid}", "template": vmid, "status": "stopped"}
     from tests.conftest import wipe_data
     wipe_data(test_db_url_owner)

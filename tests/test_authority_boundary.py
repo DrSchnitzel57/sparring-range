@@ -3,7 +3,7 @@
 These are the AUTHORITY-layer acceptance tests: real policy enforcement,
 real mutual-TLS handshakes, real SQLite durability across process-object
 restarts, real task/read-back cessation, and real writer races. Nothing is
-mocked above the proxmoxer boundary (FakePVEHttp) — the broker service,
+mocked above the backend boundary (FakeBackend) — the broker service,
 ledger, transports and HTTP server are the production code.
 """
 from __future__ import annotations
@@ -119,7 +119,7 @@ def test_policy_file_fails_closed_on_load(tmp_path):
     with pytest.raises(PolicyViolation, match="missing"):
         BrokerPolicy.load(tmp_path / "nope.json")
     for label, mutate in (
-        ("unknown key", lambda d: d.update({"arbitrary_pve_paths": True})),
+        ("unknown key", lambda d: d.update({"arbitrary_backend_paths": True})),
         ("inverted range", lambda d: d.update({"vmid_range": [300, 200]})),
         ("unbounded range", lambda d: d.update({"vmid_range": [1, 99999999]})),
         ("two NICs", lambda d: d.update({"nic": {"bridge": "vmbr1", "vlan": 66,
@@ -268,13 +268,13 @@ def test_mutual_tls_negatives_and_positive(tls_broker):
 
 
 def _http_vms(service):
-    return {v for v in service.pve.api.vms}
+    return {v for v in service.backend.vms}
 
 
-def _clones(http):
-    """CLONE requests only — not the task-status polls whose URLs embed the
-    clone path."""
-    return [r for r in http.requests if r[0] == "POST" and r[1].endswith("/clone")]
+def _clones(backend):
+    """Clone operations only — the request log records (op, args) tuples."""
+    return [r for r in backend.requests
+            if r[0] == "clone_and_wait"]
 
 
 def test_wire_surface_is_typed_only(tls_broker):
@@ -351,9 +351,9 @@ def test_latched_destroy_resolves_only_cessation_obligations(tmp_path):
     _clone(client)
     client.start_and_wait(NODE, 210, session_id="sess-1")
     # stop fails: cessation retains an open obligation and an unknown claim
-    http.fail_task_fragments = ("/210/status/stop",)
+    http.fail_tasks = {("stop", 210): True}
     report = service.hard_stop_all("stop-must-fail")
-    http.fail_task_fragments = ()
+    http.fail_tasks = {}
     assert report["failed"], report
     open_before = {o["kind"] for o in service.ledger.open_obligations()}
     assert "vm-stop-unconfirmed" in open_before
@@ -432,9 +432,9 @@ def test_resolve_refused_while_resource_present_or_uncertain(tmp_path):
     client, service, http = _mk(tmp_path)
     _clone(client)
     client.start_and_wait(NODE, 210)
-    http.fail_task_fragments = ("/210/status/stop",)
+    http.fail_tasks = {("stop", 210): True}
     service.hard_stop_all("stop-must-fail")
-    http.fail_task_fragments = ()
+    http.fail_tasks = {}
     ob = [o for o in service.ledger.open_obligations()
           if o["kind"] == "vm-stop-unconfirmed"][0]
     # still present → presence never resolves a claim-style obligation
@@ -442,10 +442,10 @@ def test_resolve_refused_while_resource_present_or_uncertain(tmp_path):
         _resolve(service, ob["id"])
     assert any(o["id"] == ob["id"] for o in service.ledger.open_obligations())
     # uncertain read → refused, open, audited
-    http.fail_request_fragments = ("/210/config",)
+    http.fail_reads = {("lookup_config", 210): True}
     with pytest.raises(BrokerUnavailable, match="uncertain"):
         _resolve(service, ob["id"])
-    http.fail_request_fragments = ()
+    http.fail_reads = {}
     # confirmed gone → resolves
     http.vms.pop(210)
     out = _resolve(service, ob["id"])
@@ -464,15 +464,15 @@ def test_resolve_unknown_obligation_id_is_refused(tmp_path):
 
 def test_intent_recorded_before_effect_and_reconciled_not_replayed(tmp_path):
     client, service, http = _mk(tmp_path)
-    # the clone task FAILS after the request reached PVE: uncertain outcome
-    http.fail_task_fragments = ("/clone",)
+    # the clone task FAILS after the request reached the hypervisor: uncertain outcome
+    http.fail_tasks = {("clone_and_wait", 210): True}
     with pytest.raises(BrokerUnavailable):
         _clone(client)
     assert service.ledger.open_obligations(), "uncertain clone must retain an obligation"
     assert service.ledger.get_claim(210)["state"] in ("creating", "reserved")
     # operator clears the fault; retry must RECONCILE, not blind-replay:
     # nothing exists at 210, so a real (second) clone is legitimate
-    http.fail_task_fragments = ()
+    http.fail_tasks = {}
     _clone(client)
     assert len(_clones(http)) == 2, "one failed + one reconciled clone"
     assert service.ledger.get_claim(210)["state"] == "created"
@@ -493,8 +493,8 @@ def test_idempotent_replay_never_clones_twice(tmp_path):
 
 
 def test_crash_between_side_effect_and_confirmation_reconciles(tmp_path):
-    """Simulate the crash: clone completed in PVE but the broker died before
-    confirming. The pending intent must be SURFACED (never auto-replayed) and
+    """Simulate the crash: clone completed at the hypervisor but the broker
+    died before confirming. The pending intent must be SURFACED (never auto-replayed) and
     the next same-intent call must CONFIRM from reality, never re-clone."""
     ledger_path = tmp_path / "ledger.sqlite3"
     client, service, http = make_fake_broker(ledger_path=ledger_path)
@@ -519,7 +519,7 @@ def test_restart_with_active_claims_and_unverified_lease_latches_and_stops(tmp_p
     _place(client)
     client.start_and_wait(NODE, 210)
     assert client.vm_status(NODE, 210) == "running"
-    # broker restarts (new service object, same ledger AND same PVE), lease
+    # broker restarts (new service object, same ledger AND same backend), lease
     # never armed
     service.stop_watchdog()
     client2, service2 = reopen_broker(http, policy=service.policy,
@@ -598,7 +598,7 @@ def test_hard_stop_all_stops_with_readback_and_retains_obligations(tmp_path):
                           net0=NET0, tags=TAG)
         client.start_and_wait(NODE, vmid)
     # 212 refuses to stop: task fails
-    http.fail_requests["qemu/212/status/stop"] = 500
+    http.fail_tasks = {("stop", 212): True}
     report = client.hard_stop_all("acceptance")
     assert report["latched"] and sorted(report["stopped"]) == [210, 211]
     assert report["failed"] and report["failed"][0]["vmid"] == 212
@@ -612,7 +612,7 @@ def test_hard_stop_all_stops_with_readback_and_retains_obligations(tmp_path):
     with pytest.raises(BrokerConflict, match="obligation"):
         service.release_latch("operator")
     # operator fixes reality (VM gone), obligation resolves via stop_and_confirm
-    http.fail_requests.pop("qemu/212/status/stop")
+    http.fail_tasks = {}
     http.vms.pop(212)
     assert client.stop_and_confirm(NODE, 212) == "absent"
     for o in ob:
@@ -884,9 +884,10 @@ def test_transport_down_is_uncertain_not_absent(tmp_path):
                       mat["client"][0], mat["client"][1])
 
 
-def test_api_holds_no_proxmox_path():
-    """Structural: nothing under srplatform/ may import the broker-private
-    PVE adapter; only infra/broker (and its own adapter) may."""
+def test_api_holds_no_direct_hypervisor_path():
+    """Structural: nothing under srplatform/ may import the appliance
+    backend or the retired direct-PVE client; only infra/broker (and the
+    appliance package itself) may reach libvirt."""
     import pathlib
     import re
 
@@ -894,16 +895,19 @@ def test_api_holds_no_proxmox_path():
     offenders = []
     for py in (root / "srplatform").rglob("*.py"):
         text = py.read_text()
-        for m in re.finditer(r"^\s*(?:from|import)\s+infra\.proxmox_client",
-                             text, re.M):
+        for m in re.finditer(
+                r"^\s*(?:from|import)\s+(?:infra\.proxmox_client"
+                r"|infra\.appliance\.backend|libvirt)\b",
+                text, re.M):
             offenders.append(f"{py.relative_to(root)}:{m.group(0).strip()}")
     assert not offenders, (
-        "the API layer must reach PVE only through the broker: " + str(offenders))
+        "the API layer must reach the hypervisor only through the broker: "
+        + str(offenders))
     # and the broker client exposes no raw-path escape hatch
     import infra.broker.client as bc
     for name in ("get", "post", "delete", "raw", "api"):
         assert not hasattr(BrokerClient, name), f"BrokerClient.{name} is an escape hatch"
-    assert not hasattr(bc, "ProxmoxClient")
+    assert not hasattr(bc, "LibvirtBackend")
 
 
 def test_local_transport_is_not_a_wire_bypass(tmp_path):

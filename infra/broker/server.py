@@ -14,8 +14,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from .errors import BrokerLatched, BrokerUnavailable, PolicyViolation
-from .ledger import Ledger
-from .policy import BrokerPolicy
 from .service import BrokerService
 
 # Operations the control plane may invoke. hard_stop_all is here on purpose
@@ -118,52 +116,3 @@ def make_server(service: BrokerService, host: str, port: int, *, certfile: str,
     srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
     srv.daemon_threads = True
     return srv
-
-
-def build_service_from_settings() -> tuple[BrokerService, Ledger, BrokerPolicy]:
-    """Broker-role boot: policy + ledger + broker-private PVE adapter."""
-    from srplatform.settings import get_settings
-
-    s = get_settings()
-    if not s.broker_policy_file:
-        raise RuntimeError("broker role requires broker_policy_file")
-    policy = BrokerPolicy.load(s.broker_policy_file)
-    ledger = Ledger(s.broker_ledger_path)
-    from infra.proxmox_client import ProxmoxClient  # broker-private import
-
-    pve = ProxmoxClient(host=s.proxmox_host, token_id=s.proxmox_token_id,
-                        token_secret=s.proxmox_token_secret)
-    return BrokerService(policy, pve, ledger,
-                         agent_ready_timeout_s=s.proxmox_agent_ready_timeout_s), \
-        ledger, policy
-
-
-def main(argv=None) -> int:
-    import argparse
-
-    ap = argparse.ArgumentParser(prog="brokerd")
-    ap.add_argument("--host", default=None)
-    ap.add_argument("--port", type=int, default=None)
-    args = ap.parse_args(argv)
-
-    from srplatform.settings import get_settings
-
-    s = get_settings()
-    service, ledger, _policy = build_service_from_settings()
-    report = service.startup_reconcile()   # fail-closed BEFORE serving
-    print(f"broker startup reconciliation: {report}", flush=True)
-    service.start_watchdog()
-    srv = make_server(service,
-                      args.host or s.broker_listen_host,
-                      args.port or s.broker_listen_port,
-                      certfile=s.broker_server_cert, keyfile=s.broker_server_key,
-                      ca_file=s.broker_tls_ca_file)
-    print(f"broker listening on {srv.server_address}", flush=True)
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        service.stop_watchdog()
-        srv.server_close()
-    return 0

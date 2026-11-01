@@ -56,17 +56,15 @@ def test_0016_grants_dml_and_default_privileges_without_ddl():
         "no blanket/alter grants to the app role"
 
 
-def test_change_placeholder_is_rejected_like_change_me():
+def test_placeholder_and_missing_material_are_rejected_in_production():
     from srplatform.settings import Settings, validate_production
     import pytest
     s = Settings(
         _env_file=None, sr_env="production",
         broker_policy_file="/x/policy.json",
-        broker_server_cert="/x/c", broker_server_key="/x/k",
-        broker_tls_ca_file="/x/ca",
-        proxmox_host="pve.internal", proxmox_token_id="sr-broker@pve!range",
-        proxmox_token_secret="CHANGE", proxmox_tls_ca_file="/x/pve-ca")
-    with pytest.raises(RuntimeError, match="Proxmox API token missing"):
+        broker_server_cert="", broker_server_key="/x/k",
+        broker_tls_ca_file="/x/ca")
+    with pytest.raises(RuntimeError, match="broker_server_cert missing"):
         validate_production(s, "broker")
     c = Settings(
         _env_file=None, sr_env="production",
@@ -74,15 +72,13 @@ def test_change_placeholder_is_rejected_like_change_me():
         broker_client_cert="/x/c", broker_client_key="/x/k",
         runner_transport="ssh", runner_ssh_target="r@10.66.0.9",
         runner_ssh_known_hosts="/x/kh",
-        postgres_url="postgresql+psycopg2://a:b@h/db",
+        postgres_url="postgresql+psycopg2://a:CHANGE_ME@h/db",
         postgres_url_owner="postgresql+psycopg2://o:b@h/db",
         bastion_targets_known_hosts="/x/bkh",
         verifier_ssh_known_hosts="/x/vkh",
         api_base_url="https://api.range.internal",
-        telemetry_ca_file="/x/api-ca.crt",
-        proxmox_token_id="sr-broker@pve!range",
-        proxmox_token_secret="CHANGE")
-    with pytest.raises(RuntimeError, match="forbidden"):
+        telemetry_ca_file="/x/api-ca.crt")
+    with pytest.raises(RuntimeError, match="placeholders"):
         validate_production(c, "controller")
 
 

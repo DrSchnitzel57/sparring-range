@@ -16,7 +16,6 @@ import uuid
 import pytest
 from sqlalchemy import select
 
-from infra.proxmox_client import PveHttpError
 from tests.conftest import launch_and_wait, wait_operation
 
 pytestmark = pytest.mark.db
@@ -42,8 +41,7 @@ def test_resume_repins_host_key_missing_after_failed_launch(client, users,
     # Pin fails (403 on the agent channel is immediate, not a not-ready
     # retry): the resource is committed `created` (ownership discipline)
     # but WITHOUT a pin.
-    fake_broker.http.fail_requests = {
-        "/agent/file-read": PveHttpError(403, "permission check failed")}
+    fake_broker.http.fail_reads = {("read_guest_file_when_ready", None): 403}
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
     assert r.status_code == 202, r.text  # accepted; the executor fails loudly
     failed = wait_operation(client, users["member"], sid)
@@ -59,7 +57,7 @@ def test_resume_repins_host_key_missing_after_failed_launch(client, users,
 
     # Repaired channel: resume must finish the pin (read + publish) and
     # reach ready — never skip it because the state already says created.
-    fake_broker.http.fail_requests = {}
+    fake_broker.http.fail_reads = {}
     launch_and_wait(client, users["member"], sid)
     resources = _deployment_resources(sid)
     assert resources[0]["state"] == "created"

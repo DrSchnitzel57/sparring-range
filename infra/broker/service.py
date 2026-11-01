@@ -31,7 +31,6 @@ import uuid
 
 from .errors import (BrokerConflict, BrokerLatched, BrokerRefused,
                      BrokerUnavailable, PolicyViolation)
-from ..proxmox_client import ProxmoxError
 from .ledger import Ledger, args_hash
 from .policy import (BrokerPolicy, check_effective_nics,
                      check_nic_vector)
@@ -42,11 +41,11 @@ MUTATING_OPS = frozenset({"next_vmid", "clone_and_wait", "set_config",
 
 
 class BrokerService:
-    def __init__(self, policy: BrokerPolicy, pve, ledger: Ledger,
+    def __init__(self, policy: BrokerPolicy, backend, ledger: Ledger,
                  now=time.time, agent_ready_timeout_s: float = 120.0,
                  agent_ready_poll_s: float = 2.0):
         self.policy = policy
-        self.pve = pve          # broker-private ProxmoxClient adapter
+        self.backend = backend      # broker-private hypervisor adapter
         self.ledger = ledger
         self.agent_ready_timeout_s = agent_ready_timeout_s
         self.agent_ready_poll_s = agent_ready_poll_s
@@ -83,20 +82,20 @@ class BrokerService:
     # ------------------------------------------------------------------ reads ---
     def lookup_vm(self, node: str, vmid: int):
         self._node(node)
-        return self.pve.lookup_vm(node, int(vmid))
+        return self.backend.lookup_vm(node, int(vmid))
 
     def lookup_config(self, node: str, vmid: int):
         self._node(node)
-        return self.pve.lookup_config(node, int(vmid))
+        return self.backend.lookup_config(node, int(vmid))
 
     def try_lookup_config(self, node: str, vmid: int):
         self._node(node)
-        return self.pve.try_lookup_config(node, int(vmid))
+        return self.backend.try_lookup_config(node, int(vmid))
 
     def read_config(self, node: str, vmid: int) -> dict:
         """Typed replacement for a raw GET of the VM config endpoint."""
         self._node(node)
-        cfg = self.pve.lookup_config(node, int(vmid))
+        cfg = self.backend.lookup_config(node, int(vmid))
         if cfg is None:
             raise BrokerRefused(f"VMID {vmid} has no readable config (absent)")
         if "_unavailable" in cfg:
@@ -127,7 +126,7 @@ class BrokerService:
         """
         from .errors import BrokerUnavailable as _BU
         try:
-            done = self.pve.read_boot_marker(
+            done = self.backend.read_boot_marker(
                 node, int(vmid), timeout_s=self.agent_ready_timeout_s,
                 poll_s=self.agent_ready_poll_s)
         except Exception as e:  # noqa: BLE001 — uncertain, retain
@@ -157,17 +156,17 @@ class BrokerService:
         300 s client bound — a false deployment failure while the broker
         kept pinning). Each read may use only the time LEFT in that window,
         and NO probe starts once it is exhausted (review find 2026-10-16
-        round 2: a zero-timeout probe was NOT free — its HTTP request still
-        costs up to `proxmox_http_timeout_s`, and the reviewer's virtual
-        clock showed three post-exhaustion successes stabilizing at 327 s
-        against the 300 s client bound). One request in flight when a
+        round 2: a zero-timeout probe was NOT free — its backend request
+        still costs up to the adapter request timeout, and the reviewer's
+        virtual clock showed three post-exhaustion successes stabilizing at
+        327 s against the 300 s client bound). One request in flight when a
         window's deadline passes may still complete: the documented server
         bound is (boot-marker window + one request) + (stability window +
-        one request) = 2*(agent_ready_timeout_s + proxmox_http_timeout_s),
+        one request) = 2*(agent_ready_timeout_s + adapter request timeout),
         and `HttpTransport.OP_TIMEOUTS["read_host_key"]` covers it.
         """
         from .errors import BrokerUnavailable as _BU
-        key_path = getattr(self.pve, "GUEST_HOST_KEY_PATH", None)
+        key_path = getattr(self.backend, "GUEST_HOST_KEY_PATH", None)
         if not key_path:
             self.ledger.add_obligation("host-key-path-unconfigured", int(vmid),
                                        "backend does not expose the fixed key path")
@@ -180,7 +179,7 @@ class BrokerService:
             if remaining <= 0:
                 break  # window exhausted: issue NO further probe
             try:
-                cur = (self.pve.read_guest_file_when_ready(
+                cur = (self.backend.read_guest_file_when_ready(
                     node, int(vmid), key_path,
                     timeout_s=remaining,
                     poll_s=self.agent_ready_poll_s) or "").strip() or None
@@ -230,7 +229,7 @@ class BrokerService:
                     f"host-key read uncertain for VMID {vmid}: {e}") from e
             # Verify ownership AFTER the read too (VMID recycled mid-read
             # must not pin a foreign machine's key).
-            cfg = self.pve.try_lookup_config(node, int(vmid)) or {}
+            cfg = self.backend.try_lookup_config(node, int(vmid)) or {}
             if cfg.get("name") not in (None, claim.get("name")):
                 self.ledger.add_obligation(
                     "host-key-foreign-identity", int(vmid),
@@ -267,17 +266,17 @@ class BrokerService:
 
     def vm_status(self, node: str, vmid: int) -> str:
         self._node(node)
-        return self.pve.vm_status(node, int(vmid))
+        return self.backend.vm_status(node, int(vmid))
 
     def artifact_for_template(self, template_vmid: int) -> dict | None:
         """The clone authority's confirmed artifact identity for
         TEMPLATE_VMID — role, template and the image SHA-256 the broker's
         OWN loaded manifest names and verifies the clone image against
         (review finding: a config re-read by the caller is not proof of
-        deployed bytes). Adapters with no artifact manifests (legacy PVE)
-        answer None; so does an unknown template. None is never guessed
+        deployed bytes). Adapters with no artifact manifests answer None;
+        so does an unknown template. None is never guessed
         around: the caller leaves cron checks UNKNOWN."""
-        fn = getattr(self.pve, "artifact_for_template", None)
+        fn = getattr(self.backend, "artifact_for_template", None)
         if fn is None:
             return None
         ident = fn(int(template_vmid))
@@ -296,7 +295,7 @@ class BrokerService:
         (from ITS loaded manifest, never from caller input). Adapters with
         no artifact manifests answer [] — an environment deploy then fails
         closed instead of guessing a template id."""
-        fn = getattr(self.pve, "template_catalog", None)
+        fn = getattr(self.backend, "template_catalog", None)
         if fn is None:
             return []
         catalog = fn()
@@ -325,22 +324,16 @@ class BrokerService:
                 if claim is not None and claim["state"] != "destroyed":
                     continue
                 try:
-                    if self.pve.lookup_vm(node, candidate) is not None:
+                    if self.backend.lookup_vm(node, candidate) is not None:
                         continue
-                except ProxmoxError as e:
-                    # Live find 2026-10-15: PVE deletes per-VMID ACL entries
-                    # when it destroys the VM, so a teardown silently eats
-                    # the window grants its own clones used. The next scan
-                    # then dies on a 403 that looks like a broker fault.
-                    # Type stays Unavailable (a transport fault is also
-                    # possible), but the message must name the re-apply.
+                except Exception as e:  # noqa: BLE001 — uncertain, never free
+                    # A failed candidate read is UNCERTAIN, not "free": the
+                    # scan refuses to allocate over a machine it could not
+                    # rule out, and the broker says so instead of guessing.
                     raise BrokerUnavailable(
-                        f"VMID scan cannot read /vms/{candidate} on "
-                        f"{node}: {e} — if PVE reports 403/"
-                        "permission-denied, that VMID's grant vanished "
-                        "with its destroyed VM: re-run "
-                        "deploy/pve_broker_acl.sh --apply on the host, "
-                        "then relaunch") from e
+                        f"VMID scan cannot read candidate {candidate} on "
+                        f"{node}: {e} — refusing to allocate on an "
+                        "uncertain read") from e
                 self.ledger.upsert_claim(candidate, node=node, state="reserved",
                                          session_id=session_id,
                                          detail={"source": "next_vmid"})
@@ -386,9 +379,9 @@ class BrokerService:
                 return
             # 'execute' or 'pending' (a previous attempt died mid-effect):
             # RECONCILE against reality — never assume, never blind-replay.
-            present = self.pve.lookup_vm(node, int(new_vmid))
+            present = self.backend.lookup_vm(node, int(new_vmid))
             if present is not None:
-                cfg = self.pve.try_lookup_config(node, int(new_vmid)) or {}
+                cfg = self.backend.try_lookup_config(node, int(new_vmid)) or {}
                 if cfg.get("name") == name:
                     self._confirm_clone(node, int(new_vmid), name, session_id,
                                         generation, key, reconciled=True)
@@ -400,7 +393,7 @@ class BrokerService:
                                      session_id=session_id, generation=generation,
                                      state="creating")
             try:
-                self.pve.clone_and_wait(node, int(template_vmid), int(new_vmid),
+                self.backend.clone_and_wait(node, int(template_vmid), int(new_vmid),
                                         name, full=bool(full))
             except Exception as e:  # noqa: BLE001 — outcome uncertain
                 self.ledger.finish_intent(key, "failed")
@@ -415,7 +408,7 @@ class BrokerService:
 
     def _confirm_clone(self, node: str, vmid: int, name: str, session_id,
                        generation: int, key: str, reconciled: bool = False) -> None:
-        cfg = self.pve.try_lookup_config(node, vmid) or {}
+        cfg = self.backend.try_lookup_config(node, vmid) or {}
         if cfg.get("name") != name:
             self.ledger.audit("clone-readback-mismatch",
                               {"vmid": vmid, "expected": name, "got": cfg.get("name")})
@@ -486,14 +479,14 @@ class BrokerService:
             check_nic_vector(self.policy, cfg, expected_nics)
         with self._op_lock:
             self._active_claim(int(vmid), session_id)
-            self.pve.set_config(node, int(vmid), **cfg)
+            self.backend.set_config(node, int(vmid), **cfg)
             audit_detail: dict = {"vmid": int(vmid), "keys": sorted(cfg)}
             if expected_nics is not None:
                 audit_detail["nics"] = [
                     {"segment": str(n.get("segment")),
                      "address": str(n.get("address"))}
                     for n in expected_nics]
-                actual = self.pve.try_lookup_config(node, int(vmid))
+                actual = self.backend.try_lookup_config(node, int(vmid))
                 try:
                     check_effective_nics(self.policy, actual or {},
                                          expected_nics)
@@ -514,8 +507,8 @@ class BrokerService:
         self._node(node)
         with self._op_lock:
             self._active_claim(int(vmid), session_id)
-            self.pve.start_and_wait(node, int(vmid), timeout=timeout)
-        st = self.pve.vm_status(node, int(vmid))
+            self.backend.start_and_wait(node, int(vmid), timeout=timeout)
+        st = self.backend.vm_status(node, int(vmid))
         if st != "running":
             raise BrokerUnavailable(f"start read-back for VMID {vmid}: {st!r}, "
                                     "not 'running'")
@@ -526,7 +519,7 @@ class BrokerService:
         self._node(node)
         with self._op_lock:
             self._active_claim(int(vmid), session_id)
-            return self.pve.stop(node, int(vmid), force=force)
+            return self.backend.stop(node, int(vmid), force=force)
 
     def stop_and_confirm(self, node: str, vmid: int, timeout: int = 60,
                          session_id: str | None = None) -> str:
@@ -538,13 +531,13 @@ class BrokerService:
         vmid = int(vmid)
         with self._op_lock:
             self._active_claim(vmid, session_id)
-        status = self.pve.vm_status(node, vmid)
+        status = self.backend.vm_status(node, vmid)
         if status in (None, "absent"):
             return "absent"
         if status != "stopped":
-            upid = self.pve.stop(node, vmid, force=True)
-            self.pve.wait_for_task(node, upid, timeout=timeout)
-            status = self.pve.vm_status(node, vmid)
+            upid = self.backend.stop(node, vmid, force=True)
+            self.backend.wait_for_task(node, upid, timeout=timeout)
+            status = self.backend.vm_status(node, vmid)
         if status == "stopped":
             return "stopped"
         if status in (None, "absent"):
@@ -582,7 +575,7 @@ class BrokerService:
             claim = self._active_claim(vmid, session_id)
             if latched:
                 self._require_positive_identity_under_latch(node, vmid, claim)
-            outcome = self.pve.destroy_and_wait(node, vmid,
+            outcome = self.backend.destroy_and_wait(node, vmid,
                                                 force_stop_timeout=force_stop_timeout)
             if outcome in ("destroyed", "already-absent"):
                 self.ledger.upsert_claim(vmid, node=node, state="destroyed")
@@ -600,7 +593,7 @@ class BrokerService:
         Returns None when the destroy may proceed (name match) or is a
         no-op (confirmed absence — the backend destroy call will report
         'already-absent'). Raises after RETAINING the obligation otherwise."""
-        cfg = self.pve.try_lookup_config(node, vmid)
+        cfg = self.backend.try_lookup_config(node, vmid)
         if cfg is None:
             return  # confirmed absent: nothing to harm, claim completes below
         if "_unavailable" in cfg:
@@ -683,7 +676,7 @@ class BrokerService:
             vmid, node = int(claim["vmid"]), claim["node"]
             try:
                 if claim.get("name"):
-                    cfg = self.pve.try_lookup_config(node, vmid)
+                    cfg = self.backend.try_lookup_config(node, vmid)
                     if (cfg and "_unavailable" not in cfg
                             and cfg.get("name") not in (None, claim["name"])):
                         results["foreign-retained"].append(
@@ -699,16 +692,16 @@ class BrokerService:
                             "vmid-recycled-no-stop", vmid,
                             f"claimed {claim['name']!r}, found {cfg.get('name')!r}")
                         continue
-                status = self.pve.vm_status(node, vmid)
+                status = self.backend.vm_status(node, vmid)
                 if status in (None, "absent"):
                     results["absent"].append(vmid)
                     continue
                 if status == "stopped":
                     results["already-stopped"].append(vmid)
                     continue
-                upid = self.pve.stop(node, vmid, force=True)
-                self.pve.wait_for_task(node, upid, timeout=60)
-                status = self.pve.vm_status(node, vmid)
+                upid = self.backend.stop(node, vmid, force=True)
+                self.backend.wait_for_task(node, upid, timeout=60)
+                status = self.backend.vm_status(node, vmid)
                 if status in ("stopped", None, "absent"):
                     results["stopped"].append(vmid)
                 else:
@@ -819,9 +812,9 @@ class BrokerService:
         return {"released": True, "operator": operator}
 
     def enroll(self, vmid: int, name: str, tag: str, operator: str) -> dict:
-        """Offline VERIFIED enrollment of an existing attacker VM: the PVE
-        identity must match EXACTLY (name + ownership tag). No name/tag
-        pattern auto-adoption, no guessing."""
+        """Offline VERIFIED enrollment of an existing attacker VM: the
+        backend identity must match EXACTLY (name + ownership tag). No
+        name/tag pattern auto-adoption, no guessing."""
         self._node(self.policy.node)
         self.policy.check_vmid(int(vmid))
         self.policy.check_name(name)
@@ -831,7 +824,7 @@ class BrokerService:
             if existing and existing["state"] != "destroyed":
                 raise BrokerConflict(f"VMID {vmid} already claimed "
                                      f"({existing['state']})")
-            cfg = self.pve.try_lookup_config(self.policy.node, int(vmid))
+            cfg = self.backend.try_lookup_config(self.policy.node, int(vmid))
             if cfg is None or "_unavailable" in (cfg or {}):
                 raise BrokerUnavailable(
                     f"cannot read identity of VMID {vmid} — enrollment refused")

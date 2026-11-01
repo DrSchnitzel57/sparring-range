@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Golden-image provisioning for Linux templates (Drew runs this ONCE per golden
-# image inside the template VM, then snapshots it as a Proxmox template — Part 5/M1).
+# image inside the template VM, then snapshots it as the template — Part 5/M1).
 #
 # What must be true of every Linux golden image:
 #   * auditd installed and running with the repo's rules (telemetry/auditd.rules)
@@ -26,4 +26,4 @@ install -d /etc/sparring-range
 cp infra/cloud-init/golden-linux.yaml /etc/sparring-range/cloud-init-baked.yaml 2>/dev/null || true
 
 systemctl enable auditd sparring-shipper
-echo "[golden] done. Snapshot this VM as a Proxmox template; put its VMID in .env."
+echo "[golden] done. Snapshot this VM as the template; put its VMID in .env."

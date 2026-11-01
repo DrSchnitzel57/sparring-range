@@ -329,7 +329,7 @@ def _prod_env(monkeypatch, tmp_path=None):
     known-hosts files when tmp_path is given, so the test exercises the
     intended channel-missing refusal instead of tripping on unpublished
     pins first. Milestone 02 contract: the controller presents broker
-    mutual-TLS material and NO PVE credentials."""
+    mutual-TLS material and NO hypervisor credentials."""
     monkeypatch.setenv("SR_ENV", "production")
     # plan 13 phase 4: production trust is mandatory — guests ship
     # authenticated telemetry to the controller's range address over

@@ -83,7 +83,7 @@ def deploy_environment(db: Session, session_id, scenario_id: str, spec: dict,
     env_id = str(spec["environment"])
     env = load_environment(env_id)
     bp = env.blueprint
-    node = s.proxmox_node
+    node = s.deploy_node
     catalog = resolve_catalog(bp, broker, env_id)
 
     from srplatform.scenario_engine import orchestrator as orch

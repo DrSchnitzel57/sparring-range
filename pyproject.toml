@@ -15,10 +15,6 @@ dependencies = [
     "psycopg2-binary>=2.9",
     "alembic>=1.13",
     "asyncssh>=2.14",
-    "proxmoxer>=2.0",
-    # proxmoxer's default https backend imports requests at runtime; without
-    # it the real PVE client cannot be constructed (live deploy, 2026-10-13).
-    "requests>=2.32",
     "pycdlib>=1.22",
     # Milestone 15: locked MySQL protocol client for controller-side reads;
     # replaces the hand-written wire implementation in mysql_direct.py.
@@ -63,8 +59,7 @@ testpaths = ["tests"]
 #   containment real cgroup v2 delegation + namespace boundary (runner supervisor)
 #   packet      real nft/netns packet semantics, disposable namespaces only
 #   authority   broker boundary/durability/cessation (infrastructure-free:
-#               real policy+ledger+mutual-TLS over loopback, no PVE/PG needed)
-#   adapter     production-adapter contract tests against simulated transports
+#               real policy+ledger+mutual-TLS over loopback, no PG needed)
 #   browser     end-to-end browser tests (opt-in; also needs db)
 #   live        operator live-infrastructure acceptance gate (never automatic)
 markers = [
@@ -72,7 +67,7 @@ markers = [
     "containment: requires a delegated cgroup v2 root and working unshare namespaces",
     "packet: requires root + nft + iproute2 (rules only inside disposable netns)",
     "authority: broker private-boundary acceptance (policy, ledger, mTLS, cessation)",
-    "adapter: production-adapter contract tests against simulated transports",
+    "adapter: legacy production-adapter contract tests (retired with direct PVE)",
     "browser: end-to-end browser tests (opt-in)",
     "live: operator live-infrastructure acceptance gate (never automatic)",
     "images: Mojang guest-image acceptance (paired 03+04 milestone 03; QEMU boot when available)",

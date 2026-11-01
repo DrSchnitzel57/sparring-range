@@ -108,7 +108,7 @@ def test_hint_jumps_queued_red_turns_across_processes(migrated_db, test_db_url_o
     import httpx
     import uvicorn
 
-    from infra.proxmox_client import FakePVEHttp
+    from infra.broker.testing import FakeBackend
     from srplatform import settings as st
     from srplatform.api import deps
     from srplatform.api.app import app
@@ -123,8 +123,8 @@ def test_hint_jumps_queued_red_turns_across_processes(migrated_db, test_db_url_o
     st.get_settings.cache_clear()
     set_model_gateway(None)
 
-    httpd = FakePVEHttp()
-    for vmid in (9001, 9002, 9003, 9004):
+    httpd = FakeBackend()
+    for vmid in (9001, 9002, 9003, 9004, 9005, 9011, 9012):
         httpd.vms[vmid] = {"name": f"tpl{vmid}", "template": vmid, "status": "stopped"}
     wipe_data(test_db_url_owner)
     from infra.broker.testing import make_broker_over, policy_from_settings

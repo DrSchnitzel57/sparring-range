@@ -525,7 +525,7 @@ def attacker_build_user_data(payload: dict[str, str], packages: list[str],
     AppArmor profile for the trusted launcher. Keys land per role_keys
     policy: the runner key authenticates ONLY to `attacker`, mgmt/emergency
     separately — never one key everywhere, never a private key. Host
-    keys/machine-id are scrubbed by the finalize boot so every PVE clone
+    keys/machine-id are scrubbed by the finalize boot so every clone
     regenerates fresh identity."""
     from infra.images.role_keys import bake_script
     files = "".join(_write_file_entry(p, c, perms=_payload_perms(p))
@@ -624,7 +624,7 @@ def finalize_user_data(role: str = "mojang-web-local",
     PUBLIC keys per the role_keys policy (runner→attacker only, bastion→
     defender, mgmt→approved management account, emergency only when
     explicitly included; deduplicated; private keys refused), then scrub
-    per-clone identity from the BUILT template so every PVE clone regenerates
+    per-clone identity from the BUILT template so every clone regenerates
     fresh SSH host keys and machine-id via cloud-init — the contract the
     broker's guest-agent host-key pinning depends on. Offline (`-net none`)."""
     bake_files, bake_call = "", ""

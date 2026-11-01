@@ -1,13 +1,14 @@
 """Offline operator tools for the broker (broker-local, never networked).
 
-These are the ONLY ways to release the cessation latch or adopt a VM into
-broker ownership, and they run on the broker host with direct ledger/PVE
-access — the API's mutual-TLS surface deliberately does not expose them.
+These are the ways to inspect, stop, release or adopt outside the API: they
+run on the appliance as the broker identity against the same manifest,
+policy and ledger files the broker daemon uses — the API's broker surface
+deliberately does not expose them.
 
   status                       inventory, obligations, lease, audit tail
   stop --yes --reason ...      independent hard cessation
   enroll --vmid --name --tag   VERIFIED adoption of an attacker VM
-                               (exact PVE identity match required)
+                               (exact backend identity match required)
   reconcile-legacy --db-url    list legacy (pre-broker) deployment resources
                                and, with --adopt, verify + adopt each one
   release --operator ...       release the latch (refused while ANY
@@ -17,14 +18,27 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 from .errors import BrokerConflict, BrokerUnavailable
-from .server import build_service_from_settings
+
+_DEFAULT_MANIFEST = "/etc/sparring-range/appliance-manifest.json"
+_DEFAULT_POLICY = "/etc/sparring-range/appliance-policy.json"
 
 
 def _service(args):
-    service, ledger, _policy = build_service_from_settings()
+    """The same boot the broker daemon performs (manifest + policy +
+    ledger + libvirt adapter), opened offline for one operator command."""
+    from infra.appliance.brokerd import build
+
+    manifest = getattr(args, "manifest", None) \
+        or os.environ.get("SR_APPLIANCE_MANIFEST", _DEFAULT_MANIFEST)
+    policy = getattr(args, "policy", None) \
+        or os.environ.get("SR_APPLIANCE_POLICY", _DEFAULT_POLICY)
+    _m, _p, ledger, _backend, service = build(
+        manifest, policy, uri=getattr(args, "uri", None) or "qemu:///system",
+        allow_tcg=False, fixture=False)
     return service, ledger
 
 
@@ -88,7 +102,7 @@ def resolve_obligation_with_readback(service, ledger, *, obligation_id: int,
                              "only be resolved with its own evidence path")
     vmid = int(ob["vmid"])
     claim = ledger.get_claim(vmid) or {}
-    cfg = service.pve.try_lookup_config(service.policy.node, vmid)
+    cfg = service.backend.try_lookup_config(service.policy.node, vmid)
     if cfg is None:
         proof = "backend read-back: VMID absent"
     elif "_unavailable" in cfg:
@@ -134,8 +148,8 @@ def cmd_resolve(args) -> int:
 
 def cmd_reconcile_legacy(args) -> int:
     """Pre-broker deployments carry resources in the app DB but no broker
-    claims. For each residual resource, verify identity against PVE (exact
-    clone name + session ownership tag) and adopt ONLY on an exact match.
+    claims. For each residual resource, verify identity against the backend
+    (exact clone name + session ownership tag) and adopt ONLY on an exact match.
     Anything unverifiable stays unresolved — the upgrade latch remains."""
     service, ledger = _service(args)
     from sqlalchemy import create_engine, text
@@ -160,7 +174,7 @@ def cmd_reconcile_legacy(args) -> int:
             if claim and claim["state"] != "destroyed":
                 print(f"  vmid {vmid}: already broker-claimed ({claim['state']})")
                 continue
-            cfg = service.pve.try_lookup_config(service.policy.node, vmid)
+            cfg = service.backend.try_lookup_config(service.policy.node, vmid)
             name = res.get("name") or ""
             tag = f"srsess-{str(row['session_id']).replace('-', '')}" \
                 if row["session_id"] else None
@@ -189,7 +203,14 @@ def cmd_reconcile_legacy(args) -> int:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="brokerctl")
-    ap.add_argument("--policy", default=None, help="override policy file")
+    ap.add_argument("--manifest", default=None,
+                    help="appliance manifest (default: $SR_APPLIANCE_MANIFEST "
+                         f"or {_DEFAULT_MANIFEST})")
+    ap.add_argument("--policy", default=None,
+                    help="appliance policy file (default: "
+                         f"$SR_APPLIANCE_POLICY or {_DEFAULT_POLICY})")
+    ap.add_argument("--uri", default=None,
+                    help="libvirt URI (default: qemu:///system)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status").set_defaults(fn=cmd_status)
     p = sub.add_parser("stop")
@@ -216,10 +237,6 @@ def main(argv=None) -> int:
     p.add_argument("--adopt", action="store_true")
     p.set_defaults(fn=cmd_reconcile_legacy)
     args = ap.parse_args(argv)
-    if args.policy:
-        import os
-
-        os.environ["BROKER_POLICY_FILE"] = args.policy
     return args.fn(args)
 
 

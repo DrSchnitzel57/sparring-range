@@ -1,6 +1,7 @@
 """F23 + milestone 02: production mode fails CLOSED on misconfiguration,
 with ROLE-SCOPED validation (worker/controller/broker). The controller must
-NOT hold PVE credentials — only the broker does — and must present mutual-TLS
+NOT hold hypervisor credentials — only the broker does — and must present
+mutual-TLS
 client material. The operator-side half is the LIVE GATE list in
 docs/FINDINGS_CHECKLIST.md."""
 import pytest
@@ -57,8 +58,6 @@ def _broker(**overrides):
         broker_server_cert="/etc/sr/broker-server.pem",
         broker_server_key="/etc/sr/broker-server.key",
         broker_tls_ca_file="/etc/sr/broker-ca.pem",
-        proxmox_host="pve.lab", proxmox_token_id="auto!sparring",
-        proxmox_token_secret="real-secret", proxmox_tls_ca_file="/etc/pve.pem",
     )
     base.update(overrides)
     return Settings(_env_file=None, **base)
@@ -66,7 +65,6 @@ def _broker(**overrides):
 
 def test_production_accepts_a_correct_config(monkeypatch):
     from srplatform import settings as s
-    monkeypatch.delenv("PROXMOX_INSECURE_LAB_OVERRIDE", raising=False)
     _ = _prod().sr_env          # constructible
     s.validate_production(_prod())   # no raise
     s.validate_production(_broker(), role="broker")   # broker validates itself
@@ -77,9 +75,6 @@ def test_production_rejects_placeholders_and_insecurities():
     bad = {
         "missing broker URL": dict(broker_url=None),
         "missing client cert": dict(broker_client_cert=""),
-        "PVE token on the controller": dict(proxmox_token_id="auto!sparring",
-                                            proxmox_token_secret="leaked"),
-        "TLS bypass": dict(proxmox_insecure_lab_override=True),
         "local runner": dict(runner_transport="local-dev"),
         "runtime nft datapath": dict(datapath_controller="nft"),
         "unpinned runner keys": dict(runner_ssh_known_hosts=""),
@@ -100,8 +95,6 @@ def test_production_broker_role_requires_its_own_boundary():
         "no policy": dict(broker_policy_file=None),
         "no server cert": dict(broker_server_cert=None),
         "no CA": dict(broker_tls_ca_file=None),
-        "no PVE token": dict(proxmox_token_secret=""),
-        "TLS bypass": dict(proxmox_insecure_lab_override=True),
     }
     for label, over in bad.items():
         with pytest.raises(RuntimeError, match="production BROKER config invalid"):

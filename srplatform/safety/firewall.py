@@ -252,7 +252,7 @@ def render_emergency_ruleset(s: Settings | None = None, drop_existing: bool = Fa
 # sees the bridge PORTS (tap/vnet devices), not the bridge master. Matching
 # iifname/oifname "{bridge}" alone would NOT drop same-bridge VM-to-VM frames.
 # Configure RANGE_BRIDGE_PORTS with every tap/vnet attached to {bridge}
-# (Proxmox: `ls /sys/class/net/{bridge}/brif/`) so the port set below matches
+# (Linux: `ls /sys/class/net/{bridge}/brif/`) so the port set below matches
 # the real topology; without it this render covers the master only and the
 # controller reports that honestly instead of claiming same-bridge coverage.
 {deletes}table inet {EMERGENCY_TABLE} {{

@@ -12,7 +12,7 @@ two launches could collide and destroy each other's machines. Now:
     failure works from the recorded list — never from name prefixes.
   * Reset/teardown act only on positively-owned recorded resources (with an
     ownership tag double-check) and ignore prefix-similar foreign VMs.
-  * Every external call goes through the task-aware ProxmoxClient (F05).
+  * Every external call goes through the typed broker boundary (F05).
   * Database failures after side effects are LOUD (recorded + raised), never
     swallowed (F06 `_log()` fix).
 """
@@ -988,7 +988,7 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
              f"{spec['environment']!r}: environment provisioning (segment "
              f"bridges + multi-NIC blueprint clones) is not in this lane yet; "
              f"no side effects were attempted"])
-    node = s.proxmox_node
+    node = s.deploy_node
     # Paired 03+04, step 4: explicit clone mode (no silent fallback) +
     # aggregate budget reservation BEFORE any side effect. Unknown retains
     # obligations/lease; stale work is fenced by the claim/generation checks
@@ -1265,15 +1265,16 @@ def _sid(session_id) -> str:
 
 
 def _ownership_tag(session_id) -> str:
-    """PVE-valid tag (pve-tag-list charset; '=' is rejected by real PVE) that
-    carries the FULL session identity."""
+    """Backend-valid tag (the shipped policy tag charset; characters outside
+    the safe list are refused at the broker) that carries the FULL session
+    identity."""
     return f"srsess-{_sid(session_id)}"
 
 
 def _vm_name(scenario_id: str, host_name: str, session_id) -> str:
     """Exact creation identity name: always starts with the shipped broker
     policy prefix ('sr-') and ends with the full session id so two sessions
-    can never produce the same name; PVE names are <= 63 chars, so the
+    can never produce the same name; backend names are <= 63 chars, so the
     readable middle is truncated, NEVER the identity suffix."""
     sid = _sid(session_id)
     prefix = f"sr-{scenario_id}-{host_name}"
@@ -1282,7 +1283,7 @@ def _vm_name(scenario_id: str, host_name: str, session_id) -> str:
 
 
 def _parse_tags(cfg: dict) -> set[str]:
-    """EXACT parsed tag set (PVE ';'-separated list) — substring matching can
+    """EXACT parsed tag set (backend ';'-separated list) — substring matching can
     be forged by a longer tag (audit N01)."""
     return {t.strip() for t in str((cfg or {}).get("tags", "")).split(";") if t.strip()}
 
@@ -1306,16 +1307,17 @@ def _verify_ownership(broker, r: dict, session_id) -> tuple[str, str]:
       'owned'   — exact ownership tag OR exact creation-identity name match
                   (the name covers the documented clone-before-tag crash
                   window: the clone itself sets this exact name);
-      'absent'  — PVE CONFIRMED 404 (idempotent removal, no delete needed);
+      'absent'  — backend CONFIRMED absence (idempotent removal, no delete
+                  needed);
       'foreign' — the VMID now belongs to someone else: never mutate it.
 
     Uncertain reads (timeout/403/500/transport) RAISE BrokerUnavailable —
     they are NOT absence and NEVER authorize a mutation.
     """
-    node = r.get("node") or get_settings().proxmox_node
+    node = r.get("node") or get_settings().deploy_node
     cfg = broker.lookup_config(node, int(r["vmid"]))   # raises when uncertain
     if cfg is None:
-        return "absent", "PVE confirms the resource does not exist"
+        return "absent", "backend confirms the resource does not exist"
     return _classify_identity(cfg, r, session_id)
 
 
@@ -1338,7 +1340,7 @@ def _destroy_owned(db: Session, session_id, dep: Deployment, broker) -> dict:
     for r in resources:
         if not (r.get("vmid") and r.get("state") in ("pending", "created", "destroy_failed")):
             continue
-        node = r.get("node") or get_settings().proxmox_node
+        node = r.get("node") or get_settings().deploy_node
         try:
             verdict, why = _verify_ownership(broker, r, session_id)
         except BrokerUnavailable as e:

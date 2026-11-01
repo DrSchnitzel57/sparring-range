@@ -104,7 +104,8 @@ class BackendConfig:
 
 
 class LibvirtBackend:
-    """Duck-typed to the broker's Proxmox adapter (lookup/clone/config/start/...)."""
+    """Implements the broker's typed backend contract
+    (lookup/clone/config/start/stop/destroy + fixed guest-agent reads)."""
 
     GUEST_HOST_KEY_PATH = GUEST_HOST_KEY_PATH
 

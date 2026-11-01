@@ -1,7 +1,7 @@
 """Mojang deployment/budget/identity/Ubuntu-guest acceptance (03+04, steps 4/7).
 
 Compound layer (images + db where noted): deploy/budget/identity tests use the
-disposable Postgres + FakePVEHttp boundary; the Ubuntu tests boot the REAL
+disposable Postgres + FakeBackend boundary; the Ubuntu tests boot the REAL
 guest (pinned base + superset overlay + NoCloud seed) in isolated QEMU.
 Required mode fails closed on missing QEMU, unverified base, or absent
 serial evidence — never a skip.
@@ -317,7 +317,7 @@ def test_images_readiness_proves_services_and_enrollment(client, users, fake_pve
 
 @pytest.mark.authority
 def test_images_broker_clone_modes_budgets_identity_and_cleanup(tmp_path):
-    """Fake-PVE coverage for modes/budgets/identity/partial deploy/reset/cleanup."""
+    """Fake-backend coverage: modes/budgets/identity/partial deploy/reset/cleanup."""
     from infra.broker.testing import make_fake_broker, make_test_policy
     from infra.broker.errors import PolicyViolation, BrokerConflict
 
@@ -364,13 +364,13 @@ def test_images_broker_clone_modes_budgets_identity_and_cleanup(tmp_path):
 
 
 @pytest.mark.authority
-def test_images_host_key_fileread_only_allowlisted_owned_pinned(tmp_path):
-    """Step 3: typed FileRead ONLY for the allowlisted host-key path, with
+def test_images_host_key_guest_read_only_allowlisted_owned_pinned(tmp_path):
+    """Step 3: guest file read ONLY for the allowlisted host-key path, with
     owned VM/session/generation checks before AND after, bounded validation,
     fresh-generation re-pin, and no post-compromise re-pin."""
+    from infra.appliance.errors import BackendUnavailable
     from infra.broker.testing import make_fake_broker
     from infra.broker.errors import BrokerConflict
-    from infra.proxmox_client import ProxmoxClient, ProxmoxError
 
     client, service, http = make_fake_broker(
         templates=(9001, 9002, 9003, 9004, 9005, 9011, 9012))
@@ -382,20 +382,20 @@ def test_images_host_key_fileread_only_allowlisted_owned_pinned(tmp_path):
     # Idempotent re-read of the same generation returns the same pin.
     assert client.read_host_key("r740", vmid, session_id="s1",
                                 generation="g1") == key1
-    # Arbitrary paths are unrepresentable (adapter refuses before HTTP).
-    pve = ProxmoxClient(api=http)
+    # Arbitrary paths are unrepresentable (the backend refuses before the
+    # guest agent is asked).
     try:
-        pve.read_guest_file("r740", vmid, "/etc/shadow")
+        http.read_guest_file_when_ready("r740", vmid, "/etc/shadow")
         raise AssertionError("arbitrary guest-agent path was not refused")
-    except ProxmoxError:
+    except BackendUnavailable:
         pass
     try:
-        pve.read_guest_file("r740", vmid, "/etc/ssh/ssh_host_rsa_key")
+        http.read_guest_file_when_ready("r740", vmid, "/etc/ssh/ssh_host_rsa_key")
         raise AssertionError("non-allowlisted key path was not refused")
-    except ProxmoxError:
+    except BackendUnavailable:
         pass
-    # No exec channel exists on the adapter or broker surface.
-    assert not hasattr(pve, "guest_exec")
+    # No exec channel exists on the backend or broker surface.
+    assert not hasattr(http, "guest_exec")
     assert not hasattr(service, "guest_exec")
     from infra.broker import server
     assert "guest_exec" not in server.CONTROL_OPS
@@ -427,10 +427,12 @@ def test_images_host_key_fileread_only_allowlisted_owned_pinned(tmp_path):
                            session_id="s1", generation="g2")
     key2 = client.read_host_key("r740", vmid, session_id="s1", generation="g2")
     assert key2 != key1 and key2.startswith("ssh-ed25519 ")
-    # No broad-ACL fallback: the fake saw ONLY file-read, never exec/shell.
-    kinds = [p for m, p, _ in http.requests]
-    assert not any("exec" in p for p in kinds), kinds
-    assert any("file-read" in p for p in kinds), kinds
+    # No broad-ACL fallback: the fake saw ONLY guest file reads, never
+    # exec/shell.
+    ops = [r[0] for r in http.requests]
+    assert not any("exec" in op or "shell" in op for op in ops), ops
+    assert any(op in ("read_guest_file_when_ready", "agent_file_read")
+               for op in ops), ops
 
 
 def test_images_supervisor_cgroup_apparmor_boundary_provable():

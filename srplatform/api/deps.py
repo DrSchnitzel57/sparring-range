@@ -3,9 +3,9 @@
 In prod: mutual-TLS BrokerClient (client cert from .env). In tests and the
 isolated synthetic fixtures: set_broker(). The API process is the only thing
 that talks to Postgres, and it reaches the deployment boundary ONLY through
-the broker — it holds no PVE credentials and cannot construct PVE paths
-(milestone 02). There is no direct-PVE fallback to remove, because there is
-no longer any path to one from this process.
+the broker — it holds no hypervisor credentials and cannot construct
+hypervisor paths (milestone 02). There is no direct-hypervisor fallback to
+remove, because there is no longer any path to one from this process.
 """
 from __future__ import annotations
 
@@ -66,9 +66,10 @@ def get_broker():
 
         s = get_settings()
         if os.environ.get("SR_BROKER_FIXTURE") == "1" and s.sr_env != "production":
-            # Explicit FIXTURE-ONLY in-process broker over the synthetic PVE
-            # double (compose demo / browser acceptance). Never selectable
-            # in production; production requires BROKER_URL + client TLS.
+            # Explicit FIXTURE-ONLY in-process broker over the synthetic
+            # backend double (compose demo / browser acceptance). Never
+            # selectable in production; production requires the appliance
+            # broker socket or broker_url + mutual-TLS material.
             from infra.broker.testing import make_fake_broker, policy_from_settings
 
             _broker, _svc, _http = make_fake_broker(policy=policy_from_settings(s))
@@ -86,8 +87,8 @@ def get_broker():
         else:
             raise BrokerUnavailable(
                 "broker not configured (BROKER_SOCKET or legacy BROKER_URL + "
-                "mutual-TLS material required) — the API has no direct Proxmox "
-                "path")
+                "mutual-TLS material required) — the API has no direct "
+                "hypervisor path")
     return _broker
 
 

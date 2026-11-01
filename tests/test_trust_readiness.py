@@ -287,12 +287,6 @@ def test_production_rejects_unparseable_private_keys(tmp_path):
                                      verifier_ssh_key_path=str(bad), **base))
 
 
-def test_template_manifest_records_baked_key_fingerprints():
-    src = (pathlib_repo / "infra/images/pve_template_build.py").read_text()
-    assert "baked_key_fingerprints" in src
-    assert "public_key_fingerprint" in src
-
-
 def test_manifest_to_provisioning_ingest_chain(tmp_path, monkeypatch):
     """Complete manifest → environment → settings → provisioning path:
     the guest shipper address always resolves to the manifest's ingest

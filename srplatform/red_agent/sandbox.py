@@ -3,7 +3,7 @@ constrained to the range VLAN (hard constraint #1 is what makes "constrained"
 true — the range simply has no other routes).
 
 Prod: subprocess on the Kali host/container the agent service runs on
-(Drew's deployment places it; `pct exec` on Proxmox is one way).
+(the deployment places it explicitly).
 Tests: scripted fake so the loop is testable without a Kali box.
 """
 from __future__ import annotations

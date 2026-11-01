@@ -271,12 +271,3 @@ def test_orchestrator_wires_provisioning_pass():
     assert "guest_config_skipped" in src
     # a channel that ANSWERS with a nonzero exit still fails the deployment
     assert "guest config provisioning failed" in src
-
-
-def test_template_build_defaults_cover_all_three_roles():
-    from infra.images import pve_template_build as ptb
-    import inspect
-    src = inspect.getsource(ptb.main)
-    assert "mojang-web-db" in src
-    assert "--runner-key" in src and "--bastion-key" in src and "--mgmt-key" in src
-    assert "ROLE_VMID" in src and set(ptb.ROLE_VMID.values()) >= {9005, 9011, 9012}

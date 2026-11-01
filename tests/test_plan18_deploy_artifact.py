@@ -5,7 +5,7 @@ Cron-pin trust binds to what the deployment ACTUALLY RUNS ON, and to a
 baseline frozen BEFORE first use — both only the clone authority can
 supply honestly. These tests drive the REAL deploy path (routes →
 executor → orchestrator → real broker service over the typed boundary)
-against the fake PVE + a real ApplianceManifest object, read the recorded
+against the fake backend + a real ApplianceManifest object, read the recorded
 identity and frozen baseline back from persisted state, and re-score the
 same session through the REAL build_scorecard with synthetic guest
 replies. The reviewer's reproduction — an in-place, same-digest pin edit
@@ -62,7 +62,7 @@ def _attach_identity(fake_broker, manifest_obj):
     """The adapter reports identity from ITS loaded manifest object —
     exactly what the appliance broker does (LibvirtBackend delegates to
     the same method); nothing here re-reads the on-disk file."""
-    fake_broker.service.pve.artifact_for_template = \
+    fake_broker.service.backend.artifact_for_template = \
         manifest_obj.artifact_identity
 
 
@@ -165,7 +165,7 @@ def test_recorded_identity_follows_the_broker_not_the_disk(
 
 def test_deploy_without_broker_identity_records_nothing(
         client, users, fake_broker):
-    """Plain fake PVE (no artifact manifest — like the legacy adapter):
+    """Plain fake backend (no artifact manifest):
     honest absence. Nothing is recorded, the map stays empty, cron checks
     stay UNKNOWN — deploy must NOT invent an identity from pins or YAML."""
     import srplatform.verification_service as vs

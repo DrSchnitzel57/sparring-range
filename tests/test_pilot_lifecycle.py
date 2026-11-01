@@ -1,6 +1,6 @@
 """Pilot step 4: minimal durable match lifecycle (db layer).
 
-Real API + real disposable Postgres + broker/PVE doubles. Proves the
+Real API + real disposable Postgres + broker/backend doubles. Proves the
 lifecycle contract: creation-time SNAPSHOT (preset/30min/pace), Begin starts
 the SERVER clock + attack worker together (duplicate Begin idempotent, never
 extends), ready-but-unstarted labs EXPIRE after 15 minutes with safe
@@ -202,7 +202,7 @@ def test_end_destroys_owned_vms_and_frees_range(client, users, fake_pve):
 
 def test_end_with_failed_destroy_keeps_lease_and_retries(client, users, fake_pve):
     sid, _ = _launch(client, users)
-    fake_pve.api.fail_task_fragments = ("/qemu",)
+    fake_pve.api.fail_tasks = {("destroy_and_wait", None): True}
     r = client.post(f"/sessions/{sid}/end", headers=users["member"])
     assert r.status_code == 200, r.text
     body = r.json()
@@ -213,7 +213,7 @@ def test_end_with_failed_destroy_keeps_lease_and_retries(client, users, fake_pve
     assert client.post(f"/sessions/{sid2}/launch",
                        headers=users["op"]).status_code == 409
     # retry after the operator fixes the destroy path: cleanup completes
-    fake_pve.api.fail_task_fragments = ()
+    fake_pve.api.fail_tasks = {}
     r2 = client.post(f"/sessions/{sid}/end", headers=users["member"])
     assert r2.status_code == 200 and r2.json()["lease_released"] is True
     assert _match_row(sid)["state"] == "completed"
@@ -275,7 +275,8 @@ def test_worker_env_carries_snapshot_pace_and_deadline(client, users, fake_pve):
         assert env["SR_ATTACK_PACE_S"] == "30"
         assert "SR_MATCH_DEADLINE_UTC" in env
         # no credential ever rides the worker env
-        assert not any(k.startswith(("LLM_", "POSTGRES_", "PROXMOX_")) for k in env)
+        assert not any(k.startswith(("LLM_", "POSTGRES_", "SR_BROKER_"))
+                 for k in env)
 
 
 # ------------------------------------------- assumed-breach start condition --

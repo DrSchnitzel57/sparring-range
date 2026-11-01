@@ -62,11 +62,9 @@ def test_launch_accepts_202_then_completes_in_background(
 
 def test_failed_launch_records_failure_and_second_launch_resumes(
         client, users, fake_broker):
-    from infra.proxmox_client import PveHttpError
     sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},
                       headers=users["member"]).json()["session_id"]
-    fake_broker.http.fail_requests = {
-        "/agent/file-read": PveHttpError(403, "permission check failed")}
+    fake_broker.http.fail_reads = {("read_guest_file_when_ready", None): 403}
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
     assert r.status_code == 202, r.text
     failed = wait_operation(client, users["member"], sid)
@@ -76,7 +74,7 @@ def test_failed_launch_records_failure_and_second_launch_resumes(
     ops = _ops(sid)
     assert len(ops) == 1 and ops[0].state == "failed"
 
-    fake_broker.http.fail_requests = {}
+    fake_broker.http.fail_reads = {}
     done = launch_and_wait(client, users["member"], sid)
     assert done["state"] == "succeeded"
     ops = _ops(sid)

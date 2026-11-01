@@ -149,7 +149,7 @@ else
   echo "HTTPS_IP not set — skipping web UI cert (set it to the control-plane LAN IP)" >&2
 fi
 
-# bastion dial keypair (public half -> pve_template_build.py --pubkey)
+# bastion dial keypair (public half -> embedded by the template/image build)
 if [ "$FRESH" = 1 ] || [ ! -f "$SR_SSH_DIR/bastion_ed25519" ]; then
   # rotation must not hang on ssh-keygen's overwrite prompt (non-interactive)
   if [ "$FRESH" = 1 ]; then
@@ -190,4 +190,5 @@ chmod 0640 broker-server.crt api-client.crt broker-server.csr \
 echo
 echo "done. Distribute: ca.crt + api-client.* -> control plane; ca.crt +
 broker-server.* -> broker VM; $SR_SSH_DIR/bastion_ed25519 stays on the
-bastion; its .pub is the --pubkey for infra/images/pve_template_build.py."
+bastion; its .pub is the bastion dial public key embedded by the image/
+template build."

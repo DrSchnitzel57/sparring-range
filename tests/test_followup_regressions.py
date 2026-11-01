@@ -171,29 +171,6 @@ def test_r11_spool_byte_bounds_and_atomic_trim(tmp_path):
 
 
 # =========================================================================== #
-# R06 — Proxmox clone uses the documented `newid`; fake rejects inventions   #
-# =========================================================================== #
-
-def test_r06_clone_posts_documented_newid_and_fake_rejects_unknowns():
-    from infra.proxmox_client import FakePVEHttp, ProxmoxClient  # adapter-level test
-
-    http = FakePVEHttp()
-    http.vms[9001] = {"name": "tpl", "template": 9001, "status": "stopped"}
-    c = ProxmoxClient(api=http)
-    upid = c.clone_template("n", 9001, 300, "vm-x")
-    c.wait_for_task("n", upid, poll_s=0)
-    clone_req = [r for r in http.requests if "/clone" in r[1]][0]
-    assert clone_req[2].get("newid") == 300, "documented parameter is newid"
-    assert "newvmid" not in clone_req[2]
-
-    # the fake REJECTS invented parameters instead of mirroring them
-    with pytest.raises(RuntimeError, match="unrecognized"):
-        http.post("/nodes/n/qemu/9001/clone", newvmid=301, name="y")
-    with pytest.raises(RuntimeError, match="newid"):
-        http.post("/nodes/n/qemu/9001/clone", name="y")
-
-
-# =========================================================================== #
 # R09 — backend scoring must forward the requested polarity                  #
 # =========================================================================== #
 
@@ -1009,7 +986,7 @@ def test_r07_teardown_failure_retains_lease_until_destroy_succeeds(client, users
     wait_operation(client, users["member"], sid)
 
     # make destroys fail -> teardown must NOT claim completion, lease retained
-    fake_pve.api.fail_task_fragments = ("/qemu",)
+    fake_pve.api.fail_tasks = {("destroy_and_wait", None): True}
     t = client.post(f"/sessions/{sid}/teardown", headers=users["member"])
     assert t.status_code == 200
     body = t.json()
@@ -1022,7 +999,7 @@ def test_r07_teardown_failure_retains_lease_until_destroy_succeeds(client, users
         "failed destroys keep the range reserved"
 
     # retry with working infra -> complete -> lease frees
-    fake_pve.api.fail_task_fragments = ()
+    fake_pve.api.fail_tasks = {}
     t = client.post(f"/sessions/{sid}/teardown", headers=users["member"])
     assert t.json().get("complete") is True, t.json()
     launch_and_wait(client, users["op"], sid2)
@@ -1049,12 +1026,12 @@ def test_r08_crash_after_clone_leaves_vm_owned_and_resumable(client, users, fake
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
     # fail AFTER the clone task completes, during config -> pending row must own it
-    fake_pve.api.fail_request_fragments = ("/config",)
+    fake_pve.api.fail_reads = {("set_config", None): True}
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
     assert r.status_code == 202, r.text  # accepted; the executor fails loudly
     crashed = wait_operation(client, users["member"], sid)
     assert crashed["state"] == "failed", crashed
-    fake_pve.api.fail_request_fragments = ()
+    fake_pve.api.fail_reads = {}
 
     from srplatform.db.session import db as db_ctx
     from srplatform.db.models import Deployment
@@ -1196,7 +1173,7 @@ def test_r01_completion_callback_is_one_shot_and_terminal_final(client, users):
 # --------------------------------------------------------------------------- #
 # The full practice loop: REAL worker subprocess → REAL HTTP API → REAL       #
 # runner (local-dev) → trusted backend verification. Fake boundaries are the  #
-# model server (fake OpenAI HTTP) and Proxmox (fake PVE HTTP) only.           #
+# model server (fake OpenAI HTTP) and the deployment backend (FakeBackend).   #
 # --------------------------------------------------------------------------- #
 
 class FakeOpenAI(threading.Thread):
@@ -1250,7 +1227,7 @@ def test_r01_real_worker_end_to_end_over_http(migrated_db, test_db_url_owner, tm
     import httpx
     import uvicorn
 
-    from infra.proxmox_client import FakePVEHttp
+    from infra.broker.testing import FakeBackend
     from srplatform import verification_service
     from srplatform.api import deps
     from srplatform.api.app import app
@@ -1258,9 +1235,10 @@ def test_r01_real_worker_end_to_end_over_http(migrated_db, test_db_url_owner, tm
     from srplatform.safety.datapath import NoopDatapath
     from srplatform.settings import get_settings
 
-    httpd = FakePVEHttp()
+    httpd = FakeBackend()
     for vmid in (9001, 9002, 9003, 9004):
-        httpd.vms[vmid] = {"name": f"tpl{vmid}", "template": vmid, "status": "stopped"}
+        httpd.vms[vmid] = {"name": f"tpl{vmid}", "template": vmid,
+                           "status": "stopped"}
     wipe_data(test_db_url_owner)
     from infra.broker.testing import make_broker_over, policy_from_settings
     from srplatform.settings import get_settings as _get_settings
@@ -1380,9 +1358,9 @@ def test_r02_bastion_token_login_binds_owner_key(migrated_db, test_db_url_owner,
     from srplatform.safety import Supervisor, set_supervisor
     from srplatform.safety.datapath import NoopDatapath
     from srplatform.settings import get_settings
-    from infra.proxmox_client import FakePVEHttp
+    from infra.broker.testing import FakeBackend
 
-    httpd = FakePVEHttp()
+    httpd = FakeBackend()
     for vmid in (9001, 9002, 9003, 9004):
         httpd.vms[vmid] = {"name": f"tpl{vmid}", "template": vmid, "status": "stopped"}
     wipe_data(test_db_url_owner)

@@ -2,7 +2,7 @@
 # sparring-range EMERGENCY datapath switch — operator recovery path (audit F02/F03).
 #
 # This script is the path that does NOT depend on the API/network: run it on
-# the Proxmox host when in doubt. It is:
+# the appliance host when in doubt. It is:
 #   * idempotent (safe to run repeatedly),
 #   * range-scoped (only the configured bridge; host management and unrelated
 #     bridges keep working),
@@ -22,7 +22,7 @@ EM_TABLE="inet sr_emergency"
 EM_L2="bridge sr_emergency_l2"
 
 if [[ "${EUID}" -ne 0 ]]; then
-  echo "killswitch must run as root on the Proxmox host" >&2
+  echo "killswitch must run as root on the appliance host" >&2
   exit 1
 fi
 

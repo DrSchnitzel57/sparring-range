@@ -30,14 +30,14 @@ def _manifest(tmp_path):
 
 
 def _broker(tmp_path, adapter=None):
-    from infra.proxmox_client import FakePVEHttp
-    from infra.broker.testing import make_broker_over, policy_from_settings
+    from infra.broker.testing import FakeBackend, make_broker_over, \
+        policy_from_settings
     from srplatform.settings import get_settings
     client, service = make_broker_over(
-        FakePVEHttp(), policy=policy_from_settings(get_settings()),
+        FakeBackend(), policy=policy_from_settings(get_settings()),
         ledger_path=str(tmp_path / "ledger.sqlite3"))
     if adapter is not None:
-        service.pve = adapter
+        service.backend = adapter
     return client, service
 
 
@@ -105,10 +105,10 @@ def test_boundary_validates_identity_and_refuses_junk(tmp_path):
 
 
 def test_adapter_without_identity_capability_is_unknown_not_error(tmp_path):
-    """Legacy PVE adapters have no artifact manifest: the boundary says
-    None (cron checks then stay UNKNOWN) and never fabricates an identity
-    from, say, the VM template name."""
-    client, _service = _broker(tmp_path)      # plain ProxmoxClient
+    """A backend with no artifact manifest answers unknown: the boundary
+    says None (cron checks then stay UNKNOWN) and never fabricates an
+    identity from, say, the VM template name."""
+    client, _service = _broker(tmp_path)      # plain FakeBackend
     assert client.artifact_for_template(9001) is None
 
 

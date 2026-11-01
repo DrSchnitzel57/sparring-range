@@ -75,7 +75,7 @@ def test_worker_role_validates_only_its_own_capability(tmp_path, monkeypatch):
                       runner_ssh_target="runner@10.66.0.9",
                       runner_ssh_known_hosts="/etc/sr/known_hosts",
                       api_base_url="http://api:8000")
-    validate_production(worker, role="worker")  # no proxmox/db/bastion needed
+    validate_production(worker, role="worker")  # no db/bastion secrets needed
     with pytest.raises(RuntimeError, match="WORKER config"):
         validate_production(worker.model_copy(update={"runner_transport": "local-dev"}),
                             role="worker")
@@ -91,7 +91,7 @@ def test_worker_never_loads_controller_dotenv(tmp_path, monkeypatch):
     (tmp_path / ".env").write_text(
         "SR_ENV=production\n"
         "POSTGRES_URL_OWNER=postgresql+psycopg2://sr_owner:SENTINEL@db/prod\n"
-        "PROXMOX_TOKEN_SECRET=SENTINEL-SECRET\n"
+        "BROKER_URL=https://sentinel-broker:8443\n"
         "BASTION_TARGETS_KNOWN_HOSTS=/sentinel\n")
     monkeypatch.chdir(tmp_path)
     for k, v in {
@@ -106,7 +106,7 @@ def test_worker_never_loads_controller_dotenv(tmp_path, monkeypatch):
         s = st.get_settings()   # would RAISE if controller validation applied
         assert s.sr_env == "production"
         assert "SENTINEL" not in s.postgres_url_owner
-        assert s.proxmox_token_secret == ""
+        assert s.broker_url != "https://sentinel-broker:8443"
         assert s.runner_ssh_target == "runner@10.0.0.9"
     finally:
         st.get_settings.cache_clear()
@@ -115,9 +115,9 @@ def test_worker_never_loads_controller_dotenv(tmp_path, monkeypatch):
 def test_worker_env_serializes_resolved_settings(tmp_path, monkeypatch):
     """The spawner serializes the controller's RESOLVED settings (dotenv or
     env — the worker cannot tell and must not care), and NOTHING else:
-    no Proxmox/owner/bastion values cross the boundary."""
+    no broker/owner/bastion values cross the boundary."""
     monkeypatch.setenv("SR_ENV", "dev")
-    monkeypatch.setenv("PROXMOX_TOKEN_SECRET", "must-not-cross")
+    monkeypatch.setenv("SR_BROKER_URL", "https://must-not-cross:8443")
     monkeypatch.setenv("POSTGRES_URL_OWNER", "postgresql://owner:secret@db/x")
     from srplatform import settings as st
     st.get_settings.cache_clear()
@@ -136,7 +136,8 @@ def test_worker_env_serializes_resolved_settings(tmp_path, monkeypatch):
         assert env["SR_WORKER_TOKEN"] == "tok-123"
         joined = " ".join(env.values())
         assert "must-not-cross" not in joined and "owner:secret" not in joined
-        assert not any(k.startswith(("PROXMOX_", "POSTGRES_", "BASTION_")) for k in env)
+        assert not any(k.startswith(("BROKER_", "SR_BROKER_", "POSTGRES_",
+                                     "BASTION_")) for k in env)
     finally:
         st.get_settings.cache_clear()
 

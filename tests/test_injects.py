@@ -16,8 +16,8 @@ pytestmark = pytest.mark.db
 @pytest.fixture(autouse=True)
 def _mojang_templates(fake_pve):
     """Mojang-scenario templates exist ONLY for these tests — the shared
-    fake PVE keeps its exact 9001–9004 set so the orphan/VM-set assertions
-    elsewhere stay meaningful."""
+    fake backend keeps its exact 9001–9004 set so the orphan/VM-set
+    assertions elsewhere stay meaningful."""
     for vmid, name in ((9005, "tpl-attacker"), (9011, "tpl-mojang-web"),
                        (9012, "tpl-mojang-db")):
         fake_pve.api.vms[vmid] = {"name": name, "template": vmid,

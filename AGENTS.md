@@ -23,10 +23,11 @@ shadowing Python's `platform` module.
   verifier/NAS credentials or GPU devices. No outer-Proxmox credentials enter
   the appliance. API/model/bastion/ingest cannot access libvirt or `/dev/kvm`.
 - Only the separate deterministic private broker uses local libvirt for approved
-  inner VMs. Legacy PVE tooling is not a production fallback. Never broaden
-  privileges, disable containment or execute arbitrary host-shell/firewall work
-  to get green tests. Operator-installed rules belong to the dedicated appliance,
-  never the outer host or unrelated workloads.
+  inner VMs. Legacy PVE tooling is retired (2026-11-01): the broker is
+  appliance/libvirt-only and no component holds a hypervisor credential. Never
+  broaden privileges, disable containment or execute arbitrary host-shell/firewall
+  work to get green tests. Operator-installed rules belong to the dedicated
+  appliance, never the outer host or unrelated workloads.
 - Range isolation denies management/WAN/Proxmox/model/NAS/unrelated workload
   access except narrow approved control paths. Attacks require real isolation
   and emergency-stop gates, not software doubles or a readiness flag.

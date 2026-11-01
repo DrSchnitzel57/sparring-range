@@ -246,7 +246,7 @@ class BrokerPolicy:
             raise bad(f"missing keys {missing}")
         node = raw["node"]
         if not isinstance(node, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", node):
-            raise bad("node must be a single exact PVE node name")
+            raise bad("node must be a single exact node/installation name")
         templates = raw["templates"]
         if (not isinstance(templates, list) or not templates
                 or not all(isinstance(t, int) and 100 <= t <= 999999 for t in templates)):

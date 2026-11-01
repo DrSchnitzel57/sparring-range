@@ -19,7 +19,7 @@ postgres`, dev roles). This version:
   * Environment, settings/engine caches, and module singletons are restored
     after the session so test order doesn't leak.
 
-Proxmox/GPU/range-host boundaries use test doubles (Drew owns that reality).
+Range-host boundaries use test doubles (Drew owns that reality).
 """
 from __future__ import annotations
 
@@ -60,7 +60,6 @@ REQUIRED_LAYER_ENV = {
     "containment": "SR_REQUIRE_CONTAINMENT",
     "packet": "SR_REQUIRE_PACKET",
     "authority": "SR_REQUIRE_AUTHORITY",
-    "adapter": "SR_REQUIRE_ADAPTER",
     "browser": "SR_REQUIRE_BROWSER",
     "live": "SR_REQUIRE_LIVE",
     "images": "SR_REQUIRE_IMAGES",
@@ -327,17 +326,17 @@ def env_dirs(migrated_db, tmp_path, monkeypatch, test_db_url_secret):
 
 @pytest.fixture()
 def fake_pve(env_dirs):
-    """ProxmoxClient over FakePVEHttp: the REAL client code (verbs, UPID
-    polling) against a fake HTTP boundary, with the scenario templates present.
-    This is the PVE-boundary double BELOW the broker; tests inspect it via
-    fake_pve.api (FakePVEHttp)."""
-    from infra.proxmox_client import FakePVEHttp, ProxmoxClient
+    """FakeBackend: the appliance-vocabulary broker double with real-libvirt
+    semantics (absence=None, uncertain=raise), with the scenario templates
+    present. This is the backend-boundary double BELOW the broker; tests
+    inspect it via fake_pve.api (the FakeBackend itself)."""
+    from infra.broker.testing import FakeBackend
 
-    http = FakePVEHttp()
-    for vmid, name in ((9001, "tpl-web"), (9002, "tpl-dc"), (9003, "tpl-win10"),
-                       (9004, "tpl-db")):
-        http.vms[vmid] = {"name": name, "template": vmid, "status": "stopped"}
-    return ProxmoxClient(api=http)
+    be = FakeBackend()
+    for vmid in (9001, 9002, 9003, 9004):
+        be.vms[vmid] = {"name": f"tpl{vmid}", "template": vmid,
+                        "status": "stopped"}
+    return be
 
 
 @pytest.fixture()

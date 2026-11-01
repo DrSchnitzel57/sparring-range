@@ -2,7 +2,7 @@
 
 Spawned by the API's run manager as a subprocess in its own process group.
 Holds ONLY: the API URL + a run-scoped token (evidence plane), and the runner
-channel from configuration. It never receives the database, Proxmox, or
+channel from configuration. It never receives the database, hypervisor, or
 verifier/management credentials — verifier execution happens in the trusted
 backend, requested over the API. Model calls go through the bounded gateway.
 """

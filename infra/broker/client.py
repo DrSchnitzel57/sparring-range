@@ -1,9 +1,10 @@
-"""API-side broker client — typed calls over mutual TLS, no fallback.
+"""API-side broker client — typed calls over an authenticated boundary, no fallback.
 
-The API never holds a PVE token and never constructs PVE paths: it calls
-these typed methods. Transport failures raise BrokerUnavailable (uncertain
-— retain obligations); refusals raise typed BrokerRefused subclasses. There
-is deliberately NO path from this module to a direct Proxmox connection.
+The API never holds a hypervisor credential and never constructs backend
+paths: it calls these typed methods. Transport failures raise
+BrokerUnavailable (uncertain — retain obligations); refusals raise typed
+BrokerRefused subclasses. There is deliberately NO path from this module to
+a direct hypervisor connection.
 """
 from __future__ import annotations
 
@@ -83,7 +84,7 @@ class HttpTransport:
     # Every bound below exceeds the documented SERVER-side bound of the op
     # (task timeout 300 s; the pin read is a 120 s boot-marker window plus a
     # 120 s shared stability window, each possibly overrun by one in-flight
-    # request of up to `proxmox_http_timeout_s` = 30 s; start wait 90 s;
+    # backend request of up to 30 s; start wait 90 s;
     # stop/destroy waits 60 s each) so a legitimate long task is never cut
     # off client-side at the old flat 30 s. When the client bound IS
     # exceeded (or the response is otherwise lost) the call raises

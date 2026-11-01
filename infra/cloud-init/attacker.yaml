@@ -6,7 +6,7 @@
 # Bake ONLY operator public keys here — never private keys/live tokens.
 # Host keys/machine IDs are FRESH per clone (scrubbed from the template,
 # regenerated on first boot); the broker pins the fresh ed25519 host key
-# through the PVE guest-agent FileRead channel (never keyscan/TOFU).
+# through the guest-agent file-read channel (never keyscan/TOFU).
 hostname: attacker
 manage_etc_hosts: true
 

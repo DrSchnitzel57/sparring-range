@@ -3,7 +3,7 @@
 Each guest: 2 vCPU / 2 GiB RAM. Disks: attacker 16 / web-local 12 / web-db 16
 GiB. Range totals (mojang-web-db-01): 6 vCPU / 6 GiB / 44 GiB disks;
 templates/control/evidence/reserve are additional. The broker enforces these
-with actual PVE read-back; the orchestrator reserves the aggregate before any
+with actual libvirt read-back; the orchestrator reserves the aggregate before any
 side effect. Guessing or resizing to get a green test is forbidden.
 """
 from __future__ import annotations

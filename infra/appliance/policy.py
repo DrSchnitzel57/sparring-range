@@ -1,6 +1,6 @@
-"""Appliance broker policy — same typed-operation discipline as the PVE broker.
+"""Appliance broker policy — same typed-operation discipline as the broker core.
 
-The appliance has no Proxmox tag/VLAN machinery: inner guests attach to ONE
+The appliance has no tag/VLAN machinery: inner guests attach to ONE
 fixed isolated Linux bridge.  The closed set of configurable fields, the
 bounded internal VMID namespace (used as the durable broker key while libvirt
 domains get UUIDs), image allowlist and aggregate budgets are otherwise the

@@ -1,5 +1,5 @@
 [Unit]
-Description=sparring-range private broker (sole Proxmox authority)
+Description=sparring-range private broker (sole hypervisor authority)
 After=network-online.target
 
 [Service]

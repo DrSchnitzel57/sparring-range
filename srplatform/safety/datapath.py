@@ -66,7 +66,7 @@ def config_identity(s: Settings) -> str:
     material = json.dumps({
         "range_bridge": s.range_bridge, "range_vlan": s.range_vlan,
         "range_cidr": s.range_cidr, "management_cidr": s.management_cidr,
-        "bastion_address": s.bastion_address, "proxmox_node": s.proxmox_node,
+        "bastion_address": s.bastion_address, "deploy_node": s.deploy_node,
         "range_bridge_ports": sorted(bridge_ports(s)),
         "api_host": _api_host(s), "api_port": _api_port(s),
         "runner_transport": s.runner_transport,

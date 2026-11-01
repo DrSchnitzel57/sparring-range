@@ -2,9 +2,9 @@
 
 Everything the broker intends to do to the outside world is written HERE
 before the side effect, and confirmed after. On restart the ledger is the
-authority: pending intents are reconciled against reality (PVE reads), never
-blindly replayed; active claims whose control lease has lapsed force the
-fail-closed stop path.
+authority: pending intents are reconciled against reality (backend reads),
+never blindly replayed; active claims whose control lease has lapsed force
+the fail-closed stop path.
 
 Tables:
   claims       VMs the broker owns (reserved/creating/created/enrolled/

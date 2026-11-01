@@ -5,6 +5,6 @@ openssh-server=1:9.6p1-3ubuntu13.20
 python3-pymysql=1.0.2-2ubuntu1.1
 ufw=0.36.2-6
 curl=8.5.0-2ubuntu10.16
-# Broker guest-agent FileRead host-key pinning on fresh PVE clones requires
+# Broker guest-agent host-key pinning on fresh clones requires
 # the in-guest agent (pilot plan step 1; universe component on noble).
 qemu-guest-agent=1:8.2.2+ds-0ubuntu1.18

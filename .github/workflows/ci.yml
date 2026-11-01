@@ -312,7 +312,7 @@ jobs:
 
   browser-e2e:
     # Real Chromium drives the built web app against the real API + worker
-    # (controlled PVE/model/runner/verifier/datapath) plus replay seek. The
+    # (controlled backend/model/runner/verifier/datapath) plus replay seek. The
     # CLI is the PINNED local one (web devDependency); the session, ports
     # and dist dir are run-owned. Required mode: no silent skips.
     needs: [frontend]

@@ -104,30 +104,10 @@ class Settings(BaseSettings):
     # A brand-new operator account (empty users table) may bootstrap itself.
     bootstrap_operator_username: str = "drew"
 
-    # --- Proxmox / control plane ---
-    proxmox_host: str = "localhost"
-    proxmox_user: str = "root@pam"  # token identity's user, e.g. automation@pam!sparring
-    proxmox_token_id: str = ""
-    proxmox_token_secret: str = ""
-    proxmox_tls_verify: bool = True          # verify against CA by default (F05)
-    proxmox_tls_ca_file: str | None = None   # path to PVE CA cert
-    proxmox_insecure_lab_override: bool = False  # explicit, loud, dev-only
-    proxmox_task_timeout_s: int = 300
-    # Per-REQUEST HTTP timeout of the proxmoxer session. Every PVE mutation
-    # returns a UPID quickly; long work is awaited via bounded task polling,
-    # so this stays short — but it must be an explicit, configurable deadline
-    # (plan 13 phase 2: client/server/task deadlines are checked together).
-    proxmox_http_timeout_s: int = 30
-    # First-boot guest-agent readiness after a clone starts (paired 03+04
-    # host-key pin). Live find 2026-10-14: PVE answers agent reads with 500
-    # "QEMU guest agent is not running" for tens of seconds after the VM is
-    # running; the broker waits this long before declaring the read uncertain.
-    proxmox_agent_ready_timeout_s: int = 120
-
-    # --- Broker (milestone 02): the ONLY component holding PVE authority ----
-    # Controller (API) side: mutual-TLS client material + broker URL. The
-    # controller must NOT hold PVE credentials in production — the broker
-    # does, and only the broker imports infra/proxmox_client.py.
+    # --- Broker (milestone 02): the ONLY component holding hypervisor authority
+    # Controller (API) side: boundary transport material. The controller
+    # must NOT hold backend credentials — the broker is the only component
+    # that reaches the hypervisor.
     broker_url: str | None = None            # legacy https://broker:8443
     # Appliance (milestone 14/15): one local Unix socket replaces remote
     # mutual TLS. The broker verifies the API's peer UID with SO_PEERCRED;
@@ -264,7 +244,11 @@ class Settings(BaseSettings):
     verifier_exec_timeout_s: int = 30
 
     # --- Deploy (M1) ---
-    proxmox_node: str = "r740"
+    # The backend's installation identity: every broker operation and every
+    # deployment resource row carries this node string (the appliance derives
+    # deterministic per-VM identity from it; the value comes from the
+    # operator manifest, never from caller input).
+    deploy_node: str = "appliance"
     deploy_vmid_base: int = 210
     # Explicit clone mode (paired 03+04, step 4): operator policy selects
     # "linked" or "full" — no silent fallback. The broker validates the mode.
@@ -388,8 +372,8 @@ def process_role() -> str:
     worker is spawned by the API with SR_PROCESS_ROLE=worker and a SERIALIZED,
     minimal environment — it must not need, and must not silently load,
     controller configuration (audit N04). The broker (milestone 02) is the
-    ONLY role that may hold PVE credentials; it validates its own policy/TLS
-    material instead of the controller's."""
+    ONLY role that may hold hypervisor authority; it validates its own
+    policy/TLS material instead of the controller's."""
     return os.environ.get("SR_PROCESS_ROLE", "controller")
 
 
@@ -489,9 +473,10 @@ def validate_production(s: Settings, role: str = "controller") -> None:
                                + "\n  - ".join(problems))
         return
     if role == "broker":
-        # Milestone 02: the broker validates ITS OWN boundary — policy,
-        # mutual-TLS server material, PVE token, ledger location. It never
-        # needs bastion pins, verifier keys, or the app owner DB.
+        # Milestone 02: the broker validates ITS OWN boundary — policy and
+        # mutual-TLS server material. It never needs bastion pins, verifier
+        # keys, or the app owner DB. (The appliance runs the broker over the
+        # peer-UID Unix socket; this role covers the mutual-TLS listener.)
         if not s.broker_policy_file:
             problems.append("broker_policy_file missing (the broker refuses to "
                             "start without an operator allowlist)")
@@ -501,13 +486,6 @@ def validate_production(s: Settings, role: str = "controller") -> None:
             if not val:
                 problems.append(f"{name} missing (mutual TLS is the broker's "
                                 "authentication)")
-        if not s.proxmox_token_id or s.proxmox_token_secret in ("", "CHANGE_ME", "CHANGE"):
-            problems.append("Proxmox API token missing (broker is the only "
-                            "PVE authority)")
-        if s.proxmox_insecure_lab_override:
-            problems.append("proxmox_insecure_lab_override must be false in production")
-        if not s.proxmox_tls_ca_file:
-            problems.append("proxmox_tls_ca_file must be configured in production")
         if problems:
             raise RuntimeError("production BROKER config invalid:\n  - "
                                + "\n  - ".join(problems))
@@ -565,13 +543,8 @@ def validate_production(s: Settings, role: str = "controller") -> None:
         return
     if role != "controller":
         raise RuntimeError(f"unknown SR_PROCESS_ROLE {role!r}")
-    # Controller (API): PVE credentials are BROKER-ONLY (milestone 02).
-    if s.proxmox_token_id or s.proxmox_token_secret not in ("", "CHANGE_ME", "CHANGE"):
-        problems.append("Proxmox credentials on the controller are forbidden — "
-                        "the broker holds the only PVE token")
-    if s.proxmox_insecure_lab_override:
-        problems.append("proxmox_insecure_lab_override must be false in production "
-                        "(and PVE TLS is the broker's concern anyway)")
+    # Controller (API): hypervisor authority is BROKER-ONLY (milestone 02) —
+    # the API reaches deployment solely through the typed broker boundary.
     if not s.broker_socket and not s.broker_url:
         problems.append("broker_socket (appliance) or broker_url (legacy) is "
                         "missing — the API reaches the deployment boundary only "

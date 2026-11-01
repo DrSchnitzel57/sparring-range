@@ -40,7 +40,8 @@ def test_config_read_timeout_retains_resource_and_lease(client, users, fake_pve)
     sid, out = _launch(client, users)
     vmid = out["deployment"]["hosts"][0]["vmid"]
 
-    fake_pve.api.fail_requests = {"/config": TimeoutError("management outage")}
+    fake_pve.api.fail_reads = {("lookup_config", None): TimeoutError(
+        "management outage")}
     t = client.post(f"/sessions/{sid}/teardown", headers=users["member"])
     assert t.status_code == 200, t.text
     body = t.json()
@@ -48,7 +49,7 @@ def test_config_read_timeout_retains_resource_and_lease(client, users, fake_pve)
     assert vmid in fake_pve.api.vms, "resource deleted on an UNCERTAIN identity read!"
     # no DELETE was ever issued for the VM whose identity could not be read
     dels = [r for r in fake_pve.api.requests
-            if r[0] == "DELETE" and f"/qemu/{vmid}" in r[1]]
+            if r[0] == "destroy_and_wait" and r[1].get("vmid") == vmid]
     assert dels == [], f"delete issued without ownership: {dels}"
 
     # lease retained -> next launch conflicts
@@ -58,7 +59,7 @@ def test_config_read_timeout_retains_resource_and_lease(client, users, fake_pve)
                        headers=users["op"]).status_code == 409
 
     # recovery: teardown completes once the API answers again
-    fake_pve.api.fail_requests = {}
+    fake_pve.api.fail_reads = {}
     t = client.post(f"/sessions/{sid}/teardown", headers=users["member"])
     assert t.json().get("complete") is True, t.json()
     assert vmid not in fake_pve.api.vms
@@ -73,7 +74,7 @@ def test_status_read_failure_during_teardown_retains_everything(client, users, f
     sid, out = _launch(client, users)
     vmid = out["deployment"]["hosts"][0]["vmid"]
 
-    fake_pve.api.fail_requests = {"/status/current": failure}
+    fake_pve.api.fail_reads = {("destroy_and_wait", None): failure}
     t = client.post(f"/sessions/{sid}/teardown", headers=users["member"])
     body = t.json()
     assert body.get("complete") is False, body
@@ -83,12 +84,12 @@ def test_status_read_failure_during_teardown_retains_everything(client, users, f
                        headers=users["op"]).json()["session_id"]
     assert client.post(f"/sessions/{sid2}/launch",
                        headers=users["op"]).status_code == 409
-    fake_pve.api.fail_requests = {}
+    fake_pve.api.fail_reads = {}
 
 
 @pytest.mark.db
 def test_confirmed_absent_is_idempotent_without_delete(client, users, fake_pve):
-    """A VM PVE CONFIRMS missing is booked as removed with NO delete call."""
+    """A VM the backend CONFIRMS missing is booked removed with NO delete."""
     sid, out = _launch(client, users)
     vmid = out["deployment"]["hosts"][0]["vmid"]
     # the machine vanishes out-of-band (operator removed it, host failure...)
@@ -98,7 +99,7 @@ def test_confirmed_absent_is_idempotent_without_delete(client, users, fake_pve):
     body = t.json()
     assert body.get("complete") is True, body
     dels = [r for r in fake_pve.api.requests
-            if r[0] == "DELETE" and f"/qemu/{vmid}" in r[1]]
+            if r[0] == "destroy_and_wait" and r[1].get("vmid") == vmid]
     assert dels == [], "unnecessary delete issued for a confirmed-absent VM"
 
 
@@ -110,12 +111,12 @@ def test_pending_vmid_now_foreign_receives_zero_mutation(client, users, fake_pve
     sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
                       headers=users["member"]).json()["session_id"]
     # crash between clone-completion and config (config endpoint down)
-    fake_pve.api.fail_request_fragments = ("/config",)
+    fake_pve.api.fail_reads = {("set_config", None): True}
     r = client.post(f"/sessions/{sid}/launch", headers=users["member"])
     assert r.status_code == 202, r.text  # durable acceptance; executor fails
     failed = wait_operation(client, users["member"], sid)
     assert failed["state"] == "failed", failed
-    fake_pve.api.fail_request_fragments = ()
+    fake_pve.api.fail_reads = {}
 
     from sqlalchemy import select
     from srplatform.db.session import db as db_ctx
@@ -139,7 +140,9 @@ def test_pending_vmid_now_foreign_receives_zero_mutation(client, users, fake_pve
     assert "foreign_resource" in (refused["error"] or ""), refused
 
     mutations = [q for q in fake_pve.api.requests[requests_before:]
-                 if q[0] in ("POST", "DELETE") and f"/qemu/{vmid}" in q[1]]
+                 if q[0] in ("set_config", "start_and_wait", "stop",
+                             "destroy_and_wait", "clone_and_wait")
+                 and (q[1].get("vmid") == vmid or q[1].get("new_vmid") == vmid)]
     assert mutations == [], f"foreign VM was mutated: {mutations}"
     assert vmid in fake_pve.api.vms and fake_pve.api.vms[vmid]["name"] == "tenant-x-db"
 
@@ -203,7 +206,7 @@ def test_concurrent_launch_cannot_double_deploy(client, users, fake_pve):
     # clone side effects must have happened EXACTLY once
     done = wait_operation(client, users["member"], sid)
     assert done["state"] == "succeeded", done
-    clones = [q for q in fake_pve.api.requests if q[0] == "POST" and "/clone" in q[1]]
+    clones = [q for q in fake_pve.api.requests if q[0] == "clone_and_wait"]
     assert len(clones) == 1, f"duplicate deployment side effects: {clones}"
 
 

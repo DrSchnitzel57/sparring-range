@@ -17,7 +17,7 @@
 # There is no separate coach service; coach routes are mounted in the API app
 # (the old `srplatform.coach.service` import never existed).
 #
-# Runtime services never receive PROXMOX_* or owner-DB credentials; model
+# Runtime services never receive hypervisor or owner-DB credentials; model
 # selection/execution happens in runner-scoped workers (see docs/ARCHITECTURE.md).
 services:
   postgres:
@@ -75,7 +75,8 @@ services:
   api:
     build: { context: ., dockerfile: infra/dev/Dockerfile }
     command: uvicorn srplatform.api.app:app --host 0.0.0.0 --port 8000
-    # NO env_file: the whole .env contains the OWNER URL and Proxmox secrets —
+    # NO env_file: the whole .env contains the OWNER URL and broker/TLS
+    # material —
     # loading it here contradicted the credential split this file claims
     # (audit R12). The API gets an EXPLICIT, auditable variable set; secrets
     # are interpolated from the invoking shell, never committed.

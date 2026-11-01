@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Ubuntu/KVM appliance installer and operator console.
 
-The legacy ``deploy/install.sh`` installs a control-plane VM that drives an
-outer Proxmox host.  This installer is the appliance replacement: one Ubuntu
+This installer owns the whole product host: one Ubuntu
 24.04 host, one local typed broker over a Unix peer-UID socket, libvirt/KVM
 full VMs on a fixed isolated bridge, and separate service UIDs.
 
@@ -13,8 +12,9 @@ Design rules enforced here:
 * Rendering is pure and deterministic: ``plan`` twice is byte-identical, which
   makes an idempotent rerun provable.  ``apply`` writes only files it owns and
   never regenerates an existing private key or token.
-* No outer Proxmox credential exists anywhere in this path.  The API gets a
-  Unix socket path, not libvirt, not ``/dev/kvm``, not a host shell.
+* No outer-host or hypervisor credential exists anywhere in this path.  The
+  API gets a Unix socket path, not libvirt, not ``/dev/kvm``, not a host
+  shell.
 * ``doctor``/``status`` are read-only.  ``recovery`` is an explicit local
   operator command, never an HTTP endpoint; resolving an obligation requires
   fresh evidence that the backend no longer owns the resource.
@@ -290,10 +290,10 @@ def render_control_env(m: ApplianceManifest, *, etc: pathlib.Path = DEFAULT_ETC,
         ("SR_CONTROLLER_RANGE_IP", str(m.network.controller_range_ip)),
         ("SR_BASTION_ADDRESS", str(m.network.bastion_address)),
         ("SR_MANAGEMENT_CIDR", str(m.network.management_cidr)),
-        # The API must never present a PVE credential.  These names remain only
-        # because the shared settings model still has legacy fields; the values
-        # are the installation id and a bounded local namespace, not PVE.
-        ("SR_PROXMOX_NODE", m.installation_id),
+        # The deployment node name IS the installation id: the local broker
+        # policy binds every operation to it, and the API holds no
+        # hypervisor credential of any kind.
+        ("SR_DEPLOY_NODE", m.installation_id),
         ("SR_DEPLOY_VMID_BASE", "200"),
         ("SR_DEPLOY_CLONE_MODE", "full"),
         ("SR_TEMPLATE_VMID_ATTACKER", by_role["attacker"]),

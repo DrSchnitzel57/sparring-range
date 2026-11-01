@@ -2,7 +2,8 @@
 
 The real Next.js app (web/, a pure API client) served by `next start`, the
 real uvicorn API on a disposable DB, and the real worker subprocess. Only the
-external services are controlled substitutes: Proxmox (FakePVEHttp), the
+external services are controlled substitutes: the deployment backend
+(FakeBackend), the
 model endpoint (fast fake OpenAI), the runner (local-dev transport), the
 verifier exec (controlled host state) and the datapath (fake).
 
@@ -219,7 +220,7 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
     import uvicorn
     from sqlalchemy import create_engine, text
 
-    from infra.proxmox_client import FakePVEHttp
+    from infra.broker.testing import FakeBackend
     from srplatform import settings as st
     from srplatform import verification_service
     from srplatform.api import deps
@@ -246,8 +247,8 @@ def test_browser_member_practice_loop(browser, web_app, ports, migrated_db,
     monkeypatch.setenv("API_ALLOWED_ORIGINS", WEB_URL)  # THIS run's web origin
     st.get_settings.cache_clear()
 
-    httpd = FakePVEHttp()
-    for vmid in (9001, 9002, 9003, 9004):
+    httpd = FakeBackend()
+    for vmid in (9001, 9002, 9003, 9004, 9005, 9011, 9012):
         httpd.vms[vmid] = {"name": f"tpl{vmid}", "template": vmid, "status": "stopped"}
     wipe_data(test_db_url_owner)
     from infra.broker.testing import make_broker_over, policy_from_settings

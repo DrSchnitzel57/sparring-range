@@ -1,8 +1,8 @@
 """Appliance-local error types.
 
-They deliberately do not inherit their Proxmox-era cousins: an appliance
-backend can never be mistaken for a PVE path, and the typed server maps each
-one to a stable wire code.
+They deliberately do not inherit the broker's transport-era error cousins: an
+appliance backend can never be mistaken for a remote-broker path, and the
+typed server maps each one to a stable wire code.
 """
 
 from __future__ import annotations

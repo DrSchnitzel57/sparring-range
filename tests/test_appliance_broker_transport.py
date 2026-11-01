@@ -1,7 +1,7 @@
 """Appliance broker transport tests: local Unix socket + peer UID.
 
-Infrastructure-free: a real BrokerService over the synthetic PVE boundary,
-served on a real Unix socket. No PVE, libvirt or database is touched.
+Infrastructure-free: a real BrokerService over the fake backend boundary,
+served on a real Unix socket. No libvirt or database is touched.
 """
 from __future__ import annotations
 

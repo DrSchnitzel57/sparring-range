@@ -28,8 +28,8 @@ import shutil
 import subprocess
 import tempfile
 
-# Pinned by the release.  The appliance needs no Proxmox client, no outer
-# token and no hypervisor tooling beyond these.  python3-libvirt is the
+# Pinned by the release.  The appliance needs no hypervisor client, no
+# outer token and no tooling beyond these.  python3-libvirt is the
 # broker's ONLY libvirt binding (plan 18: it was missing, and the isolated
 # venv cannot see the distro module without the narrow exposure below);
 # curl/ca-certificates/xz-utils serve the pinned Node provisioning.

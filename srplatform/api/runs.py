@@ -595,7 +595,7 @@ def worker_failed(db: Session, run_id, reason: str,
 # (audit N04): it must not depend on whether the operator supplied a value via
 # os.environ or via dotenv, and it must not inherit anything else. The worker
 # is the least-privileged component — API capability and runner channel ONLY;
-# no DB/Proxmox/owner/bastion credentials AND no model endpoint credential
+# no DB/hypervisor/owner/bastion credentials AND no model endpoint credential
 # (audit Stage 5: red turns are scheduled through the API's shared gateway).
 _WORKER_SETTING_KEYS = {
     "SR_ENV": "sr_env",
