@@ -191,7 +191,8 @@ def test_lab_aggregate_roundtrip_and_constraints(migrated_db):
             select(LabGuest.id).where(LabGuest.lab_id == lab_id,
                                       LabGuest.guest == "ecomm")).one()).generation == 2
         p = db.get(LabResetPlan, plan_id)
-        assert p.status == "proposed" and p.plan["plan_version"] == 1
+        assert p.status == "proposed" and p.plan["plan_version"] == \
+            RESET_PLAN_VERSION
         s = db.get(SessionRow, sess_id)
         assert s.lab_id == lab_id
 
