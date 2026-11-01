@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, IPvAnyAddress, ValidationError, field_validator
+from pydantic import (BaseModel, ConfigDict, Field, IPvAnyAddress, ValidationError,
+                      field_validator, model_validator)
 
 from verifiers import registry
 
@@ -122,6 +123,10 @@ class BlueCheck(Strict):
 
 class Scoring(Strict):
     blue_checks: list[BlueCheck] = Field(min_length=1)
+    # Environment scenarios (schema v2) bind availability to the versioned
+    # service-check registry instead of HTTP/MySQL port assumptions. Each id
+    # must exist in the environment's checks document (validated below).
+    availability: list[str] = []
 
 
 class ScenarioSpec(Strict):
@@ -138,9 +143,26 @@ class ScenarioSpec(Strict):
     # but readiness requires the manifest on mojang presets).
     seed_version: int | None = None
     image_version: str | None = None
-    topology: Topology
+    topology: Topology | None = None
+    # Environment-referencing scenario (Underpressure plan, step 2): the
+    # topology lives in the versioned environment blueprint (single source
+    # of truth); this scenario is the exercise overlay (objectives, checks,
+    # availability). Legacy presets carry no `environment` and must provide
+    # `topology` exactly as before.
+    environment: str | None = None
     red: Red
     scoring: Scoring | None = None
+
+    @model_validator(mode="after")
+    def _topology_or_environment(self) -> "ScenarioSpec":
+        if self.environment is None and self.topology is None:
+            raise ValueError("a scenario without an `environment` must declare "
+                             "`topology` (legacy presets keep their own hosts)")
+        if self.environment is not None and self.topology is not None:
+            raise ValueError("an environment scenario must NOT repeat hosts in "
+                             "`topology` — the environment blueprint is the "
+                             "single source of truth")
+        return self
 
     @field_validator("id")
     @classmethod
@@ -194,12 +216,38 @@ def validate_scenario(spec: Any, where: str = "<spec>") -> dict:
         raise ScenarioError(issues)
 
     data = model.model_dump(mode="json")
-    hostnames = {h["name"] for h in data["topology"]["hosts"]}
-    for h in data["topology"]["hosts"]:
-        if h.get("db_ref"):
-            if h["db_ref"] not in hostnames:
-                issues.append(f"{where}: host '{h['name']}': db_ref "
-                              f"'{h['db_ref']}' not in topology")
+    env_pins: dict | None = None
+    if data.get("environment"):
+        from srplatform import environment_specs as envspecs
+        try:
+            loaded_env = envspecs.load_environment(data["environment"])
+        except envspecs.EnvironmentError as e:
+            raise ScenarioError([f"{where}: environment "
+                                 f"{data['environment']!r}: {e}"]) from e
+        env_pins = loaded_env.pins()
+        hostnames = {g.name for g in loaded_env.blueprint.guests}
+        check_ids = {c.id for c in loaded_env.checks.checks}
+    else:
+        hostnames = {h["name"] for h in data["topology"]["hosts"]}
+        for h in data["topology"]["hosts"]:
+            if h.get("db_ref"):
+                if h["db_ref"] not in hostnames:
+                    issues.append(f"{where}: host '{h['name']}': db_ref "
+                                  f"'{h['db_ref']}' not in topology")
+        check_ids = set()
+
+    # service-check-registry availability only exists for environment
+    # scenarios; legacy scenarios keep their port/service uptime derivation
+    availability = (data.get("scoring") or {}).get("availability") or []
+    for cid in availability:
+        if not data.get("environment"):
+            issues.append(f"{where}: scoring.availability requires an "
+                          f"environment scenario")
+        elif cid not in check_ids:
+            issues.append(f"{where}: scoring.availability references unknown "
+                          f"service check {cid!r}")
+    if env_pins is not None:
+        data["environment_pins"] = env_pins
 
     def check(prefix: str, verifier_id: str, args: dict, needs_host: bool = True) -> None:
         if verifier_id not in registry.REGISTRY:

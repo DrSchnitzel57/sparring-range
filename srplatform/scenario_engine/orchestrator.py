@@ -33,7 +33,7 @@ from srplatform.db.models import (Deployment, Event, LoginToken, OperationClaim,
                                   ServiceToken,
                                   Session as SessionModel)
 from srplatform import host_roles
-from srplatform.scenario_engine.loader import load_scenario
+from srplatform.scenario_engine.loader import ScenarioError, load_scenario
 from srplatform.settings import bastion_login_target, get_settings
 
 
@@ -977,6 +977,17 @@ def deploy(db: Session, session_id, scenario_id: str, broker, resume: bool = Tru
         spec = verification_service.scenario_spec(db, session_id)
     else:
         spec = load_scenario(scenario_id)
+    if spec.get("environment"):
+        # ENVIRONMENT SCENARIOS (Underpressure plan): provisioning follows
+        # the blueprint — segment bridges, role-specific multi-NIC attach and
+        # per-generation identity — through the versioned broker lane. Flat
+        # single-bridge cloning REFUSES such a scenario rather than silently
+        # misprovisioning one address of one NIC and calling it deployed.
+        raise ScenarioError(
+            [f"scenario '{scenario_id}' binds environment "
+             f"{spec['environment']!r}: environment provisioning (segment "
+             f"bridges + multi-NIC blueprint clones) is not in this lane yet; "
+             f"no side effects were attempted"])
     node = s.proxmox_node
     # Paired 03+04, step 4: explicit clone mode (no silent fallback) +
     # aggregate budget reservation BEFORE any side effect. Unknown retains

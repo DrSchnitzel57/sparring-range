@@ -1,0 +1,65 @@
+# Underpressure range — live AI offense exercise (environment scenario).
+#
+# Schema v2: the topology, segments, dependencies and availability checks
+# live in `environments/underpressure-range/` (versioned, frozen per
+# session via `environment_pins`). This file is the exercise overlay: red
+# objectives and security-state checks graded with deterministic verifiers.
+#
+# Availability binds to the service-check registry (real transactions from
+# the trusted scoring vantage), NOT to HTTP/MySQL port liveness. Timing is
+# free: the lab is persistent and optional timed exercises are a session
+# setting, not a property of this file.
+id: underpressure-range-01
+name: "Underpressure: defend the water authority"
+difficulty: 4
+focus: [ad, mssql, web, mail, defense-in-depth, live-ai-offense]
+est_minutes: 240            # planning estimate only — never a disposal clock
+techniques: [T1190, T1078, T1558.003, T1098, T1552.001, T1021.006]
+version: 1
+environment: underpressure-range
+red:
+  start_phase: recon
+  objectives:
+    - id: external-store-access
+      phase: initial-access
+      description: "Obtain code execution on the store through its public path (no provided foothold)"
+      verifier: flag_file_present
+      args: { host: ecomm, path: /tmp/.sr-practice-ecomm.txt,
+              expected_content: "SRUP{ecomm}" }
+    - id: directory-compromise
+      phase: lateral
+      description: "Reach the domain controller through real directory/management paths"
+      verifier: flag_file_present
+      args: { host: ad-dns, path: C:/Users/Public/.sr-practice-ad.txt,
+              expected_content: "SRUP{ad-dns}" }
+    - id: bounded-persistence
+      phase: persistence
+      verifier: cron_persistence_present
+      args: { host: webmail, baseline_files: [underpressure-webmail-clean] }
+scoring:
+  # PRACTICE rubric: no official competition weights (none were supplied).
+  availability:
+    - store-catalog-https
+    - store-seeded-read
+    - mail-roundtrip
+    - roundcube-login
+    - dns-authoritative
+    - directory-auth
+    - roundcube-db-read
+    - splunk-known-events
+  blue_checks:
+    - { verifier: service_present, host: ecomm, points: 10, domain: recover,
+        service: nginx }
+    - { verifier: service_present, host: webmail, points: 10, domain: recover,
+        service: sshd }
+    - { verifier: firewall_enabled, host: webmail, points: 5, domain: protect }
+    - { verifier: no_rogue_admin, host: splunk, points: 10, domain: identify }
+    - { verifier: cron_persistence_present, host: webmail, points: 10,
+        domain: detect, expect: absent,
+        baseline_files: [underpressure-webmail-clean] }
+    - { verifier: flag_file_present, host: ecomm, points: 10, domain: identify,
+        expect: absent, path: /tmp/.sr-practice-ecomm.txt,
+        expected_content: "SRUP{ecomm}" }
+    - { verifier: flag_file_present, host: ad-dns, points: 10, domain: identify,
+        expect: absent, path: C:/Users/Public/.sr-practice-ad.txt,
+        expected_content: "SRUP{ad-dns}" }

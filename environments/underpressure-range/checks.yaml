@@ -1,0 +1,154 @@
+# Underpressure practice scoring contracts (clearly NOT official).
+#
+# Versioned service-check registry: availability is REAL transactions run
+# from the trusted external scoring vantage (via the replica's own DNAT
+# paths), never bare port liveness. Dependency failures yield UNKNOWN
+# evidence — not downtime, not free points. Credentials appear only as
+# `credential:<ref>` logical names resolved by the protected captain/
+# verifier path; a credential VALUE in this file is a load error. No
+# official competition weights, checker accounts or scoring ports are
+# claimed — those were never supplied.
+schema_version: 1
+environment: underpressure-range
+version: 1
+practice_only: true
+checks:
+  - id: store-catalog-https
+    kind: https-content
+    guest: ecomm
+    title: "Store serves its catalogue over HTTPS through the public VIP"
+    params:
+      url_path: /
+      expected_text: "Underpressure Water Authority Store"
+      host_header: shop.underpressure.local
+      verify_tls_against_lab_ca: true
+    depends_on_guests: [vyos-edge, opnsense-fw]
+    interval_class: fast
+    practice_note: "Storefront transaction content, not just HTTP 200."
+  - id: store-seeded-read
+    kind: sql-seed-read
+    guest: mssql
+    title: "Store database answers its seeded read transaction"
+    params:
+      database: UnderpressureStore
+      seed_expectation: store_seed_rows
+      app_account_ref: "credential:store-app-sql"
+    depends_on_guests: [vyos-edge, opnsense-fw]
+    interval_class: steady
+    practice_note: "Database name/login are synthetic reconstruction choices
+      (the original app DB/login were unrecorded); labeled in fidelity."
+  - id: mail-roundtrip
+    kind: mail-roundtrip
+    guest: webmail
+    title: "Synthetic mail sends via SMTP and is retrieved via IMAP and POP3"
+    params:
+      sender_ref: "credential:prb-mail-sender"
+      recipient_ref: "credential:prb-mail-reader"
+      protocols: [imap, pop3]
+      subject_prefix: SRPRB
+    depends_on_guests: [vyos-edge, opnsense-fw]
+    interval_class: fast
+    practice_note: "Proves Postfix+Dovecot auth against seeded identities end
+      to end; SSSD join alone is not mail authentication."
+  - id: roundcube-login
+    kind: web-login
+    guest: webmail
+    title: "Roundcube webmail answers HTTPS and logs a synthetic user in"
+    params:
+      url_path: /
+      account_ref: "credential:prb-roundcube"
+      success_text: "Inbox"
+      verify_tls_against_lab_ca: true
+    depends_on_guests: [vyos-edge, opnsense-fw]
+    interval_class: fast
+    practice_note: "Roundcube reads its sqlsrv database; a dead SQL backend
+      must degrade this honestly (it depends on the perimeter path, and the
+      app's own dependency shows in content, not just the port)."
+  - id: dns-authoritative
+    kind: dns-records
+    guest: ad-dns
+    title: "AD DNS answers apex/MX/alias/SRV queries authoritatively"
+    params:
+      records:
+        underpressure.local: [MX]
+        mail.underpressure.local: [A]
+        ecomm.underpressure.local: [A]
+        shop.underpressure.local: [A]
+        dc.underpressure.local: [A]
+        _ldap._tcp.dc._msdcs.underpressure.local: [SRV]
+    depends_on_guests: [vyos-edge, opnsense-fw]
+    interval_class: fast
+  - id: directory-auth
+    kind: directory-auth
+    guest: ad-dns
+    title: "Directory authenticates the synthetic practice account"
+    params:
+      account_ref: "credential:prb-directory"
+      method: simple-bind
+    depends_on_guests: [vyos-edge, opnsense-fw]
+    interval_class: fast
+    practice_note: "Authentication availability only; group membership is a
+      security check, never availability."
+  - id: roundcube-db-read
+    kind: sql-seed-read
+    guest: mssql
+    title: "Roundcube database answers its seeded read transaction"
+    params:
+      database: roundcube
+      seed_expectation: rc_seed_rows
+      app_account_ref: "credential:rc-app-sql"
+    depends_on_guests: [vyos-edge, opnsense-fw]
+    interval_class: steady
+  - id: splunk-known-events
+    kind: splunk-search
+    guest: splunk
+    title: "Splunk ingests known events (edge syslog + workstation forwarder)
+      and answers an authenticated search"
+    params:
+      index: main
+      search_expectation: replica_known_events
+      ingest_account_ref: "credential:splunk-prb"
+    depends_on_guests: [vyos-edge, opnsense-fw]
+    interval_class: steady
+    practice_note: "Checks the ingest CHAIN (router/forwarder -> index ->
+      searchable), not the web port."
+
+tasks:
+  - id: keep-store-online
+    title: "Keep the public store serving authenticated catalogue traffic"
+    service_checks: [store-catalog-https, store-seeded-read]
+    points: 20
+    domain: recover
+    description: "Availability of the store path through the replica's own
+      DNAT/routing. Repairing rather than restarting around breakage is what
+      earns this task repeatedly."
+  - id: keep-mail-online
+    title: "Keep send/retrieve mail and webmail login working"
+    service_checks: [mail-roundtrip, roundcube-login]
+    points: 20
+    domain: recover
+    description: "Mail must actually deliver and retrieve synthetic messages;
+      a listening SMTP alone does not satisfy it."
+  - id: keep-directory-online
+    title: "Keep directory and DNS answering real queries"
+    service_checks: [dns-authoritative, directory-auth]
+    points: 15
+    domain: recover
+    description: "DNS + authentication availability via the public VIP path."
+  - id: keep-telemetry-online
+    title: "Keep the Splunk pipeline ingesting searchable events"
+    service_checks: [splunk-known-events]
+    points: 10
+    domain: detect
+    description: "Defenders need their own telemetry working; broken ingest
+      hides both attack and repair evidence."
+  - id: remediate-entry-paths
+    title: "Detect and remediate exposed entry configuration"
+    service_checks: []
+    points: 25
+    domain: identify
+    description: "Scenario-specific security-state work (weak WinRM listener,
+      exposed CA material, permissive rules, weak service accounts) is
+      verified by deterministic scenario tasks against healthy positive
+      controls; remediation of one known access path must not break the
+      services above."

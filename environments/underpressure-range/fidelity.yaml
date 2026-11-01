@@ -1,0 +1,145 @@
+# Underpressure replica — fidelity / deviation ledger (versioned).
+#
+# The supplied Environment_Replication_Spec is REPORTED evidence: its
+# screenshots, exports, disks and malware were not independently inspected.
+# Every blueprint value that is not a plain reported fact is classified
+# here. `excluded` entries name original artifacts intentionally NOT
+# reproduced. Nothing in this ledger may be presented to users as a
+# byte-for-byte replication of the original competition environment.
+schema_version: 1
+environment: underpressure-range
+version: 1
+sources:
+  - replication-spec        # the supplied spec/report text (operator-local copy)
+  - plan-defaults           # approved plan decisions (reduced budget, substitutes)
+  - lab-synthesis           # generated lab content and policies
+entries:
+  - {path: /id, classification: synthetic, source: lab-synthesis,
+     note: "Lab environment identifier; not part of the original."}
+  - {path: /domain, classification: reported, source: replication-spec,
+     note: "underpressure.local per the spec."}
+  - {path: /resource_policy, classification: synthetic, source: plan-defaults,
+     note: "64 GiB / 16 vCPU candidate profile is a PLAN INPUT, not measured
+            capacity; nested-KVM, Windows 11 CPU support and real storage fit
+            remain preflight gates on the actual appliance."}
+  - {path: /segments/0, classification: reported, source: replication-spec,
+     note: "Team segment 172.17.0.0/24 to VyOS eth0 172.17.0.1."}
+  - {path: /segments/1, classification: reported, source: replication-spec,
+     note: "Transit 172.16.0.0/24 (firewall external <-> VyOS eth1)."}
+  - {path: /segments/2, classification: reported, source: replication-spec,
+     note: "Inner LAN 172.20.240.0/24; firewall internal .254 resolved to /24
+            per plan default. Permissive starting policy is the documented
+            training weakness; the appliance boundary stays independent."}
+  - {path: /segments/2/dhcp_pool, classification: synthetic, source: plan-defaults,
+     note: "Original pool unknown; deterministic lab pool containing the two
+            workstation reservations. Actual DHCP is exercised from the
+            firewall; AD DNS and firewall gateway are the reported pattern."}
+  - {path: /segments/3, classification: reported, source: replication-spec,
+     note: "VyOS WAN 172.31.31.2/29 toward simulated upstream 172.31.31.1;
+            the upstream router is an appliance boundary, not a guest."}
+  - {path: /segments/4, classification: reported, source: replication-spec,
+     note: "Public VIP prefix 172.25.31.0/24 routed by the simulated upstream,
+            not bound to an interface. Exists only inside the isolated
+            simulation; never routed onto the real network."}
+  - {path: /guests/0, classification: reported, source: replication-spec,
+     note: "EdgeRouter / VyOS 1.4.0 with the three reported interfaces, DNAT
+            on the edge, masquerade and static LAN route."}
+  - {path: /guests/1/role, classification: substituted, source: plan-defaults,
+     note: "OPNsense replaces the Palo Alto PA-VM2 (PAN-OS 11.0.2, expired
+            license). No PAN-OS/App-ID equivalence is claimed; the substitute
+            is labeled in all UI. Only the two Layer-3 NICs are reproduced;
+            the tap interface and separate management address are not."}
+  - {path: /guests/1/lab_only_defaults, classification: synthetic, source: lab-synthesis,
+     note: "Opening guest credentials are generated per lab generation and
+            disclosed to the captain; never the original values, never
+            platform accounts."}
+  - {path: /guests/2/services, classification: inferred, source: replication-spec,
+     note: "nginx 1.20.1 fronting .NET 8.0.31 nopCommerce is reported; the
+            exact nopCommerce release is unknown, so the pinned compatible
+            build is declared, not claimed as the original."}
+  - {path: /guests/2/resources, classification: synthetic, source: plan-defaults,
+     note: "Reduced-budget sizing from the plan table, not an observed value."}
+  - {path: /guests/3/resources, classification: synthetic, source: plan-defaults,
+     note: "Reported 15GB root LV at 96% full (snap/PowerShell log bloat) is
+            reproduced as BOUNDED synthetic content inside this guest's fixed
+            filesystem only; it can never consume the appliance evidence
+            reserve."}
+  - {path: /guests/3/services, classification: reported, source: replication-spec,
+     note: "Postfix 3.6.4 / Dovecot 2.3.16 / Apache+Roundcube 1.6.17 with
+            sqlsrv DSN to 172.20.240.120 and SMTP TLS verification disabled —
+            the reported vulnerable opening configuration. SMTP/Dovecot auth
+            against seeded identities must be proven end to end; SSSD join
+            alone proves neither."}
+  - {path: /guests/4/resources, classification: synthetic, source: plan-defaults,
+     note: "Original observed 16GB reduced to 8GB per the approved 64 GiB
+            profile; responsiveness is a measured live gate."}
+  - {path: /guests/4/services, classification: inferred, source: replication-spec,
+     note: "Splunk 10.0.2 on Debian 12 reported; ports 8000/8089/9997 were
+            never specified and are declared practice choices."}
+  - {path: /guests/5/services, classification: reported, source: replication-spec,
+     note: "Defender off and the weak HTTP WinRM listener (5985, AllowUnencrypted,
+            Basic, TrustedHosts *, relaxed CBT) are reported opening
+            weaknesses, pinned deliberately. Fresh lab-only CA material
+            (ca_priv.pem et al. under C:\\Users\\Administrator\\ca) is
+            regenerated; the original CA key is never used."}
+  - {path: /guests/6, classification: substituted, source: plan-defaults,
+     note: "SQL Server 2022 Developer on Server 2019 is the approved
+            reconstruction; original edition/version/auth were unrecorded. It
+            must serve BOTH a real nopCommerce-style store database and a
+            real Roundcube database (no fake SQL placeholders)."}
+  - {path: /guests/7, classification: reported, source: replication-spec,
+     note: "Ubuntu desktop: socket-activated sshd, CUPS on loopback :631,
+            Avahi, chrony, splunkfwd interactive bash; 3.3 GiB observed.
+            AD-join status is inferred from domain context and must be
+            verified, not assumed. Desktop cosmetics deferred."}
+  - {path: /guests/7/interfaces/0/ipv4/address, classification: synthetic, source: plan-defaults,
+     note: "Observed lease .112; reproduced as a deterministic DHCP reservation."}
+  - {path: /guests/8, classification: substituted, source: plan-defaults,
+     note: "Windows 11 Enterprise evaluation substitutes for the observed Pro
+            Education build 26200 when that media/entitlement is unavailable.
+            The E5-2697A v4 is NOT in Microsoft's published supported CPU
+            list: virtual-hardware/installer/UEFI/vTPM behavior must be
+            validated on the appliance before this guest is promised; no
+            check bypass or silent downgrade."}
+  - {path: /guests/8/interfaces/0/ipv4/address, classification: synthetic, source: plan-defaults,
+     note: "Observed lease .113; deterministic reservation."}
+  - {path: /guests/9, classification: reported, source: replication-spec,
+     note: "Team Kali per spec (SSH default-enabled, postgres/sysadmin users,
+            LightDM/NetworkManager/cups). Reduced 8->4 GiB per plan. It is
+            NOT the AI infrastructure attacker."}
+  - {path: /guests/10, classification: synthetic, source: plan-defaults,
+     note: "Separate infrastructure attacker required by the approved plan:
+            the AI never shares a login with the team's Kali, and enters via
+            the replica's routed/NAT path with no handed foothold."}
+  - {path: /guests/11, classification: synthetic, source: plan-defaults,
+     note: "Trusted external scoring vantage; never attacker-controlled,
+            never a management shortcut."}
+  - {path: /edges/2, classification: reported, source: replication-spec,
+     note: "DNAT destinations 172.25.31.{10,15,20,100,120} -> 172.20.240.same,
+            on the VyOS edge."}
+  - {path: /edges/10, classification: inferred, source: replication-spec,
+     note: "Ubuntu workstation Universal Forwarder reported; 9997 is the
+            standard receiver port, inferred (not observed)."}
+  - {path: /dns_records, classification: reported, source: replication-spec,
+     note: "Apex A + MX10 mail, host A records and CNAME aliases per the
+            spec; SRV records are the standard AD-generated set (labeled as
+            such). Reverse zones were unknown and are synthesized by the
+            provisioning layer, not claimed as original."}
+  - {path: /excluded/original-malware-c2, classification: excluded, source: plan-defaults,
+     note: "Original competition malware/C2 (claudestrike*, irqbalance-daemon,
+            net-pathd, rt-tagd, pamspam, time-slewd and friends), the listed
+            C2/staging addresses, original attacker keys and the original CA
+            key are NEVER reproduced or contacted. Incident artifacts are
+            not clean baseline requirements."}
+  - {path: /excluded/late-incident-artifacts, classification: excluded, source: plan-defaults,
+     note: "networkd-tmp.bak fake-systemd artifact, suspected trojaned
+            /bin/gz,/bin/tar (inference only), ccdcuser1 backup-admin, the
+            fake Coraza Apache module and attacker SSH-key history are late
+            incident state, excluded from the clean opening baseline."}
+  - {path: /excluded/cosmetics, classification: excluded, source: plan-defaults,
+     note: "Exact desktop disguises, broken menus, typing glitches, packet
+            counters, MACs, clock values and hardware strings are explicitly
+            not delivery gates; usable normal desktops ship initially."}
+  - {path: /excluded/mojang-diag, classification: excluded, source: plan-defaults,
+     note: "The old Mojang diagnostic endpoint vulnerability is never added
+            here; opening weaknesses come from the replica spec only."}

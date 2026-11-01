@@ -1,0 +1,304 @@
+# Underpressure Regional Water Authority — replica opening state.
+#
+# Reconstruction of the 10 competition machines plus the infrastructure
+# attacker and trusted scoring vantage. Addresses/hostnames/dependencies
+# follow the supplied Environment_Replication_Spec (REPORTED evidence —
+# screenshots/disks were not independently inspected); every deviation,
+# synthetic value and substitution is classified in fidelity.yaml. The
+# opening state reproduces the vulnerable START configuration; it is not a
+# snapshot of the original incident.
+#
+# Non-secret by construction: opening guest credentials are lab-generated
+# (never original, never platform), and this file references no media
+# paths, bridges or credentials. Bridges are bound to segment NAMES by the
+# operator-installed appliance manifest; scenarios/models cannot choose
+# them.
+schema_version: 1
+id: underpressure-range
+name: "Underpressure Regional Water Authority (replica)"
+domain: underpressure.local
+version: 1
+description: >-
+  Ten-machine defensive practice replica (VyOS edge, substitute perimeter
+  firewall, Rocky 9 store, Ubuntu mail, Debian 12 Splunk, Server 2022 AD/DNS,
+  Server 2019 SQL, joined Ubuntu and Windows workstations, team Kali) with a
+  separate infrastructure attacker and trusted scoring vantage. Vulnerable
+  opening configuration per the supplied spec; persistent team lab with
+  explicit, dependency-aware resets.
+
+resource_policy:
+  # 64 GiB / 16 vCPU candidate profile (plan input, NOT measured capacity;
+  # preflight must prove it on the actual appliance). Guest memory is never
+  # oversubscribed; vCPU oversubscription is explicit with an aggregate CPU
+  # limit so controller/broker/scoring keep headroom.
+  outer_memory_mb: 65536
+  outer_vcpus: 16
+  controller_reserve_mb: 8192
+  headroom_reserve_mb: 7168
+  aggregate_cpu_limit_percent: 350
+
+segments:
+  - name: team
+    purpose: team
+    cidr: 172.17.0.0/24
+    default_gateway: 172.17.0.1
+    egress_denied: true
+  - name: transit
+    purpose: transit
+    cidr: 172.16.0.0/24
+    egress_denied: true
+  - name: inside-lan
+    purpose: inside-lan
+    cidr: 172.20.240.0/24
+    default_gateway: 172.20.240.254
+    # Original pool unknown; deterministic lab pool holding the two
+    # workstation reservations (see fidelity).
+    dhcp_pool: 172.20.240.112/29
+    dns_servers: ["172.20.240.100"]
+    egress_denied: true
+  - name: wan
+    purpose: simulated-wan
+    cidr: 172.31.31.0/29
+    egress_denied: true
+  - name: public-nat
+    purpose: public-nat
+    cidr: 172.25.31.0/24
+    # VIP prefix routed by the simulated upstream; never bound to an inner
+    # guest interface. The red entry and scoring vantage are upstream
+    # clients; real egress stays appliance-denied.
+    egress_denied: true
+
+guests:
+  - name: vyos-edge
+    display_name: "EdgeRouter (VyOS 1.4.0)"
+    role: router
+    os: router
+    interfaces:
+      - segment: team
+        ipv4: {mode: static, address: 172.17.0.1}
+      - segment: transit
+        ipv4: {mode: static, address: 172.16.0.254}
+      - segment: wan
+        ipv4: {mode: static, address: 172.31.31.2}
+    resources: {vcpus: 1, memory_mb: 2048, disk_gb: 8}
+    boot: {firmware: efi, bootstrap: serial-seed, image_profile: router-vyos-140}
+    depends_on: []
+    services: []
+    lab_only_defaults: true
+
+  - name: opnsense-fw
+    display_name: "Perimeter firewall (OPNsense substitute for PA-VM2)"
+    role: firewall
+    os: linux
+    interfaces:
+      - segment: transit
+        ipv4: {mode: static, address: 172.16.0.1}
+      - segment: inside-lan
+        ipv4: {mode: static, address: 172.20.240.254}
+    resources: {vcpus: 2, memory_mb: 4096, disk_gb: 12}
+    boot: {firmware: efi, bootstrap: serial-seed, image_profile: firewall-opnsense}
+    depends_on: [vyos-edge]
+    services: []
+    lab_only_defaults: true
+
+  - name: ecomm
+    display_name: "Ecomm store (Rocky 9, nginx + nopCommerce/.NET 8)"
+    role: linux-server
+    os: linux
+    interfaces:
+      - segment: inside-lan
+        ipv4: {mode: static, address: 172.20.240.10}
+    resources: {vcpus: 2, memory_mb: 4096, disk_gb: 40}
+    boot: {firmware: efi, bootstrap: qga-ssh, image_profile: rocky9-ecomm}
+    depends_on: [ad-dns, mssql]
+    services: [nginx, nopcommerce, sssd-ad, ssh]
+    lab_only_defaults: true
+
+  - name: webmail
+    display_name: "webmail (Ubuntu 22.04, Postfix/Dovecot/Roundcube)"
+    role: mail-server
+    os: linux
+    interfaces:
+      - segment: inside-lan
+        ipv4: {mode: static, address: 172.20.240.15}
+    resources: {vcpus: 2, memory_mb: 4096, disk_gb: 40}
+    boot: {firmware: efi, bootstrap: qga-ssh, image_profile: ubuntu2204-mail}
+    depends_on: [ad-dns, mssql]
+    services: [postfix, dovecot, roundcube, sssd-ad, ssh]
+    lab_only_defaults: true
+
+  - name: splunk
+    display_name: "Splunk (Debian 12, Splunk Enterprise 10.0.2)"
+    role: splunk-server
+    os: linux
+    interfaces:
+      - segment: inside-lan
+        ipv4: {mode: static, address: 172.20.240.20}
+    resources: {vcpus: 2, memory_mb: 8192, disk_gb: 120}
+    boot: {firmware: efi, bootstrap: qga-ssh, image_profile: debian12-splunk}
+    depends_on: [ad-dns]
+    services: [splunk, syslog-receiver, sssd-ad, ssh]
+    lab_only_defaults: true
+
+  - name: ad-dns
+    display_name: "AD-DNS (Server 2022 Standard, domain controller)"
+    role: windows-dc
+    os: windows
+    interfaces:
+      - segment: inside-lan
+        ipv4: {mode: static, address: 172.20.240.100}
+    resources: {vcpus: 2, memory_mb: 4096, disk_gb: 64}
+    boot: {firmware: efi, bootstrap: qga-winrm, image_profile: ws2022-dc}
+    depends_on: []
+    services: [active-directory, dns, winrm, ca-fileshare]
+    lab_only_defaults: true
+
+  - name: mssql
+    display_name: "MSSQL (Server 2019 Standard + SQL Server 2022 Developer)"
+    role: windows-sql
+    os: windows
+    interfaces:
+      - segment: inside-lan
+        ipv4: {mode: static, address: 172.20.240.120}
+    resources: {vcpus: 2, memory_mb: 6144, disk_gb: 80}
+    boot: {firmware: efi, bootstrap: qga-winrm, image_profile: ws2019-sql}
+    depends_on: [ad-dns]
+    services: [mssql]
+    lab_only_defaults: true
+
+  - name: ubuntu-wkst
+    display_name: "Ubuntu workstation (KDE, Splunk forwarder)"
+    role: linux-desktop
+    os: linux
+    interfaces:
+      - segment: inside-lan
+        ipv4: {mode: dhcp, address: 172.20.240.112}
+    resources: {vcpus: 2, memory_mb: 3072, disk_gb: 60}
+    boot: {firmware: efi, bootstrap: qga-ssh, image_profile: ubuntu-desktop}
+    depends_on: [ad-dns, splunk]
+    services: [ssh, splunk-forwarder, cups, avahi, chrony, sssd-ad]
+    lab_only_defaults: true
+
+  - name: win11-wkst
+    display_name: "WIN11-WKST (Windows 11 Enterprise evaluation substitute)"
+    role: windows-desktop
+    os: windows
+    interfaces:
+      - segment: inside-lan
+        ipv4: {mode: dhcp, address: 172.20.240.113}
+    resources: {vcpus: 2, memory_mb: 6144, disk_gb: 60}
+    boot: {firmware: efi-tpm, bootstrap: qga-winrm, image_profile: win11-ent-eval}
+    depends_on: [ad-dns]
+    services: []
+    lab_only_defaults: true
+
+  - name: team-kali
+    display_name: "Team Kali (competition team tooling VM)"
+    role: attacker
+    os: linux
+    interfaces:
+      - segment: team
+        ipv4: {mode: static, address: 172.17.0.2}
+    resources: {vcpus: 2, memory_mb: 4096, disk_gb: 40}
+    boot: {firmware: efi, bootstrap: qga-ssh, image_profile: kali-rolling}
+    depends_on: [vyos-edge]
+    services: [ssh]
+    lab_only_defaults: true
+
+  - name: red-entry
+    display_name: "Infrastructure attacker (AI offense; separate from team Kali)"
+    role: red-entry
+    os: linux
+    interfaces:
+      - segment: public-nat
+        ipv4: {mode: static, address: 172.25.31.250}
+    resources: {vcpus: 2, memory_mb: 2048, disk_gb: 20}
+    boot: {firmware: efi, bootstrap: qga-ssh, image_profile: attacker-debian}
+    depends_on: []
+    services: [ssh]
+    lab_only_defaults: true
+
+  - name: scoring-vantage
+    display_name: "Trusted scoring vantage (external observer; not attacker-controlled)"
+    role: scoring
+    os: linux
+    interfaces:
+      - segment: public-nat
+        ipv4: {mode: static, address: 172.25.31.240}
+    resources: {vcpus: 1, memory_mb: 2048, disk_gb: 20}
+    boot: {firmware: efi, bootstrap: qga-ssh, image_profile: scoring-debian}
+    depends_on: []
+    services: []
+    lab_only_defaults: false
+
+edges:
+  # --- routing / NAT (VyOS per spec: DNAT lives on the edge, not the firewall)
+  - {kind: routes, src: vyos-edge, dst: wan, protocol: tcp,
+     detail: "Masquerade 172.16.0.0/12 out eth2; static route 172.20.240.0/24 via 172.16.0.1"}
+  - {kind: ntp, src: vyos-edge, dst: wan, protocol: udp, port: 123,
+     detail: "NTP names from the spec become simulated/offline build inputs; never real egress"}
+  - {kind: nat, src: vyos-edge, dst: ecomm,
+     detail: "DNAT 172.25.31.10 -> 172.20.240.10 (public store VIP)"}
+  - {kind: nat, src: vyos-edge, dst: webmail,
+     detail: "DNAT 172.25.31.15 -> 172.20.240.15 (public mail VIP)"}
+  - {kind: nat, src: vyos-edge, dst: splunk,
+     detail: "DNAT 172.25.31.20 -> 172.20.240.20 (public splunk VIP)"}
+  - {kind: nat, src: vyos-edge, dst: ad-dns,
+     detail: "DNAT 172.25.31.100 -> 172.20.240.100 (public directory VIP)"}
+  - {kind: nat, src: vyos-edge, dst: mssql,
+     detail: "DNAT 172.25.31.120 -> 172.20.240.120 (public database VIP)"}
+  # --- perimeter substitute: documented permissive inner starting behavior
+  - {kind: dhcp, src: opnsense-fw, dst: inside-lan, port: 67, protocol: udp,
+     detail: "DHCP from the perimeter firewall; deterministic reservations for the two workstations"}
+  - {kind: routes, src: opnsense-fw, dst: inside-lan,
+     detail: "Permit Outbound any/any application-default; Permit Inbound external/any application-default; no security profiles attached (substitute labels differences vs PAN-OS App-ID)"}
+  - {kind: routes, src: vyos-edge, dst: team,
+     detail: "Team segment reaches the replica via routed path through transit/firewall; masqueraded public address only"}
+  # --- syslog / telemetry
+  - {kind: syslog, src: vyos-edge, dst: splunk, port: 5514, protocol: udp,
+     detail: "Edge syslog to 172.20.240.20:5514/udp"}
+  - {kind: syslog, src: ubuntu-wkst, dst: splunk, port: 9997, protocol: tcp,
+     detail: "Splunk Universal Forwarder to 9997 (port inferred; see fidelity)"}
+  # --- application dependencies (provisioning order + real traffic)
+  - {kind: sql, src: ecomm, dst: mssql, port: 1433, protocol: tcp,
+     detail: "nopCommerce application database on 172.20.240.120:1433 (exact original db/login unknown -> synthetic seeds)"}
+  - {kind: sql, src: webmail, dst: mssql, port: 1433, protocol: tcp,
+     detail: "Roundcube DSN sqlsrv database roundcube on 172.20.240.120:1433"}
+  - {kind: dns, src: ecomm, dst: ad-dns, port: 53, protocol: udp, detail: "AD DNS (SSSD realm underpressure.local)"}
+  - {kind: ldap, src: ecomm, dst: ad-dns, port: 389, protocol: tcp, detail: "SSSD AD provider, ldap_id_mapping"}
+  - {kind: kerberos, src: ecomm, dst: ad-dns, port: 88, protocol: tcp, detail: "SSSD AD provider Kerberos"}
+  - {kind: dns, src: webmail, dst: ad-dns, port: 53, protocol: udp, detail: "SSSD (access_provider permit; different homedir pattern than ecomm)"}
+  - {kind: ldap, src: webmail, dst: ad-dns, port: 389, protocol: tcp, detail: "SSSD AD provider on webmail"}
+  - {kind: dns, src: splunk, dst: ad-dns, port: 53, protocol: udp, detail: "SSSD/oddjob domain-joined vantage"}
+  - {kind: ldap, src: splunk, dst: ad-dns, port: 389, protocol: tcp, detail: "Splunk AD login integration path"}
+  - {kind: dns, src: ubuntu-wkst, dst: ad-dns, port: 53, protocol: udp, detail: "Domain/DNS client to AD DNS"}
+  - {kind: dns, src: win11-wkst, dst: ad-dns, port: 53, protocol: udp, detail: "Domain member DNS"}
+  - {kind: kerberos, src: win11-wkst, dst: ad-dns, port: 88, protocol: tcp, detail: "Domain member authentication"}
+  - {kind: smb, src: win11-wkst, dst: ad-dns, port: 445, protocol: tcp, detail: "Domain member SMB/DC traffic"}
+
+dns_records:
+  - {name: underpressure.local, type: A, value: 172.20.240.100}
+  - {name: ad-dns.underpressure.local, type: A, value: 172.20.240.100}
+  - {name: dc.underpressure.local, type: A, value: 172.20.240.100}
+  - {name: ecomm.underpressure.local, type: A, value: 172.20.240.10}
+  - {name: mail.underpressure.local, type: A, value: 172.20.240.15}
+  - {name: splunk.underpressure.local, type: A, value: 172.20.240.20}
+  - {name: mssql.underpressure.local, type: A, value: 172.20.240.120}
+  - {name: win11-wkst.underpressure.local, type: A, value: 172.20.240.113}
+  - {name: underpressure.local, type: MX, value: mail.underpressure.local, preference: 10}
+  - {name: ca.underpressure.local, type: CNAME, value: dc.underpressure.local}
+  - {name: pki.underpressure.local, type: CNAME, value: dc.underpressure.local}
+  - {name: dns.underpressure.local, type: CNAME, value: dc.underpressure.local}
+  - {name: ldap.underpressure.local, type: CNAME, value: dc.underpressure.local}
+  - {name: ns1.underpressure.local, type: CNAME, value: dc.underpressure.local}
+  - {name: db.underpressure.local, type: CNAME, value: mssql.underpressure.local}
+  - {name: sql.underpressure.local, type: CNAME, value: mssql.underpressure.local}
+  - {name: imap.underpressure.local, type: CNAME, value: mail.underpressure.local}
+  - {name: pop3.underpressure.local, type: CNAME, value: mail.underpressure.local}
+  - {name: smtp.underpressure.local, type: CNAME, value: mail.underpressure.local}
+  - {name: webmail.underpressure.local, type: CNAME, value: mail.underpressure.local}
+  - {name: shop.underpressure.local, type: CNAME, value: ecomm.underpressure.local}
+  - {name: store.underpressure.local, type: CNAME, value: ecomm.underpressure.local}
+  - {name: www.underpressure.local, type: CNAME, value: ecomm.underpressure.local}
+  - {name: _ldap._tcp.dc._msdcs.underpressure.local, type: SRV, value: "0 100 389 dc.underpressure.local"}
+  - {name: _kerberos._tcp.dc._msdcs.underpressure.local, type: SRV, value: "0 100 88 dc.underpressure.local"}

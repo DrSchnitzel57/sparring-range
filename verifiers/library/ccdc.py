@@ -33,9 +33,22 @@ class PathArg(HostArg):
     @field_validator("path")
     @classmethod
     def _abs_path(cls, v: str) -> str:
-        if not v.startswith("/") or ".." in v.split("/") or len(v) > 512:
-            raise ValueError("path must be absolute and traversal-free")
-        return v
+        # POSIX absolute paths: as always, traversal-free.
+        if v.startswith("/"):
+            if ".." in v.split("/") or len(v) > 512:
+                raise ValueError("path must be absolute and traversal-free")
+            return v
+        # Windows absolute drive paths (Underpressure Windows guests):
+        # drive-letter prefix only, traversal-free, and FORWARD-SLASH
+        # separators beyond the drive (backslashes are excluded to keep the
+        # quoting story uniform; scenario data normalizes to `/`).
+        # The EXEC CHANNEL decides what it can honestly observe; the args
+        # contract just refuses non-absolute/traversal shapes.
+        if re.fullmatch(r"[A-Za-z]:[/\\][^:|;&<>\"'`$*?\\]{0,508}", v):
+            if ".." in re.split(r"[/\\]", v):
+                raise ValueError("path must be absolute and traversal-free")
+            return v
+        raise ValueError("path must be absolute (/... or X:/...) and traversal-free")
 
 
 class ServiceArg(HostArg):
