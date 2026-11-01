@@ -35,9 +35,13 @@ shadowing Python's `platform` module.
 - Events are append-only; reports/specifications are versioned. Use forward
   migrations, not edits to applied migrations. Mutable operational metadata is
   an explicit exception, not permission to rewrite evidence.
-- The appliance targets fresh installs only: no migration path from an older
-  installation is required (operator decision 2026-11-01). Preserving-upgrade
-  and legacy-compatibility machinery stays green until retired, never extended.
+- The appliance is fully fresh-replacement: no data, upgrade path or
+  byte-compatibility from an older installation is preserved (operator
+  decision 2026-11-01, widened same day) — drop old contracts when the change
+  serves current goals. Preserving-upgrade and legacy-compatibility machinery
+  stays green until retired, never extended. This relaxes compatibility only:
+  authority, isolation, append-only evidence and fail-closed obligations stay
+  fully binding.
 - Verified scores require deterministic authenticated evidence; subjective
   feedback cannot award verified points. Enforce competition visibility in APIs.
   Compromised-host telemetry is not independent truth.
