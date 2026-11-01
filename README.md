@@ -12,9 +12,11 @@ disposable nested full VMs and the existing external inference endpoint. The
 appliance holds no outer-Proxmox credentials. See the
 [current architecture](docs/ARCHITECTURE.md#ubuntukvm-appliance--2026-10-20) and
 [three-milestone completion sequence](docs/ROADMAP.md#current-completion-sequence--draft-2026-10-20).
-Subsequent scoped SSH/isolation commissioning is recorded in the findings ledger;
-approved upgrade plans 18–21 and whole-release acceptance remain outstanding.
-Older deployment/baseline prose below is historical, not the new installation path.
+Scoped SSH/isolation commissioning is recorded in the findings ledger; the
+installed appliance remains **not accepted** for live model-driven practice,
+and the Underpressure team-practice feature is under construction
+(incomplete, not accepted). Older deployment/baseline prose below is
+historical, not the new installation path.
 
 ## Current project contract
 
@@ -31,7 +33,7 @@ OpenChamber Todos hold actionable work; `.openchamber/plans/` contains saved
 implementation agreements. Existing numbered plans and roadmap entries remain
 traceable history, not a required milestone process. Planning/implementation/review
 use native OpenChamber flows and task-selected models, without a custom global
-rulebook. [Historical agent receipts](docs/AGENT_HISTORY.md) are not current policy.
+rulebook.
 
 ## Agreed first release
 
@@ -50,9 +52,10 @@ current UI. Windows/AD follows the first Linux release.
 Attacker and targets are full VMs, not LXCs. The existing inference LXC on the
 same R740 serves the operator's Qwen 3.8 Flash Next endpoint outside the attack
 network. AI commands never receive Proxmox/host-root, DB-owner, verifier or NAS
-authority. A private deterministic deployment service with restricted PVE access
-and permanent operator-configured isolation is planned; current privileged nft
-wiring is **not** the accepted production design.
+authority. A private deterministic broker holding the sole local-libvirt
+authority, with permanent operator-configured isolation, is the appliance
+design (the legacy direct-PVE adapter is retired); privileged nft wiring from
+that era is **not** the accepted production design.
 
 ## Repository layout
 
@@ -60,12 +63,12 @@ wiring is **not** the accepted production design.
 |---|---|
 | `srplatform/` | FastAPI, DB/migrations, scenario engine, bastion, supervised worker, coach and safety |
 | `rangectl/` | HTTP CLI client; explicit offline DB migration/admin exceptions |
-| `infra/` | Existing PVE adapter, image/cloud-init, runner and dev deployment artifacts |
+| `infra/` | Appliance/broker/image builds and dev acceptance tooling (the legacy PVE adapter is retired) |
 | `scenarios/` | Validated YAML snapshots; usable release presets still need completion |
 | `verifiers/` | Trusted deterministic state checks, not model self-reported success |
 | `telemetry/` | Linux audit shipper/spool/unit and later Windows artifacts |
 | `web/` | Next.js Pages Router client of the same API |
-| `tests/`, `audit/` | Regression/integration tests and preserved historical probes |
+| `tests/` | Regression/integration tests |
 | `.openchamber/plans/` | Agreed milestone plans only |
 
 The Python package is `srplatform`, not `platform`, to avoid shadowing the Python

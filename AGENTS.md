@@ -35,6 +35,9 @@ shadowing Python's `platform` module.
 - Events are append-only; reports/specifications are versioned. Use forward
   migrations, not edits to applied migrations. Mutable operational metadata is
   an explicit exception, not permission to rewrite evidence.
+- The appliance targets fresh installs only: no migration path from an older
+  installation is required (operator decision 2026-11-01). Preserving-upgrade
+  and legacy-compatibility machinery stays green until retired, never extended.
 - Verified scores require deterministic authenticated evidence; subjective
   feedback cannot award verified points. Enforce competition visibility in APIs.
   Compromised-host telemetry is not independent truth.
@@ -59,5 +62,10 @@ prerequisites first. DB fixtures require disposable `srtest_*` databases via
 `npm ci` and `npm run build` in `web/`; browser acceptance is separate. Do not
 displace OpenChamber or another service to free a port.
 
-Old test totals and task-specific authorizations are retained in
-[historical receipts](docs/AGENT_HISTORY.md), not fresh baseline results.
+## Working agreement
+
+Feature work proceeds as small contract-bounded slices; each slice gets ONE
+fresh-session review against its contract, with at most one fix round. Receipts
+are recorded in the findings ledger only for live-appliance gates. The
+per-review-round bundle re-seal and receipt-bundle ceremony is retired; dated
+process history lives in Git, not in fresh documents.
