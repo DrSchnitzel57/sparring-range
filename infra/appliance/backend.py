@@ -497,16 +497,19 @@ class LibvirtBackend:
         dom, desc = self._find(int(vmid), node)
         if dom is None or desc is None:
             raise BackendUnavailable(f"VMID {vmid} has no appliance domain")
+        prev_ipconfig0 = desc.get("ipconfig0")
         nic_indices = sorted({
-            int(m.group(2)) for key in cfg
+            int(m.group(1)) for key in cfg
             if (m := re.fullmatch(r"(?:net|ipconfig)(\d+)", key))})
         nic_change = any(re.fullmatch(r"net\d+", k) for k in cfg)
         changed = False
         nic_converged = False
         for key in ("name", "net0", "ipconfig0", "tags"):
             if key in cfg and cfg[key] is not None:
-                desc[key] = str(cfg[key])
-                changed = True
+                val = str(cfg[key])
+                if desc.get(key) != val:
+                    desc[key] = val
+                    changed = True
         if nic_indices:
             # The full effective vector (net0..net{max}) is rewritten from
             # THIS config; every NIC's address binds to the segment bridge
@@ -565,6 +568,13 @@ class LibvirtBackend:
                         f"{got} is not the wanted {want}: NIC layout "
                         "changes require a stopped domain (redefine would "
                         "not take effect until reboot — never claim it did)")
+                if ("ipconfig0" in cfg
+                        and str(cfg["ipconfig0"]) != str(prev_ipconfig0 or "")):
+                    raise BackendUnavailable(
+                        f"VMID {vmid} domain is running: the NIC vector "
+                        "already matches but ipconfig0 differs from the "
+                        "recorded binding — an address re-bind needs a "
+                        "stopped domain, never a silent seed swap")
                 nic_converged = True
             for n in nics:
                 desc[f"net{n['index']}"] = f"virtio,bridge={n['bridge']}"
@@ -575,7 +585,7 @@ class LibvirtBackend:
             if not nic_converged:
                 changed = True
         image = self._image(int(desc["template_id"]))
-        if "ipconfig0" in cfg:
+        if "ipconfig0" in cfg and not nic_converged:
             m = re.fullmatch(r"ip=([0-9.]+)/(\d+)", str(cfg["ipconfig0"]))
             if not m:
                 raise BackendUnavailable("ipconfig0 must be ip=<addr>/<prefix>")
