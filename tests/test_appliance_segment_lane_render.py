@@ -174,3 +174,56 @@ def test_bundle_ships_environments_and_no_dead_dirs():
     assert is_runtime("environments/underpressure-range/blueprint.yaml")
     # the archived audit/ dir was removed; a dead payload name only drifts
     assert "audit" not in APP_DIRS and "audit" not in RUNTIME_DIRS
+
+
+def test_segment_bridges_render_as_unnumbered_pairs(tmp_path):
+    """The broker boots every env-lane NIC onto its segment bridge BY NAME;
+    the installer must therefore CREATE the declared bridges (a fresh
+    segment-declaring appliance had only srlab0 and the first env clone
+    failed on the missing bridge — commissioning find 2026-11-02). Each
+    non-range bridge gets an unnumbered netdev+network pair; the range
+    bridge keeps its single addressed rendering."""
+    from infra.appliance.netrules import (render_networkd,
+                                          render_segment_bridge_files)
+
+    m = _segmented(tmp_path / "seg")
+    files = dict(render_segment_bridge_files(m))
+
+    assert "10-sr-team.netdev" in files and "20-sr-team.network" in files
+    assert "10-sr-transit.netdev" in files and "20-sr-transit.network" in files
+    for bridge in ("sr-team", "sr-transit"):
+        netdev = files[f"10-{bridge}.netdev"]
+        assert f"Name={bridge}\nKind=bridge" in netdev, netdev
+        network = files[f"20-{bridge}.network"]
+        assert f"Name={bridge}\n" in network
+        assert "ConfigureWithoutCarrier=yes" in network
+        # UNNUMBERED: segment addressing is a guest-router job, never a
+        # host-side address or default route.
+        assert "Address=" not in network, network
+        assert "Gateway=" not in network, network
+    # the range segment shares srlab0: never a second, unnumbered
+    # rendering that would fight the addressed one
+    assert not any("srlab0" in name for name in files), files
+    assert "srlab0" in render_networkd(m)
+
+    # a lane with ONLY the range segment renders no extra files at all
+    range_only = _segmented(tmp_path / "ro",
+                            segments=[SEG_LANE[0]], max_nics=1)
+    assert render_segment_bridge_files(range_only) == []
+
+
+def test_installer_plan_wires_the_segment_bridges(tmp_path):
+    """The rendering is only useful if the INSTALL PLAN writes it: a
+    segment-declaring manifest must put every segment bridge's netdev and
+    network file into the networkd directory."""
+    from deploy import appliance as ap
+
+    m = _segmented(tmp_path / "seg")
+    lay = ap.default_layout(root=tmp_path / "r")
+    plan = ap.render_files(m, layout=lay)
+    names = {f.path.name for f in plan.files
+             if str(f.path).startswith(str(lay.network_dir))}
+    assert {"10-sr-team.netdev", "20-sr-team.network",
+            "10-sr-transit.netdev", "20-sr-transit.network"} <= names, names
+    # the range bridge is still rendered exactly once, addressed
+    assert "10-srlab.netdev" in names and "20-srlab.network" in names

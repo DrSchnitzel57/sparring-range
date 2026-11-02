@@ -147,3 +147,32 @@ def render_networkd(m: ApplianceManifest) -> str:
         "IPv6AcceptRA=no\n"
         "IPMasquerade=no\n"
     )
+
+
+def render_segment_bridge_files(m: ApplianceManifest) -> list[tuple[str, str]]:
+    """Unnumbered bridges for the operator's approved lab SEGMENTS.
+
+    The broker boots every environment-lane NIC onto its segment bridge by
+    NAME, so the appliance installation must create them — an appliance
+    whose manifest declares segments the host has no bridge for fails at
+    the FIRST clone (live commissioning find, 2026-11-02). Deliberately
+    UNNUMBERED: routing/addressing between segments is a guest (router)
+    job, never a host-side default. The range bridge keeps its own
+    addressed rendering and is never duplicated here. Returns
+    (filename, content) pairs for the installer to write."""
+    n = m.network
+    files: list[tuple[str, str]] = []
+    for seg in n.segments:
+        if seg.bridge == n.range_bridge:
+            continue  # the range segment IS srlab0, already rendered
+        files.append((f"10-{seg.bridge}.netdev",
+                      f"[NetDev]\nName={seg.bridge}\nKind=bridge\n"))
+        files.append((f"20-{seg.bridge}.network",
+                      "[Match]\n"
+                      f"Name={seg.bridge}\n"
+                      "[Network]\n"
+                      "ConfigureWithoutCarrier=yes\n"
+                      "LinkLocalAddressing=no\n"
+                      "IPv6AcceptRA=no\n"
+                      "IPMasquerade=no\n"))
+    return files

@@ -53,6 +53,7 @@ if str(ROOT) not in sys.path:
 
 from infra.appliance.manifest import ApplianceManifest  # noqa: E402
 from infra.appliance.netrules import (nft_scope_problems, render_networkd,
+                                      render_segment_bridge_files,
                                       render_nftables)  # noqa: E402
 from infra.appliance.policy import AppliancePolicy  # noqa: E402
 
@@ -799,6 +800,12 @@ def render_files(m: ApplianceManifest, *,
                      render_web_unit(lay, _appliance_node_binary()), 0o644),
         RenderedFile(lay.nginx_dir / "sparring-range.conf",
                      render_nginx_site(m, lay), 0o644),
+        # Segment lane: one unnumbered bridge per operator-approved segment.
+        # The broker boots environment-lane NICs onto these BY NAME; a
+        # manifest that declares segments the host has no bridge for fails
+        # at the first env clone (live commissioning find, 2026-11-02).
+        *[RenderedFile(lay.network_dir / name, content, 0o644)
+          for name, content in render_segment_bridge_files(m)],
     ]
     actions = [
         "create groups: " + ", ".join(GROUPS),
@@ -1234,6 +1241,13 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
     if not lay.sandboxed:
         run("systemctl", "daemon-reload", check=False)
         _apply_sysctls(run)
+        # Load written networkd config (segment bridges included). This is
+        # non-disruptive: re-reading config creates missing link devices
+        # but never removes an existing bridge, address or route, and it
+        # touches no firewall state. Segment bridges must exist BEFORE the
+        # broker's first env-lane clone names them (commissioning find
+        # 2026-11-02); waiting for a reboot would strand deploys silently.
+        run("networkctl", "reload", check=False)
         # Network artifacts are installed but not applied to the host by this
         # command: the operator applies them during the approved maintenance
         # window after reviewing the generated rules.  The netrules LOADER is
