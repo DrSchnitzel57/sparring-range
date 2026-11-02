@@ -32,7 +32,7 @@ jobs:
     # classification invariants: every test is fast-default or a required
     # layer; required modes fail for absent prereqs / empty selections
     timeout-minutes: 15
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -47,7 +47,7 @@ jobs:
     # fresh locked installs + dependency consistency + entrypoint imports
     # across the supported matrix (no re-resolve: exact pins, --no-deps app)
     timeout-minutes: 20
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
@@ -74,7 +74,7 @@ jobs:
     # layer includes worker-chain tests that ALSO need the containment
     # boundary, so this job provides BOTH prerequisites.
     timeout-minutes: 40
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -175,7 +175,7 @@ jobs:
     # real supervisor + namespace boundary regressions under an explicitly
     # delegated cgroup v2 subtree, unprivileged identity, required mode
     timeout-minutes: 30
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -196,7 +196,7 @@ jobs:
     # broker private boundary: policy, durable ledger, real mutual-TLS,
     # cessation read-back + lease races (infrastructure-free, required mode)
     timeout-minutes: 20
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -212,7 +212,7 @@ jobs:
     # as root ONLY so they can create DISPOSABLE network namespaces — the
     # tests never apply rules to the host namespace
     timeout-minutes: 30
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -227,7 +227,7 @@ jobs:
   frontend:
     # npm ci + production build + zero high/critical production audit
     timeout-minutes: 20
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -247,7 +247,7 @@ jobs:
     # real image build + bootstrap + idempotent rerun with run-owned
     # project/ports and synthetic credentials; cleans only its own stack
     timeout-minutes: 40
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -268,7 +268,7 @@ jobs:
     # its own disposable postgres:16). The boundary probe needs the same
     # delegated-cgroup + userns-profile prerequisites as db/containment.
     timeout-minutes: 60
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -292,7 +292,7 @@ jobs:
     # crash/outage/reboot/overflow, bastion casts/replay, and a REAL isolated
     # QEMU boot. Same bounds/isolation/prerequisites as the images job.
     timeout-minutes: 60
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -317,7 +317,7 @@ jobs:
     # and dist dir are run-owned. Required mode: no silent skips.
     needs: [frontend]
     timeout-minutes: 40
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
