@@ -201,6 +201,23 @@ def test_readiness_exempts_environment_guests_from_pin_inventory():
     assert reasons
 
 
+def test_enrollment_rows_exempt_environment_guests():
+    """The telemetry-enrollment half of the environment_guest exemption:
+    only CREATED golden-lane rows are scanned. Environment rows never
+    enter the enrollment inventory; golden rows still do (no waiver)."""
+    import types as _types
+
+    from srplatform.verification_service import _enrollment_rows
+
+    dep = _types.SimpleNamespace(resources=[
+        {"host": "alpha", "state": "created", "environment_guest": True},
+        {"host": "attacker", "state": "created"},
+        {"host": "web", "state": "destroyed"},
+        {"host": "db", "state": "created", "environment_guest": False}])
+    assert [r["host"] for r in _enrollment_rows(dep)] == ["attacker", "db"]
+    assert _enrollment_rows(None) == []
+
+
 def test_domain_uuid_helper_returns_canonical_text_uuid():
     """libvirt's UUID() is raw BYTES; str() of those is a malformed
     <uuid> element that real libvirt rejects (the fake backend objects

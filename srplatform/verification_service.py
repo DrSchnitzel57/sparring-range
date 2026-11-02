@@ -186,6 +186,17 @@ def _pin_items(dep) -> tuple[list, list]:
     return items, reasons
 
 
+def _enrollment_rows(dep) -> list:
+    """Resource rows whose telemetry enrollment readiness must confirm:
+    CREATED golden-lane guests. Environment-lane rows are exempt by
+    contract (env_deploy docstring) — requiring enrollment there would
+    strand every environment deploy, but golden truth is never waived."""
+    if dep is None:
+        return []
+    return [r for r in (dep.resources or [])
+            if r.get("state") == "created" and not r.get("environment_guest")]
+
+
 def readiness_checks(db: Session, session_id) -> dict:
     """Service-readiness gate for the provisioning contract (audit N10 item
     4, T05, T06): every service declared by the session's snapshot topology
@@ -209,22 +220,13 @@ def readiness_checks(db: Session, session_id) -> dict:
     enroll_items = []
     dep = active_deployment(db, session_id)
     from srplatform.scenario_engine import orchestrator
-    if dep is not None:
-        for r in (dep.resources or []):
-            if r.get("state") != "created":
-                continue
-            if r.get("environment_guest"):
-                # Environment-lane guests carry no golden telemetry agent by
-                # contract (env_deploy docstring); their attestation and
-                # shipper work lands separately, and requiring enrollment
-                # here would strand every environment deploy.
-                continue
-            phase = (r.get("telemetry_enroll") or {}).get("phase")
-            evidence_ok = orchestrator.enrollment_evidence_current(
-                db, session_id, r.get("host"), dep.deployment_id)
-            enroll_items.append({"host": r.get("host"), "phase": phase,
-                                 "evidence_current": evidence_ok,
-                                 "ok": phase == "confirmed" and evidence_ok})
+    for r in _enrollment_rows(dep):
+        phase = (r.get("telemetry_enroll") or {}).get("phase")
+        evidence_ok = orchestrator.enrollment_evidence_current(
+            db, session_id, r.get("host"), dep.deployment_id)
+        enroll_items.append({"host": r.get("host"), "phase": phase,
+                             "evidence_current": evidence_ok,
+                             "ok": phase == "confirmed" and evidence_ok})
     enroll_enforced = orchestrator.enrollment_channel_available()
     pin_items, pin_reasons = _pin_items(dep)
     if pin_items:

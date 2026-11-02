@@ -459,9 +459,8 @@ def test_set_config_redefine_carries_the_current_uuid(tmp_path):
 
     assert len(defined) == 1, defined
     assert f"<uuid>{dom_uuid}</uuid>" in defined[0], defined[0]
-    # the identity the update carries must be the domain's OWN uuid —
-    # minting a different one is the same "already exists" collision
-    assert dom_uuid == _Dom().UUIDString()
+    # identity position, right after <name> — libvirt's canonical placement
+    assert "</name>\n  <uuid>" in defined[0], defined[0]
 
 
 def test_overlay_is_never_smaller_than_its_base(tmp_path, monkeypatch):

@@ -378,3 +378,51 @@ def test_worker_unit_and_provisioned_directory_never_diverge(tmp_path):
                 / "deploy" / "systemd" / "sr-worker-supervisor.service")
     if str(m.state_dir) == "/var/lib/sparring-range":
         assert unit_def == template.read_text()
+
+
+# --------------------------------------------------------------------------- #
+# verifier pinned known-hosts bootstrap (commissioning find 2026-11-02)         #
+# --------------------------------------------------------------------------- #
+
+def test_range_hosts_bootstrapped_create_if_missing(tmp_path):
+    """The management exec channel counts as configured only when the
+    verifier's pinned known-hosts file EXISTS (a fresh box had only the
+    directory and stranded every readiness check). It is created 640
+    srrange:srrange — and an existing file with real pins is NEVER
+    touched, because truncating it would silently un-pin every host."""
+    import subprocess
+
+    root = tmp_path / "root"
+    range_hosts = None
+
+    # first apply: the file does not exist -> created with pins preserved
+    m_path = _manifest(tmp_path)
+    from deploy import appliance as ap
+    m = ap.ApplianceManifest.load(m_path)
+    lay = ap.default_layout(root=root)
+    sm = ap.sandbox_manifest(m, root)
+    range_hosts = pathlib.Path(sm.state_dir) / "known_hosts/range_hosts"
+
+    def real(*cmd, check=True, **kw):
+        return subprocess.run([str(c) for c in cmd], check=check,
+                              capture_output=True)
+
+    ap._ensure_dirs(sm, real, lay)
+    assert range_hosts.is_file(), "fresh apply must bootstrap the file"
+    assert stat.S_IMODE(range_hosts.stat().st_mode) == 0o640
+
+    range_hosts.write_text("ssh-ed25519 AAAAREALPIN pinned-host\n")
+    ap._ensure_dirs(sm, real, lay)
+    assert range_hosts.read_text().endswith("pinned-host\n"), \
+        "re-apply must never truncate real pins"
+
+    # and when it exists, no install command for it is issued at all
+    calls: list[tuple] = []
+
+    def recording(*cmd, check=True, **kw):
+        calls.append(tuple(str(a) for a in cmd))
+        return _Res()
+
+    ap._ensure_dirs(sm, recording, lay)
+    assert not [c for c in calls if c[0] == "install" and "range_hosts" in c], \
+        calls
