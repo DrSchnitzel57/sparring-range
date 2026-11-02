@@ -227,3 +227,17 @@ def test_installer_plan_wires_the_segment_bridges(tmp_path):
             "10-sr-transit.netdev", "20-sr-transit.network"} <= names, names
     # the range bridge is still rendered exactly once, addressed
     assert "10-srlab.netdev" in names and "20-srlab.network" in names
+
+
+def test_bridge_named_srlab_is_reserved(tmp_path):
+    """The static range pair is written as 10-srlab.netdev/20-srlab.network;
+    a segment bridge literally named 'srlab' would derive the SAME paths and
+    silently shadow the addressed range rendering (last write wins). The
+    manifest refuses the collision at load."""
+    import pytest
+
+    from infra.appliance.manifest import ManifestError
+
+    clash = [{"name": "sneaky", "bridge": "srlab", "cidr": "172.19.0.0/24"}]
+    with pytest.raises(ManifestError, match="reserved"):
+        _segmented(tmp_path / "clash", segments=[SEG_LANE[0], *clash])

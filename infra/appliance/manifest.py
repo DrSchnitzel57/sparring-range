@@ -350,6 +350,12 @@ class ApplianceManifest:
                 raise _bad(f"{where}.name must be a unique safe segment name")
             seen_seg_names.add(sname)
             sbridge = _str(item, "bridge", where)
+            if sbridge == "srlab":
+                # Reserved: the installer's static range pair is named
+                # 10-srlab.netdev/20-srlab.network, so a bridge literally
+                # named "srlab" would silently shadow it (last write wins).
+                raise _bad(f"{where}.bridge {sbridge!r} is reserved for the "
+                           f"installer's own {bridge!r} rendering")
             try:
                 snet = ipaddress.ip_network(_str(item, "cidr", where), strict=True)
             except ValueError as exc:

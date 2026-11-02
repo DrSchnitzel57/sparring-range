@@ -158,8 +158,11 @@ def render_segment_bridge_files(m: ApplianceManifest) -> list[tuple[str, str]]:
     the FIRST clone (live commissioning find, 2026-11-02). Deliberately
     UNNUMBERED: routing/addressing between segments is a guest (router)
     job, never a host-side default. The range bridge keeps its own
-    addressed rendering and is never duplicated here. Returns
-    (filename, content) pairs for the installer to write."""
+    addressed rendering and is never duplicated here. Removing a segment
+    from the manifest does NOT remove an existing bridge (networkd never
+    deletes link devices) — the operator deletes the rendered pair and the
+    link explicitly. Returns (filename, content) pairs for the installer
+    to write."""
     n = m.network
     files: list[tuple[str, str]] = []
     for seg in n.segments:

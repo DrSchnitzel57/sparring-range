@@ -1247,11 +1247,17 @@ def apply_plan(m: ApplianceManifest, plan: Plan, *,
         # touches no firewall state. Segment bridges must exist BEFORE the
         # broker's first env-lane clone names them (commissioning find
         # 2026-11-02); waiting for a reboot would strand deploys silently.
-        run("networkctl", "reload", check=False)
-        # Network artifacts are installed but not applied to the host by this
-        # command: the operator applies them during the approved maintenance
-        # window after reviewing the generated rules.  The netrules LOADER is
-        # enabled too — once the operator starts it (or reboots), the range
+        _net_reload = run("networkctl", "reload", check=False)
+        if getattr(_net_reload, "returncode", 0) != 0:
+            print("! networkctl reload FAILED: segment bridges may be "
+                  "missing until systemd-networkd re-reads its config "
+                  "(fix systemd-networkd, reboot, or run `networkctl "
+                  "reload` manually) — env-lane deploys stay broken until "
+                  "then", file=sys.stderr)
+        # The FIREWALL ruleset is intentionally NOT applied here: the
+        # operator applies it during the approved maintenance window after
+        # reviewing the generated rules.  The netrules LOADER is enabled
+        # too — once the operator starts it (or reboots), the range
         # isolation survives restarts instead of silently vanishing.
         for unit in [*plan.units, NETRULES_UNIT]:
             run("systemctl", "enable", unit, check=False)
