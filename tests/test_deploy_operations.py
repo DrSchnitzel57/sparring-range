@@ -60,6 +60,40 @@ def test_launch_accepts_202_then_completes_in_background(
     assert ops[0].completed_at is not None
 
 
+def test_terminal_operation_and_claim_release_are_one_commit(
+        client, users, fake_broker):
+    """CI race (db lane, 2026-11-02): teardown raced the executor and got
+    409 operation_in_progress — the operation row read `succeeded` BEFORE
+    the claim row was deleted in a separate commit. Terminal state + claim
+    release are now ONE transaction: the instant a poller sees a completed
+    operation, the next lifecycle call must be accepted."""
+    from srplatform.db.models import OperationClaim
+    from srplatform.db.session import db as db_ctx
+
+    sid = client.post("/sessions", json={"scenario_id": "quick-win-01"},
+                      headers=users["member"]).json()["session_id"]
+    done = launch_and_wait(client, users["member"], sid)
+    assert done["state"] == "succeeded"
+    with db_ctx() as s:
+        assert s.get(OperationClaim, uuid.UUID(sid)) is None, (
+            "succeeded operation still holds the session claim — the "
+            "two-commit release race is back")
+    t = client.post(f"/sessions/{sid}/teardown", headers=users["member"])
+    assert t.status_code == 200, t.text
+
+    # and a FAILED operation releases too (same single-commit path)
+    fake_broker.http.fail_reads = {("read_guest_file_when_ready", None): 403}
+    sid2 = client.post("/sessions", json={"scenario_id": "quick-win-01"},
+                       headers=users["member"]).json()["session_id"]
+    failed = client.post(f"/sessions/{sid2}/launch",
+                         headers=users["member"])
+    assert failed.status_code == 202, failed.text
+    dead = wait_operation(client, users["member"], sid2)
+    assert dead["state"] == "failed", dead
+    with db_ctx() as s:
+        assert s.get(OperationClaim, uuid.UUID(sid2)) is None
+
+
 def test_failed_launch_records_failure_and_second_launch_resumes(
         client, users, fake_broker):
     sid = client.post("/sessions", json={"scenario_id": "web-foothold-01"},

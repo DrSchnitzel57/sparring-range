@@ -194,8 +194,8 @@ def _finish_launch(db, row, session_id, user_id, scenario_id, result, owner,
         raise _Failed(409, "readiness_failed", str(e)[:500]) from e
     orchestrator.finish_deploy_operation(
         db, row, "succeeded",
-        result=_redacted_result(result, instructions, readiness))
-    orchestrator.release_operation(db, session_id, owner)
+        result=_redacted_result(result, instructions, readiness),
+        release_claim_owner=owner)
     note("ready")
 
 
@@ -219,8 +219,8 @@ def _finish_reset(db, row, session_id, user_id, out, owner, note) -> None:
         raise _Failed(409, "readiness_failed", str(e)[:500]) from e
     orchestrator.finish_deploy_operation(
         db, row, "succeeded",
-        result=_redacted_result(out, instructions, readiness))
-    orchestrator.release_operation(db, session_id, owner)
+        result=_redacted_result(out, instructions, readiness),
+        release_claim_owner=owner)
     note("ready")
 
 
@@ -264,8 +264,10 @@ def _record_failure(session_id, owner, operation_id, error: str) -> None:
             if row is not None and str(row.operation_id) == str(operation_id) \
                     and row.fence == owner \
                     and row.state in ("accepted", "running"):
-                orchestrator.finish_deploy_operation(db, row, "failed",
-                                                     error=error)
-            orchestrator.release_operation(db, session_id, owner)
+                orchestrator.finish_deploy_operation(
+                    db, row, "failed", error=error,
+                    release_claim_owner=owner)
+            else:
+                orchestrator.release_operation(db, session_id, owner)
     except Exception:  # noqa: BLE001 — evidence best-effort; claim release
         pass           # also attempted; startup reconcile is the backstop

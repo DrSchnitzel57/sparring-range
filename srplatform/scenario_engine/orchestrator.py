@@ -108,19 +108,28 @@ def claim_operation(db: Session, session_id, operation: str,
     return owner
 
 
-def release_operation(db: Session, session_id, owner: str | None = None) -> bool:
-    """Release the claim. WITH an owner token the delete is FENCED (audit T02):
-    it only removes the row this request still owns — a stale request whose
-    claim was taken over returns False and erases nothing. Without a token
-    (startup reconciliation only) the row is removed unconditionally."""
+def _delete_claim_fenced(db: Session, session_id, owner: str | None) -> bool:
+    """Stage the claim-row delete WITHOUT committing. With an owner token
+    the delete is FENCED (audit T02): a stale request whose claim was taken
+    over erases nothing."""
     row = db.get(OperationClaim, session_id)
     if row is None:
         return False
     if owner is not None and row.owner != owner:
         return False   # someone else holds it now — never erase their ownership
     db.delete(row)
-    db.commit()
     return True
+
+
+def release_operation(db: Session, session_id, owner: str | None = None) -> bool:
+    """Release the claim. WITH an owner token the delete is FENCED (audit T02):
+    it only removes the row this request still owns — a stale request whose
+    claim was taken over returns False and erases nothing. Without a token
+    (startup reconciliation only) the row is removed unconditionally."""
+    removed = _delete_claim_fenced(db, session_id, owner)
+    if removed:
+        db.commit()
+    return removed
 
 
 def clear_operation_claims(db: Session) -> int:
@@ -174,11 +183,19 @@ def advance_deploy_operation(db: Session, row, phase: str) -> None:
 
 def finish_deploy_operation(db: Session, row, state: str, *,
                             error: str | None = None,
-                            result: dict | None = None) -> None:
+                            result: dict | None = None,
+                            release_claim_owner: str | None = None) -> bool:
     """Terminal outcome, committed. `error` is redacted + bounded by the
     caller; full provisioning commands and secrets never reach this row.
     `result` is the REDACTED completed payload pollers receive (no
-    plaintext enrollments — the ServiceToken rows are the durable record)."""
+    plaintext enrollments — the ServiceToken rows are the durable record).
+
+    `release_claim_owner` releases the session's operation claim in the
+    SAME transaction as the terminal state: a poller that sees a completed
+    operation can never observe the launch claim still held (the CI race:
+    teardown raced the executor's separate release commit and got 409
+    operation_in_progress). The delete is fenced to that owner, so a
+    superseded executor erases a replacement's claim never."""
     from sqlalchemy import update
     from srplatform.db.models import DeployOperation
     # ATOMIC conditional transition (single UPDATE … WHERE state IN
@@ -197,6 +214,8 @@ def finish_deploy_operation(db: Session, row, state: str, *,
         .where(DeployOperation.operation_id == row.operation_id,
                DeployOperation.state.in_(("accepted", "running")))
         .values(**values)).rowcount
+    if release_claim_owner is not None:
+        _delete_claim_fenced(db, row.session_id, release_claim_owner)
     db.commit()
     return bool(n)
 
