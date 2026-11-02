@@ -87,6 +87,42 @@ Do not deploy merely because this checkpoint is on the default branch.
   tooling payload, packet-level segment isolation on real nft/libvirt, and
   every installed-appliance / real-model qualification gate.
 
+## Appliance commissioning + env-lane deploy smoke — 2026-11-02 (live gate)
+
+Fresh-replacement commissioning of the dedicated appliance VM (Ubuntu
+24.04.5, nested KVM boot-proven; disk grown to 258 GiB, 211 GiB free) and
+the FIRST environment-lane deploy smoke on real hardware.
+
+- **Receipt:** `commissioning-smoke-01` (3-guest blueprint: two Linux
+  guests on `sr-team`/`sr-inside`, one `red-entry` vantage on `sr-wan`,
+  all clones of the real sha-pinned `appliance-base` template 1001),
+  launched through the public API on the commissioned stack. After the
+  three fixes below: operation `succeeded`, readiness `ok: true`, all
+  three domains running with their NIC vector on the correct segment
+  bridges (verified on `bridge link`, one tap per bridge), alpha alive at
+  172.17.0.10 on the team bridge, bravo NOT reachable from the team
+  segment (physical isolation), teardown `complete: true` with zero
+  domain/ledger/disk residue. Code equivalence at gate time: box files
+  sha256-identical to repo commit `62ba5ef`.
+- **Real-hardware defects found and fixed (same commit):** uuid-less
+  re-define refused by real libvirt (config step now carries the
+  domain's current `<uuid>`; `_domain_uuid` returned raw bytes), pin
+  inventory + telemetry enrollment ignoring the documented
+  `environment_guest` exemption (stranded every env deploy at
+  readiness), missing verifier pinned known-hosts file on fresh boxes
+  (installer now creates it empty, never truncating).
+- **Operator deviations (not product truth):** five segment bridges
+  (`sr-team/sr-transit/sr-inside/sr-wan/sr-pubnat`) created by manual
+  networkd drop-ins because the installer only renders `srlab0`; the
+  legacy image roles (`attacker`, `mojang-web-local`, `mojang-web-db`)
+  are seeded as base copies (templates 9005/9012/9011) pending real
+  buildout; env-guest names must differ within their FIRST 4 characters
+  (domain-name builder truncates the guest name).
+- **Not claimed by this gate:** real blueprint guest images (Windows/
+  router/firewall media pending operator downloads), model endpoint
+  (placeholder key), packet-level service checks, full 12-guest session,
+  TLS/hostname for team web access.
+
 ## Supervised installed-upgrade findings — 2026-10-29 (plan 22 authorized)
 
 User authorized consolidated repair and autonomous Qwen-high implementation /
