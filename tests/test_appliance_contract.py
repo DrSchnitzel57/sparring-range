@@ -419,6 +419,51 @@ def test_network_artifacts_are_isolated_and_fixed(tmp_path):
     assert f"Address={m.network.controller_range_ip}/{m.network.range_cidr.prefixlen}" in netdev
 
 
+def test_set_config_redefine_carries_the_current_uuid(tmp_path):
+    """Re-defining an EXISTING domain name from XML without a <uuid> is a
+    hard error on real libvirt ("domain 'x' already exists with uuid …");
+    only re-define carrying the domain's CURRENT uuid updates in place.
+    The fake backend objects never modelled this, so the env-lane config
+    step failed on the first real-hardware deploy until the update path
+    started passing the uuid through."""
+    from infra.appliance.backend import BackendConfig, LibvirtBackend
+
+    m = ApplianceManifest.from_dict(_manifest(tmp_path), verify_images=True)
+    backend = LibvirtBackend(m, AppliancePolicy.from_manifest(m),
+                             BackendConfig(fixture_mode=True))
+    image = m.image_for_role("attacker")
+    dom_uuid = "3453af7b-886d-483e-9ea0-a29e2d4fc777"
+
+    class _Dom:
+        def isActive(self):
+            return False
+
+        def UUIDString(self):
+            return dom_uuid
+
+    desc = {"vmid": 200, "node": m.installation_id, "name": "sr-x-200",
+            "template_id": image.template_id, "tags": "old"}
+    defined = []
+
+    class _Conn:
+        def defineXML(self, xml):
+            defined.append(xml)
+
+    backend._find = lambda vmid, node=None: (_Dom(), desc)
+    backend._image = lambda tid: image
+    backend._domain_xml = lambda d, i: ('<domain type="kvm">\n'
+                                        '  <name>sr-x-200</name>\n</domain>')
+    backend.connect = lambda: _Conn()
+
+    backend.set_config(m.installation_id, 200, tags="srsess-" + "a" * 32)
+
+    assert len(defined) == 1, defined
+    assert f"<uuid>{dom_uuid}</uuid>" in defined[0], defined[0]
+    # the identity the update carries must be the domain's OWN uuid —
+    # minting a different one is the same "already exists" collision
+    assert dom_uuid == _Dom().UUIDString()
+
+
 def test_overlay_is_never_smaller_than_its_base(tmp_path, monkeypatch):
     """A qcow2 overlay smaller than its backing file truncates the partition
     table: the guest then cannot find root=LABEL=... and drops to an

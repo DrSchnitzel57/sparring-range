@@ -177,6 +177,50 @@ def test_readiness_refuses_unpublished_pin():
     assert reasons, "an unpublished pin must produce a readiness reason"
 
 
+def test_readiness_exempts_environment_guests_from_pin_inventory():
+    """Full-OS blueprint guests are OUTSIDE the golden host-key lane by
+    contract (env_deploy docstring) — the first real-hardware environment
+    deploy failed readiness here because the inventory ignored the flag."""
+    import types as _types
+
+    from srplatform.verification_service import _pin_items
+
+    env_only = _types.SimpleNamespace(resources=[
+        {"host": "alpha", "state": "created", "environment_guest": True},
+        {"host": "bravo", "state": "created", "environment_guest": True}])
+    assert _pin_items(env_only) == ([], [])
+
+    # a mixed deployment still refuses the GOLDEN row that lacks its pin;
+    # the exemption must never waive golden-lane truth
+    mixed = _types.SimpleNamespace(resources=[
+        {"host": "alpha", "state": "created", "environment_guest": True},
+        {"host": "attacker", "state": "created",
+         "host_key_ref": "ssh-ed25519 AAAA…BBBB"}])
+    items, reasons = _pin_items(mixed)
+    assert [i["host"] for i in items] == ["attacker"], items
+    assert reasons
+
+
+def test_domain_uuid_helper_returns_canonical_text_uuid():
+    """libvirt's UUID() is raw BYTES; str() of those is a malformed
+    <uuid> element that real libvirt rejects (the fake backend objects
+    hid this until the first real re-define)."""
+    from infra.appliance.backend import LibvirtBackend
+
+    class _Dom:
+        def UUIDString(self):
+            return "3453af7b-886d-483e-9ea0-a29e2d4fc777"
+
+    assert LibvirtBackend._domain_uuid(_Dom()) == \
+        "3453af7b-886d-483e-9ea0-a29e2d4fc777"
+
+    class _Broken:
+        def UUIDString(self):
+            raise RuntimeError("no identity")
+
+    assert LibvirtBackend._domain_uuid(_Broken()) == ""
+
+
 def test_teardown_unpublishes_pins_keeps_other_hosts(tmp_path, monkeypatch):
     import pathlib
 

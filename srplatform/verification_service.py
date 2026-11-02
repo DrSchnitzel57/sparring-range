@@ -151,6 +151,13 @@ def _pin_items(dep) -> tuple[list, list]:
     for r in (dep.resources or []):
         if r.get("state") != "created":
             continue
+        if r.get("environment_guest"):
+            # Full-OS blueprint guests are OUTSIDE the golden-image
+            # host-key lane by contract (env_deploy docstring): their
+            # attestation work has not landed, and requiring a golden
+            # pin here would strand every environment deploy at
+            # readiness on real hardware.
+            continue
         if not r.get("host_key_pin"):
             # The FULL pinned key (`host_key_pin`) is the requirement, never
             # the truncated display ref: a ref-only row (legacy writer) is
@@ -205,6 +212,12 @@ def readiness_checks(db: Session, session_id) -> dict:
     if dep is not None:
         for r in (dep.resources or []):
             if r.get("state") != "created":
+                continue
+            if r.get("environment_guest"):
+                # Environment-lane guests carry no golden telemetry agent by
+                # contract (env_deploy docstring); their attestation and
+                # shipper work lands separately, and requiring enrollment
+                # here would strand every environment deploy.
                 continue
             phase = (r.get("telemetry_enroll") or {}).get("phase")
             evidence_ok = orchestrator.enrollment_evidence_current(

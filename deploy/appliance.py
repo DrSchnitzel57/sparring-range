@@ -969,6 +969,17 @@ def _ensure_dirs(m: ApplianceManifest, run: Runner, lay: Layout) -> None:
         else:
             run("install", "-d", "-m", oct(mode)[2:], "-o", user, "-g", group,
                 str(path))
+    # The verifier's pinned known-hosts file must EXIST (empty is fine) for
+    # the management exec channel to count as configured; the readiness gate
+    # checks os.path.exists, and the first real environment deploy stranded
+    # here on a fresh box. Create-if-missing only — never truncate real pins.
+    range_hosts = pathlib.Path(m.state_dir) / "known_hosts/range_hosts"
+    if not range_hosts.exists():
+        if lay.sandboxed:
+            run("install", "-m", "640", "/dev/null", str(range_hosts))
+        else:
+            run("install", "-m", "640", "-o", "srrange", "-g", "srrange",
+                "/dev/null", str(range_hosts))
 
 
 def _write_files(files: list[RenderedFile], run: Runner,

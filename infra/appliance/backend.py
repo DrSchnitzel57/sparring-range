@@ -218,9 +218,12 @@ class LibvirtBackend:
 
     @staticmethod
     def _domain_uuid(dom) -> str:
-        """The libvirt domain UUID — the guest's own immutable identity."""
+        """The libvirt domain UUID — the guest's own immutable identity.
+        UUIDString() is the canonical hyphenated text; UUID() returns raw
+        BYTES, and str() of those is not a uuid (real libvirt rejects it
+        as a malformed <uuid> element)."""
         try:
-            return str(dom.UUID())
+            return str(dom.UUIDString())
         except Exception:  # noqa: BLE001 — an unreadable UUID is unknown
             return ""
 
@@ -599,6 +602,16 @@ class LibvirtBackend:
             self._write_seed(desc, image, int(vmid), desc["name"], None)
         if changed:
             xml = self._domain_xml(desc, image)
+            # Real libvirt REFUSES to re-define an existing domain name from
+            # XML that carries no <uuid> ("domain 'x' already exists with
+            # uuid …"), while re-define with the CURRENT uuid updates in
+            # place. Carry the existing uuid through an update; the fake
+            # broker never modelled this, so it was invisible until the
+            # first boot on real hardware.
+            uuid_now = self._domain_uuid(dom)
+            if uuid_now:
+                xml = xml.replace(
+                    "</name>", f"</name>\n  <uuid>{uuid_now}</uuid>", 1)
             try:
                 self.connect().defineXML(xml)
             except Exception as exc:  # noqa: BLE001
