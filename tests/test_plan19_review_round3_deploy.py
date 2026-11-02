@@ -135,11 +135,18 @@ def test_posix_math_uses_exact_access_semantics_for_service_uids(tmp_path):
     f.write_text("x")
     f.chmod(0o600)
     st = f.stat()
-    foreign_root = 0 if st.st_uid != 0 else 1001  # never the owner
+    # Each tuple must be foreign through ALL channels; a tuple the ambient
+    # environment makes non-foreign (file owned by uid 0 as root, file group
+    # inside a probe group set) is skipped, never quietly weakened.
+    ran = 0
     for uid, gid, groups in ((1001, 1001, {100, 101}),
-                             (foreign_root, 100, {0}),   # wrong-uid root-group
+                             (0, 100, {0}),          # wrong-uid root-group
                              (st.st_gid + 900, 5, {5})):
+        if uid == st.st_uid or st.st_gid in ({gid} | groups):
+            continue
+        ran += 1
         assert not svc._posix_readable(st, uid, gid, groups)
+    assert ran >= 2, "probe degenerated to nothing on this host"
     assert svc._posix_readable(st, st.st_uid, st.st_gid, set())
     # and the SAME math proves the OLD shape leaked to the group:
     old = tmp_path / "old"
