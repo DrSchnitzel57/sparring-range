@@ -41,6 +41,10 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install -r requirements.lock
           .venv/bin/pip install --no-deps -e .
+      # The selection layer must run its suite WITHOUT prerequisite skips:
+      # the release-bundle tests need qemu-img (absent from the runner image),
+      # and an absent prerequisite is never a green job (audit F8).
+      - run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends qemu-utils
       - run: .venv/bin/python infra/dev/acceptance.py selection
 
   python:

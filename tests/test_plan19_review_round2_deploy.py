@@ -59,6 +59,32 @@ class _RunRecorder:
         return " | ".join(" ".join(c) for c in self.calls)
 
 
+def _aliased_postgres_identity(monkeypatch) -> None:
+    """The installer's secret handoff chowns to the postgres user and runs
+    `su postgres` — root-only operations. A postgres-less host (plain dev
+    box) exercises the documented no-handoff branch; a ROOT host does the
+    real thing. This covers the third shape — non-root host WITH a
+    postgres user, the CI-runner case — by aliasing that identity to the
+    current user, so the REAL chown + SQL-file handoff code path still
+    executes (the `su` invocation is recorder-captured, never run). No
+    prerequisite skips in the default suite."""
+    import pwd
+
+    real = pwd.getpwnam
+    try:
+        real("postgres")
+    except KeyError:
+        return                      # no-handoff branch: real behavior runs
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return                      # root: real identity, real handoff
+    alias = pwd.struct_passwd(("postgres", "x", os.getuid(), os.getgid(),
+                               "aliased for the unprivileged handoff shape",
+                               "/nonexistent", "/usr/sbin/nologin"))
+    monkeypatch.setattr(
+        pwd, "getpwnam",
+        lambda name: alias if name == "postgres" else real(name))
+
+
 def _install_fixture(tmp_path: pathlib.Path):
     prefix = tmp_path / "opt"
     (prefix / ".venv" / "bin").mkdir(parents=True)
@@ -76,8 +102,7 @@ def _install_fixture(tmp_path: pathlib.Path):
 
 def test_fresh_install_provisions_the_secret_role_and_api_only_file(tmp_path,
                                                                     monkeypatch):
-    from tests.helpers import require_sql_handoff_prereq
-    require_sql_handoff_prereq()
+    _aliased_postgres_identity(monkeypatch)
     monkeypatch.delenv("SR_PG_SECRET_URL", raising=False)
     monkeypatch.delenv("SR_POSTGRES_URL", raising=False)
     monkeypatch.delenv("SR_POSTGRES_URL_OWNER", raising=False)
@@ -125,8 +150,7 @@ def test_fresh_install_provisions_the_secret_role_and_api_only_file(tmp_path,
 
 
 def test_rerun_preserves_the_existing_secret_file(tmp_path, monkeypatch):
-    from tests.helpers import require_sql_handoff_prereq
-    require_sql_handoff_prereq()
+    _aliased_postgres_identity(monkeypatch)
     monkeypatch.delenv("SR_PG_SECRET_URL", raising=False)
     monkeypatch.delenv("SR_POSTGRES_URL", raising=False)
     monkeypatch.delenv("SR_POSTGRES_URL_OWNER", raising=False)
@@ -157,8 +181,7 @@ def test_rerun_preserves_the_existing_secret_file(tmp_path, monkeypatch):
 
 
 def test_dry_run_writes_no_secret_file(tmp_path, monkeypatch):
-    from tests.helpers import require_sql_handoff_prereq
-    require_sql_handoff_prereq()
+    _aliased_postgres_identity(monkeypatch)
     monkeypatch.delenv("SR_PG_SECRET_URL", raising=False)
     monkeypatch.delenv("SR_POSTGRES_URL", raising=False)
     monkeypatch.delenv("SR_POSTGRES_URL_OWNER", raising=False)
