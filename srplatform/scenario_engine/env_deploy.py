@@ -88,6 +88,22 @@ def deploy_environment(db: Session, session_id, scenario_id: str, spec: dict,
 
     from srplatform.scenario_engine import orchestrator as orch
 
+    # Domain names truncate the readable scenario+guest middle to fit the
+    # 63-char backend limit, so two guests whose names collide WITHIN the
+    # surviving prefix produce the SAME domain (libvirt "already exists")
+    # and the deploy strands. Refuse BEFORE any side effect, exactly like
+    # the catalog gate above (live commissioning find, 2026-11-02).
+    names = [orch._vm_name(scenario_id, g.name, session_id) for g in bp.guests]
+    if len(set(names)) != len(names):
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        colliding = sorted(g.name for g, n in zip(bp.guests, names)
+                           if n in dupes)
+        raise ScenarioError(
+            [f"environment {env_id!r} guests {colliding} collapse to the "
+             f"same domain name(s) {dupes} under scenario "
+             f"{scenario_id!r} — guest names must stay distinct within "
+             f"the truncated prefix; no clone was attempted"])
+
     dep = orch._active_deployment(db, session_id, scenario_id) if resume else None
     if dep is not None and dep.status == "ready":
         resources = [dict(r) for r in (dep.resources or [])]
