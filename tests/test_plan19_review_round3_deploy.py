@@ -128,9 +128,10 @@ def test_posix_math_uses_exact_access_semantics_for_service_uids(tmp_path):
     """The math, not os.access (which lies about every file as root):
     a 0600 file is unreadable by every uid/gid that is not the owner's,
     including any group membership; the exact POSIX ordering is applied.
-    The probe uids are derived from the file's ACTUAL owner so the same
-    assertions hold unprivileged (dev box) and as root (CI runner) —
-    a literal uid 0 would silently be the owner when running as root."""
+    Each probe tuple must be foreign through ALL channels (uid, gid,
+    supplementary groups); a tuple the AMBIENT file ownership makes
+    non-foreign on this host is skipped, never quietly weakened, and a
+    ran>=2 floor keeps the test from degenerating to nothing anywhere."""
     f = tmp_path / "db-secret.env"
     f.write_text("x")
     f.chmod(0o600)
