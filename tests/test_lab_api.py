@@ -400,3 +400,33 @@ def test_http_delete_is_verified_then_a_new_lab_can_follow(client, users,
                       headers=users["member"]).status_code == 404
     fresh = _http_lab(client, users["member"])
     assert fresh["lab_id"] != lab["lab_id"]
+
+
+def test_http_delete_releases_the_range_lease(client, users, migrated_db):
+    """A deleted lab must not keep the single-range reservation: the next
+    lab has to be able to provision (live find 2026-11-03: the gate's
+    delete tore the VMs down but left the lease held, so the rerun failed
+    range_busy with a dead holder)."""
+    from sqlalchemy import create_engine, select
+    from sqlalchemy.orm import Session as SASession
+
+    from srplatform.db.models import RangeLease
+
+    lab = _http_lab(client, users["member"])
+    with SASession(create_engine(migrated_db)) as db:
+        home_id = __import__("uuid").UUID(lab["home_session_id"])
+        row = db.execute(select(RangeLease).where(
+            RangeLease.id == 1)).scalar_one_or_none()
+        if row is None:
+            from srplatform.db.models import RangeLease as RL
+            db.add(RL(id=1, session_id=home_id))
+        else:
+            row.session_id, row.released_at = home_id, None
+        db.commit()
+    deleted = client.delete(f"/labs/{lab['lab_id']}",
+                            headers=users["member"])
+    assert deleted.status_code == 200, deleted.text
+    with SASession(create_engine(migrated_db)) as db:
+        row = db.execute(select(RangeLease).where(
+            RangeLease.id == 1)).scalar_one()
+        assert row.released_at is not None

@@ -251,6 +251,13 @@ def delete_lab(lab_id: uuid.UUID, p: Principal = Depends(_principal),
             "failed": out.get("failed"),
             "note": "verified absence is required; the lab and its "
                     "reservation are retained"})
+    # A deleted lab must not keep the single-range reservation: the VMs are
+    # verified gone, so the lease is released for the NEXT lab (live find:
+    # gate delete left the lease held and the next provision failed
+    # range_busy with a session that no longer existed in use).
+    home.status = "torn_down"
+    db.flush()
+    orchestrator.release_lease(db, home.session_id)
     lab_service.mark_deleted(db, lab, actor_id=p.user_id)
     lab_service.revoke_session_capabilities(db, home.session_id, "lab_deleted")
     db.commit()
