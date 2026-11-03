@@ -49,7 +49,25 @@ def _env(eng):
     bp, catalog = _bp_and_catalog()
 
     class ResettingBroker(StubBroker):
-        """Stub + the two calls a selective reset makes."""
+        """Stub + the calls a selective reset makes (and its clone
+        generation, which must CHANGE on rebuild)."""
+
+        generations: list = []
+
+        def clone_and_wait(self, node, template_vmid, vmid, name,
+                           full=True, session_id=None, generation=None):
+            self.generations.append(generation)
+            return StubBroker.clone_and_wait(self, node, template_vmid, vmid,
+                                             name, full=full,
+                                             session_id=session_id,
+                                             generation=generation)
+
+        def next_vmid(self, node, base, session_id=None):
+            # scan like the real broker: never hand out a vmid already held
+            candidate = int(base)
+            while candidate in self.vms:
+                candidate += 1
+            return candidate
 
         def destroy_and_wait(self, node, vmid, session_id=None):
             self.calls.append(("destroy", int(vmid)))
@@ -210,9 +228,16 @@ def test_selective_reset_rebuilds_only_the_planned_guest(eng):
         lab_service.approve_plan(db, lab, plan.plan_id,
                                  approved_by=lab.owner_id, is_operator=False,
                                  actor_role="captain")
+        before_generations = list(broker.generations)
         out = lab_service.execute_plan(db, sid, SCENARIO, broker,
                                        plan.plan_id)
         assert out["action"] == "selective_reset"
+        # the rebuilt guest's clone is a NEW intent, not a replay of the
+        # original deploy (third live broker fact): generation attempt bumps.
+        assert broker.generations[len(before_generations):], \
+            "the rebuilt guest must be re-cloned"
+        assert broker.generations[-1].endswith(":a1"), \
+            broker.generations[-1]
         assert out["destroyed"] == ["ubuntu-wkst"]
         lab_service.reflect_reset(db, sid, plan.plan_id)
 

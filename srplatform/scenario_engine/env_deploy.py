@@ -240,14 +240,24 @@ def deploy_environment(db: Session, session_id, scenario_id: str, spec: dict,
             if res and res.get("vmid"):
                 vmid = int(res["vmid"])
             else:
+                # The generation ATTEMPT must survive this rebuild of the
+                # resource dict; losing it makes the reset re-clone replay
+                # the original intent and set_config then finds no domain
+                # (third live broker fact, 2026-11-03).
+                previous_attempt = int((res or {}).get("generation_attempt")
+                                       or 0)
                 vmid = int(broker.next_vmid(node, s.deploy_vmid_base + i,
                                             session_id=session_id))
                 res = {"vmid": vmid, "node": node, "name": name,
                        "host": guest.name, "template_vmid": template_vmid,
                        "image_profile": profile, "state": "pending",
                        "environment_guest": True,
+                       "generation_attempt": previous_attempt,
                        "planned_nics": plan}
-                resources.append(res)
+                # replace the row of this host instead of appending a second
+                # one (a duplicate pending row is teardown noise)
+                resources = [x for x in resources
+                             if x.get("host") != guest.name] + [res]
                 by_host[guest.name] = res
                 dep.resources = resources
                 flag_modified(dep, "resources")
