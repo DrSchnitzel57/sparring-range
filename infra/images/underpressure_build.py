@@ -163,6 +163,14 @@ def enable_cloud_init(disk: pathlib.Path) -> None:
             if link.is_symlink() or link.exists():
                 link.unlink()
             link.symlink_to("/lib/systemd/system/cloud-init.target")
+            # Belt-and-braces: pin NoCloud to the seed device EXPLICITLY.
+            # Debian 22.4.2 reported DataSourceNone even with SMBIOS
+            # ds=nocloud and the target enabled (live finds 2026-11-03);
+            # this config removes detection from the equation entirely.
+            (base / "etc/cloud/cloud.cfg.d").mkdir(parents=True,
+                                                   exist_ok=True)
+            (base / "etc/cloud/cloud.cfg.d/99-sr-nocloud.cfg").write_text(
+                "datasource_list: [ NoCloud ]\n")
         finally:
             subprocess.run(["umount", str(base)], check=False)
     finally:
@@ -256,6 +264,33 @@ poweroff: true
 """
 
 
+def build_seed_disk(path: pathlib.Path, user_data: str, meta_data: str,
+                    network_config: str | None = None) -> pathlib.Path:
+    """Seed as an ext4 DISK labeled CIDATA (live find 2026-11-03).
+
+    NoCloud's label scan runs in init-local ~10 s after boot — a CD-ROM
+    device does not exist yet at that moment on this stack, so blkid found
+    nothing and the seed was never consumed (DataSourceNone). An ext4 disk
+    with LABEL=CIDATA is present immediately (virtio-blk), so the same
+    module mounts and reads it with no timing race."""
+    subprocess.run(["qemu-img", "create", "-f", "raw", str(path), "16M"],
+                   check=True, timeout=60)
+    subprocess.run(["mkfs.ext4", "-q", "-F", "-L", "CIDATA", str(path)],
+                   check=True, timeout=120)
+    mnt = pathlib.Path("/mnt/sr-seed-build")
+    mnt.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["mount", "-o", "loop", str(path), str(mnt)], check=True)
+    try:
+        (mnt / "user-data").write_text(user_data, encoding="utf-8")
+        (mnt / "meta-data").write_text(meta_data, encoding="utf-8")
+        if network_config is not None:
+            (mnt / "network-config").write_text(network_config,
+                                                encoding="utf-8")
+    finally:
+        subprocess.run(["umount", str(mnt)], check=False)
+    return path
+
+
 def _network_config() -> str:
     return """version: 2
 ethernets:
@@ -292,9 +327,8 @@ def build_profile(*, profile: str, base: pathlib.Path, pubkey: pathlib.Path,
                                pubkeys=pubkeys)
     meta = json.dumps({"instance-id": f"sr-build-{profile}",
                        "local-hostname": hostname})
-    seed = guest_seed.build_seed_iso(run_dir / f"{profile}.seed.iso",
-                                     userdata, meta,
-                                     network_config=_network_config())
+    seed = build_seed_disk(run_dir / f"{profile}.seed.img", userdata, meta,
+                           network_config=_network_config())
     disk = qemu_guest.fresh_role_overlay(base, run_dir, profile, disk_gb)
     enable_cloud_init(disk)
     # NoCloud via SMBIOS: the systemd generator already declined the CD
@@ -304,8 +338,7 @@ def build_profile(*, profile: str, base: pathlib.Path, pubkey: pathlib.Path,
     boot = qemu_guest.boot_full_guest(
         disk=disk, seed_iso=seed, memory_mb=memory_mb, smp=smp,
         net="user", timeout_s=timeout_s,
-        expect=("SR-GUEST-DONE rc=0",),
-        extra_args=("-smbios", "type=1,serial=ds=nocloud;s=/dev/sr0"))
+        expect=("SR-GUEST-DONE rc=0",), seed_as_disk=True)
     serial = run_dir / f"{profile}.serial.log"
     observed = serial.read_text(errors="replace").replace("\r", "")
     caps: dict[str, str] = {}

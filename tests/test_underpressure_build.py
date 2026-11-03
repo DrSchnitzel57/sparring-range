@@ -122,7 +122,7 @@ def _fake_harness(monkeypatch, tmp_path, serial_text):
                         lambda disk: None)  # root-only, proven live instead
     monkeypatch.setattr(ub.qemu_guest, "fresh_role_overlay", fake_overlay)
     monkeypatch.setattr(ub.qemu_guest, "boot_full_guest", fake_boot)
-    monkeypatch.setattr(ub.guest_seed, "build_seed_iso", fake_seed)
+    monkeypatch.setattr(ub, "build_seed_disk", fake_seed)
     return ub, base
 
 
