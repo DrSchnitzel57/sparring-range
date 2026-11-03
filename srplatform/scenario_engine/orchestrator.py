@@ -247,7 +247,8 @@ def latest_deploy_operation(db: Session, session_id):
     ).scalars().first()
 
 
-def finalize_ready(db: Session, session_id, user_id, result) -> tuple[list, dict]:
+def finalize_ready(db: Session, session_id, user_id, result,
+                   broker=None) -> tuple[list, dict]:
     """Shared READY workflow (audit T06): readiness gate, per-host member
     connection capabilities, status transition, evidence. Used by the
     supervised executor for BOTH launch and reset so a reset can never skip
@@ -258,7 +259,8 @@ def finalize_ready(db: Session, session_id, user_id, result) -> tuple[list, dict
     if sess is None:
         raise ReadinessFailed({"reason": "session vanished mid-deploy",
                                "enforced": True, "ok": False, "checks": []})
-    readiness = verification_service.readiness_checks(db, session_id)
+    readiness = verification_service.readiness_checks(db, session_id,
+                                                      broker=broker)
     if readiness["enforced"] and not readiness["ok"]:
         raise ReadinessFailed(readiness)
     # member-specific host connection capabilities (F08)

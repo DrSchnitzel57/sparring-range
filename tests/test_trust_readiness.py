@@ -376,3 +376,37 @@ def test_manifest_to_provisioning_ingest_chain(tmp_path, monkeypatch):
     cmd = _provision_command("web01", "tok", "nonce1", S())
     assert f"SR_API_URL={ingest}" in cmd
     assert manifest["urls"]["public_https"] not in cmd
+
+
+def test_readiness_requires_created_guests_to_be_running():
+    """Live find 2026-11-03: a buggy golden powered itself off and the
+    12-guest deploy still reported succeeded/readiness (11/12 domains).
+    READY now reads the broker's vm_status for every created row."""
+    import types as _types
+
+    from srplatform.verification_service import _running_items
+
+    dep = _types.SimpleNamespace(resources=[
+        {"host": "alpha", "state": "created", "vmid": 201, "node": "n1"},
+        {"host": "bravo", "state": "created", "vmid": 202, "node": "n1"},
+        {"host": "gone", "state": "destroyed", "vmid": 203, "node": "n1"}])
+
+    class _Broker:
+        def vm_status(self, node, vmid):
+            return {201: "running", 202: "shutoff"}.get(int(vmid), "absent")
+
+    items = _running_items(dep, _Broker())
+    assert [i["vmid"] for i in items] == [201, 202]
+    assert items[0]["status"] == "passed"
+    assert items[1]["status"] == "failed" and "not running" in items[1]["reason"]
+
+    class _Boom:
+        def vm_status(self, node, vmid):
+            raise RuntimeError("broker down")
+
+    boom = _running_items(dep, _Boom())
+    assert all(i["status"] == "failed" for i in boom)
+    assert "unknown" in str(boom[0]["evidence"]).lower() or \
+        "error" in str(boom[0]["evidence"]).lower()
+    # no broker -> no fabricated evidence
+    assert _running_items(dep, None) == []

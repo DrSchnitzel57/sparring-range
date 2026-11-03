@@ -197,7 +197,36 @@ def _enrollment_rows(dep) -> list:
             if r.get("state") == "created" and not r.get("environment_guest")]
 
 
-def readiness_checks(db: Session, session_id) -> dict:
+def _running_items(dep, broker) -> list:
+    """READY also requires every created guest to be RUNNING at the broker.
+
+    Live find 2026-11-03: a golden that powered itself off (buggy verify
+    reporter) produced a deploy that reported succeeded/readiness with one
+    of twelve guests SHUT OFF — readiness never asked the authority. A
+    stopped created clone is a failed item, never silence: the broker's
+    vm_status is the read-back, no guest claim is trusted."""
+    if broker is None or dep is None:
+        return []
+    items = []
+    for r in (dep.resources or []):
+        if r.get("state") != "created":
+            continue
+        try:
+            status = broker.vm_status(r.get("node"), int(r.get("vmid")))
+        except Exception as exc:  # noqa: BLE001 — an unreadable state is unknown
+            status = f"error:{type(exc).__name__}"
+        passed = status == "running"
+        items.append({
+            "host": r.get("host"), "vmid": r.get("vmid"),
+            "unit": "guest-running",
+            "status": "passed" if passed else "failed",
+            "evidence": status, "error": None if passed else status,
+            "reason": None if passed else
+            f"created guest {r.get('host')} is not running (broker: {status})"})
+    return items
+
+
+def readiness_checks(db: Session, session_id, broker=None) -> dict:
     """Service-readiness gate for the provisioning contract (audit N10 item
     4, T05, T06): every service declared by the session's snapshot topology
     must be PRESENT (service_present against the owned active inventory) AND
@@ -249,6 +278,13 @@ def readiness_checks(db: Session, session_id) -> dict:
                           "verified (unknown is not ok)"}
     items, ok = [], True
     reasons = []
+    run_items = _running_items(dep, broker)
+    if run_items:
+        items.extend(run_items)
+        if not all(i["status"] == "passed" for i in run_items):
+            ok = False
+            reasons.extend(i["reason"] for i in run_items
+                           if i["status"] != "passed")
     if declared:
         if not chan_ok:
             ok = False

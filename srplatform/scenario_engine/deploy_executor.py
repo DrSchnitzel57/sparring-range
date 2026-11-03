@@ -80,7 +80,7 @@ def _execute(*, operation_id, session_id, user_id, operation, scenario_id,
                     raise _Failed(409, "foreign_resource",
                                   str(e)[:500]) from e
                 _finish_launch(db, row, session_id, user_id, scenario_id,
-                               result, owner, note)
+                               result, owner, note, broker=broker)
             elif operation == "reset":
                 orchestrator.advance_deploy_operation(db, row, "redeploy")
                 try:
@@ -91,7 +91,8 @@ def _execute(*, operation_id, session_id, user_id, operation, scenario_id,
                                   f"holder_session={e.holder_session_id}") from e
                 except RuntimeError as e:
                     raise _Failed(409, "reset_failed", str(e)[:500]) from e
-                _finish_reset(db, row, session_id, user_id, out, owner, note)
+                _finish_reset(db, row, session_id, user_id, out, owner, note,
+                              broker=broker)
             else:
                 orchestrator.finish_deploy_operation(
                     db, row, "failed",
@@ -174,7 +175,7 @@ def _require_live(db, row, owner: str, operation_id: str,
 
 
 def _finish_launch(db, row, session_id, user_id, scenario_id, result, owner,
-                   note) -> None:
+                   note, broker=None) -> None:
     """Readiness gate + capabilities + ready transition (moved from the
     request path: identical checks, executor-owned session)."""
     from srplatform import verification_service
@@ -185,7 +186,7 @@ def _finish_launch(db, row, session_id, user_id, scenario_id, result, owner,
     _require_live(db, row, owner, str(row.operation_id), "finalize")
     try:
         instructions, readiness = orchestrator.finalize_ready(
-            db, session_id, user_id, result)
+            db, session_id, user_id, result, broker=broker)
     except orchestrator.ReadinessFailed as e:
         db.add(Event(session_id=session_id, ts=datetime.now(timezone.utc),
                      actor="system", action_type="readiness_failed",
@@ -199,7 +200,8 @@ def _finish_launch(db, row, session_id, user_id, scenario_id, result, owner,
     note("ready")
 
 
-def _finish_reset(db, row, session_id, user_id, out, owner, note) -> None:
+def _finish_reset(db, row, session_id, user_id, out, owner, note,
+                  broker=None) -> None:
     from srplatform.db.models import Event, Session as SessionModel
     from srplatform.scenario_engine import orchestrator
 
@@ -207,7 +209,7 @@ def _finish_reset(db, row, session_id, user_id, out, owner, note) -> None:
         orchestrator.advance_deploy_operation(db, row, "readiness")
         _require_live(db, row, owner, str(row.operation_id), "finalize")
         instructions, readiness = orchestrator.finalize_ready(
-            db, session_id, user_id, out)
+            db, session_id, user_id, out, broker=broker)
     except orchestrator.ReadinessFailed as e:
         sess = db.get(SessionModel, session_id)
         if sess is not None:
