@@ -446,3 +446,27 @@ real admin terminal casts or mutable generated files as proof in Git.
 
 Only close a blocker after independently executing its agreed milestone criteria.
 No implementation milestone is closed by this documentation pass.
+
+### Scale rehearsal — full 12-guest environment deploy (2026-11-03 live gate)
+
+- **Setup:** every blueprint image profile seeded as a base copy (10 new
+  2.3 GiB copies of the sha-pinned `appliance-base`, templates 9101-9110;
+  `network.max_nics`=3, budgets vcpus 18<=26, disks 234<=576, after two
+  manifest-validation catches: image vcpu/disk totals are bounded sums).
+  Scenario `underpressure-range-01` launched through the public API on the
+  commissioned stack after re-applying the manifest and releasing the
+  broker latch (the stale smoke-era clone obligation, VMID 201, was
+  resolved first with backend read-back proof of absence — operator path).
+- **Result:** ALL 12 guests cloned, configured, started and the operation
+  reached `succeeded/readiness` in ~2.5 minutes; 12/12 domains running with
+  the expected NIC-vector distribution across `sr-team` (2), `sr-transit`
+  (2), `sr-inside` (8), `sr-wan` (3); `sr-pubnat` carries no direct guest
+  NIC (router-routed, as designed). Teardown: `complete: true`, 12 removed,
+  0 domains left, 0 bridge taps, disk back to baseline (67 GiB used of 258).
+- **Honest limits of this rehearsal:** guests are base copies (Linux
+  cloud image, 2 GiB/1 vCPU domains per seeded template) — it proves
+  orchestration, topology, budgeting and teardown at full 12-guest scale,
+  NOT role fidelity, real service readiness or the 50 GiB memory profile
+  (domains ran 24 GiB total; the real buildout's per-role resources and
+  Windows/router bootstraps remain pending media builds and the WinRM
+  management adapter).
