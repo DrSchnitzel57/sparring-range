@@ -129,6 +129,45 @@ def verify_pinned(path: pathlib.Path, pin: dict) -> str:
     return f"{algo}:{got}"
 
 
+def enable_cloud_init(disk: pathlib.Path) -> None:
+    """Persist cloud-init's enablement INSIDE the image before first boot.
+
+    Live find 2026-11-03: the Debian 12 genericcloud image ships the
+    cloud-init units under cloud-init.target, but nothing pulls the TARGET
+    in (systemd's cloud-init generator decided no datasource at first
+    boot). The first real build booted to a bare login prompt with ZERO
+    cloud-init, no seed consumed, no markers. Enabling the target at
+    multi-user.level fixes it permanently; an already-enabled image is
+    unchanged (ln -sf). Needs root (qemu-nbd/mount) — the builder runs as
+    root on the appliance.
+    """
+    dev, base = "/dev/nbd0", pathlib.Path("/mnt/sr-build-root")
+    subprocess.run(["modprobe", "nbd"], check=False)
+    subprocess.run(["qemu-nbd", "-c", dev, str(disk)], check=True, timeout=120)
+    try:
+        time.sleep(2)
+        base.mkdir(parents=True, exist_ok=True)
+        mounted = False
+        for part in sorted(pathlib.Path("/sys/class/block").glob("nbd0p*")):
+            if subprocess.run(["mount", "-t", "ext4", f"/dev/{part.name}",
+                               str(base)], capture_output=True).returncode == 0:
+                mounted = True
+                break
+        if not mounted:
+            raise RuntimeError(f"{disk}: no mountable root partition")
+        try:
+            wants = base / "etc/systemd/system/multi-user.target.wants"
+            wants.mkdir(parents=True, exist_ok=True)
+            link = wants / "cloud-init.target"
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            link.symlink_to("/lib/systemd/system/cloud-init.target")
+        finally:
+            subprocess.run(["umount", str(base)], check=False)
+    finally:
+        subprocess.run(["qemu-nbd", "-d", dev], check=False)
+
+
 def render_userdata(*, profile: str, hostname: str,
                     pubkeys: list[str]) -> str:
     """Cloud-init build seed: install the profile's toolset, then REPORT
@@ -256,6 +295,7 @@ def build_profile(*, profile: str, base: pathlib.Path, pubkey: pathlib.Path,
                                      userdata, meta,
                                      network_config=_network_config())
     disk = qemu_guest.fresh_role_overlay(base, run_dir, profile, disk_gb)
+    enable_cloud_init(disk)
     boot = qemu_guest.boot_full_guest(disk=disk, seed_iso=seed,
                                      memory_mb=memory_mb, smp=smp,
                                      net="user", timeout_s=timeout_s,
