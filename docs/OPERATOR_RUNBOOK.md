@@ -500,3 +500,44 @@ recovery password lives at `/root/.sr-operator-bootstrap` ON it).
 6. **Re-run the interrupted gate** (`infra/dev/lab_gate.py`, with the
    control-plane env files sourced) and only then trust lab/API evidence.
    Never copy a pre-outage state into FINDINGS without the rerun.
+
+## Getting into an environment lab (2026-11-03 findings)
+
+**Bastion tokens do NOT work for environment guests yet, by design.** The
+proxy refuses to dial a range host without a deployment-served host-key pin
+("the deployment served no guest host-key pin — refusing to dial on a local
+file or on TOFU"); environment guests are recorded honestly as
+`environment_guest: true` and stay outside the pin lane until their own
+attestation slice lands. Token logins still fail closed with a clear
+message in the member's terminal.
+
+**Live stopgap (verified):** from the operator box,
+
+    ssh -t appliance "sudo ssh -i /etc/sparring-range/keys/runner sr@<guest-ip>"
+
+`sr` exists in every chroot-built golden, has the runner public key and
+NOPASSWD sudo. Verified reachable on 2026-11-03: ecomm `172.20.240.10`,
+webmail `172.20.240.15`, ubuntu-wkst `172.20.240.112`.
+
+**Why the appliance needs segment addresses:** the host starts with NO
+address on any segment bridge, so neither the bastion nor `ssh` can reach
+inside-lan guests. The lab test gave it temporary addresses
+(`172.17.0.253/24`, `172.20.240.253/24`, `172.16.0.253/24`,
+`172.31.31.254/29`); they are NOT persisted and are an installer decision
+(narrow control path), not a lab property.
+
+**Bastion wiring facts that cost an hour each:**
+- the unit loads ONLY `/etc/sparring-range/control-plane.bastion.env`
+  (not `control-plane.env`); overrides belong there;
+- client key is `/etc/sparring-range/ssh/bastion_client_ed25519` (no
+  `.pub` sibling — derive with `ssh-keygen -y -f`), and must be readable by
+  the `srbastion` user;
+- `authorized_keys` format is `user <pubkey>` (the token OWNER's username,
+  not the token) — a bare key line authenticates nobody;
+- the pinned known-hosts file is
+  `/var/lib/sparring-range/state/known_hosts/range_hosts`;
+- its `SR_API_BASE_URL` was the placeholder `https://range.example.edu`;
+  on this appliance use `http://127.0.0.1:8000` with an EMPTY route prefix.
+- **guest images must trust the bastion client key**: it is derived from
+  the private key above and appended to the guest `sr` account; the
+  builders should bake it in (open item).

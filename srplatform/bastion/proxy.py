@@ -350,7 +350,8 @@ class BastionProxy:
             # keys, tokens, or pin material — to the member, the cast, and
             # the (root-only) journal, so a stale pin is loud, not silent.
             cast.write("o", f"\n[bastion] target connection failed: {e}\n")
-            print(f"[bastion] guest dial failed: {type(e).__name__}", flush=True)
+            print(f"[bastion] guest dial failed: {type(e).__name__}: "
+                  f"{str(e)[:200]}", flush=True)
             process.stderr.write(
                 "target connection failed (%s) — retry, or ask the operator "
                 "to check range health\r\n" % type(e).__name__)
