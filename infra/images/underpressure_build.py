@@ -16,12 +16,30 @@ Splunk/Windows need their own installers (recorded, not guessed).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import pathlib
 import subprocess
+import tempfile
 import time
 import sys
+
+
+@contextlib.contextmanager
+def _nbd_lock():
+    """Serialize every qemu-nbd/mount operation: the helpers all use the
+    fixed /dev/nbd0 and shared mount paths, and two concurrent builds
+    collided live (qemu-nbd exit 1 + ENOENT under /mnt, 2026-11-03)."""
+    lock = pathlib.Path("/run/lock/sparring-range-nbd.lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open("w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 from infra.dev import qemu_guest
 from infra.images import guest_seed
@@ -138,6 +156,15 @@ def verify_pinned(path: pathlib.Path, pin: dict) -> str:
     return f"{algo}:{got}"
 
 
+def _locked(fn):
+    def inner(*a, **k):
+        with _nbd_lock():
+            return fn(*a, **k)
+    inner.__name__ = fn.__name__
+    return inner
+
+
+@_locked
 def enable_cloud_init(disk: pathlib.Path) -> None:
     """Persist cloud-init's enablement INSIDE the image before first boot.
 
@@ -405,6 +432,7 @@ ln -sf /etc/systemd/system/sr-verify.service /etc/systemd/system/multi-user.targ
 """
 
 
+@_locked
 def provision_chroot(disk: pathlib.Path, *, profile: str,
                      pubkey: pathlib.Path) -> dict:
     """Deterministic offline provisioning: chroot into the fresh overlay and
@@ -416,7 +444,7 @@ def provision_chroot(disk: pathlib.Path, *, profile: str,
     artifact is then proven by ONE marker boot with no seed attached."""
     dev = "/dev/nbd0"
     part = _root_partition(disk)          # attached by _root_partition
-    root = pathlib.Path("/mnt/sr-chroot")
+    root = pathlib.Path(tempfile.mkdtemp(prefix="sr-chroot-", dir="/mnt"))
     root.mkdir(parents=True, exist_ok=True)
     try:
         subprocess.run(["mount", "-t", "ext4", f"/dev/{part}", str(root)],
@@ -452,9 +480,10 @@ def provision_chroot(disk: pathlib.Path, *, profile: str,
         for line in versions.stdout.splitlines() if "=" in line}}
 
 
-def read_build_report(disk: pathlib.Path, *,
-                      mount_root: pathlib.Path = pathlib.Path("/mnt/sr-report")
-                      ) -> str:
+@_locked
+def read_build_report(disk: pathlib.Path, *, mount_root=None) -> str:
+    if mount_root is None:
+        mount_root = pathlib.Path(tempfile.mkdtemp(prefix="sr-report-", dir="/mnt"))
     """The verify boot's on-disk report (/var/lib/sr-build-report.txt)."""
     dev = "/dev/nbd0"
     subprocess.run(["modprobe", "nbd"], check=False)
@@ -481,6 +510,7 @@ def read_build_report(disk: pathlib.Path, *,
         subprocess.run(["qemu-nbd", "-d", dev], check=False)
 
 
+@_locked
 def disable_verify_reporter(disk: pathlib.Path) -> None:
     """Disable the verify-boot reporter AFTER verification.
 
@@ -491,7 +521,7 @@ def disable_verify_reporter(disk: pathlib.Path) -> None:
     dev = "/dev/nbd0"
     subprocess.run(["modprobe", "nbd"], check=False)
     subprocess.run(["qemu-nbd", "-c", dev, str(disk)], check=True, timeout=120)
-    root = pathlib.Path("/mnt/sr-chroot")
+    root = pathlib.Path(tempfile.mkdtemp(prefix="sr-chroot-", dir="/mnt"))
     root.mkdir(parents=True, exist_ok=True)
     try:
         time.sleep(2)
