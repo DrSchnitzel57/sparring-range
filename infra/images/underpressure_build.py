@@ -48,6 +48,14 @@ PINS: dict[str, dict] = {
                                 "9/images/x86_64/Rocky-9-GenericCloud-Base."
                                 "latest.x86_64.qcow2.CHECKSUM",
     },
+    "appliance-base": {
+        # The appliance's own proven golden (Ubuntu 24.04, cloud-init and
+        # QGA verified in the commissioning smoke): the reliable base for
+        # role images until each OS family's clone-time behavior is proven.
+        "url": "appliance-local",
+        "sha256": "96172e5eec7200d0a21da9857958ece83f07ef9fc30129603380e935abb13715",
+        "source_checksum_file": "operator appliance manifest (template 1001)",
+    },
     "jammy": {
         "url": "https://cloud-images.ubuntu.com/jammy/current/"
                "jammy-server-cloudimg-amd64.img",
@@ -68,7 +76,7 @@ PROFILE_MEDIA: dict[str, str] = {
 
 #: Distro family per media key: decides the package manager + version probe.
 DISTROS: dict[str, str] = {"debian12": "apt", "jammy": "apt",
-                          "rocky9": "dnf"}
+                          "rocky9": "dnf", "appliance-base": "apt"}
 
 #: ROLE READINESS: services the role must have RUNNING in the artifact. A
 #: missing service is recorded as a gap, never hidden behind an exit code.
