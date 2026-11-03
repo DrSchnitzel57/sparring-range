@@ -118,6 +118,7 @@ def _fake_harness(monkeypatch, tmp_path, serial_text):
                 "serial": str(disk.parent / f"{disk.stem}.serial.log")}
 
     monkeypatch.setitem(ub.PINS, "fake", pin)
+    monkeypatch.setattr(ub, "enable_cloud_init", lambda disk: None)
     monkeypatch.setattr(ub.qemu_guest, "fresh_role_overlay", fake_overlay)
     monkeypatch.setattr(ub, "provision_chroot", fake_provision)
     monkeypatch.setattr(ub, "verify_boot", fake_verify)
