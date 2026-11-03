@@ -587,6 +587,14 @@ def provision_chroot(disk: pathlib.Path, *, profile: str,
     root = pathlib.Path(tempfile.mkdtemp(prefix="sr-chroot-", dir="/mnt"))
     root.mkdir(parents=True, exist_ok=True)
     try:
+        # The overlay's VIRTUAL size was grown by qemu-img, but the ext4
+        # filesystem inside is still the base's size. Grow it before any
+        # install: the Splunk vendor deb hit "No space left on device"
+        # unpacking onto a 2 GiB root (live, 2026-11-03).
+        subprocess.run(["e2fsck", "-f", "-y", f"/dev/{part}"],
+                       check=False, capture_output=True, timeout=1800)
+        subprocess.run(["resize2fs", f"/dev/{part}"], check=True,
+                       capture_output=True, timeout=1800)
         subprocess.run(["mount", "-t", "ext4", f"/dev/{part}", str(root)],
                        check=True, timeout=120)
         try:
