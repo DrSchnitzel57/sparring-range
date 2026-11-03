@@ -470,3 +470,42 @@ No implementation milestone is closed by this documentation pass.
   (domains ran 24 GiB total; the real buildout's per-role resources and
   Windows/router bootstraps remain pending media builds and the WinRM
   management adapter).
+
+### Real image gate — first golden artifacts on the appliance (2026-11-03 live gate)
+
+- **Attacker golden** (`attacker-debian`, template 9109): Debian-family
+  toolset provisioned offline in chroot onto the PROVEN appliance base
+  (Ubuntu 24.04; the Debian genericcloud base lost two clone-time fights —
+  cloud-init target and netplan permissions — and is kept for later).
+  Live clone verified through SSH from the appliance: hostname, sudo,
+  `ssh`/`qemu-guest-agent` active, `nmap 7.94SVN` present. Honest gaps
+  recorded, not hidden: `impacket`'s pip wheel ships no `impacket-*`
+  console names (library present, CLIs missing) and `netexec` has no
+  Ubuntu 24.04 distribution.
+- **Mail golden** (`ubuntu2204-mail`, template 9111): Ubuntu 22.04 +
+  postfix/dovecot from the pinned jammy cloud base, same chroot
+  provisioning; the build boot REPORT reads from disk
+  (`/var/lib/sr-build-report.txt`) and recorded REAL package versions
+  (`qemu-guest-agent 1:6.2+dfsg-2ubuntu6.31`, `ufw 0.36.1-4ubuntu0.1`).
+  Live clone: postfix and dovecot RUNNING, SSH + sudo working.
+- **Full 12-guest deploy with these real artifacts**:
+  `succeeded/readiness` under the NEW running gate, 12/12 domains
+  running on the correct segments, both real guests reached by SSH from
+  the appliance over their segments, teardown `complete: true` with zero
+  domain residue.
+- **Live defects fixed in this gate:** the verify reporter was enabled
+  permanently (a registered golden powered ITSELF OFF — the deploy read
+  11/12; readiness passed anyway → _running_items now requires created
+  guests RUNNING against the broker's vm_status); serial reports lose
+  lines (build evidence read from disk); two parallel builds collided on
+  /dev/nbd0 (fcntl lock + unique mount roots); service checks raced boot
+  (retry window); clones need cloud-init enabled even though chroot
+  provisioning does not.
+- **Windows status (not yet claimed):** the unattended Server 2022
+  install loop WORKS on BIOS/MBR (build 20348, AutoLogon,
+  FirstLogonCommands, ACPI shutdown, offline NTFS marker read). Driver
+  and QGA staging moved to the unattend's SPECIALIZE pass (the
+  first-logon PowerShell phase can stall indefinitely); verification
+  reads `qemu-ga.exe` and `System32\drivers\viostor.sys` off the disk.
+  The current rebuild remains in progress; UEFI/vTPM is declared in
+  blueprints but unimplemented in the backend (stated, never implied).
