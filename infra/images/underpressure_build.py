@@ -132,6 +132,26 @@ APT_PACKAGES: dict[str, list[str]] = {
 SCORING_BINARIES = ("curl", "wget", "openssl", "python3", "ldapsearch",
                     "kinit", "klist", "dig", "ssh")
 
+#: Cross-base package sets: a role built from a different family's base
+#: uses that distro's package names (ecomm's Fedora httpd becomes apache2).
+CROSS_DISTRO_PACKAGES: dict[str, dict[str, list[str]]] = {
+    "rocky9-ecomm": {
+        "apt": ["apache2", "php", "libapache2-mod-php", "php-fpm",
+                "openssh-server", "qemu-guest-agent", "auditd", "ufw"],
+        "dnf": ["httpd", "php", "php-fpm", "mod_ssl", "openssh-server",
+                "qemu-guest-agent", "auditd", "policycoreutils", "firewalld"],
+    },
+}
+
+#: Service-name candidates per role: Fedora httpd == Ubuntu apache2 etc.
+#: The reporter tries each candidate and names the one that actually runs.
+ROLE_SERVICE_CANDIDATES: dict[str, dict[str, list[str]]] = {
+    "rocky9-ecomm": {
+        "httpd": ["apache2", "httpd"],
+        "php-fpm": ["php8.3-fpm", "php8.2-fpm", "php8.1-fpm", "php-fpm"],
+    },
+}
+
 #: pip packages that are not apt-packaged (build-phase fetch). Versions are
 #: RECORDED from the guest (pip show), never assumed pinned to 'latest'.
 PIP_PACKAGES: dict[str, list[str]] = {
@@ -356,10 +376,11 @@ def _root_partition(disk: pathlib.Path) -> str:
     raise RuntimeError(f"{disk}: no ext4 root partition found")
 
 
-def _provision_script(profile: str) -> str:
+def _provision_script(profile: str, *, distro: str | None = None) -> str:
     media = PROFILE_MEDIA.get(profile, "debian12")
-    distro = DISTROS.get(media, "apt")
-    pkgs = APT_PACKAGES.get(profile, [])
+    distro = distro or DISTROS.get(media, "apt")
+    cross = CROSS_DISTRO_PACKAGES.get(profile, {})
+    pkgs = cross.get(distro) or APT_PACKAGES.get(profile, [])
     pkgs_join = " ".join(pkgs)
     if distro == "apt":
         install = ("apt-get update -qq\n"
@@ -381,12 +402,19 @@ def _provision_script(profile: str) -> str:
     checks = "".join(
         f'command -v {b} >/dev/null 2>&1 && echo "SR-GUEST-CAP-OK:{b}" '
         f'|| echo "SR-GUEST-CAP-MISSING:{b}"\n' for b in binaries)
-    svcs = "".join(
-        f'for _ in 1 2 3 4 5 6 7 8 9 10; do '
-        f'systemctl is-active --quiet {s} && break; sleep 3; done; '
-        f'systemctl is-active --quiet {s} && echo "SR-GUEST-SVC-OK:{s}" '
-        f'|| echo "SR-GUEST-SVC-MISSING:{s}"\n'
-        for s in ROLE_SERVICES.get(profile, []))
+    cands_map = ROLE_SERVICE_CANDIDATES.get(profile, {})
+    svc_parts = []
+    for svc in ROLE_SERVICES.get(profile, []):
+        cands = cands_map.get(svc, [svc])
+        attempts = " ".join(cands)
+        svc_parts.append(
+            f'found=0; for _ in 1 2 3 4 5 6 7 8 9 10; do '
+            f'for cand in {attempts}; do '
+            f'systemctl is-active --quiet $cand && '
+            f'{{ echo "SR-GUEST-SVC-OK:{svc}:$cand"; found=1; break; }}; '
+            f'done; [ $found = 1 ] && break; sleep 3; done; '
+            f'[ $found = 1 ] || echo "SR-GUEST-SVC-MISSING:{svc}"\n')
+    svcs = "".join(svc_parts)
     pip_cmd = (f"pip3 install --break-system-packages -q {pips} "
                f"|| echo SR-GUEST-PIP-FAIL\n") if pips else ""
     return f"""
@@ -434,7 +462,7 @@ ln -sf /etc/systemd/system/sr-verify.service /etc/systemd/system/multi-user.targ
 
 @_locked
 def provision_chroot(disk: pathlib.Path, *, profile: str,
-                     pubkey: pathlib.Path) -> dict:
+                     pubkey: pathlib.Path, distro: str | None = None) -> dict:
     """Deterministic offline provisioning: chroot into the fresh overlay and
     install the role with the HOST's network — no cloud-init, no seed, no
     device-detection race (live finds 2026-11-03: NoCloud missed the seed
@@ -456,7 +484,7 @@ def provision_chroot(disk: pathlib.Path, *, profile: str,
                                check=False)
             keys = [ln.strip() for ln in pathlib.Path(pubkey).read_text(
                 errors="replace").splitlines() if ln.strip()]
-            script = _provision_script(profile).replace(
+            script = _provision_script(profile, distro=distro).replace(
                 "SRPUBKEY",
                 "\n".join(f"echo '{k}' >> /home/sr/.ssh/authorized_keys"
                            for k in keys))
@@ -464,10 +492,14 @@ def provision_chroot(disk: pathlib.Path, *, profile: str,
                             str(root / "etc/resolv.conf")], check=False)
             subprocess.run(["chroot", str(root), "/bin/bash", "-c", script],
                            check=True, timeout=3600)
+            cross = CROSS_DISTRO_PACKAGES.get(profile, {})
+            pkgs_for_probe = cross.get(distro or "") or APT_PACKAGES.get(profile, [])
+            probe_pm = "rpm" if distro == "dnf" else "dpkg-query"
             versions = subprocess.run(
-                ["chroot", str(root), "dpkg-query", "-W",
-                 "-f=${Package}=${Version}\n"] +
-                list(APT_PACKAGES.get(profile, [])),
+                ["chroot", str(root), probe_pm] + (
+                    ["-q", "--queryformat", "%{NAME}=%{VERSION}\n"]
+                    if probe_pm == "rpm" else
+                    ["-W", "-f=${Package}=${Version}\n"]) + list(pkgs_for_probe),
                 capture_output=True, text=True)
         finally:
             for fs in ("run", "dev", "sys", "proc"):
@@ -582,9 +614,9 @@ def build_profile(*, profile: str, base: pathlib.Path, pubkey: pathlib.Path,
     base = pathlib.Path(base)
     if not base.is_file():
         raise RuntimeError(f"base image {base} does not exist")
-    pin_spec = PINS[pin or PROFILE_MEDIA.get(profile, "debian12")]
-    if pin_spec is None:
-        raise RuntimeError(f"no pinned media for profile {profile!r}")
+    media = pin or PROFILE_MEDIA.get(profile, "debian12")
+    pin_spec = PINS[media]
+    distro = DISTROS.get(media, "apt")
     pin_evidence = verify_pinned(base, pin_spec)
     pubkeys = [line.strip() for line in pathlib.Path(pubkey).read_text(
         encoding="utf-8", errors="replace").splitlines() if line.strip()]
@@ -597,7 +629,8 @@ def build_profile(*, profile: str, base: pathlib.Path, pubkey: pathlib.Path,
     # cloud-init.target is not pulled in boots without an address (live find
     # 2026-11-03: the real attacker had no route until re-enabled).
     enable_cloud_init(disk)
-    provisioned = provision_chroot(disk, profile=profile, pubkey=pubkey)
+    provisioned = provision_chroot(disk, profile=profile, pubkey=pubkey,
+                                   distro=distro)
     verified = verify_boot(disk, profile=profile, timeout_s=timeout_s)
     disable_verify_reporter(disk)
     return {"profile": profile, "artifact": str(disk),

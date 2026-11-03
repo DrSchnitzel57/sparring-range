@@ -108,7 +108,7 @@ def _fake_harness(monkeypatch, tmp_path, serial_text):
         path.write_bytes(b"overlay")
         return path
 
-    def fake_provision(disk, *, profile, pubkey):
+    def fake_provision(disk, *, profile, pubkey, distro=None):
         return {"versions": {"curl": "8.5.0-2"}}
 
     def fake_verify(disk, *, profile, timeout_s=600):
