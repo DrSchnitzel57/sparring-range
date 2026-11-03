@@ -322,7 +322,21 @@ def _root_partition(disk: pathlib.Path) -> str:
 
 
 def _provision_script(profile: str) -> str:
-    pkgs = " ".join(APT_PACKAGES.get(profile, []))
+    media = PROFILE_MEDIA.get(profile, "debian12")
+    distro = DISTROS.get(media, "apt")
+    pkgs = APT_PACKAGES.get(profile, [])
+    pkgs_join = " ".join(pkgs)
+    if distro == "apt":
+        install = ("apt-get update -qq\n"
+                   f"apt-get -y -qq install {pkgs_join}")
+        version_cmd = ("dpkg-query -W -f='SR-GUEST-PKG:"
+                       "${Package}=${Version}\\n' "
+                       f"{pkgs_join} 2>/dev/null || true")
+    else:
+        install = f"dnf -y -q install {pkgs_join}"
+        version_cmd = ("rpm -q --queryformat "
+                       "'SR-GUEST-PKG:%{NAME}=%{VERSION}\\n' "
+                       f"{pkgs_join} 2>/dev/null || true")
     pips = " ".join(PIP_PACKAGES.get(profile, []))
     caps = ATTACKER_PROFILES.get(profile)
     if caps is None:
@@ -343,8 +357,7 @@ def _provision_script(profile: str) -> str:
     return f"""
 export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C
-apt-get update -qq
-apt-get -y -qq install {pkgs}
+{install}
 {pip_cmd}useradd -m -s /bin/bash sr 2>/dev/null || true
 mkdir -p /home/sr/.ssh
 chmod 700 /home/sr/.ssh
@@ -359,7 +372,7 @@ cat > /usr/local/sbin/sr-verify.sh <<'EOS'
 exec >/dev/ttyS0 2>&1
 echo SR-GUEST-BOOT
 sleep 10
-{checks}{svcs}dpkg-query -W -f='SR-GUEST-PKG:${{Package}}=${{Version}}\n' {pkgs} 2>/dev/null || true
+{checks}{svcs}{version_cmd}
 echo "SR-GUEST-DONE rc=0"
 systemctl poweroff
 EOS
