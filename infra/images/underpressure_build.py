@@ -74,6 +74,13 @@ PINS: dict[str, dict] = {
         "sha256": "96172e5eec7200d0a21da9857958ece83f07ef9fc30129603380e935abb13715",
         "source_checksum_file": "operator appliance manifest (template 1001)",
     },
+    "kali": {
+        # extracted from the provider tar.xz (sha256 of the tar is recorded
+        # in the media fetch log); this is the extracted cloud disk.
+        "url": "operator-extracted-kali",
+        "sha256": "54bf445bac7e621afe735275e316d4a35c76dd51095428ba550c96b77a1b7793",
+        "source_checksum_file": "kali SHA256SUMS (cloud tar.xz)",
+    },
     "jammy": {
         "url": "https://cloud-images.ubuntu.com/jammy/current/"
                "jammy-server-cloudimg-amd64.img",
@@ -90,17 +97,21 @@ PROFILE_MEDIA: dict[str, str] = {
     "scoring-debian": "debian12",
     "rocky9-ecomm": "rocky9",
     "ubuntu2204-mail": "jammy",
+    "ubuntu-desktop": "jammy",
+    "team-kali": "kali",
 }
 
 #: Distro family per media key: decides the package manager + version probe.
 DISTROS: dict[str, str] = {"debian12": "apt", "jammy": "apt",
-                          "rocky9": "dnf", "appliance-base": "apt"}
+                          "rocky9": "dnf", "appliance-base": "apt",
+                          "kali": "apt"}
 
 #: ROLE READINESS: services the role must have RUNNING in the artifact. A
 #: missing service is recorded as a gap, never hidden behind an exit code.
 ROLE_SERVICES: dict[str, list[str]] = {
     "rocky9-ecomm": ["httpd", "php-fpm"],
     "ubuntu2204-mail": ["postfix", "dovecot"],
+    "team-kali": ["ssh"],
 }
 
 #: The binary capability contract per profile comes from attacker_tools so
@@ -117,6 +128,10 @@ APT_PACKAGES: dict[str, list[str]] = {
     "rocky9-ecomm": ["httpd", "php", "php-fpm", "mod_ssl",
                      "openssh-server", "qemu-guest-agent", "auditd",
                      "policycoreutils", "firewalld"],
+    "ubuntu-desktop": ["ubuntu-desktop-minimal", "qemu-guest-agent",
+                       "openssh-server", "auditd"],
+    "team-kali": ["kali-linux-headless", "openssh-server",
+                  "qemu-guest-agent", "auditd", "nmap"],
     "ubuntu2204-mail": ["postfix", "dovecot-core", "dovecot-imapd",
                         "dovecot-pop3d", "openssh-server",
                         "qemu-guest-agent", "auditd", "ufw"],

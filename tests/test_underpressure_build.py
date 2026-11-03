@@ -25,8 +25,8 @@ def _key(tmp_path):
 
 def test_pins_declare_url_and_provider_checksum():
     for name, pin in ub.PINS.items():
-        assert pin["url"].startswith("https://") or \
-            pin["url"] == "appliance-local", name
+        assert (pin["url"].startswith("https://")
+                or pin["url"] in ("appliance-local", "operator-extracted-kali")), name
         assert pin.get("sha512") or pin.get("sha256"), name
         if "sha512" in pin:
             assert len(pin["sha512"]) == 128, name
