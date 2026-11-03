@@ -501,6 +501,26 @@ No implementation milestone is closed by this documentation pass.
   /dev/nbd0 (fcntl lock + unique mount roots); service checks raced boot
   (retry window); clones need cloud-init enabled even though chroot
   provisioning does not.
+### OPEN INCIDENT — appliance VM unreachable (2026-11-03, 20:50Z)
+
+The appliance VM (10.10.10.105) stopped answering ARP entirely while a
+live lab gate (12 nested guests) and a Windows Server 2019 golden build
+ran together; the LAN gateway, two other hosts and the internet stayed
+reachable from the operator box (checked with `ip neigh`, TCP probes).
+Suspicion: the OUTER host stopped/OOM-killed the appliance guest (61 GiB
+assigned; ~40 GiB of nested guests plus a 6 GiB Windows build inside).
+Evidence at interruption: lab gate had completed a 12/12 deploy
+(`active`) and was mid selective-reset; a second real bug was found and
+fixed there — the broker releases a destroyed guest's vmid, so a rebuilt
+guest cannot be re-cloned onto it ("VMID 210 is not broker-owned" /
+"no appliance domain"); the selective path now drops the guest from the
+inventory and allocates a fresh vmid. The appliance's own recovery
+password lives at `/root/.sr-operator-bootstrap` ON the VM, so a stopped
+guest cannot self-recover; restarting it needs outer-host access.
+This is NOT acceptance and NOT a claimed root cause: re-verify on the
+appliance as soon as it answers, and record the outer host's state
+(RAM, VM status) before running another parallel 12-guest + Windows load.
+
 ### Real image gate 2 — goldens, Windows finding, lab API (2026-11-03, later)
 
 - **Seven real goldens now registered** (template id, verified by an
@@ -512,8 +532,11 @@ No implementation milestone is closed by this documentation pass.
   to its own login prompt; no cloud-init, configured by console),
   `scoring` 9110 (zero missing capabilities), `ubuntu-desktop` 9107 and
   `team-kali` 9005 (`nmap 7.99`, `python3-impacket`, explicit tool set).
-  Six of twelve placeholders remain: splunk, vyos, win11, ws2019-sql,
-  ws2022-dc and the appliance-base copies behind them.
+  Splunk (9104, vendor `splunk-10.2.0` deb via chroot, `Splunkd`
+  RUNNING, zero missing capabilities) and Server 2022 DC (9105,
+  `qemu-ga.exe` on disk, viostor in DriverStore) joined later the same
+  evening, so NINE of twelve are real; remaining placeholders: vyos,
+  win11, ws2019-sql.
 - **Builder defects fixed by these builds (each cost a live run):**
   - non-attacker profiles were graded against the SCORING binoculars
     (desktop reported `kinit`/`ldapsearch` "missing"); `capability_contract`
