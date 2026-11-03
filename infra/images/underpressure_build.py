@@ -335,7 +335,7 @@ def _provision_script(profile: str) -> str:
     svcs = "".join(
         f'systemctl is-active --quiet {s} && echo "SR-GUEST-SVC-OK:{s}" '
         f'|| echo "SR-GUEST-SVC-MISSING:{s}"\n' for s in ROLE_SERVICES.get(profile, []))
-    pip_cmd = (f"pip3 install --break-system-packages -q {pips}\n"
+    pip_cmd = (f"pip3 install --break-system-packages -q {pips} "
                f"|| echo SR-GUEST-PIP-FAIL\n") if pips else ""
     return f"""
 export DEBIAN_FRONTEND=noninteractive
