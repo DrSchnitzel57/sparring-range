@@ -34,6 +34,10 @@ def test_autounattend_is_keyless_datacenter_core_with_first_logon():
     assert "qemu-ga-x86_64.msi" not in xml.split("pass=\"oobeSystem\"")[0]
     # first logon: ONE cmd line — QGA, then marker, then ACPI shutdown
     assert "qemu-ga-x86_64.msi" in xml
+    # msiexec is a GUI-subsystem exe: plain cmd does NOT wait for it, and
+    # the shutdown raced a half-done install (build #9 evidence: marker +
+    # stage log, no qemu-ga.exe). `start /wait` is required.
+    assert "start /wait msiexec.exe" in xml
     assert "echo build-complete" in xml
     assert "shutdown.exe /s /t 5" in xml      # ACPI shutdown ends qemu
 

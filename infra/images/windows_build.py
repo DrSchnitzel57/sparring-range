@@ -92,7 +92,8 @@ FIRST_LOGON_CMD = (
     r'cmd /c echo firstlogon > C:\sr-stage.log '
     r'& for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do '
     r'if exist %I:\guest-agent\qemu-ga-x86_64.msi '
-    r'msiexec.exe /i %I:\guest-agent\qemu-ga-x86_64.msi /qn /norestart '
+    r'start /wait msiexec.exe /i '
+    r'%I:\guest-agent\qemu-ga-x86_64.msi /qn /norestart '
     r'/l*v C:\sr-qga.log '
     r'& for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do '
     r'if exist %I:\viostor\2k22\amd64\viostor.inf '
@@ -338,8 +339,14 @@ def _offline_evidence(disk: pathlib.Path,
             try:
                 evidence["qemu_ga"] = (mount_root
                                        / "Program Files/qemu-ga/qemu-ga.exe").is_file()
-                evidence["viostor"] = (mount_root
-                                       / "Windows/System32/drivers/viostor.sys").is_file()
+                # pnputil /add-driver /install only lands a storage driver in
+                # the DriverStore until the device needs it (an IDE disk never
+                # does); System32/drivers is the WRONG place to prove staging.
+                store = mount_root / "Windows/System32/DriverStore/FileRepository"
+                evidence["viostor"] = bool(
+                    list(store.glob("viostor*/viostor.sys"))
+                    if store.is_dir() else []) or (mount_root
+                    / "Windows/System32/drivers/viostor.sys").is_file()
                 marker = mount_root / "sr-build-complete.txt"
                 if marker.is_file():
                     evidence["marker"] = marker.read_text(

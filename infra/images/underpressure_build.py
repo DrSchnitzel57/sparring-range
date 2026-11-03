@@ -594,6 +594,12 @@ def provision_chroot(disk: pathlib.Path, *, profile: str,
                 (root / fs).mkdir(parents=True, exist_ok=True)
                 subprocess.run(["mount", "--bind", f"/{fs}", str(root / fs)],
                                check=False)
+            # dpkg needs a PTY even non-interactively: without /dev/pts its
+            # log helper dies ("Can not write log") and unpacking aborts on
+            # a broken pipe (live: the Splunk vendor deb, 2026-11-03).
+            (root / "dev/pts").mkdir(parents=True, exist_ok=True)
+            subprocess.run(["mount", "-t", "devpts", "devpts",
+                            str(root / "dev/pts")], check=False)
             keys = [ln.strip() for ln in pathlib.Path(pubkey).read_text(
                 errors="replace").splitlines() if ln.strip()]
             script = _provision_script(profile, distro=distro).replace(
@@ -617,6 +623,7 @@ def provision_chroot(disk: pathlib.Path, *, profile: str,
                     ["-W", "-f=${Package}=${Version}\n"]) + list(pkgs_for_probe),
                 capture_output=True, text=True)
         finally:
+            subprocess.run(["umount", str(root / "dev/pts")], check=False)
             for fs in ("run", "dev", "sys", "proc"):
                 subprocess.run(["umount", str(root / fs)], check=False)
             subprocess.run(["umount", str(root)], check=False)
