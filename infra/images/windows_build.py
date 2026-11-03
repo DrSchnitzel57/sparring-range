@@ -48,29 +48,8 @@ DATACENTER_CORE_INDEX = {"2022": 3, "2019": 3}
 #: and records COUNTS — a false `virtio=True` from pnputil alone is not
 #: evidence that the guest agent exists.
 FIRST_LOGON_PS = (
-    "powershell -NoProfile -ExecutionPolicy Bypass -Command "
-    "\"$ErrorActionPreference='Continue'; "
-    "$letters=68..90 | ForEach-Object {[char]$_}; $cd=''; "
-    "foreach ($l in $letters) { "
-    "if (Test-Path ($l.ToString()+':\\viostor')) "
-    "{ $cd=$l.ToString(); break } }; "
-    "$drivers=0; if ($cd) { "
-    "$infs=Get-ChildItem ($cd+':') -Recurse -Filter *.inf "
-    "-ErrorAction SilentlyContinue | Where-Object "
-    "{ $_.FullName -match '\\\\amd64\\\\' -or "
-    "$_.FullName -match '\\\\2k22\\\\' -or "
-    "$_.FullName -match '\\\\2k19\\\\' }; "
-    "$drivers=@($infs).Count; "
-    "foreach ($inf in $infs) "
-    "{ pnputil.exe /add-driver $inf.FullName /install | Out-Null } }; "
-    "$qga=0; if ($cd) { msiexec.exe /i "
-    "($cd+':\\guest-agent\\qemu-ga-x86_64.msi') /qn /norestart; "
-    "$qga=[int](Test-Path 'C:\\Program Files\\qemu-ga\\qemu-ga.exe') }; "
-    "$m='C:\\sr-build-complete.txt'; "
-    "Set-Content -Path $m -Encoding ascii -Value "
-    "('cd=' + $cd + ' drivers=' + $drivers + ' qga=' + $qga + "
-    "' ver=' + [Environment]::OSVersion.Version); "
-    "shutdown.exe /s /t 5 /f\""
+    "cmd /c echo build-complete > C:\\sr-build-complete.txt "
+    "&& shutdown.exe /s /t 5 /f"
 )
 
 
@@ -142,6 +121,20 @@ _UNATTEND_TEMPLATE = r"""<?xml version="1.0" encoding="utf-8" standalone="yes"?>
     </component>
   </settings>
   <settings pass="specialize">
+    <component name="Microsoft-Windows-Deployment"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>cmd /c for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %I:\viostor for /r %I:\viostor %J in (*.inf) do pnputil.exe /add-driver %J /install</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>cmd /c for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %I:\guest-agent\qemu-ga-x86_64.msi msiexec.exe /i %I:\guest-agent\qemu-ga-x86_64.msi /qn /norestart</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
     <component name="Microsoft-Windows-Shell-Setup"
                processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
                language="neutral" versionScope="nonSxS">
@@ -264,6 +257,42 @@ def read_marker_offline(disk: pathlib.Path,
         subprocess.run(["qemu-nbd", "-d", dev], check=False)
 
 
+def offline_evidence(disk: pathlib.Path,
+                     mount_root: pathlib.Path = pathlib.Path("/mnt/sr-win-ev")
+                     ) -> dict:
+    """Files ON THE DISK that prove drivers/QGA landed (not the marker's
+    self-report): qemu-ga.exe and System32\\drivers\\viostor.sys."""
+    dev = "/dev/nbd0"
+    subprocess.run(["modprobe", "nbd"], check=False)
+    evidence = {"qemu_ga": False, "viostor": False, "marker": None}
+    subprocess.run(["qemu-nbd", "-r", "-c", dev, str(disk)], check=True,
+                   timeout=120)
+    try:
+        time.sleep(2)
+        for part in sorted(pathlib.Path("/sys/class/block").glob("nbd0p*")):
+            mount_root.mkdir(parents=True, exist_ok=True)
+            r = subprocess.run(["mount", "-t", "ntfs3", "-o", "ro",
+                                f"/dev/{part.name}", str(mount_root)],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                continue
+            try:
+                evidence["qemu_ga"] = (mount_root
+                                       / "Program Files/qemu-ga/qemu-ga.exe").is_file()
+                evidence["viostor"] = (mount_root
+                                       / "Windows/System32/drivers/viostor.sys").is_file()
+                marker = mount_root / "sr-build-complete.txt"
+                if marker.is_file():
+                    evidence["marker"] = marker.read_text(
+                        errors="replace").strip()
+                return evidence
+            finally:
+                subprocess.run(["umount", str(mount_root)], check=False)
+        return evidence
+    finally:
+        subprocess.run(["qemu-nbd", "-d", dev], check=False)
+
+
 def build_windows(*, windows_iso: pathlib.Path, virtio_iso: pathlib.Path,
                   run_dir: pathlib.Path, version: str = "2022",
                   disk_gb: int = 60, memory_mb: int = 4096, smp: int = 4,
@@ -295,7 +324,9 @@ def build_windows(*, windows_iso: pathlib.Path, virtio_iso: pathlib.Path,
         error = f"install boot timed out after {install_timeout_s}s"
         qemu_rc, qemu_tail = None, str(exc)[-400:]
     marker = read_marker_offline(disk)
-    installed = bool(marker) and "qga=1" in str(marker)
+    evidence = offline_evidence(disk)
+    installed = (bool(marker) and evidence["qemu_ga"]
+                 and evidence["viostor"])
     return {"disk": str(disk), "installed": installed, "marker": marker,
-            "qemu_rc": qemu_rc, "qemu_tail": qemu_tail,
-            "error": error, "serial": str(serial)}
+            "evidence": evidence, "qemu_rc": qemu_rc,
+            "qemu_tail": qemu_tail, "error": error, "serial": str(serial)}

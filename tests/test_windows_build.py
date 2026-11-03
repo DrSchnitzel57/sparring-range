@@ -23,13 +23,13 @@ def test_autounattend_is_keyless_datacenter_core_with_first_logon():
     # (the first live attempt sat at the sign-in screen with an idle disk)
     assert "<AutoLogon>" in xml and "<LogonCount>1</LogonCount>" in xml
     assert "FirstLogonCommands" in xml
-    assert "pnputil.exe /add-driver" in xml   # virtio drivers installed
-    assert "'cd=' + $cd" in xml               # marker names the CD it found
-    assert "qemu-ga-x86_64.msi" in xml        # QGA installed by its MSI
-    # the first live run found NO virtio CD via Get-Volume labels; the
-    # provisioning now PROBES letters for the real viostor.inf payload
-    assert "$l.ToString()+':\\viostor'" in xml   # modern virtio-win layout
-    assert "sr-build-complete.txt" in xml     # offline-verifiable marker
+    # drivers/QGA install in SPECIALIZE (unattended, no logon needed):
+    # the first-logon phase is only marker + shutdown.
+    assert "Microsoft-Windows-Deployment" in xml
+    assert "RunSynchronous" in xml
+    assert "pnputil.exe /add-driver" in xml
+    assert "qemu-ga-x86_64.msi" in xml
+    assert "echo build-complete" in xml
     assert "shutdown.exe /s /t 5" in xml      # ACPI shutdown ends qemu
 
 
