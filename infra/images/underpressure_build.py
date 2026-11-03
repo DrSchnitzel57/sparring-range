@@ -355,7 +355,7 @@ cat > /usr/local/sbin/sr-verify.sh <<'EOS'
 #!/bin/bash
 exec >/dev/ttyS0 2>&1
 echo SR-GUEST-BOOT
-{checks}{svcs}dpkg-query -W -f='SR-GUEST-PKG:%{{Package}}=%{{Version}}\n' {pkgs} 2>/dev/null || true
+{checks}{svcs}dpkg-query -W -f='SR-GUEST-PKG:${{Package}}=${{Version}}\n' {pkgs} 2>/dev/null || true
 echo "SR-GUEST-DONE rc=0"
 systemctl poweroff
 EOS
