@@ -20,6 +20,7 @@ import hashlib
 import json
 import pathlib
 import subprocess
+import time
 import sys
 
 from infra.dev import qemu_guest
