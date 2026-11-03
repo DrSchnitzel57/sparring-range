@@ -28,6 +28,7 @@ class StubBroker:
         self.catalog = catalog
         self.calls: list[tuple] = []
         self.vms: dict[int, dict] = {}
+        self.host_key_reads: list[tuple[int, str]] = []
         self.on_first_clone = None
 
     def template_catalog(self):
@@ -75,6 +76,10 @@ class StubBroker:
 
     def artifact_for_template(self, template_vmid):
         return None
+
+    def read_host_key(self, node, vmid, session_id=None, generation=1):
+        self.host_key_reads.append((int(vmid), str(generation)))
+        return f"ssh-ed25519 AAAALABKEY{int(vmid):04d} lab@guest"
 
 
 def _bp_and_catalog():
@@ -267,3 +272,60 @@ def test_orchestrator_deploy_end_to_end(eng):
         again = orch_deploy(db, sid, "underpressure-range-01", broker)
     assert again["idempotent"] is True and not [
         c for c in broker.calls if c[0] == "clone"][12:]
+
+
+def test_linux_guests_get_a_pin_and_windows_stay_honestly_unpinned(eng):
+    """The bastion refuses to dial a guest without a deployment-served pin.
+    Linux guests (sshd + QGA) are pinned through the broker's typed channel;
+    Windows/router goldens stay honestly unpinned until their own lane."""
+    from tests.test_env_deploy_flow import StubBroker
+
+    bp, catalog = _bp_and_catalog()
+    broker = StubBroker(catalog)
+    sid = _session_row(eng)
+    _deploy(eng, sid, broker)
+    dep = _deployment(eng, sid)
+    resources = {r["host"]: r for r in dep.resources}
+    linux = [g.name for g in bp.guests
+             if str(getattr(g.os, "value", g.os)) == "linux"]
+    assert linux, "blueprint must declare linux guests"
+    for name in linux:
+        assert resources[name]["host_key"] == "pinned", name
+        assert resources[name]["host_key_pin"].startswith("ssh-ed25519"), name
+    for g in bp.guests:
+        if str(getattr(g.os, "value", g.os)) != "linux":
+            assert resources[g.name]["host_key"] == \
+                "unenforced-environment-guest", g.name
+            assert "host_key_pin" not in resources[g.name], g.name
+    # every pin was read for the deployment generation
+    gens = {gen for _vmid, gen in broker.host_key_reads}
+    assert len(gens) == 1
+
+
+def test_reset_repins_with_the_new_generation_attempt(eng):
+    """A rebuilt guest's key is read for :a1, not the original generation:
+    a stale-generation read is refused by the broker by design."""
+    from tests.test_env_deploy_flow import StubBroker
+
+    bp, catalog = _bp_and_catalog()
+    broker = StubBroker(catalog)
+    sid = _session_row(eng)
+    _deploy(eng, sid, broker)
+    dep = _deployment(eng, sid)
+    dep.resources = [dict(r) for r in dep.resources]
+    target = next(r for r in dep.resources if r["host"] == "ubuntu-wkst")
+    from srplatform.scenario_engine.env_deploy import _clear_resource
+    _clear_resource(target)
+    # simulate the reset redeploy through the same broker
+    from sqlalchemy.orm import Session as SASession
+    with SASession(eng) as db:
+        from srplatform.scenario_engine.env_deploy import deploy_environment
+        from srplatform.db.models import Deployment
+        row = db.get(Deployment, dep.deployment_id)
+        row.status = "preparing"
+        row.resources = dep.resources
+        db.commit()
+        deploy_environment(db, sid, f"{ENV_ID}-t1", {"environment": ENV_ID},
+                           broker, resume=True)
+    attempted = [g for _v, g in broker.host_key_reads if g.endswith(":a1")]
+    assert attempted, broker.host_key_reads

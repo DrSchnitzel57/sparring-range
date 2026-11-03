@@ -540,6 +540,11 @@ chown -R sr:sr /home/sr/.ssh
 echo 'sr ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/sr
 chmod 0440 /etc/sudoers.d/sr
 systemctl enable ssh qemu-guest-agent auditd >/dev/null 2>&1 || true
+# The broker waits for /var/lib/sparring-range/first-boot-complete before
+# it will read (and pin) a guest's SSH host key; chroot images bake it, and
+# their host keys are generated at build time, so a clone's pin is stable.
+mkdir -p /var/lib/sparring-range
+echo "chroot-build" > /var/lib/sparring-range/first-boot-complete
 # verify-boot reporter (no seed needed): markers on ttyS0, then poweroff
 cat > /usr/local/sbin/sr-verify.sh <<'EOS'
 #!/bin/bash

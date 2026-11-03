@@ -177,6 +177,61 @@ def reset_guests(db: Session, session_id, scenario_id: str, spec: dict,
     return out
 
 
+def _wants_host_key(guest) -> bool:
+    """Only Linux guests carry sshd (and the guest agent reads its key);
+    Windows/router/firewall goldens stay honest-unpinned until their own
+    access lanes exist."""
+    os_value = getattr(guest.os, "value", guest.os)
+    return str(os_value) == "linux"
+
+
+def _pin_env_host_key(db, session_id, dep, res: dict, resources: list,
+                      broker, node: str, generation: str) -> bool:
+    """Pin a Linux environment guest's SSH host key for the bastion.
+
+    Environment guests were honestly outside the pin lane until now; the
+    bastion REFUSES to dial without a deployment-served pin, so member SSH
+    was impossible. The broker reads the key through its typed guest-agent
+    channel (ownership + generation verified) and the pin is stored on the
+    resource the token route serves (`dial_pin_for`). Failures are RECORDED
+    per guest and do not sink the deploy: an unpinned guest is honestly
+    `unenforced-environment-guest`, never a silent TOFU.
+    """
+    read = getattr(broker, "read_host_key", None)
+    if read is None:
+        res["host_key"] = "unenforced-environment-guest"
+        return False
+    try:
+        key = read(node, int(res["vmid"]), session_id=session_id,
+                   generation=generation)
+    except Exception as e:  # noqa: BLE001 — per-guest, loud, not fatal
+        res["host_key"] = "unenforced-environment-guest"
+        res["host_key_pin_error"] = str(e)[:200]
+        res.pop("host_key_pin", None)
+        from srplatform.scenario_engine import orchestrator as orch
+        orch._log(db, session_id, "env_host_key_pin_failed", res.get("host"),
+                  {"vmid": res.get("vmid"), "error": str(e)[:200]})
+        return False
+    from srplatform.scenario_engine import orchestrator as orch
+    res["host_key"] = "pinned"
+    res["host_key_ref"] = f"{key[:24]}…{key[-8:]}"
+    res["host_key_pin"] = key
+    res.pop("host_key_pin_error", None)
+    ip = res.get("ip")
+    if ip:
+        err = orch._publish_pinned_host_key(ip, key)
+        if err:
+            res["host_key_publish_error"] = err
+            orch._log(db, session_id, "env_host_key_publish_failed",
+                      res.get("host"), {"vmid": res.get("vmid"),
+                                        "error": err})
+        else:
+            res.pop("host_key_publish_error", None)
+    orch._log(db, session_id, "env_host_key_pinned", res.get("host"),
+              {"vmid": res.get("vmid"), "key_ref": res["host_key_ref"]})
+    return True
+
+
 def deploy_environment(db: Session, session_id, scenario_id: str, spec: dict,
                        broker, resume: bool = True) -> dict:
     """Provision (or resume) every blueprint guest. Same idempotence
@@ -235,8 +290,20 @@ def deploy_environment(db: Session, session_id, scenario_id: str, spec: dict,
             template_vmid = int(catalog[profile]["template_id"])
             name = orch._vm_name(scenario_id, guest.name, session_id)
             res = by_host.get(guest.name)
+            attempt = int((res or {}).get("generation_attempt") or 0)
+            generation = str(dep.deployment_id) + (f":a{attempt}"
+                                                   if attempt else "")
             if res and res.get("state") == "created":
-                continue  # owned & NIC-verified earlier — resume skips
+                # owned & NIC-verified earlier — resume skips, but a created
+                # guest that never got a host-key pin (failed or pre-pin
+                # deploy) is retried here, exactly like the flat lane.
+                if _wants_host_key(guest) and not res.get("host_key_pin"):
+                    _pin_env_host_key(db, session_id, dep, res, resources,
+                                      broker, node, generation)
+                    dep.resources = resources
+                    flag_modified(dep, "resources")
+                    db.commit()
+                continue
             if res and res.get("vmid"):
                 vmid = int(res["vmid"])
             else:
@@ -270,9 +337,6 @@ def deploy_environment(db: Session, session_id, scenario_id: str, spec: dict,
             # a pending VMID is an intention; a foreign machine there gets
             # no set-config/start call.
             exists = broker.lookup_vm(node, vmid)
-            attempt = int(res.get("generation_attempt") or 0) if res else 0
-            generation = str(dep.deployment_id) + (f":a{attempt}"
-                                                   if attempt else "")
             if exists is None:
                 broker.clone_and_wait(node, template_vmid, vmid, name,
                                       full=True, session_id=session_id,
@@ -319,6 +383,13 @@ def deploy_environment(db: Session, session_id, scenario_id: str, spec: dict,
                         "host_key": "unenforced-environment-guest"})
             if domain_uuid:
                 res["domain_uuid"] = domain_uuid
+            # PIN the fresh generation's SSH host key for Linux guests: the
+            # bastion refuses to dial without a deployment-served pin, so
+            # member SSH into an environment lab was impossible until this
+            # call existed. Non-Linux goldens stay honestly unpinned.
+            if _wants_host_key(guest):
+                _pin_env_host_key(db, session_id, dep, res, resources,
+                                  broker, node, generation)
             art = broker.artifact_for_template(template_vmid)
             if isinstance(art, dict) and art.get("artifact_sha256"):
                 res["deployed_artifact"] = art
