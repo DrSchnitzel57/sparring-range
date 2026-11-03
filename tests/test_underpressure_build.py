@@ -107,22 +107,20 @@ def _fake_harness(monkeypatch, tmp_path, serial_text):
         path.write_bytes(b"overlay")
         return path
 
-    def fake_seed(path, user_data, meta_data, network_config=None):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"seed")
-        return path
+    def fake_provision(disk, *, profile, pubkey):
+        return {"versions": {"curl": "8.5.0-2"}}
 
-    def fake_boot(*, disk, seed_iso, **kwargs):
-        serial = disk.parent / f"{disk.stem}.serial.log"
-        serial.write_text(serial_text)
-        return {"ok": True}
+    def fake_verify(disk, *, profile, timeout_s=600):
+        return {"capabilities": {"curl": "ok", "nmap": "missing"},
+                "packages": {"curl": "8.5.0-2"},
+                "missing": ["nmap"],
+                "boot": {"ok": True},
+                "serial": str(disk.parent / f"{disk.stem}.serial.log")}
 
     monkeypatch.setitem(ub.PINS, "fake", pin)
-    monkeypatch.setattr(ub, "enable_cloud_init",
-                        lambda disk: None)  # root-only, proven live instead
     monkeypatch.setattr(ub.qemu_guest, "fresh_role_overlay", fake_overlay)
-    monkeypatch.setattr(ub.qemu_guest, "boot_full_guest", fake_boot)
-    monkeypatch.setattr(ub, "build_seed_disk", fake_seed)
+    monkeypatch.setattr(ub, "provision_chroot", fake_provision)
+    monkeypatch.setattr(ub, "verify_boot", fake_verify)
     return ub, base
 
 

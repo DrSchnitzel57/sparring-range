@@ -128,7 +128,7 @@ def fresh_role_overlay(base_img: pathlib.Path, run_dir: pathlib.Path, name: str,
     return overlay
 
 
-def boot_full_guest(*, disk: pathlib.Path, seed_iso: pathlib.Path,
+def boot_full_guest(*, disk: pathlib.Path, seed_iso: pathlib.Path | None,
                     memory_mb: int = 2048, smp: int = 2,
                     net: str = "none", host_api_port: int | None = None,
                     expect: tuple[str, ...] = ("SR-GUEST-DONE rc=0",),
@@ -170,9 +170,10 @@ def boot_full_guest(*, disk: pathlib.Path, seed_iso: pathlib.Path,
         raise ValueError(f"net must be 'none' or 'user', got {net!r}")
     cmd = [qemu, "-M", "q35", "-m", str(memory_mb), "-smp", str(smp),
            "-drive", f"file={disk},format=qcow2,if=virtio",
-           "-drive", (f"file={seed_iso},format=raw,if=virtio"
-                      if seed_as_disk else
-                      f"file={seed_iso},format=raw,media=cdrom,readonly=on"),
+           *(["-drive", (f"file={seed_iso},format=raw,if=virtio"
+                         if seed_as_disk else
+                         f"file={seed_iso},format=raw,media=cdrom,readonly=on")]
+             if seed_iso is not None else []),
            *net_args, *extra_args, "-nographic", "-serial", f"file:{serial}",
            "-no-reboot", "-display", "none", *accel]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,

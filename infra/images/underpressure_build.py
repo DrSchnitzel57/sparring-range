@@ -302,6 +302,154 @@ ethernets:
 """
 
 
+def _root_partition(disk: pathlib.Path) -> str:
+    """The mountable ext4 root partition name on DISK (via qemu-nbd)."""
+    subprocess.run(["modprobe", "nbd"], check=False)
+    subprocess.run(["qemu-nbd", "-c", "/dev/nbd0", str(disk)], check=True,
+                   timeout=120)
+    time.sleep(2)
+    for part in sorted(pathlib.Path("/sys/class/block").glob("nbd0p*")):
+        probe = subprocess.run(["blkid", "-o", "export", f"/dev/{part.name}"],
+                               capture_output=True, text=True)
+        if "TYPE=\"ext4\"" in probe.stdout:
+            return part.name
+        r = subprocess.run(["blkid", f"/dev/{part.name}"],
+                           capture_output=True, text=True)
+        if "ext4" in r.stdout:
+            return part.name
+    subprocess.run(["qemu-nbd", "-d", "/dev/nbd0"], check=False)
+    raise RuntimeError(f"{disk}: no ext4 root partition found")
+
+
+def _provision_script(profile: str) -> str:
+    pkgs = " ".join(APT_PACKAGES.get(profile, []))
+    pips = " ".join(PIP_PACKAGES.get(profile, []))
+    caps = ATTACKER_PROFILES.get(profile)
+    if caps is None:
+        binaries = list(SCORING_BINARIES)
+    else:
+        binaries = sorted({b for bins in caps.values() for b in bins})
+    checks = "".join(
+        f'command -v {b} >/dev/null 2>&1 && echo "SR-GUEST-CAP-OK:{b}" '
+        f'|| echo "SR-GUEST-CAP-MISSING:{b}"\n' for b in binaries)
+    svcs = "".join(
+        f'systemctl is-active --quiet {s} && echo "SR-GUEST-SVC-OK:{s}" '
+        f'|| echo "SR-GUEST-SVC-MISSING:{s}"\n' for s in ROLE_SERVICES.get(profile, []))
+    pip_cmd = (f"pip3 install --break-system-packages -q {pips}\n"
+               f"|| echo SR-GUEST-PIP-FAIL\n") if pips else ""
+    return f"""
+export DEBIAN_FRONTEND=noninteractive
+export LC_ALL=C
+apt-get update -qq
+apt-get -y -qq install {pkgs}
+{pip_cmd}useradd -m -s /bin/bash sr 2>/dev/null || true
+mkdir -p /home/sr/.ssh
+chmod 700 /home/sr/.ssh
+SRPUBKEY
+chown -R sr:sr /home/sr/.ssh
+echo 'sr ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/sr
+chmod 0440 /etc/sudoers.d/sr
+systemctl enable ssh qemu-guest-agent auditd >/dev/null 2>&1 || true
+# verify-boot reporter (no seed needed): markers on ttyS0, then poweroff
+cat > /usr/local/sbin/sr-verify.sh <<'EOS'
+#!/bin/bash
+exec >/dev/ttyS0 2>&1
+echo SR-GUEST-BOOT
+{checks}{svcs}dpkg-query -W -f='SR-GUEST-PKG:%{{Package}}=%{{Version}}\n' {pkgs} 2>/dev/null || true
+echo "SR-GUEST-DONE rc=0"
+systemctl poweroff
+EOS
+chmod 0755 /usr/local/sbin/sr-verify.sh
+cat > /etc/systemd/system/sr-verify.service <<'EOS'
+[Unit]
+Description=sparring-range build verification marker boot
+After=network.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sr-verify.sh
+[Install]
+WantedBy=multi-user.target
+EOS
+mkdir -p /etc/systemd/system/multi-user.target.wants
+ln -sf /etc/systemd/system/sr-verify.service /etc/systemd/system/multi-user.target.wants/sr-verify.service
+"""
+
+
+def provision_chroot(disk: pathlib.Path, *, profile: str,
+                     pubkey: pathlib.Path) -> dict:
+    """Deterministic offline provisioning: chroot into the fresh overlay and
+    install the role with the HOST's network — no cloud-init, no seed, no
+    device-detection race (live finds 2026-11-03: NoCloud missed the seed
+    at init-local twice: generator disabled, then blkid vs virtio timing).
+
+    Services, ssh key, sudo and a verify-boot reporter are baked in; the
+    artifact is then proven by ONE marker boot with no seed attached."""
+    dev = "/dev/nbd0"
+    part = _root_partition(disk)          # attached by _root_partition
+    root = pathlib.Path("/mnt/sr-chroot")
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(["mount", "-t", "ext4", f"/dev/{part}", str(root)],
+                       check=True, timeout=120)
+        try:
+            for fs in ("proc", "sys", "dev", "run"):
+                (root / fs).mkdir(parents=True, exist_ok=True)
+                subprocess.run(["mount", "--bind", f"/{fs}", str(root / fs)],
+                               check=False)
+            keys = [ln.strip() for ln in pathlib.Path(pubkey).read_text(
+                errors="replace").splitlines() if ln.strip()]
+            script = _provision_script(profile).replace(
+                "SRPUBKEY",
+                "\n".join(f"echo '{k}' >> /home/sr/.ssh/authorized_keys"
+                           for k in keys))
+            subprocess.run(["cp", "/etc/resolv.conf",
+                            str(root / "etc/resolv.conf")], check=False)
+            subprocess.run(["chroot", str(root), "/bin/bash", "-c", script],
+                           check=True, timeout=3600)
+            versions = subprocess.run(
+                ["chroot", str(root), "dpkg-query", "-W",
+                 "-f=${Package}=${Version}\n"] +
+                list(APT_PACKAGES.get(profile, [])),
+                capture_output=True, text=True)
+        finally:
+            for fs in ("run", "dev", "sys", "proc"):
+                subprocess.run(["umount", str(root / fs)], check=False)
+            subprocess.run(["umount", str(root)], check=False)
+    finally:
+        subprocess.run(["qemu-nbd", "-d", dev], check=False)
+    return {"versions": {
+        line.split("=", 1)[0]: line.split("=", 1)[1]
+        for line in versions.stdout.splitlines() if "=" in line}}
+
+
+def verify_boot(disk: pathlib.Path, *, profile: str,
+                timeout_s: int = 600) -> dict:
+    """ONE marker boot with NO seed: proves the provisioned artifact runs,
+    reports the same capability inventory, and powers itself off."""
+    boot = qemu_guest.boot_full_guest(
+        disk=disk, seed_iso=None, memory_mb=2048, smp=2, net="none",
+        timeout_s=timeout_s, expect=("SR-GUEST-DONE rc=0",))
+    serial = disk.parent / f"{disk.stem}.serial.log"
+    observed = serial.read_text(errors="replace").replace("\r", "")
+    caps: dict[str, str] = {}
+    packages: dict[str, str] = {}
+    for line in observed.splitlines():
+        if line.startswith("SR-GUEST-CAP-OK:"):
+            caps[line.split(":", 1)[1]] = "ok"
+        elif line.startswith("SR-GUEST-CAP-MISSING:"):
+            caps[line.split(":", 1)[1]] = "missing"
+        elif line.startswith("SR-GUEST-SVC-OK:"):
+            caps[line.split(":", 1)[1]] = "running"
+        elif line.startswith("SR-GUEST-SVC-MISSING:"):
+            caps[line.split(":", 1)[1]] = "service-missing"
+        elif line.startswith("SR-GUEST-PKG:"):
+            key, _, ver = line.split(":", 1)[1].partition("=")
+            packages[key] = ver
+    return {"boot": boot, "capabilities": caps,
+            "packages": packages,
+            "missing": sorted(b for b, s in caps.items() if s != "ok")}
+
+
 def build_profile(*, profile: str, base: pathlib.Path, pubkey: pathlib.Path,
                   run_dir: pathlib.Path, disk_gb: int = 16,
                   memory_mb: int = 2048, smp: int = 2,
@@ -322,45 +470,16 @@ def build_profile(*, profile: str, base: pathlib.Path, pubkey: pathlib.Path,
     if not pubkeys:
         raise RuntimeError(f"pubkey file {pubkey} is empty")
     run_dir.mkdir(parents=True, exist_ok=True)
-    hostname = f"sr-build-{profile.replace('_', '-')}"
-    userdata = render_userdata(profile=profile, hostname=hostname,
-                               pubkeys=pubkeys)
-    meta = json.dumps({"instance-id": f"sr-build-{profile}",
-                       "local-hostname": hostname})
-    seed = build_seed_disk(run_dir / f"{profile}.seed.img", userdata, meta,
-                           network_config=_network_config())
     disk = qemu_guest.fresh_role_overlay(base, run_dir, profile, disk_gb)
-    enable_cloud_init(disk)
-    # NoCloud via SMBIOS: the systemd generator already declined the CD
-    # label (live find 2026-11-03: DataSourceNone, seed never consumed), so
-    # tell cloud-init the device DIRECTLY. `ds=nocloud;s=/dev/sr0` in the
-    # SMBIOS serial is the standard KVM/libvirt datasource injection.
-    boot = qemu_guest.boot_full_guest(
-        disk=disk, seed_iso=seed, memory_mb=memory_mb, smp=smp,
-        net="user", timeout_s=timeout_s,
-        expect=("SR-GUEST-DONE rc=0",), seed_as_disk=True)
-    serial = run_dir / f"{profile}.serial.log"
-    observed = serial.read_text(errors="replace").replace("\r", "")
-    caps: dict[str, str] = {}
-    packages: dict[str, str] = {}
-    for line in observed.splitlines():
-        if line.startswith("SR-GUEST-CAP-OK:"):
-            caps[line.split(":", 1)[1]] = "ok"
-        elif line.startswith("SR-GUEST-CAP-MISSING:"):
-            caps[line.split(":", 1)[1]] = "missing"
-        elif line.startswith("SR-GUEST-SVC-OK:"):
-            caps[line.split(":", 1)[1]] = "running"
-        elif line.startswith("SR-GUEST-SVC-MISSING:"):
-            caps[line.split(":", 1)[1]] = "service-missing"
-        elif line.startswith("SR-GUEST-PKG:") or line.startswith("SR-GUEST-PIP:"):
-            key, _, ver = line.split(":", 1)[1].partition("=")
-            packages[key] = ver
-    missing = sorted(b for b, s in caps.items() if s != "ok")
+    provisioned = provision_chroot(disk, profile=profile, pubkey=pubkey)
+    verified = verify_boot(disk, profile=profile, timeout_s=timeout_s)
     return {"profile": profile, "artifact": str(disk),
             "base": str(base), "base_pin": pin_evidence,
-            "capabilities": caps, "missing": missing,
-            "packages": packages,
-            "boot": boot, "serial": str(serial)}
+            "capabilities": verified["capabilities"],
+            "missing": verified["missing"],
+            "packages": verified["packages"] or provisioned["versions"],
+            "boot": verified["boot"], "serial":
+                str(run_dir / f"{profile}.serial.log")}
 
 
 def main(argv: list[str] | None = None) -> int:
