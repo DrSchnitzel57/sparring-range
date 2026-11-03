@@ -520,6 +520,11 @@ def build_profile(*, profile: str, base: pathlib.Path, pubkey: pathlib.Path,
         raise RuntimeError(f"pubkey file {pubkey} is empty")
     run_dir.mkdir(parents=True, exist_ok=True)
     disk = qemu_guest.fresh_role_overlay(base, run_dir, profile, disk_gb)
+    # chroot provisioning does not need cloud-init, but the CLONE does: the
+    # env lane applies its seed through cloud-init, and an image whose
+    # cloud-init.target is not pulled in boots without an address (live find
+    # 2026-11-03: the real attacker had no route until re-enabled).
+    enable_cloud_init(disk)
     provisioned = provision_chroot(disk, profile=profile, pubkey=pubkey)
     verified = verify_boot(disk, profile=profile, timeout_s=timeout_s)
     disable_verify_reporter(disk)
