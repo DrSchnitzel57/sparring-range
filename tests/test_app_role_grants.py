@@ -26,18 +26,19 @@ def _revisions():
     return revs
 
 
-def test_migration_chain_is_linear_with_head_0029():
+def test_migration_chain_is_linear_with_current_head():
     revs = _revisions()
     children = {down for down, _ in revs.values() if down}
     heads = [r for r in revs if r not in children]
-    assert heads == ["0029"], f"expected single head 0029, got {heads}"
+    assert len(heads) == 1, f"expected exactly one alembic head, got {heads}"
+    head = heads[0]
     # walk from head to root: must visit every revision exactly once
-    seen, cur = [], "0029"
+    seen, cur = [], head
     while cur is not None:
         assert cur in revs, f"missing revision file for {cur}"
         seen.append(cur)
         cur = revs[cur][0]
-    assert len(seen) == len(revs) == 29, f"non-linear chain: {seen}"
+    assert len(seen) == len(revs), f"non-linear chain: {seen}"
 
 
 def test_0016_grants_dml_and_default_privileges_without_ddl():
@@ -101,3 +102,15 @@ def test_0016_has_no_hardcoded_owner():
     code = text.split('"""', 2)[-1]  # prose may name roles; SQL must not
     assert 'FOR ROLE "' not in code
     assert "sr_owner" not in code
+
+
+def test_0030_grants_the_lab_tables_to_the_app_role():
+    """Migration 0029 created the lab tables WITHOUT runtime grants; the
+    first real lab-API request failed with "permission denied for table
+    labs". 0030 is forward-only and idempotent (GRANT only)."""
+    text = (VERSIONS / "0030_lab_grants.py").read_text()
+    up = text.split("def upgrade")[1].split("def downgrade")[0]
+    assert "GRANT SELECT, INSERT, UPDATE ON {table}" in up
+    for table in ("labs", "lab_guests", "lab_members", "lab_reset_plans"):
+        assert table in up, f"0030 never grants {table}"
+    assert "DELETE" not in up, "labs are soft-deleted, never row-deleted"

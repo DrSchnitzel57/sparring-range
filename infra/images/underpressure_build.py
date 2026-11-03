@@ -641,7 +641,8 @@ def verify_boot(disk: pathlib.Path, *, profile: str,
             packages[key] = ver
     return {"boot": boot, "capabilities": caps,
             "packages": packages,
-            "missing": sorted(b for b, s in caps.items() if s != "ok")}
+            "missing": sorted(b for b, s in caps.items()
+                              if s not in ("ok", "running"))}
 
 
 def build_profile(*, profile: str, base: pathlib.Path, pubkey: pathlib.Path,

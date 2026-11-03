@@ -36,8 +36,9 @@ ENVIRONMENT_FILES = ("blueprint.yaml", "fidelity.yaml", "checks.yaml",
                      "attack.yaml", "defender.md")
 
 LAB_ROLES = frozenset({"captain", "member"})
-_LIVE_LAB_STATES = frozenset({"provisioning", "active", "degraded",
-                              "stopped"})
+#: A plan needs deployed guests: `provisioning` has none yet, so it is
+#: deliberately NOT here (a plan against nothing is not a plan).
+_LIVE_LAB_STATES = frozenset({"active", "degraded", "stopped"})
 
 
 class LabError(Exception):
@@ -68,9 +69,10 @@ def environment_digest(environment_id: str) -> str:
 
 def default_scenario_id(environment_id: str) -> str | None:
     """The first scenario file that references this environment."""
-    from .scenario_engine.loader import load_scenario, scenario_ids
+    from .scenario_engine.loader import list_scenarios, load_scenario
 
-    for sid in scenario_ids():
+    for entry in list_scenarios():
+        sid = str(entry.get("id"))
         try:
             spec = load_scenario(sid)
         except Exception:  # noqa: BLE001 — one broken overlay never hides
@@ -298,12 +300,9 @@ def _revoke_member_capabilities(db, lab: Lab, user_id) -> int:
             LoginToken.revoked_at.is_(None))).all():
         lt.revoked_at = t
         n += 1
-    for st in db.scalars(select(ServiceToken).where(
-            ServiceToken.session_id == home.session_id,
-            ServiceToken.user_id == user_id,
-            ServiceToken.revoked_at.is_(None))).all():
-        st.revoked_at = t
-        n += 1
+    # ServiceToken rows are session/host-scoped capabilities (no user_id):
+    # a leaving MEMBER only loses their own login credentials here; the
+    # session-level service tokens are handled by the reset fences.
     return n
 
 

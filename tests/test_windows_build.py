@@ -23,11 +23,16 @@ def test_autounattend_is_keyless_datacenter_core_with_first_logon():
     # (the first live attempt sat at the sign-in screen with an idle disk)
     assert "<AutoLogon>" in xml and "<LogonCount>1</LogonCount>" in xml
     assert "FirstLogonCommands" in xml
-    # drivers/QGA install in SPECIALIZE (unattended, no logon needed):
-    # the first-logon phase is only marker + shutdown.
+    # SPECIALIZE is minimal AND logged: VBS/hypervisor off (nested-KVM
+    # freezes), no drivers/MSIs there; the stage log proves how far it got.
     assert "Microsoft-Windows-Deployment" in xml
     assert "RunSynchronous" in xml
-    assert "pnputil.exe /add-driver" in xml
+    assert "EnableVirtualizationBasedSecurity /t REG_DWORD /d 0" in xml
+    assert "hypervisorlaunchtype off" in xml
+    assert "sr-stage.log" in xml
+    assert "pnputil.exe /add-driver" not in xml.split("pass=\"oobeSystem\"")[0]
+    assert "qemu-ga-x86_64.msi" not in xml.split("pass=\"oobeSystem\"")[0]
+    # first logon: ONE cmd line — QGA, then marker, then ACPI shutdown
     assert "qemu-ga-x86_64.msi" in xml
     assert "echo build-complete" in xml
     assert "shutdown.exe /s /t 5" in xml      # ACPI shutdown ends qemu

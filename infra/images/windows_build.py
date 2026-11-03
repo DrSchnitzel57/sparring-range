@@ -31,25 +31,76 @@ role provisioning.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import pathlib
 import subprocess
 import time
 
 import pycdlib
 
+#: The Linux builder and this one share /dev/nbd0 and /mnt; the SAME lock
+#: file serializes every nbd attach. Without it, a concurrent Windows
+#: offline read detaches the device under an in-progress Linux build (two
+#: live SIGBUS failures in apt, 2026-11-03).
+NBD_LOCK_PATH = pathlib.Path("/run/lock/sparring-range-nbd.lock")
+
+
+@contextlib.contextmanager
+def nbd_lock():
+    NBD_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with NBD_LOCK_PATH.open("w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
 #: /IMAGE/INDEX on Server 2019/2022 EVAL media:
 #: 1 Std Core, 2 Std Desktop, 3 Datacenter Core, 4 Datacenter Desktop.
 DATACENTER_CORE_INDEX = {"2022": 3, "2019": 3}
 
-#: The first-logon provisioning command (single line; lives in the answer
-#: file as plain XML text). Finds the virtio-win CD by looking for its
-#: real `amd64\*.inf` payload (the ISO volume label is 'virtio-win-*',
-#: never 'VirtIO'), installs every driver, installs QGA from its MSI,
-#: and records COUNTS — a false `virtio=True` from pnputil alone is not
-#: evidence that the guest agent exists.
-FIRST_LOGON_PS = (
-    "cmd /c echo build-complete > C:\\sr-build-complete.txt "
-    "&& shutdown.exe /s /t 5 /f"
+#: SPECIALIZE is now deliberately MINIMAL: no drivers, no MSI. Three live
+#: builds stalled black-screen with the disk frozen and two vCPUs pinned
+#: while running pnputil over the virtio ISO there (qemu-ga MSI included).
+#: Research (2026-11-03): Windows Server 2022 enables Virtualization-Based
+#: Security by default, and VBS/Hyper-V code paths inside NESTED KVM are a
+#: known freeze source on some Intel CPUs — which matches the symptom
+#: exactly (CPU spent, zero I/O, no progress). So specialize now only:
+#:   1. drops a STAGE LOG first (offline evidence of how far it got),
+#:   2. turns VBS OFF in the registry (DeviceGuard),
+#:   3. turns the hypervisor launcher off (bcdedit),
+#:   4. logs completion. Nothing else runs during specialize.
+SPECIALIZE_COMMANDS: tuple[str, ...] = (
+    r'cmd /c echo specialize-start > C:\sr-stage.log',
+    r'cmd /c reg add "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard" '
+    r'/v EnableVirtualizationBasedSecurity /t REG_DWORD /d 0 /f '
+    r'& echo vbs-off >> C:\sr-stage.log',
+    r'cmd /c reg add "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard" '
+    r'/v RequirePlatformSecurityFeatures /t REG_DWORD /d 0 /f '
+    r'& echo vbs-required0 >> C:\sr-stage.log',
+    r'cmd /c bcdedit /set hypervisorlaunchtype off '
+    r'& echo hypervisor-off >> C:\sr-stage.log',
+    r'cmd /c echo specialize-done >> C:\sr-stage.log',
+)
+
+#: The FIRST-LOGON command installs QGA (and the virtio storage driver for
+#: future virtio disks) from the driver CD, then writes the ASCII marker
+#: and ACPI-shuts down. It logs its own start FIRST, so an offline mount
+#: can always tell a stalled logon from a stalled specialize.
+FIRST_LOGON_CMD = (
+    r'cmd /c echo firstlogon > C:\sr-stage.log '
+    r'& for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do '
+    r'if exist %I:\guest-agent\qemu-ga-x86_64.msi '
+    r'msiexec.exe /i %I:\guest-agent\qemu-ga-x86_64.msi /qn /norestart '
+    r'/l*v C:\sr-qga.log '
+    r'& for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do '
+    r'if exist %I:\viostor\2k22\amd64\viostor.inf '
+    r'pnputil.exe /add-driver %I:\viostor\2k22\amd64\viostor.inf '
+    r'/install '
+    r'& echo qga-and-driver-attempted >> C:\sr-stage.log '
+    r'& echo build-complete > C:\sr-build-complete.txt '
+    r'& shutdown.exe /s /t 5 /f'
 )
 
 
@@ -59,9 +110,19 @@ def render_autounattend(*, version: str = "2022",
     if version not in DATACENTER_CORE_INDEX:
         raise ValueError(f"no eval index for Server {version}; known: "
                          f"{sorted(DATACENTER_CORE_INDEX)}")
+    def _xml(text: str) -> str:
+        return text.replace("&", "&amp;").replace(">", "&gt;")
+
+    rows = "".join(
+        "        <RunSynchronousCommand wcm:action=\"add\">\n"
+        f"          <Order>{i}</Order>\n"
+        f"          <Path>{_xml(cmd)}</Path>\n"
+        "        </RunSynchronousCommand>\n"
+        for i, cmd in enumerate(SPECIALIZE_COMMANDS, 1))
     return _UNATTEND_TEMPLATE.replace(
         "%INDEX%", str(DATACENTER_CORE_INDEX[version])).replace(
-        "%PS%", FIRST_LOGON_PS).replace("%NAME%", computer_name)
+        "%PS%", _xml(FIRST_LOGON_CMD)).replace(
+        "%SPECIALIZE%", rows).replace("%NAME%", computer_name)
 
 
 _UNATTEND_TEMPLATE = r"""<?xml version="1.0" encoding="utf-8" standalone="yes"?>
@@ -125,38 +186,7 @@ _UNATTEND_TEMPLATE = r"""<?xml version="1.0" encoding="utf-8" standalone="yes"?>
                processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
                language="neutral" versionScope="nonSxS">
       <RunSynchronous>
-        <RunSynchronousCommand wcm:action="add">
-          <Order>1</Order>
-          <Path>cmd /c echo staging &gt; C:\\sr-stage.log</Path>
-        </RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add">
-          <Order>2</Order>
-          <Path>cmd /c for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %I:\\viostor\\2k22\\amd64\\viostor.inf ( pnputil.exe /add-driver %I:\\viostor\\2k22\\amd64\\viostor.inf /install &amp; echo viostor %I &gt;&gt; C:\\sr-stage.log )</Path>
-        </RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add">
-          <Order>3</Order>
-          <Path>cmd /c for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %I:\\vioscsi\\2k22\\amd64\\vioscsi.inf ( pnputil.exe /add-driver %I:\\vioscsi\\2k22\\amd64\\vioscsi.inf /install &amp; echo vioscsi &gt;&gt; C:\\sr-stage.log )</Path>
-        </RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add">
-          <Order>4</Order>
-          <Path>cmd /c for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %I:\\NetKvm\\2k22\\amd64\\netkvm.inf ( pnputil.exe /add-driver %I:\\NetKvm\\2k22\\amd64\\netkvm.inf /install &amp; echo netkvm &gt;&gt; C:\\sr-stage.log )</Path>
-        </RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add">
-          <Order>5</Order>
-          <Path>cmd /c for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %I:\\Balloon\\2k22\\amd64\\balloon.inf ( pnputil.exe /add-driver %I:\\Balloon\\2k22\\amd64\\balloon.inf /install &amp; echo balloon &gt;&gt; C:\\sr-stage.log )</Path>
-        </RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add">
-          <Order>6</Order>
-          <Path>cmd /c for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %I:\\vioserial\\2k22\\amd64\\vioserial.inf ( pnputil.exe /add-driver %I:\\vioserial\\2k22\\amd64\\vioserial.inf /install &amp; echo vioserial &gt;&gt; C:\\sr-stage.log )</Path>
-        </RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add">
-          <Order>7</Order>
-          <Path>cmd /c for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %I:\\guest-agent\\qemu-ga-x86_64.msi ( msiexec.exe /i %I:\\guest-agent\\qemu-ga-x86_64.msi /qn /norestart /l*v C:\\sr-qga.log &amp; echo qga &gt;&gt; C:\\sr-stage.log )</Path>
-        </RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add">
-          <Order>8</Order>
-          <Path>cmd /c echo staging-done &gt;&gt; C:\\sr-stage.log</Path>
-        </RunSynchronousCommand>
+%SPECIALIZE%
       </RunSynchronous>
     </component>
     <component name="Microsoft-Windows-Shell-Setup"
@@ -232,7 +262,11 @@ def install_command(*, disk: pathlib.Path, windows_iso: pathlib.Path,
     accel = ["-accel", "kvm"] if kvm else ["-accel", "tcg"]
     return [
         "qemu-system-x86_64", "-machine", "pc", *accel,
-        "-cpu", "host" if kvm else "max",
+        # hv_* enlightenments are what Windows Server 2022 expects on KVM;
+        # without them VBS/Hyper-V code inside NESTED KVM spins (the 1h
+        # black-screen stalls). Harmless for older guests.
+        "-cpu", ("host,hv_relaxed=on,hv_spinlocks=0x1fff,hv_vapic=on,"
+                 "hv_time=on") if kvm else "max",
         "-m", str(memory_mb), "-smp", str(smp),
         "-drive", f"file={disk},format=qcow2,if=ide,index=0",
         "-drive", f"file={windows_iso},media=cdrom,readonly=on,index=1",
@@ -248,7 +282,7 @@ def install_command(*, disk: pathlib.Path, windows_iso: pathlib.Path,
     ]
 
 
-def read_marker_offline(disk: pathlib.Path,
+def _read_marker_offline(disk: pathlib.Path,
                         mount_root: pathlib.Path = pathlib.Path("/mnt"),
                         marker: str = "sr-build-complete.txt") -> str | None:
     """Read the marker from the installed system OFFLINE via qemu-nbd +
@@ -281,14 +315,15 @@ def read_marker_offline(disk: pathlib.Path,
         subprocess.run(["qemu-nbd", "-d", dev], check=False)
 
 
-def offline_evidence(disk: pathlib.Path,
+def _offline_evidence(disk: pathlib.Path,
                      mount_root: pathlib.Path = pathlib.Path("/mnt/sr-win-ev")
                      ) -> dict:
     """Files ON THE DISK that prove drivers/QGA landed (not the marker's
     self-report): qemu-ga.exe and System32\\drivers\\viostor.sys."""
     dev = "/dev/nbd0"
     subprocess.run(["modprobe", "nbd"], check=False)
-    evidence = {"qemu_ga": False, "viostor": False, "marker": None}
+    evidence = {"qemu_ga": False, "viostor": False, "marker": None,
+                "stage": None}
     subprocess.run(["qemu-nbd", "-r", "-c", dev, str(disk)], check=True,
                    timeout=120)
     try:
@@ -309,12 +344,26 @@ def offline_evidence(disk: pathlib.Path,
                 if marker.is_file():
                     evidence["marker"] = marker.read_text(
                         errors="replace").strip()
+                stage = mount_root / "sr-stage.log"
+                if stage.is_file():
+                    evidence["stage"] = stage.read_text(
+                        errors="replace").replace("\r", "").strip()
                 return evidence
             finally:
                 subprocess.run(["umount", str(mount_root)], check=False)
         return evidence
     finally:
         subprocess.run(["qemu-nbd", "-d", dev], check=False)
+
+
+def read_marker_offline(*a, **k):
+    with nbd_lock():
+        return _read_marker_offline(*a, **k)
+
+
+def offline_evidence(*a, **k):
+    with nbd_lock():
+        return _offline_evidence(*a, **k)
 
 
 def build_windows(*, windows_iso: pathlib.Path, virtio_iso: pathlib.Path,
@@ -349,8 +398,9 @@ def build_windows(*, windows_iso: pathlib.Path, virtio_iso: pathlib.Path,
         qemu_rc, qemu_tail = None, str(exc)[-400:]
     marker = read_marker_offline(disk)
     evidence = offline_evidence(disk)
-    installed = (bool(marker) and evidence["qemu_ga"]
-                 and evidence["viostor"])
+    # viostor is ADVISORY (IDE installs need no virtio driver); the marker
+    # and a real qemu-ga.exe on disk are what "installed" requires.
+    installed = bool(marker) and evidence["qemu_ga"]
     return {"disk": str(disk), "installed": installed, "marker": marker,
             "evidence": evidence, "qemu_rc": qemu_rc,
             "qemu_tail": qemu_tail, "error": error, "serial": str(serial)}
