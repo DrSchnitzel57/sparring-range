@@ -377,11 +377,16 @@ systemctl enable ssh qemu-guest-agent auditd >/dev/null 2>&1 || true
 # verify-boot reporter (no seed needed): markers on ttyS0, then poweroff
 cat > /usr/local/sbin/sr-verify.sh <<'EOS'
 #!/bin/bash
-exec >/dev/ttyS0 2>&1
+# Build evidence goes to DISK (deterministic; serial is best-effort and
+# live runs proved it can lose lines): the verifier reads the file back
+# offline from the overlay.
+exec >/var/lib/sr-build-report.txt 2>&1
 echo SR-GUEST-BOOT
 sleep 10
 {checks}{svcs}{version_cmd}
 echo "SR-GUEST-DONE rc=0"
+exec >/dev/ttyS0 2>&1
+cat /var/lib/sr-build-report.txt
 systemctl poweroff
 EOS
 chmod 0755 /usr/local/sbin/sr-verify.sh
@@ -447,6 +452,35 @@ def provision_chroot(disk: pathlib.Path, *, profile: str,
         for line in versions.stdout.splitlines() if "=" in line}}
 
 
+def read_build_report(disk: pathlib.Path, *,
+                      mount_root: pathlib.Path = pathlib.Path("/mnt/sr-report")
+                      ) -> str:
+    """The verify boot's on-disk report (/var/lib/sr-build-report.txt)."""
+    dev = "/dev/nbd0"
+    subprocess.run(["modprobe", "nbd"], check=False)
+    subprocess.run(["qemu-nbd", "-r", "-c", dev, str(disk)], check=True,
+                   timeout=120)
+    try:
+        time.sleep(2)
+        for part in sorted(pathlib.Path("/sys/class/block").glob("nbd0p*")):
+            mount_root.mkdir(parents=True, exist_ok=True)
+            r = subprocess.run(["mount", "-t", "ext4", "-o", "noload",
+                                f"/dev/{part.name}", str(mount_root)],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                continue
+            try:
+                report = mount_root / "var/lib/sr-build-report.txt"
+                if report.is_file():
+                    return report.read_text(errors="replace").replace("\r", "")
+                return ""
+            finally:
+                subprocess.run(["umount", str(mount_root)], check=False)
+        return ""
+    finally:
+        subprocess.run(["qemu-nbd", "-d", dev], check=False)
+
+
 def disable_verify_reporter(disk: pathlib.Path) -> None:
     """Disable the verify-boot reporter AFTER verification.
 
@@ -485,9 +519,9 @@ def verify_boot(disk: pathlib.Path, *, profile: str,
     reports the same capability inventory, and powers itself off."""
     boot = qemu_guest.boot_full_guest(
         disk=disk, seed_iso=None, memory_mb=2048, smp=2, net="none",
-        timeout_s=timeout_s, expect=("SR-GUEST-DONE rc=0",))
+        timeout_s=timeout_s, expect=("SR-GUEST-BOOT",))
     serial = disk.parent / f"{disk.stem}.serial.log"
-    observed = serial.read_text(errors="replace").replace("\r", "")
+    observed = read_build_report(disk)
     caps: dict[str, str] = {}
     packages: dict[str, str] = {}
     for line in observed.splitlines():
