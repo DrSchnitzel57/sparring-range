@@ -127,11 +127,35 @@ _UNATTEND_TEMPLATE = r"""<?xml version="1.0" encoding="utf-8" standalone="yes"?>
       <RunSynchronous>
         <RunSynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <Path>cmd /c for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %I:\viostor for /r %I:\viostor %J in (*.inf) do pnputil.exe /add-driver %J /install</Path>
+          <Path>cmd /c echo staging &gt; C:\\sr-stage.log</Path>
         </RunSynchronousCommand>
         <RunSynchronousCommand wcm:action="add">
           <Order>2</Order>
-          <Path>cmd /c for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %I:\guest-agent\qemu-ga-x86_64.msi msiexec.exe /i %I:\guest-agent\qemu-ga-x86_64.msi /qn /norestart</Path>
+          <Path>cmd /c for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %I:\\viostor\\2k22\\amd64\\viostor.inf ( pnputil.exe /add-driver %I:\\viostor\\2k22\\amd64\\viostor.inf /install &amp; echo viostor %I &gt;&gt; C:\\sr-stage.log )</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>cmd /c for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %I:\\vioscsi\\2k22\\amd64\\vioscsi.inf ( pnputil.exe /add-driver %I:\\vioscsi\\2k22\\amd64\\vioscsi.inf /install &amp; echo vioscsi &gt;&gt; C:\\sr-stage.log )</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Path>cmd /c for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %I:\\NetKvm\\2k22\\amd64\\netkvm.inf ( pnputil.exe /add-driver %I:\\NetKvm\\2k22\\amd64\\netkvm.inf /install &amp; echo netkvm &gt;&gt; C:\\sr-stage.log )</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>5</Order>
+          <Path>cmd /c for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %I:\\Balloon\\2k22\\amd64\\balloon.inf ( pnputil.exe /add-driver %I:\\Balloon\\2k22\\amd64\\balloon.inf /install &amp; echo balloon &gt;&gt; C:\\sr-stage.log )</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>6</Order>
+          <Path>cmd /c for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %I:\\vioserial\\2k22\\amd64\\vioserial.inf ( pnputil.exe /add-driver %I:\\vioserial\\2k22\\amd64\\vioserial.inf /install &amp; echo vioserial &gt;&gt; C:\\sr-stage.log )</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>7</Order>
+          <Path>cmd /c for %I in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %I:\\guest-agent\\qemu-ga-x86_64.msi ( msiexec.exe /i %I:\\guest-agent\\qemu-ga-x86_64.msi /qn /norestart /l*v C:\\sr-qga.log &amp; echo qga &gt;&gt; C:\\sr-stage.log )</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>8</Order>
+          <Path>cmd /c echo staging-done &gt;&gt; C:\\sr-stage.log</Path>
         </RunSynchronousCommand>
       </RunSynchronous>
     </component>
