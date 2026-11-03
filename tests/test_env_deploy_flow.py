@@ -329,3 +329,25 @@ def test_reset_repins_with_the_new_generation_attempt(eng):
                            broker, resume=True)
     attempted = [g for _v, g in broker.host_key_reads if g.endswith(":a1")]
     assert attempted, broker.host_key_reads
+
+
+def test_token_route_serves_the_pinned_key_for_the_dial_target(eng):
+    """The bastion reads `target_host_key` off the token; that value must be
+    exactly the pin the broker recorded for the guest's address."""
+    from srplatform.api.app import dial_pin_for
+    from tests.test_env_deploy_flow import StubBroker
+
+    bp, catalog = _bp_and_catalog()
+    broker = StubBroker(catalog)
+    sid = _session_row(eng)
+    _deploy(eng, sid, broker)
+    dep = _deployment(eng, sid)
+    ecomm = next(r for r in dep.resources if r["host"] == "ecomm")
+    served = dial_pin_for(dep.resources, ecomm["ip"])
+    assert served == ecomm["host_key_pin"]
+    assert served.startswith("ssh-ed25519")
+    # a Windows guest with no pin serves None (the bastion must refuse,
+    # never TOFU): pick a documented unpinned host
+    windows = next(r for r in dep.resources
+                   if r["host"] == "ad-dns")
+    assert dial_pin_for(dep.resources, windows["ip"]) is None
