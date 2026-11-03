@@ -108,7 +108,8 @@ def _fake_harness(monkeypatch, tmp_path, serial_text):
         path.write_bytes(b"overlay")
         return path
 
-    def fake_provision(disk, *, profile, pubkey, distro=None):
+    def fake_provision(disk, *, profile, pubkey, distro=None,
+                       extra_debs=None):
         return {"versions": {"curl": "8.5.0-2"}}
 
     def fake_verify(disk, *, profile, timeout_s=600):
@@ -254,3 +255,42 @@ def test_sized_base_copy_grows_a_small_base(tmp_path):
                          text=True).stdout
     import json
     assert json.loads(out)["virtual-size"] == 16 * (1 << 30)
+
+
+# --------------------------------------------------------------------------- #
+# Splunk: not in any apt repo — vendor .deb installed inside the chroot       #
+# --------------------------------------------------------------------------- #
+
+def test_splunk_profile_installs_the_vendor_deb_and_enables_boot_start():
+    assert ub.PROFILE_MEDIA["debian12-splunk"] == "debian12"
+    urls = ub.EXTRA_DEB["debian12-splunk"]
+    assert urls and all(u.startswith("https://download.splunk.com/")
+                        for u in urls)
+    script = ub._provision_script("debian12-splunk")
+    assert "dpkg -i" in script and "splunk-*.deb" in script
+    assert "enable boot-start" in script and "--accept-license" in script
+    assert "systemctl enable Splunkd" in script
+    assert ub.ROLE_SERVICES["debian12-splunk"] == ["Splunkd"]
+    _, bins = ub.capability_contract("debian12-splunk")
+    assert "curl" in bins and "ssh" in bins
+
+
+def test_fetch_extra_debs_caches_and_hashes_the_bytes(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, check, timeout):
+        calls.append(cmd)
+        pathlib.Path(cmd[-1]).write_bytes(b"deb-bytes")
+
+    monkeypatch.setattr(ub.subprocess, "run", fake_run)
+    files = ub.fetch_extra_debs("debian12-splunk", tmp_path)
+    assert len(files) == 1
+    assert files[0].read_bytes() == b"deb-bytes"
+    assert ub.sha256_file(files[0]) == \
+        hashlib.sha256(b"deb-bytes").hexdigest()
+    ub.fetch_extra_debs("debian12-splunk", tmp_path)  # cached
+    assert len(calls) == 1
+
+
+def test_profiles_without_vendor_debs_fetch_nothing(tmp_path):
+    assert ub.fetch_extra_debs("attacker-debian", tmp_path) == []

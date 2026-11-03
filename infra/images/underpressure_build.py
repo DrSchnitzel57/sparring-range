@@ -99,6 +99,7 @@ PROFILE_MEDIA: dict[str, str] = {
     "ubuntu2204-mail": "jammy",
     "ubuntu-desktop": "jammy",
     "team-kali": "kali",
+    "debian12-splunk": "debian12",
 }
 
 #: Distro family per media key: decides the package manager + version probe.
@@ -112,6 +113,8 @@ ROLE_SERVICES: dict[str, list[str]] = {
     "rocky9-ecomm": ["httpd", "php-fpm"],
     "ubuntu2204-mail": ["postfix", "dovecot"],
     "team-kali": ["ssh"],
+    # enable boot-start creates this systemd unit inside the image.
+    "debian12-splunk": ["Splunkd"],
 }
 
 #: The binary capability contract per profile comes from attacker_tools so
@@ -137,6 +140,11 @@ APT_PACKAGES: dict[str, list[str]] = {
     "team-kali": ["nmap", "smbclient", "ncat", "dnsutils", "curl", "wget",
                   "openssl", "python3", "python3-impacket",
                   "openssh-server", "qemu-guest-agent", "auditd"],
+    # Splunk is not in any apt repo (download.splunk.com only), so the role
+    # installs the vendor deb in-chroot — see EXTRA_DEB.
+    "debian12-splunk": ["curl", "wget", "openssl", "python3", "dnsutils",
+                        "openssh-server", "qemu-guest-agent", "auditd",
+                        "ca-certificates"],
     "ubuntu2204-mail": ["postfix", "dovecot-core", "dovecot-imapd",
                         "dovecot-pop3d", "openssh-server",
                         "qemu-guest-agent", "auditd", "ufw"],
@@ -184,6 +192,7 @@ PROFILE_BINARIES: dict[str, tuple[str, ...]] = {
     # empty binary contract is explicit truth, not a missing contract.
     "rocky9-ecomm": (),
     "ubuntu2204-mail": (),
+    "debian12-splunk": ("curl", "wget", "openssl", "python3", "dig", "ssh"),
 }
 
 
@@ -202,12 +211,54 @@ def capability_contract(profile: str) -> tuple[dict[str, list[str]], list[str]]:
     raise ValueError(f"no capability contract for profile {profile!r}")
 
 
+#: Vendor .debs that exist in NO apt repo (Splunk ships only from
+#: download.splunk.com). Fetched on the host and installed INSIDE the chroot;
+#: the URL's own bytes are hashed and recorded in the build result, and the
+#: guest report still proves what the running image sees.
+EXTRA_DEB: dict[str, list[str]] = {
+    "debian12-splunk": [
+        "https://download.splunk.com/products/splunk/releases/10.2.0/linux/"
+        "splunk-10.2.0-d749cb17ea65-linux-amd64.deb",
+    ],
+}
+
 #: pip packages that are not apt-packaged (build-phase fetch). Versions are
 #: RECORDED from the guest (pip show), never assumed pinned to 'latest'.
 PIP_PACKAGES: dict[str, list[str]] = {
     "attacker-debian": ["impacket", "netexec"],
     "scoring-debian": [],
 }
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    h = hashlib.sha256()
+    with pathlib.Path(path).open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def fetch_extra_debs(profile: str, run_dir: pathlib.Path
+                     ) -> list[pathlib.Path]:
+    """Fetch the profile's vendor .debs once per build run (cached in the run
+    dir). Bytes are hashed into the build result; a failed download FAILS
+    the build instead of silently producing an image without the role."""
+    urls = EXTRA_DEB.get(profile) or []
+    if not urls:
+        return []
+    target = run_dir / "extra"
+    target.mkdir(parents=True, exist_ok=True)
+    files: list[pathlib.Path] = []
+    for url in urls:
+        name = url.rsplit("/", 1)[-1]
+        if not name.endswith(".deb"):
+            raise RuntimeError(f"vendor artifact is not a .deb: {url}")
+        dest = target / name
+        if not dest.is_file() or dest.stat().st_size == 0:
+            subprocess.run(["curl", "-fsSL", "--retry", "3", url,
+                            "-o", str(dest)], check=True, timeout=3600)
+        files.append(dest)
+    return files
 
 
 def verify_pinned(path: pathlib.Path, pin: dict) -> str:
@@ -458,11 +509,30 @@ def _provision_script(profile: str, *, distro: str | None = None) -> str:
     svcs = "".join(svc_parts)
     pip_cmd = (f"pip3 install --break-system-packages -q {pips} "
                f"|| echo SR-GUEST-PIP-FAIL\n") if pips else ""
+    # Vendor-deb profiles: dpkg -i the file(s) copied in by the host side,
+    # then the role's own post-install (Splunk needs a license acceptance,
+    # a one-off start, and a boot-start unit or it never runs at clone time).
+    vendor = ""
+    if EXTRA_DEB.get(profile):
+        if profile == "debian12-splunk":
+            vendor = (
+                "for deb in /root/splunk-*.deb; do dpkg -i \"$deb\" || exit 1; done\n"
+                "systemctl enable Splunkd >/dev/null 2>&1 || true\n"
+                "/opt/splunk/bin/splunk start --accept-license --no-prompt "
+                ">/dev/null 2>&1 || true\n"
+                "/opt/splunk/bin/splunk enable boot-start -user root "
+                "--accept-license --no-prompt >/dev/null 2>&1 || true\n"
+                "/opt/splunk/bin/splunk stop >/dev/null 2>&1 || true\n"
+                "systemctl enable Splunkd >/dev/null 2>&1 || true\n")
+        else:
+            vendor = ("for deb in /root/*.deb; do dpkg -i \"$deb\" || exit 1; "
+                      "done\n")
+
     return f"""
 export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C
 {install}
-{pip_cmd}useradd -m -s /bin/bash sr 2>/dev/null || true
+{vendor}{pip_cmd}useradd -m -s /bin/bash sr 2>/dev/null || true
 mkdir -p /home/sr/.ssh
 chmod 700 /home/sr/.ssh
 SRPUBKEY
@@ -503,7 +573,8 @@ ln -sf /etc/systemd/system/sr-verify.service /etc/systemd/system/multi-user.targ
 
 @_locked
 def provision_chroot(disk: pathlib.Path, *, profile: str,
-                     pubkey: pathlib.Path, distro: str | None = None) -> dict:
+                     pubkey: pathlib.Path, distro: str | None = None,
+                     extra_debs: list[pathlib.Path] | None = None) -> dict:
     """Deterministic offline provisioning: chroot into the fresh overlay and
     install the role with the HOST's network — no cloud-init, no seed, no
     device-detection race (live finds 2026-11-03: NoCloud missed the seed
@@ -531,6 +602,9 @@ def provision_chroot(disk: pathlib.Path, *, profile: str,
                            for k in keys))
             subprocess.run(["cp", "/etc/resolv.conf",
                             str(root / "etc/resolv.conf")], check=False)
+            for deb in (extra_debs or []):
+                subprocess.run(["cp", str(deb), str(root / "root" / deb.name)],
+                               check=True)
             subprocess.run(["chroot", str(root), "/bin/bash", "-c", script],
                            check=True, timeout=3600)
             cross = CROSS_DISTRO_PACKAGES.get(profile, {})
@@ -665,6 +739,7 @@ def build_profile(*, profile: str, base: pathlib.Path, pubkey: pathlib.Path,
     if not pubkeys:
         raise RuntimeError(f"pubkey file {pubkey} is empty")
     run_dir.mkdir(parents=True, exist_ok=True)
+    extra = fetch_extra_debs(profile, run_dir)
     disk = qemu_guest.fresh_role_overlay(base, run_dir, profile, disk_gb)
     # chroot provisioning does not need cloud-init, but the CLONE does: the
     # env lane applies its seed through cloud-init, and an image whose
@@ -672,11 +747,16 @@ def build_profile(*, profile: str, base: pathlib.Path, pubkey: pathlib.Path,
     # 2026-11-03: the real attacker had no route until re-enabled).
     enable_cloud_init(disk)
     provisioned = provision_chroot(disk, profile=profile, pubkey=pubkey,
-                                   distro=distro)
+                                   distro=distro, extra_debs=extra)
     verified = verify_boot(disk, profile=profile, timeout_s=timeout_s)
     disable_verify_reporter(disk)
     return {"profile": profile, "artifact": str(disk),
             "base": str(base), "base_pin": pin_evidence,
+            "extra_debs": [{"url": url, "file": f.name,
+                            "sha256": sha256_file(f),
+                            "size_bytes": f.stat().st_size}
+                           for url, f in zip(EXTRA_DEB.get(profile) or [],
+                                             extra)],
             "capabilities": verified["capabilities"],
             "missing": verified["missing"],
             "packages": verified["packages"] or provisioned["versions"],
