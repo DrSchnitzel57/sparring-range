@@ -472,3 +472,31 @@ outer host; all steps happen on the appliance or on the operator's workstation.
 Until items 1-5 are on the appliance, `sr` environment commands and the broker's
 environment deploy path stay correctly blocked (no template VMs exist); fixture
 tests remain the only proof of the control plane.
+
+## When the appliance stops answering (learned 2026-11-03)
+
+The appliance is a Proxmox guest; a stopped guest cannot fix itself (its
+recovery password lives at `/root/.sr-operator-bootstrap` ON it).
+
+1. **Confirm it is the VM, not the LAN:** `ip neigh show dev eth0` — a
+   `FAILED` entry for the appliance MAC plus a reachable gateway/other hosts
+   means the guest is gone. `ssh` then says "No route to host".
+2. **Check the outer host:** the VM must be started again in Proxmox
+   (`qmstart <vmid>` / UI). Suspects when it dies unattended: outer-host OOM
+   from nested guests (`~40 GiB` of a 12-guest lab) plus a Windows golden
+   build (`~6 GiB`) inside a 61 GiB guest. Do not re-run that combination
+   before measuring the host's real RAM.
+3. **After it boots, clean build debris before trusting anything:**
+   `mount | grep /mnt/sr-` (stale chroot mounts hold `/dev/nbd0`),
+   `qemu-nbd -d /dev/nbd0`, `rmdir /mnt/sr-chroot-* /mnt/sr-report*`, then
+   check `df -h /` (build overlays eat tens of GiB).
+4. **Services + latch:** `systemctl is-active sr-api sr-appliance-broker
+   sr-worker-supervisor`; the broker LATCHES on restart — release with
+   `.venv/bin/python -m infra.broker.tools release --operator drew --note …`
+   after resolving any open obligation.
+5. **Range lease:** a dead gate run can leave `RangeLease` held. Release it
+   (fenced) before the next provision — `infra/dev/lab_gate.py` deletes
+   stale labs first, and `DELETE /labs/{id}` now releases the lease itself.
+6. **Re-run the interrupted gate** (`infra/dev/lab_gate.py`, with the
+   control-plane env files sourced) and only then trust lab/API evidence.
+   Never copy a pre-outage state into FINDINGS without the rerun.
