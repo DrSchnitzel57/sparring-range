@@ -422,6 +422,38 @@ def provision_chroot(disk: pathlib.Path, *, profile: str,
         for line in versions.stdout.splitlines() if "=" in line}}
 
 
+def disable_verify_reporter(disk: pathlib.Path) -> None:
+    """Disable the verify-boot reporter AFTER verification.
+
+    Live find 2026-11-03: the reporter was enabled permanently, so the
+    registered attacker artifact powered itself off on EVERY boot (the
+    12-guest deploy ran 11/12 domains and readiness still said ok). The
+    marker boot must be one-shot, never a property of the shipped image."""
+    dev = "/dev/nbd0"
+    subprocess.run(["modprobe", "nbd"], check=False)
+    subprocess.run(["qemu-nbd", "-c", dev, str(disk)], check=True, timeout=120)
+    root = pathlib.Path("/mnt/sr-chroot")
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        time.sleep(2)
+        part = None
+        for cand in sorted(pathlib.Path("/sys/class/block").glob("nbd0p*")):
+            if subprocess.run(["mount", "-t", "ext4", f"/dev/{cand.name}",
+                               str(root)], capture_output=True).returncode == 0:
+                part = cand
+                break
+        if part is None:
+            raise RuntimeError(f"{disk}: cannot mount root to disable reporter")
+        try:
+            link = root / "etc/systemd/system/multi-user.target.wants/sr-verify.service"
+            if link.is_symlink() or link.exists():
+                link.unlink()
+        finally:
+            subprocess.run(["umount", str(root)], check=False)
+    finally:
+        subprocess.run(["qemu-nbd", "-d", dev], check=False)
+
+
 def verify_boot(disk: pathlib.Path, *, profile: str,
                 timeout_s: int = 600) -> dict:
     """ONE marker boot with NO seed: proves the provisioned artifact runs,
@@ -473,6 +505,7 @@ def build_profile(*, profile: str, base: pathlib.Path, pubkey: pathlib.Path,
     disk = qemu_guest.fresh_role_overlay(base, run_dir, profile, disk_gb)
     provisioned = provision_chroot(disk, profile=profile, pubkey=pubkey)
     verified = verify_boot(disk, profile=profile, timeout_s=timeout_s)
+    disable_verify_reporter(disk)
     return {"profile": profile, "artifact": str(disk),
             "base": str(base), "base_pin": pin_evidence,
             "capabilities": verified["capabilities"],

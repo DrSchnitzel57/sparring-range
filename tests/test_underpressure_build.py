@@ -121,6 +121,7 @@ def _fake_harness(monkeypatch, tmp_path, serial_text):
     monkeypatch.setattr(ub.qemu_guest, "fresh_role_overlay", fake_overlay)
     monkeypatch.setattr(ub, "provision_chroot", fake_provision)
     monkeypatch.setattr(ub, "verify_boot", fake_verify)
+    monkeypatch.setattr(ub, "disable_verify_reporter", lambda disk: None)
     return ub, base
 
 
