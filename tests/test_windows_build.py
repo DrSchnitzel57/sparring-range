@@ -16,13 +16,14 @@ from infra.images import windows_build as wb
 
 def test_autounattend_is_keyless_datacenter_core_with_first_logon():
     xml = wb.render_autounattend(version="2022", computer_name="sr-dc")
-    assert "<Value>4</Value>" in xml          # Datacenter (Core), eval media
+    assert "<Value>3</Value>" in xml          # Datacenter CORE, eval media
     assert "sr-dc" in xml
     assert "AdministratorPassword" in xml
     assert "FirstLogonCommands" in xml
-    assert "pnputil /add-driver" in xml       # virtio drivers installed
+    assert "pnputil.exe /add-driver" in xml   # virtio drivers installed
+    assert "qemu-ga-x86_64.msi" in xml        # QGA installed by its MSI
     assert "sr-build-complete.txt" in xml     # offline-verifiable marker
-    assert "shutdown /s /t 5" in xml          # qemu exits via -no-reboot
+    assert "shutdown.exe /s /t 5" in xml      # ACPI shutdown ends qemu
 
 
 def test_autounattend_refuses_unknown_windows_version():
@@ -52,9 +53,11 @@ def test_install_command_is_driver_free_and_offline(tmp_path):
     joined = " ".join(cmd)
     assert "if=ide" in joined          # SATA: no virtio driver needed to install
     assert joined.count("media=cdrom") == 3
-    assert "-no-reboot" in joined
+    assert "index=4" not in joined     # pc supports IDE units 0..3 only
+    assert "-no-reboot" not in joined  # Setup resets mid-install
+    assert "-boot order=d" in joined
+    assert "-nic none" in joined       # zero network egress
     assert "-accel kvm" in joined
-    assert "-net" not in joined        # zero network egress during install
     tcg = wb.install_command(
         disk=tmp_path / "d.qcow2", windows_iso=tmp_path / "w.iso",
         virtio_iso=tmp_path / "v.iso", answer_iso=tmp_path / "a.iso",

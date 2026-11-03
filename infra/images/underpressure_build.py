@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import json
 import pathlib
+import subprocess
 import sys
 
 from infra.dev import qemu_guest
@@ -57,7 +58,13 @@ APT_PACKAGES: dict[str, list[str]] = {
     ],
 }
 
-#: pip packages that are not apt-packaged (build-phase fetch, pinned set).
+#: The scoring vantage is not an ATTACKER_PROFILES entry (it never attacks);
+#: its checks are spelled out here so a successful build is never vacuous.
+SCORING_BINARIES = ("curl", "wget", "openssl", "python3", "ldapsearch",
+                    "kinit", "klist", "dig", "ssh")
+
+#: pip packages that are not apt-packaged (build-phase fetch). Versions are
+#: RECORDED from the guest (pip show), never assumed pinned to 'latest'.
 PIP_PACKAGES: dict[str, list[str]] = {
     "attacker-debian": ["impacket", "netexec"],
     "scoring-debian": [],
@@ -85,10 +92,30 @@ def render_userdata(*, profile: str, hostname: str,
     """Cloud-init build seed: install the profile's toolset, then REPORT
     the actual capability inventory from inside the guest. Markers go to
     the serial console; a missing binary is a recorded gap, never hidden."""
-    caps = ATTACKER_PROFILES.get(profile, {})
-    binaries = sorted({b for bins in caps.values() for b in bins})
+    if profile in ATTACKER_PROFILES:
+        caps = ATTACKER_PROFILES[profile]
+        binaries = sorted({b for bins in caps.values() for b in bins})
+    else:
+        caps = {}
+        binaries = list(SCORING_BINARIES)
     pkgs = APT_PACKAGES.get(profile, [])
     pips = PIP_PACKAGES.get(profile, [])
+    pip_set = set(PIP_PACKAGES.get(profile, []))
+    library_checks = []
+    for lib in sorted(pip_set):
+        library_checks.append(
+            f'python3 -c "import {lib}" 2>/dev/null && '
+            f'echo "SR-GUEST-CAP-OK:{lib}-library" || '
+            f'echo "SR-GUEST-CAP-MISSING:{lib}-library"')
+    # impacket's wheel installs .py tools, NOT console scripts: the
+    # impacket-<tool> binary checks above must stay honest MISSING even
+    # after a successful install. The library probe is the real evidence.
+    version_cmds = [
+        f"dpkg-query -W -f='${{Package}}=${{Version}}\\n' {p} 2>/dev/null "
+        f"| sed 's/^/SR-GUEST-PKG:/' || true" for p in pkgs]
+    version_cmds += [
+        f"python3 -m pip show {p} 2>/dev/null | sed -n 's/^Version: /"
+        f"SR-GUEST-PIP:{p}=/p' || true" for p in sorted(pip_set)]
     check_lines = []
     for b in binaries:
         check_lines.append(
@@ -104,6 +131,8 @@ def render_userdata(*, profile: str, hostname: str,
         *pip_cmds,
         "apt-get -qq update || echo SR-GUEST-APT-UPDATE-FAIL",
         *check_lines,
+        *library_checks,
+        *version_cmds,
         'echo "SR-GUEST-DONE rc=0"',
         "shutdown -h now",
     ])
@@ -144,7 +173,7 @@ ethernets:
 
 
 def build_profile(*, profile: str, base: pathlib.Path, pubkey: pathlib.Path,
-                  run_dir: pathlib.Path, disk_gb: int = 20,
+                  run_dir: pathlib.Path, disk_gb: int = 16,
                   memory_mb: int = 2048, smp: int = 2,
                   timeout_s: int = 3600, pin: str | None = None) -> dict:
     """Build one profile artifact. Returns the overlay path, the pinned-base
@@ -177,15 +206,20 @@ def build_profile(*, profile: str, base: pathlib.Path, pubkey: pathlib.Path,
     serial = run_dir / f"{profile}.serial.log"
     observed = serial.read_text(errors="replace").replace("\r", "")
     caps: dict[str, str] = {}
+    packages: dict[str, str] = {}
     for line in observed.splitlines():
         if line.startswith("SR-GUEST-CAP-OK:"):
             caps[line.split(":", 1)[1]] = "ok"
         elif line.startswith("SR-GUEST-CAP-MISSING:"):
             caps[line.split(":", 1)[1]] = "missing"
+        elif line.startswith("SR-GUEST-PKG:") or line.startswith("SR-GUEST-PIP:"):
+            key, _, ver = line.split(":", 1)[1].partition("=")
+            packages[key] = ver
     missing = sorted(b for b, s in caps.items() if s != "ok")
     return {"profile": profile, "artifact": str(disk),
             "base": str(base), "base_pin": pin_evidence,
             "capabilities": caps, "missing": missing,
+            "packages": packages,
             "boot": boot, "serial": str(serial)}
 
 
@@ -195,8 +229,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--base", required=True, type=pathlib.Path)
     ap.add_argument("--pubkey", required=True, type=pathlib.Path)
     ap.add_argument("--run-dir", required=True, type=pathlib.Path)
-    ap.add_argument("--disk-gb", type=int, default=20)
+    ap.add_argument("--disk-gb", type=int, default=16)
     ap.add_argument("--memory-mb", type=int, default=2048)
+    ap.add_argument("--smp", type=int, default=2)
+    ap.add_argument("--pin", default=None, help="pinned base key (default debian12)")
     ap.add_argument("--timeout-s", type=int, default=3600)
     ap.add_argument("--out", type=pathlib.Path,
                     help="copy the finished overlay here (else in run-dir)")
@@ -205,14 +241,19 @@ def main(argv: list[str] | None = None) -> int:
         out = build_profile(profile=args.profile, base=args.base,
                             pubkey=args.pubkey, run_dir=args.run_dir,
                             disk_gb=args.disk_gb, memory_mb=args.memory_mb,
+                            smp=args.smp, pin=args.pin,
                             timeout_s=args.timeout_s)
     except RuntimeError as exc:
         print(f"underpressure-build: {exc}", file=sys.stderr)
         return 2
     if args.out:
-        import shutil
-        shutil.copy2(out["artifact"], args.out)
+        # a copied overlay's backing file lives in the run dir — convert to
+        # a self-contained artifact so the image never dangles
+        subprocess.run(["qemu-img", "convert", "-O", "qcow2",
+                        out["artifact"], str(args.out)], check=True,
+                       timeout=1800)
         out["artifact"] = str(args.out)
+        out["backing_inlined"] = True
     print(json.dumps(out, indent=2, sort_keys=True))
     return 0
 
