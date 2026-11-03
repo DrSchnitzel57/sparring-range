@@ -75,10 +75,10 @@ def resolve_catalog(bp, broker, env_id: str) -> dict[str, dict]:
 
 
 def _clear_resource(res: dict) -> None:
-    """Forget a destroyed guest's identity while keeping the durable intent
-    (vmid/name/host stay: the SAME VMID is re-cloned, so generations map)."""
+    """Forget a destroyed guest's identity (see reset_guests: re-cloning on
+    the OLD vmid left the new domain unclaimed in the broker ledger)."""
     res["state"] = "pending"
-    for key in ("ip", "domain_uuid", "applied_nics", "host_key",
+    for key in ("vmid", "ip", "domain_uuid", "applied_nics", "host_key",
                 "deployed_artifact"):
         res.pop(key, None)
 
@@ -150,7 +150,13 @@ def reset_guests(db: Session, session_id, scenario_id: str, spec: dict,
         destroyed.append(str(r.get("host")))
         orch._log(db, session_id, "lab_reset_destroyed", r.get("host"),
                   {"vmid": r["vmid"]})
+        # The REBUILT guest is DROPPED from the deployment inventory: the
+        # broker released that vmid with the destroy, and re-cloning onto it
+        # produced a domain the ledger never claimed ("VMID 210 is not
+        # broker-owned", live gate 2026-11-03). The resume path then
+        # allocates a FRESH vmid and re-provisions under a new identity.
         _clear_resource(r)
+        resources = [x for x in resources if x.get("host") != r.get("host")]
         dep.resources = resources
         flag_modified(dep, "resources")
         db.commit()  # evidence per guest survives a later failure
