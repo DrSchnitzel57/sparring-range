@@ -133,7 +133,8 @@ def boot_full_guest(*, disk: pathlib.Path, seed_iso: pathlib.Path,
                     net: str = "none", host_api_port: int | None = None,
                     expect: tuple[str, ...] = ("SR-GUEST-DONE rc=0",),
                     timeout_s: int = 900,
-                    serial_name: str | None = None) -> dict:
+                    serial_name: str | None = None,
+                    extra_args: tuple[str, ...] = ()) -> dict:
     """Boot a REAL Ubuntu guest (disk + NoCloud seed) in isolated QEMU.
 
     - `net="none"`: no guest egress at all (verification/negative boots —
@@ -169,7 +170,7 @@ def boot_full_guest(*, disk: pathlib.Path, seed_iso: pathlib.Path,
     cmd = [qemu, "-M", "q35", "-m", str(memory_mb), "-smp", str(smp),
            "-drive", f"file={disk},format=qcow2,if=virtio",
            "-drive", f"file={seed_iso},format=raw,media=cdrom,readonly=on",
-           *net_args, "-nographic", "-serial", f"file:{serial}",
+           *net_args, *extra_args, "-nographic", "-serial", f"file:{serial}",
            "-no-reboot", "-display", "none", *accel]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)

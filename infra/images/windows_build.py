@@ -190,7 +190,8 @@ def build_answer_iso(path: pathlib.Path, xml: str) -> pathlib.Path:
 def install_command(*, disk: pathlib.Path, windows_iso: pathlib.Path,
                     virtio_iso: pathlib.Path, answer_iso: pathlib.Path,
                     serial_log: pathlib.Path, memory_mb: int = 4096,
-                    smp: int = 4, kvm: bool = True) -> list[str]:
+                    smp: int = 4, kvm: bool = True,
+                    monitor_socket: pathlib.Path | None = None) -> list[str]:
     """Install boot: driver-free SATA + NO NIC (`-nic none` = zero egress),
     answer/virtio/Windows CDs on IDE indexes 1..3 (pc has exactly 4 IDE
     units: the old index 4 cannot attach), DVD-then-HDD boot order so
@@ -208,6 +209,8 @@ def install_command(*, disk: pathlib.Path, windows_iso: pathlib.Path,
         "-nic", "none",
         "-boot", "order=d", "-name", "sr-winbuild",
         "-display", "none", "-vga", "std",
+        *(["-monitor", f"unix:{monitor_socket},server=on,wait=off"]
+          if monitor_socket else []),
         "-serial", f"file:{serial_log}",
         "-rtc", "base=localtime",
     ]
@@ -266,7 +269,8 @@ def build_windows(*, windows_iso: pathlib.Path, virtio_iso: pathlib.Path,
     cmd = install_command(disk=disk, windows_iso=windows_iso,
                           virtio_iso=virtio_iso, answer_iso=answer,
                           serial_log=serial, memory_mb=memory_mb, smp=smp,
-                          kvm=kvm)
+                          kvm=kvm,
+                          monitor_socket=run_dir / "monitor.sock")
     error = None
     try:
         proc = subprocess.run(cmd, timeout=install_timeout_s,

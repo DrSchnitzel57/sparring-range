@@ -297,10 +297,15 @@ def build_profile(*, profile: str, base: pathlib.Path, pubkey: pathlib.Path,
                                      network_config=_network_config())
     disk = qemu_guest.fresh_role_overlay(base, run_dir, profile, disk_gb)
     enable_cloud_init(disk)
-    boot = qemu_guest.boot_full_guest(disk=disk, seed_iso=seed,
-                                     memory_mb=memory_mb, smp=smp,
-                                     net="user", timeout_s=timeout_s,
-                                     expect=("SR-GUEST-DONE rc=0",))
+    # NoCloud via SMBIOS: the systemd generator already declined the CD
+    # label (live find 2026-11-03: DataSourceNone, seed never consumed), so
+    # tell cloud-init the device DIRECTLY. `ds=nocloud;s=/dev/sr0` in the
+    # SMBIOS serial is the standard KVM/libvirt datasource injection.
+    boot = qemu_guest.boot_full_guest(
+        disk=disk, seed_iso=seed, memory_mb=memory_mb, smp=smp,
+        net="user", timeout_s=timeout_s,
+        expect=("SR-GUEST-DONE rc=0",),
+        extra_args=("-smbios", "type=1,serial=ds=nocloud;s=/dev/sr0"))
     serial = run_dir / f"{profile}.serial.log"
     observed = serial.read_text(errors="replace").replace("\r", "")
     caps: dict[str, str] = {}
