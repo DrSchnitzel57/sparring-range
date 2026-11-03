@@ -130,8 +130,13 @@ APT_PACKAGES: dict[str, list[str]] = {
                      "policycoreutils", "firewalld"],
     "ubuntu-desktop": ["ubuntu-desktop-minimal", "qemu-guest-agent",
                        "openssh-server", "auditd"],
-    "team-kali": ["kali-linux-headless", "openssh-server",
-                  "qemu-guest-agent", "auditd", "nmap"],
+    # Explicit tool list, not the kalinux-headless META-package: the meta
+    # pulls hundreds of packages through one nbd mount (two live builds
+    # died with SIGBUS in apt at 18:36) and this role only needs the tools
+    # its own capability contract names.
+    "team-kali": ["nmap", "smbclient", "ncat", "dnsutils", "curl", "wget",
+                  "openssl", "python3", "python3-impacket",
+                  "openssh-server", "qemu-guest-agent", "auditd"],
     "ubuntu2204-mail": ["postfix", "dovecot-core", "dovecot-imapd",
                         "dovecot-pop3d", "openssh-server",
                         "qemu-guest-agent", "auditd", "ufw"],

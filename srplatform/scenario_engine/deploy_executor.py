@@ -83,16 +83,26 @@ def _execute(*, operation_id, session_id, user_id, operation, scenario_id,
                                result, owner, note, broker=broker)
             elif operation == "reset":
                 orchestrator.advance_deploy_operation(db, row, "redeploy")
+                plan_id = (row.progress or {}).get("lab_plan_id")
                 try:
-                    out = orchestrator.reset(db, session_id, scenario_id,
-                                             broker)
+                    if plan_id:
+                        # LAB PLAN reset (Underpressure step 3): destroy and
+                        # rebuild ONLY the approved dependency plan's guests;
+                        # preserved guests keep running.
+                        from srplatform import lab_service
+                        out = lab_service.execute_plan(db, session_id,
+                                                       scenario_id, broker,
+                                                       plan_id)
+                    else:
+                        out = orchestrator.reset(db, session_id, scenario_id,
+                                                 broker)
                 except orchestrator.LeaseConflict as e:
                     raise _Failed(409, "range_busy",
                                   f"holder_session={e.holder_session_id}") from e
                 except RuntimeError as e:
                     raise _Failed(409, "reset_failed", str(e)[:500]) from e
                 _finish_reset(db, row, session_id, user_id, out, owner, note,
-                              broker=broker)
+                              broker=broker, plan_id=plan_id)
             else:
                 orchestrator.finish_deploy_operation(
                     db, row, "failed",
@@ -193,6 +203,8 @@ def _finish_launch(db, row, session_id, user_id, scenario_id, result, owner,
                      payload=e.payload))
         db.commit()
         raise _Failed(409, "readiness_failed", str(e)[:500]) from e
+    from srplatform import lab_service
+    lab_service.reflect_launch(db, session_id, result)
     orchestrator.finish_deploy_operation(
         db, row, "succeeded",
         result=_redacted_result(result, instructions, readiness),
@@ -201,7 +213,7 @@ def _finish_launch(db, row, session_id, user_id, scenario_id, result, owner,
 
 
 def _finish_reset(db, row, session_id, user_id, out, owner, note,
-                  broker=None) -> None:
+                  broker=None, plan_id=None) -> None:
     from srplatform.db.models import Event, Session as SessionModel
     from srplatform.scenario_engine import orchestrator
 
@@ -219,6 +231,8 @@ def _finish_reset(db, row, session_id, user_id, out, owner, note,
                      payload={"detail": str(e)[:500]}))
         db.commit()
         raise _Failed(409, "readiness_failed", str(e)[:500]) from e
+    from srplatform import lab_service
+    lab_service.reflect_reset(db, session_id, plan_id)
     orchestrator.finish_deploy_operation(
         db, row, "succeeded",
         result=_redacted_result(out, instructions, readiness),

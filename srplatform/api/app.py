@@ -131,9 +131,12 @@ principal, any_member, operator, service = make_auth_dependencies()
 # M5 coach routes + M7 web routes (auth-wired there as well)
 from srplatform.api.coach_routes import router as coach_router  # noqa: E402
 from srplatform.api.web_routes import router as web_router      # noqa: E402
+# Underpressure step 3: durable labs, membership, dependency-aware resets
+from srplatform.api.lab_routes import router as lab_router      # noqa: E402
 
 app.include_router(coach_router)
 app.include_router(web_router)
+app.include_router(lab_router)
 
 
 # --- health: liveness vs readiness (F23) -------------------------------------

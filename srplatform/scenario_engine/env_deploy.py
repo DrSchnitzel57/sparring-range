@@ -74,6 +74,98 @@ def resolve_catalog(bp, broker, env_id: str) -> dict[str, dict]:
     return catalog
 
 
+def _clear_resource(res: dict) -> None:
+    """Forget a destroyed guest's identity while keeping the durable intent
+    (vmid/name/host stay: the SAME VMID is re-cloned, so generations map)."""
+    res["state"] = "pending"
+    for key in ("ip", "domain_uuid", "applied_nics", "host_key",
+                "deployed_artifact"):
+        res.pop(key, None)
+
+
+def reset_guests(db: Session, session_id, scenario_id: str, spec: dict,
+                 broker, rebuild: set[str]) -> dict:
+    """SELECTIVE reset: destroy and re-provision ONLY the planned guests;
+    every preserved guest keeps its VM, disks and running services.
+
+    Fail closed BEFORE any redeploy: a guest of the rebuild set whose
+    ownership cannot be positively verified aborts with its resources
+    retained — destroying a possibly-foreign machine would be worse than an
+    incomplete reset. Guests in the set that were never created are simply
+    (re)provisioned by the normal resume path.
+    """
+    from srplatform.scenario_engine import orchestrator as orch
+
+    if not rebuild:
+        raise RuntimeError("refusing an empty selective reset")
+    env_id = str(spec["environment"])
+    env = load_environment(env_id)
+    bp = env.blueprint
+    known = {g.name for g in bp.guests}
+    unknown = sorted(set(rebuild) - known)
+    if unknown:
+        raise RuntimeError(
+            f"planned guests are not in blueprint {env_id!r}: {unknown} — "
+            f"refusing to reset against a plan the environment does not own")
+    resolve_catalog(bp, broker, env_id)  # same preflight as a deploy
+    dep = orch._active_deployment(db, session_id, scenario_id)
+    if dep is None:
+        raise RuntimeError(
+            "no deployment on record for this lab session — nothing to reset "
+            "against (unknown ownership is not reset success)")
+    resources = [dict(r) for r in (dep.resources or [])]
+    node = get_settings().deploy_node
+    destroyed: list[str] = []
+    for r in resources:
+        if r.get("host") not in rebuild:
+            continue
+        if r.get("state") not in ("created", "destroy_failed"):
+            continue  # never created: resume provisions it fresh
+        if not r.get("vmid"):
+            raise RuntimeError(f"resource for {r.get('host')!r} has no vmid")
+        try:
+            verdict, why = orch._verify_ownership(broker, r, session_id)
+        except Exception as e:  # noqa: BLE001 — uncertain identity ABORTS
+            raise RuntimeError(
+                f"ownership of {r.get('host')!r} (vmid {r['vmid']}) could not "
+                f"be verified: {str(e)[:300]} — resources retained") from e
+        if verdict != "owned":
+            raise RuntimeError(
+                f"{r.get('host')!r} (vmid {r['vmid']}) is not this "
+                f"deployment's resource ({verdict}: {why}) — refusing to "
+                f"destroy what we do not provably own")
+        rnode = r.get("node") or node
+        try:
+            broker.destroy_and_wait(rnode, int(r["vmid"]),
+                                    session_id=session_id)
+        except Exception as e:  # noqa: BLE001 — destroy failure is RETAINED
+            r["state"] = "destroy_failed"
+            dep.resources = resources
+            flag_modified(dep, "resources")
+            db.commit()
+            raise RuntimeError(
+                f"destroy of {r.get('host')!r} (vmid {r['vmid']}) failed: "
+                f"{str(e)[:300]} — resource retained, redeploy NOT attempted "
+                f"over unremoved machines") from e
+        destroyed.append(str(r.get("host")))
+        orch._log(db, session_id, "lab_reset_destroyed", r.get("host"),
+                  {"vmid": r["vmid"]})
+        _clear_resource(r)
+        dep.resources = resources
+        flag_modified(dep, "resources")
+        db.commit()  # evidence per guest survives a later failure
+    dep.status = "preparing"
+    dep.resources = resources
+    flag_modified(dep, "resources")
+    db.commit()
+    out = deploy_environment(db, session_id, scenario_id, spec, broker,
+                             resume=True)
+    out["action"] = "selective_reset"
+    out["destroyed"] = sorted(destroyed)
+    out["preserved_planned"] = sorted(known - set(rebuild))
+    return out
+
+
 def deploy_environment(db: Session, session_id, scenario_id: str, spec: dict,
                        broker, resume: bool = True) -> dict:
     """Provision (or resume) every blueprint guest. Same idempotence
