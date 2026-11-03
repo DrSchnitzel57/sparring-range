@@ -28,7 +28,7 @@ def test_autounattend_is_keyless_datacenter_core_with_first_logon():
     assert "qemu-ga-x86_64.msi" in xml        # QGA installed by its MSI
     # the first live run found NO virtio CD via Get-Volume labels; the
     # provisioning now PROBES letters for the real viostor.inf payload
-    assert "viostor.inf" in xml and "68..90" in xml
+    assert "$l.ToString()+':\\viostor'" in xml   # modern virtio-win layout
     assert "sr-build-complete.txt" in xml     # offline-verifiable marker
     assert "shutdown.exe /s /t 5" in xml      # ACPI shutdown ends qemu
 
