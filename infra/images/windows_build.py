@@ -158,6 +158,15 @@ _UNATTEND_TEMPLATE = r"""<?xml version="1.0" encoding="utf-8" standalone="yes"?>
           <PlainText>true</PlainText>
         </AdministratorPassword>
       </UserAccounts>
+      <AutoLogon>
+        <Password>
+          <Value>SrBuild-Only-1!</Value>
+          <PlainText>true</PlainText>
+        </Password>
+        <Enabled>true</Enabled>
+        <LogonCount>1</LogonCount>
+        <Username>Administrator</Username>
+      </AutoLogon>
       <FirstLogonCommands>
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>

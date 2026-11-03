@@ -19,6 +19,9 @@ def test_autounattend_is_keyless_datacenter_core_with_first_logon():
     assert "<Value>3</Value>" in xml          # Datacenter CORE, eval media
     assert "sr-dc" in xml
     assert "AdministratorPassword" in xml
+    # FirstLogonCommands only fire on a logon; the unattend must AUTOLOGON
+    # (the first live attempt sat at the sign-in screen with an idle disk)
+    assert "<AutoLogon>" in xml and "<LogonCount>1</LogonCount>" in xml
     assert "FirstLogonCommands" in xml
     assert "pnputil.exe /add-driver" in xml   # virtio drivers installed
     assert "qemu-ga-x86_64.msi" in xml        # QGA installed by its MSI
