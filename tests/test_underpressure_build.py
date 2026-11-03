@@ -172,3 +172,85 @@ def test_every_profile_builds_from_a_pinned_media_it_declares():
         assert media, f"{profile} declares no pinned media"
         assert media in ub.PINS, f"{profile} media {media} not pinned"
         assert ub.DISTROS[media] in ("apt", "dnf")
+
+
+# --------------------------------------------------------------------------- #
+# Capability contract: each profile is graded against ITS OWN binaries        #
+# --------------------------------------------------------------------------- #
+
+def test_each_profile_gets_its_own_capability_contract():
+    """Non-attacker roles were once graded against the scoring vantage's
+    toolset; the desktop build reported kinit/ldapsearch 'missing' because of
+    it. Every profile now resolves to an explicit contract."""
+    caps, bins = ub.capability_contract("attacker-debian")
+    assert "nmap" in bins and "ldapsearch" in bins
+    assert caps, "attacker profiles keep their per-category capability map"
+
+    _, desktop = ub.capability_contract("ubuntu-desktop")
+    assert "kinit" not in desktop and "ldapsearch" not in desktop
+    assert "ssh" in desktop and "python3" in desktop
+
+    _, kali = ub.capability_contract("team-kali")
+    assert "nmap" in kali and "kinit" not in kali
+
+    _, scoring = ub.capability_contract("scoring-debian")
+    assert "ldapsearch" in scoring and "kinit" in scoring
+
+    # Service-only roles: no invented binary contract.
+    assert ub.capability_contract("rocky9-ecomm") == ({}, [])
+    assert ub.capability_contract("ubuntu2204-mail") == ({}, [])
+
+
+def test_unknown_profile_fails_closed():
+    with pytest.raises(ValueError, match="no capability contract"):
+        ub.capability_contract("no-such-role")
+
+
+def test_seed_checks_named_capabilities_for_a_non_attacker_profile():
+    userdata = ub.render_userdata(profile="ubuntu-desktop", hostname="dsk",
+                                  pubkeys=["ssh-ed25519 AAAA k"])
+    assert "SR-GUEST-CAP-OK:ssh" in userdata
+    assert "SR-GUEST-CAP-OK:kinit" not in userdata
+
+
+# --------------------------------------------------------------------------- #
+# Disk sizing never SHRINKS a provider base (Kali cloud is 25 GiB)            #
+# --------------------------------------------------------------------------- #
+
+def test_sized_base_copy_never_shrinks_a_larger_base(tmp_path):
+    import shutil
+    import subprocess
+
+    if shutil.which("qemu-img") is None:
+        pytest.skip("qemu-img not installed")
+    from infra.dev import qemu_guest
+
+    base = tmp_path / "kali.qcow2"
+    subprocess.run(["qemu-img", "create", "-f", "qcow2", str(base), "25G"],
+                   check=True, capture_output=True)
+    copy = qemu_guest.sized_base_copy(base, tmp_path, "kali", 16)
+    out = subprocess.run(["qemu-img", "info", "--output", "json",
+                          str(copy)], check=True, capture_output=True,
+                         text=True).stdout
+    import json
+    assert json.loads(out)["virtual-size"] == 25 * (1 << 30)
+    assert base.exists(), "provider base must never be modified"
+
+
+def test_sized_base_copy_grows_a_small_base(tmp_path):
+    import shutil
+    import subprocess
+
+    if shutil.which("qemu-img") is None:
+        pytest.skip("qemu-img not installed")
+    from infra.dev import qemu_guest
+
+    base = tmp_path / "small.qcow2"
+    subprocess.run(["qemu-img", "create", "-f", "qcow2", str(base), "4G"],
+                   check=True, capture_output=True)
+    copy = qemu_guest.sized_base_copy(base, tmp_path, "small", 16)
+    out = subprocess.run(["qemu-img", "info", "--output", "json",
+                          str(copy)], check=True, capture_output=True,
+                         text=True).stdout
+    import json
+    assert json.loads(out)["virtual-size"] == 16 * (1 << 30)

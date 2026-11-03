@@ -167,6 +167,36 @@ ROLE_SERVICE_CANDIDATES: dict[str, dict[str, list[str]]] = {
     },
 }
 
+#: Explicit binary contract for non-attacker profiles. Without this a role
+#: was graded against the SCORING vantage's toolset instead of its own (the
+#: desktop build once reported kinit/ldapsearch "missing"). Nothing here is
+#: inferred: each entry lists what that role must actually be able to run.
+PROFILE_BINARIES: dict[str, tuple[str, ...]] = {
+    "ubuntu-desktop": ("curl", "wget", "openssl", "python3", "dig", "ssh"),
+    "team-kali": ("nmap", "curl", "wget", "openssl", "python3", "dig",
+                  "ssh", "smbclient"),
+    # Service-only roles: their evidence is the running service set, so an
+    # empty binary contract is explicit truth, not a missing contract.
+    "rocky9-ecomm": (),
+    "ubuntu2204-mail": (),
+}
+
+
+def capability_contract(profile: str) -> tuple[dict[str, list[str]], list[str]]:
+    """(capability map, binaries) for a profile — one source of truth shared by
+    the cloud-init seed and the offline reporter, so image evidence and
+    preflight can never disagree. An unknown profile FAILS CLOSED instead of
+    being graded against a role it does not play."""
+    caps = ATTACKER_PROFILES.get(profile)
+    if caps is not None:
+        return caps, sorted({b for bins in caps.values() for b in bins})
+    if profile in PROFILE_BINARIES:
+        return {}, list(PROFILE_BINARIES[profile])
+    if profile == "scoring-debian":
+        return {}, list(SCORING_BINARIES)
+    raise ValueError(f"no capability contract for profile {profile!r}")
+
+
 #: pip packages that are not apt-packaged (build-phase fetch). Versions are
 #: RECORDED from the guest (pip show), never assumed pinned to 'latest'.
 PIP_PACKAGES: dict[str, list[str]] = {
@@ -252,12 +282,7 @@ def render_userdata(*, profile: str, hostname: str,
     """Cloud-init build seed: install the profile's toolset, then REPORT
     the actual capability inventory from inside the guest. Markers go to
     the serial console; a missing binary is a recorded gap, never hidden."""
-    if profile in ATTACKER_PROFILES:
-        caps = ATTACKER_PROFILES[profile]
-        binaries = sorted({b for bins in caps.values() for b in bins})
-    else:
-        caps = {}
-        binaries = list(SCORING_BINARIES)
+    caps, binaries = capability_contract(profile)
     pkgs = APT_PACKAGES.get(profile, [])
     pips = PIP_PACKAGES.get(profile, [])
     distro = DISTROS.get(PROFILE_MEDIA.get(profile, "debian12"), "apt")
@@ -409,11 +434,7 @@ def _provision_script(profile: str, *, distro: str | None = None) -> str:
                        "'SR-GUEST-PKG:%{NAME}=%{VERSION}\\n' "
                        f"{pkgs_join} 2>/dev/null || true")
     pips = " ".join(PIP_PACKAGES.get(profile, []))
-    caps = ATTACKER_PROFILES.get(profile)
-    if caps is None:
-        binaries = list(SCORING_BINARIES)
-    else:
-        binaries = sorted({b for bins in caps.values() for b in bins})
+    _caps, binaries = capability_contract(profile)
     checks = "".join(
         f'command -v {b} >/dev/null 2>&1 && echo "SR-GUEST-CAP-OK:{b}" '
         f'|| echo "SR-GUEST-CAP-MISSING:{b}"\n' for b in binaries)

@@ -36,6 +36,7 @@ so the required gate fails closed with a name, not a skip.
 """
 from __future__ import annotations
 
+import json
 import pathlib
 import shutil
 import subprocess
@@ -103,15 +104,28 @@ def sized_base_copy(base_img: pathlib.Path, run_dir: pathlib.Path, name: str,
     """Run-owned resized COPY of the verified base (qcow2 resize is sparse
     and instant). The stock cloud disk is 3.5 GiB — too small once real
     packages + MySQL initialize; production guest budgets are 12–16 GiB, so
-    test disks match the budgeted sizes instead of an undersized default."""
-    if size_gb < 4 or size_gb > 16:
-        raise ValueError(f"test disk {size_gb}GiB outside 4..16 bound")
+    test disks match the budgeted sizes instead of an undersized default.
+
+    Never SHRINK a provider base: some (Kali cloud) are provisioned at 25 GiB
+    and qemu-img refuses a silent shrink. When the base is already larger the
+    requested size is a floor, not an exact size, and the copy is left alone —
+    the guest sees the base's own filesystem, which is what it will boot."""
+    if size_gb < 4 or size_gb > 32:
+        raise ValueError(f"test disk {size_gb}GiB outside 4..32 bound")
     copy = run_dir / f"{name}-base.qcow2"
     shutil.copyfile(base_img, copy)
-    r = subprocess.run(["qemu-img", "resize", str(copy), f"{size_gb}G"],
-                       capture_output=True, text=True, timeout=300)
-    if r.returncode != 0:
-        raise RuntimeError(f"qemu-img resize failed: {(r.stderr or r.stdout)[:300]}")
+    probe = subprocess.run(["qemu-img", "info", "-f", "qcow2", "--output",
+                            "json", str(copy)],
+                           capture_output=True, text=True, timeout=60)
+    if probe.returncode != 0:
+        raise RuntimeError(f"qemu-img info failed: {probe.stderr[:300]}")
+    have_gb = int(json.loads(probe.stdout)["virtual-size"]) / (1 << 30)
+    if have_gb <= size_gb:
+        r = subprocess.run(["qemu-img", "resize", str(copy), f"{size_gb}G"],
+                           capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"qemu-img resize failed: {(r.stderr or r.stdout)[:300]}")
     return copy
 
 
