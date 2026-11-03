@@ -75,9 +75,17 @@ def resolve_catalog(bp, broker, env_id: str) -> dict[str, dict]:
 
 
 def _clear_resource(res: dict) -> None:
-    """Forget a destroyed guest's identity (see reset_guests: re-cloning on
-    the OLD vmid left the new domain unclaimed in the broker ledger)."""
+    """Forget a destroyed guest's identity, but KEEP a generation attempt.
+
+    Two broker facts found live (2026-11-03):
+      * destroy releases the vmid, so it must be re-allocated (removed here);
+      * clone_and_wait is idempotent per (vmid, template, name, generation),
+        and the deployment id alone does NOT change on reset — the same
+        clone intent was replayed as "already done" and set_config then hit
+        a domain that did not exist ("VMID 210 has no appliance domain").
+    Bumping the attempt makes the reset clone a genuinely NEW intent."""
     res["state"] = "pending"
+    res["generation_attempt"] = int(res.get("generation_attempt") or 0) + 1
     for key in ("vmid", "ip", "domain_uuid", "applied_nics", "host_key",
                 "deployed_artifact"):
         res.pop(key, None)
@@ -150,13 +158,10 @@ def reset_guests(db: Session, session_id, scenario_id: str, spec: dict,
         destroyed.append(str(r.get("host")))
         orch._log(db, session_id, "lab_reset_destroyed", r.get("host"),
                   {"vmid": r["vmid"]})
-        # The REBUILT guest is DROPPED from the deployment inventory: the
-        # broker released that vmid with the destroy, and re-cloning onto it
-        # produced a domain the ledger never claimed ("VMID 210 is not
-        # broker-owned", live gate 2026-11-03). The resume path then
-        # allocates a FRESH vmid and re-provisions under a new identity.
+        # The rebuilt guest keeps its inventory ROW but loses its identity
+        # (fresh vmid on resume; a bumped clone attempt so the broker does
+        # not replay the old clone intent).
         _clear_resource(r)
-        resources = [x for x in resources if x.get("host") != r.get("host")]
         dep.resources = resources
         flag_modified(dep, "resources")
         db.commit()  # evidence per guest survives a later failure
@@ -255,10 +260,13 @@ def deploy_environment(db: Session, session_id, scenario_id: str, spec: dict,
             # a pending VMID is an intention; a foreign machine there gets
             # no set-config/start call.
             exists = broker.lookup_vm(node, vmid)
+            attempt = int(res.get("generation_attempt") or 0) if res else 0
+            generation = str(dep.deployment_id) + (f":a{attempt}"
+                                                   if attempt else "")
             if exists is None:
                 broker.clone_and_wait(node, template_vmid, vmid, name,
                                       full=True, session_id=session_id,
-                                      generation=str(dep.deployment_id))
+                                      generation=generation)
             else:
                 cfg = broker.try_lookup_config(node, vmid)
                 if cfg is None or "_unavailable" in (cfg or {}):
