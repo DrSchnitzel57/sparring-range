@@ -333,8 +333,11 @@ def _provision_script(profile: str) -> str:
         f'command -v {b} >/dev/null 2>&1 && echo "SR-GUEST-CAP-OK:{b}" '
         f'|| echo "SR-GUEST-CAP-MISSING:{b}"\n' for b in binaries)
     svcs = "".join(
+        f'for _ in 1 2 3 4 5 6 7 8 9 10; do '
+        f'systemctl is-active --quiet {s} && break; sleep 3; done; '
         f'systemctl is-active --quiet {s} && echo "SR-GUEST-SVC-OK:{s}" '
-        f'|| echo "SR-GUEST-SVC-MISSING:{s}"\n' for s in ROLE_SERVICES.get(profile, []))
+        f'|| echo "SR-GUEST-SVC-MISSING:{s}"\n'
+        for s in ROLE_SERVICES.get(profile, []))
     pip_cmd = (f"pip3 install --break-system-packages -q {pips} "
                f"|| echo SR-GUEST-PIP-FAIL\n") if pips else ""
     return f"""
@@ -355,6 +358,7 @@ cat > /usr/local/sbin/sr-verify.sh <<'EOS'
 #!/bin/bash
 exec >/dev/ttyS0 2>&1
 echo SR-GUEST-BOOT
+sleep 10
 {checks}{svcs}dpkg-query -W -f='SR-GUEST-PKG:${{Package}}=${{Version}}\n' {pkgs} 2>/dev/null || true
 echo "SR-GUEST-DONE rc=0"
 systemctl poweroff
