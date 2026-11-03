@@ -591,6 +591,11 @@ def provision_chroot(disk: pathlib.Path, *, profile: str,
         # filesystem inside is still the base's size. Grow it before any
         # install: the Splunk vendor deb hit "No space left on device"
         # unpacking onto a 2 GiB root (live, 2026-11-03).
+        # The GPT partition table is still the base image's: resize2fs on
+        # its own reports "nothing to do" because the PARTITION is 3 GiB
+        # even though the device is 24 GiB (Splunk deb: no space left).
+        subprocess.run(["growpart", dev, part.removeprefix("nbd0p")],
+                       check=False, capture_output=True, timeout=300)
         subprocess.run(["e2fsck", "-f", "-y", f"/dev/{part}"],
                        check=False, capture_output=True, timeout=1800)
         subprocess.run(["resize2fs", f"/dev/{part}"], check=True,
