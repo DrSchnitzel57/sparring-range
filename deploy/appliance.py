@@ -1796,6 +1796,74 @@ def seed_profile(manifest_path: pathlib.Path, *,
                     "once at start)"}
 
 
+
+def register_image(manifest_path: pathlib.Path, *, role: str, profile: str,
+                   template_id: int, artifact: pathlib.Path,
+                   disk_gb: int = 16, memory_mb: int = 2048, vcpus: int = 1,
+                   dest: pathlib.Path | None = None, replace: bool = False,
+                   dry_run: bool = False) -> dict:
+    """Register a BUILT artifact as a role's image (operator path).
+
+    Distinct from seed_profile (a byte-copy placeholder): builders emit a
+    verified artifact on which this records its own digest. The manifest is
+    validated (uniqueness + every budget sum) BEFORE any copy; the artifact
+    is copied to the images directory (default: the existing role's file,
+    --replace required), then recorded atomically. Next steps are explicit:
+    apply (policy) + broker restart (its catalog loads ONCE at start)."""
+    manifest_path = pathlib.Path(manifest_path)
+    artifact = pathlib.Path(artifact)
+    try:
+        raw = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise InstallError(
+            f"cannot read manifest {manifest_path}: {exc}") from exc
+    if not artifact.is_file():
+        raise InstallError(f"artifact {artifact} does not exist")
+    images = dict(raw.get("images") or {})
+    existing = images.get(role)
+    if dest is not None:
+        dest_path = pathlib.Path(dest)
+    elif isinstance(existing, dict) and existing.get("path"):
+        dest_path = pathlib.Path(str(existing["path"]))
+    else:
+        dest_path = manifest_path.parent / f"{role}.qcow2"
+    if (dest_path.exists() and not dry_run
+            and str(dest_path.resolve()) != str(artifact.resolve())
+            and not replace):
+        raise InstallError(f"{dest_path} exists; pass --replace to replace it")
+    entry = {"template_id": int(template_id), "path": str(dest_path),
+             "sha256": "0" * 64, "size_bytes": 1, "disk_gb": int(disk_gb),
+             "memory_mb": int(memory_mb), "vcpus": int(vcpus),
+             "profile": str(profile)}
+    probe = dict(raw)
+    probe["images"] = {**images, role: entry}
+    try:
+        ApplianceManifest.from_dict(probe, verify_images=False,
+                                    verify_model_key=False)
+    except Exception as exc:  # noqa: BLE001 — the rule is in the message
+        raise InstallError(f"manifest would be invalid: {exc}") from exc
+    if dry_run:
+        return {"dry_run": True, "role": role, "profile": profile,
+                "template_id": template_id, "artifact": str(artifact),
+                "path": str(dest_path)}
+    if dest_path.exists() and dest_path.resolve() != artifact.resolve():
+        dest_path.unlink()
+    subprocess.run(["cp", "--reflink=auto", str(artifact), str(dest_path)],
+                   check=True)
+    sha = _sha256_file(dest_path)
+    entry["sha256"] = sha
+    entry["size_bytes"] = dest_path.stat().st_size
+    probe["images"][role] = entry
+    _atomic_write(manifest_path, json.dumps(probe, indent=2, sort_keys=True)
+                  + "\n", 0o644, 0, 0)
+    return {"dry_run": False, "role": role, "profile": profile,
+            "template_id": template_id, "path": str(dest_path),
+            "sha256": sha, "size_bytes": entry["size_bytes"],
+            "next": "run `apply`, then restart sr-appliance-broker (its "
+                    "catalog loads the manifest once at start) and release "
+                    "its latch if restart latched it"}
+
+
 def _layout(args) -> Layout:
     """The installation layout for the requested (possibly sandboxed) root."""
     root = pathlib.Path(getattr(args, "system_root", "/"))
@@ -1884,6 +1952,19 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--fixture", action="store_true")
     pr.add_argument("--json", action="store_true")
 
+    pri = sub.add_parser("register-image")
+    pri.add_argument("--manifest", required=True)
+    pri.add_argument("--role", required=True)
+    pri.add_argument("--profile", required=True)
+    pri.add_argument("--template-id", type=int, required=True)
+    pri.add_argument("--artifact", required=True)
+    pri.add_argument("--dest")
+    pri.add_argument("--replace", action="store_true")
+    pri.add_argument("--disk-gb", type=int, default=16)
+    pri.add_argument("--memory-mb", type=int, default=2048)
+    pri.add_argument("--vcpus", type=int, default=1)
+    pri.add_argument("--dry-run", action="store_true")
+
     psp = sub.add_parser("seed-profile")
     psp.add_argument("--manifest", required=True)
     psp.add_argument("--role", required=True,
@@ -1901,6 +1982,21 @@ def main(argv: list[str] | None = None) -> int:
     psp.add_argument("--dry-run", action="store_true")
 
     args = ap.parse_args(argv)
+    if args.cmd == "register-image":
+        try:
+            out = register_image(
+                pathlib.Path(args.manifest), role=args.role,
+                profile=args.profile, template_id=args.template_id,
+                artifact=pathlib.Path(args.artifact),
+                disk_gb=args.disk_gb, memory_mb=args.memory_mb,
+                vcpus=args.vcpus,
+                dest=pathlib.Path(args.dest) if args.dest else None,
+                replace=args.replace, dry_run=args.dry_run)
+        except InstallError as exc:
+            print(f"register-image: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return 0
     if args.cmd == "seed-profile":
         try:
             out = seed_profile(

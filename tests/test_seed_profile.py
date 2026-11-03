@@ -155,3 +155,64 @@ def test_seed_profile_refuses_symlinked_destination(tmp_path):
                      template_id=9109, source_role=SOURCE_ROLE, disk_gb=11,
                      dest=link)
     assert link.is_symlink() and real.read_bytes() == b"keep"
+
+
+# --------------------------------------------------------------------------- #
+# register-image: a BUILT artifact becomes a role's image                      #
+# --------------------------------------------------------------------------- #
+
+def test_register_image_records_the_artifact_digest(tmp_path):
+    from deploy.appliance import register_image
+
+    path, raw = _write(tmp_path)
+    artifact = tmp_path / "built.qcow2"
+    artifact.write_bytes(b"the-built-artifact")
+    out = register_image(path, role="attacker", profile="attacker-built",
+                         template_id=9210, artifact=artifact,
+                         disk_gb=11, replace=True)
+    recorded = json.loads(path.read_text())["images"]["attacker"]
+    assert recorded["sha256"] == hashlib.sha256(b"the-built-artifact").hexdigest()
+    assert recorded["size_bytes"] == len(b"the-built-artifact")
+    assert recorded["profile"] == "attacker-built"
+    ApplianceManifest.from_dict(json.loads(path.read_text()),
+                                verify_images=True, verify_model_key=False)
+    assert "broker" in out["next"] and "apply" in out["next"]
+
+
+def test_register_image_requires_replace_or_dry_run_harmless(tmp_path):
+    from deploy.appliance import register_image
+
+    path, _ = _write(tmp_path)
+    artifact = tmp_path / "built.qcow2"
+    artifact.write_bytes(b"x")
+    with pytest.raises(InstallError, match="--replace"):
+        register_image(path, role="attacker", profile="p2",
+                       template_id=9211, artifact=artifact)
+    before = path.read_text()
+    out = register_image(path, role="attacker", profile="p2",
+                         template_id=9211, artifact=artifact, dry_run=True)
+    assert out["dry_run"] and path.read_text() == before
+
+
+def test_register_image_refuses_missing_artifact(tmp_path):
+    from deploy.appliance import register_image
+
+    path, _ = _write(tmp_path)
+    with pytest.raises(InstallError, match="does not exist"):
+        register_image(path, role="attacker", profile="p3",
+                       template_id=9212,
+                       artifact=tmp_path / "nope.qcow2")
+
+
+def test_register_image_validates_budgets_before_copy(tmp_path):
+    from deploy.appliance import register_image
+
+    path, _ = _write(tmp_path)
+    artifact = tmp_path / "built.qcow2"
+    artifact.write_bytes(b"x")
+    before = path.read_text()
+    with pytest.raises(InstallError, match="invalid"):
+        register_image(path, role="attacker", profile="p4",
+                       template_id=9213, artifact=artifact, vcpus=9,
+                       replace=True)
+    assert path.read_text() == before, "refusal must touch nothing"
