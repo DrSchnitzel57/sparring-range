@@ -38,6 +38,42 @@ PINS: dict[str, dict] = {
         "source_checksum_file": "https://cloud.debian.org/images/cloud/"
                                 "bookworm/latest/SHA512SUMS",
     },
+    "rocky9": {
+        "url": "https://download.rockylinux.org/pub/rocky/9/images/x86_64/"
+               "Rocky-9-GenericCloud-Base-9.8-20260525.0.x86_64.qcow2",
+        "sha256": "92c206cc6f790c61583247eefe87890f8828420662c17cacf"
+                  "247cec78ab4eec8",
+        "source_checksum_file": "https://download.rockylinux.org/pub/rocky/"
+                                "9/images/x86_64/Rocky-9-GenericCloud-Base."
+                                "latest.x86_64.qcow2.CHECKSUM",
+    },
+    "jammy": {
+        "url": "https://cloud-images.ubuntu.com/jammy/current/"
+               "jammy-server-cloudimg-amd64.img",
+        "sha256": "58be26aa7452f3005a4f7370a43928bfb33a7f35a77a8f3b264"
+                  "bf00266a17ca0",
+        "source_checksum_file": "https://cloud-images.ubuntu.com/jammy/"
+                                "current/SHA256SUMS",
+    },
+}
+
+#: Which pinned provider image each profile builds FROM.
+PROFILE_MEDIA: dict[str, str] = {
+    "attacker-debian": "debian12",
+    "scoring-debian": "debian12",
+    "rocky9-ecomm": "rocky9",
+    "ubuntu2204-mail": "jammy",
+}
+
+#: Distro family per media key: decides the package manager + version probe.
+DISTROS: dict[str, str] = {"debian12": "apt", "jammy": "apt",
+                          "rocky9": "dnf"}
+
+#: ROLE READINESS: services the role must have RUNNING in the artifact. A
+#: missing service is recorded as a gap, never hidden behind an exit code.
+ROLE_SERVICES: dict[str, list[str]] = {
+    "rocky9-ecomm": ["httpd", "php-fpm"],
+    "ubuntu2204-mail": ["postfix", "dovecot"],
 }
 
 #: The binary capability contract per profile comes from attacker_tools so
@@ -51,6 +87,12 @@ APT_PACKAGES: dict[str, list[str]] = {
         "python3-pymssql", "ruby", "git", "auditd", "qemu-guest-agent",
         "dnsrecon", "ruby-net-ldap",
     ],
+    "rocky9-ecomm": ["httpd", "php", "php-fpm", "mod_ssl",
+                     "openssh-server", "qemu-guest-agent", "auditd",
+                     "policycoreutils", "firewalld"],
+    "ubuntu2204-mail": ["postfix", "dovecot-core", "dovecot-imapd",
+                        "dovecot-pop3d", "openssh-server",
+                        "qemu-guest-agent", "auditd", "ufw"],
     "scoring-debian": [
         "curl", "wget", "openssl", "python3", "python3-pip",
         "ldap-utils", "krb5-user", "python3-pymssql", "qemu-guest-agent",
@@ -100,6 +142,7 @@ def render_userdata(*, profile: str, hostname: str,
         binaries = list(SCORING_BINARIES)
     pkgs = APT_PACKAGES.get(profile, [])
     pips = PIP_PACKAGES.get(profile, [])
+    distro = DISTROS.get(PROFILE_MEDIA.get(profile, "debian12"), "apt")
     pip_set = set(PIP_PACKAGES.get(profile, []))
     library_checks = []
     for lib in sorted(pip_set):
@@ -110,9 +153,20 @@ def render_userdata(*, profile: str, hostname: str,
     # impacket's wheel installs .py tools, NOT console scripts: the
     # impacket-<tool> binary checks above must stay honest MISSING even
     # after a successful install. The library probe is the real evidence.
-    version_cmds = [
-        f"dpkg-query -W -f='${{Package}}=${{Version}}\\n' {p} 2>/dev/null "
-        f"| sed 's/^/SR-GUEST-PKG:/' || true" for p in pkgs]
+    if distro == "apt":
+        version_cmds = [
+            f"dpkg-query -W -f='${{Package}}=${{Version}}\\n' {p} 2>/dev/null "
+            f"| sed 's/^/SR-GUEST-PKG:/' || true" for p in pkgs]
+    else:
+        version_cmds = [
+            f"rpm -q --queryformat 'SR-GUEST-PKG:%{{NAME}}=%{{VERSION}}\\n' "
+            f"{p} 2>/dev/null || true" for p in pkgs]
+    svc_checks = []
+    for svc in ROLE_SERVICES.get(profile, []):
+        svc_checks.append(
+            f'if systemctl is-active --quiet {svc}; then '
+            f'echo "SR-GUEST-SVC-OK:{svc}"; '
+            f'else echo "SR-GUEST-SVC-MISSING:{svc}"; fi')
     version_cmds += [
         f"python3 -m pip show {p} 2>/dev/null | sed -n 's/^Version: /"
         f"SR-GUEST-PIP:{p}=/p' || true" for p in sorted(pip_set)]
@@ -131,6 +185,7 @@ def render_userdata(*, profile: str, hostname: str,
         *pip_cmds,
         "apt-get -qq update || echo SR-GUEST-APT-UPDATE-FAIL",
         *check_lines,
+        *svc_checks,
         *library_checks,
         *version_cmds,
         'echo "SR-GUEST-DONE rc=0"',
@@ -183,7 +238,9 @@ def build_profile(*, profile: str, base: pathlib.Path, pubkey: pathlib.Path,
     base = pathlib.Path(base)
     if not base.is_file():
         raise RuntimeError(f"base image {base} does not exist")
-    pin_spec = PINS[pin or "debian12"]
+    pin_spec = PINS[pin or PROFILE_MEDIA.get(profile, "debian12")]
+    if pin_spec is None:
+        raise RuntimeError(f"no pinned media for profile {profile!r}")
     pin_evidence = verify_pinned(base, pin_spec)
     pubkeys = [line.strip() for line in pathlib.Path(pubkey).read_text(
         encoding="utf-8", errors="replace").splitlines() if line.strip()]
@@ -212,6 +269,10 @@ def build_profile(*, profile: str, base: pathlib.Path, pubkey: pathlib.Path,
             caps[line.split(":", 1)[1]] = "ok"
         elif line.startswith("SR-GUEST-CAP-MISSING:"):
             caps[line.split(":", 1)[1]] = "missing"
+        elif line.startswith("SR-GUEST-SVC-OK:"):
+            caps[line.split(":", 1)[1]] = "running"
+        elif line.startswith("SR-GUEST-SVC-MISSING:"):
+            caps[line.split(":", 1)[1]] = "service-missing"
         elif line.startswith("SR-GUEST-PKG:") or line.startswith("SR-GUEST-PIP:"):
             key, _, ver = line.split(":", 1)[1].partition("=")
             packages[key] = ver
@@ -232,7 +293,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--disk-gb", type=int, default=16)
     ap.add_argument("--memory-mb", type=int, default=2048)
     ap.add_argument("--smp", type=int, default=2)
-    ap.add_argument("--pin", default=None, help="pinned base key (default debian12)")
+    ap.add_argument("--pin", default=None,
+                    help="pinned base key (default: the profile's media)")
     ap.add_argument("--timeout-s", type=int, default=3600)
     ap.add_argument("--out", type=pathlib.Path,
                     help="copy the finished overlay here (else in run-dir)")

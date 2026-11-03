@@ -147,3 +147,25 @@ def test_build_profile_refuses_a_pubkey_that_is_empty(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="empty"):
         ub.build_profile(profile="scoring-debian", base=base, pubkey=empty,
                          run_dir=tmp_path / "run9", pin="fake")
+
+
+def test_multi_distro_renders_the_right_package_manager_and_service_gates():
+    rocky = ub.render_userdata(profile="rocky9-ecomm", hostname="h",
+                               pubkeys=["ssh-ed25519 AAAK k"])
+    assert "rpm -q --queryformat" in rocky
+    assert "SR-GUEST-SVC-MISSING:httpd" in rocky
+    assert "SR-GUEST-SVC-MISSING:php-fpm" in rocky
+    assert "  - httpd" in rocky
+    mail = ub.render_userdata(profile="ubuntu2204-mail", hostname="h",
+                              pubkeys=["ssh-ed25519 AAAK k"])
+    assert "dpkg-query" in mail
+    assert "SR-GUEST-SVC-MISSING:postfix" in mail
+    assert "SR-GUEST-SVC-MISSING:dovecot" in mail
+
+
+def test_every_profile_builds_from_a_pinned_media_it_declares():
+    for profile in ub.APT_PACKAGES:
+        media = ub.PROFILE_MEDIA.get(profile)
+        assert media, f"{profile} declares no pinned media"
+        assert media in ub.PINS, f"{profile} media {media} not pinned"
+        assert ub.DISTROS[media] in ("apt", "dnf")
