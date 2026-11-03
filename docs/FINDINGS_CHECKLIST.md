@@ -501,6 +501,58 @@ No implementation milestone is closed by this documentation pass.
   /dev/nbd0 (fcntl lock + unique mount roots); service checks raced boot
   (retry window); clones need cloud-init enabled even though chroot
   provisioning does not.
+### Real image gate 2 — goldens, Windows finding, lab API (2026-11-03, later)
+
+- **Seven real goldens now registered** (template id, verified by an
+  in-guest capability report read back off the built disk):
+  `attacker-debian` 9109, `webmail` 9111, `ecomm` 9103 (`apache2` +
+  `php8.3-fpm` RUNNING, built from the appliance base with apt names —
+  the Fedora profile's dnf set cannot be used on an Ubuntu base),
+  `opnsense` 9102 (vendor serial image converted to qcow2, boot verified
+  to its own login prompt; no cloud-init, configured by console),
+  `scoring` 9110 (zero missing capabilities), `ubuntu-desktop` 9107 and
+  `team-kali` 9005 (`nmap 7.99`, `python3-impacket`, explicit tool set).
+  Six of twelve placeholders remain: splunk, vyos, win11, ws2019-sql,
+  ws2022-dc and the appliance-base copies behind them.
+- **Builder defects fixed by these builds (each cost a live run):**
+  - non-attacker profiles were graded against the SCORING binoculars
+    (desktop reported `kinit`/`ldapsearch` "missing"); `capability_contract`
+    is now the single source of truth, unknown profiles FAIL CLOSED;
+  - `sized_base_copy` refused the 25 GiB Kali base (`qemu-img` shrink);
+    size is now a floor and a larger provider base is never shrunk;
+  - a service reported RUNNING was counted as missing;
+  - `dpkg` inside chroot died on a missing `/dev/pts` (mount it);
+  - the overlay's ext4 was never grown (`resize2fs` before mirroring
+    installs — the 1.35 GB Splunk vendor deb hit "No space left");
+  - the `nbd` lock serializes mounts but not boot, so parallel builds
+    still queue; and an unlocked Windows offline read tore the device out
+    from under a running apt (`SIGBUS`) — Windows now shares the lock.
+- **Windows: the freeze was VBS in nested KVM, not the scripts.** Build
+  #9 (specialize reduced to a stage-log + VBS-off + `hypervisorlaunchtype
+  off`, install boot with `hv_relaxed`/`hv_spinlocks`/`hv_vapic`/`hv_time`)
+  finished with `qemu_rc 0`, a clean ACPI shutdown and an offline stage
+  log `firstlogon → qga-and-driver-attempted` in about 30 minutes. The
+  three earlier hour-long black-screen stalls ran `pnputil`/`msiexec`
+  during that freeze window. Remaining QGA gap: `msiexec` is a
+  GUI-subsystem exe, plain `cmd` does not wait for it and the 5 s
+  shutdown raced the MSI (marker written, no `qemu-ga.exe`); first logon
+  now uses `start /wait`. Driver staging evidence moved to the DriverStore.
+- **Lab product (step 3, first slice):** `labs`/`lab_guests`/`lab_members`/
+  `lab_reset_plans` (migration 0029) now have runtime grants (0030 —
+  without them the first real request was 500 "permission denied"), a
+  service (`lab_service`) and an HTTP surface: create/list/get,
+  membership (owner/last-captain protected, capabilities revoked on
+  removal), captain-only dependency PLANS with blockers persisted,
+  approval that fences the AI/worker and hands the plan id to the
+  executor, and a SELECTIVE reset (`env_deploy.reset_guests`) that
+  destroys and re-clones only the approved rebuild set. Verified delete
+  only on a complete teardown. Unknown state is never success: a lab is
+  `active` only when every guest is `ready`, else `degraded`.
+- **Availability lane:** `srplatform/availability.py` decides what one
+  sample MEANS — a down router/firewall makes carried checks UNKNOWN (not
+  downtime), a scorer error is UNKNOWN, an unsampled check is UNKNOWN,
+  and task rollups never award points on unknown evidence.
+
 - **Windows status (not yet claimed):** the unattended Server 2022
   install loop WORKS on BIOS/MBR (build 20348, AutoLogon,
   FirstLogonCommands, ACPI shutdown, offline NTFS marker read). Driver

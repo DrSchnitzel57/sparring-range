@@ -337,8 +337,16 @@ def _offline_evidence(disk: pathlib.Path,
             if r.returncode != 0:
                 continue
             try:
-                evidence["qemu_ga"] = (mount_root
-                                       / "Program Files/qemu-ga/qemu-ga.exe").is_file()
+                # NTFS keeps the vendor's capitalisation ("Qemu-ga") and
+                # the Linux ntfs3 mount is case-SENSITIVE: a hard-coded
+                # lowercase path reported a false negative on build #10
+                # while qemu-ga.exe was plainly installed.
+                program_files = mount_root / "Program Files"
+                evidence["qemu_ga"] = any(
+                    d.is_dir() and d.name.lower() == "qemu-ga"
+                    and (d / "qemu-ga.exe").is_file()
+                    for d in program_files.iterdir()) \
+                    if program_files.is_dir() else False
                 # pnputil /add-driver /install only lands a storage driver in
                 # the DriverStore until the device needs it (an IDE disk never
                 # does); System32/drivers is the WRONG place to prove staging.
