@@ -39,7 +39,6 @@ import json
 import os
 import pathlib
 import pwd
-import re
 import secrets
 import shutil
 import stat
@@ -1712,7 +1711,7 @@ def _sha256_file(path: pathlib.Path) -> str:
 def seed_profile(manifest_path: pathlib.Path, *,
                  role: str, profile: str, template_id: int,
                  source_role: str = "appliance-base",
-                 disk_gb: int = 20, memory_mb: int = 2048, vcpus: int = 2,
+                 disk_gb: int = 20, memory_mb: int = 2048, vcpus: int = 1,
                  dest: pathlib.Path | None = None,
                  dry_run: bool = False) -> dict:
     """Seed a NEW role profile as a byte-copy of an existing pinned image.
@@ -1722,24 +1721,36 @@ def seed_profile(manifest_path: pathlib.Path, *,
     budget-sum rules blind (image vcpu/memory/disk totals are BOUNDED sums,
     live commissioning finds 2026-11-02/03). This records the copy with its
     own digest, refuses to overwrite anything, validates the WHOLE manifest
-    (role/profile/template uniqueness, every budget sum) BEFORE writing,
-    and leaves `apply` as the explicit next step (it re-renders the policy
-    and the broker's catalog).  The bytes are a copy of SOURCE_ROLE, so the
-    profile is only as faithful as its source until a real build replaces
-    it — that is stated, never implied.
+    (role/profile/template uniqueness, every budget sum) BEFORE writing.
+    `vcpus` defaults to 1: image vcpu totals are a bounded SUM across every
+    role, so a per-role 2 would overflow the common 12-role lane on the
+    smallest valid budget (live find: 28 > 26).
+
+    The bytes are a base copy, so the profile is only as faithful as its
+    source until a real build replaces it — that is stated, never implied.
+    Next steps are explicit: `apply` re-renders the policy, and the broker
+    (which reads the manifest ONCE at start) must be restarted for the new
+    profile to appear in its catalog.
     """
     manifest_path = pathlib.Path(manifest_path)
-    raw = json.loads(manifest_path.read_text())
+    try:
+        raw = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise InstallError(
+            f"cannot read manifest {manifest_path}: {exc}") from exc
     images = dict(raw.get("images") or {})
     if role in images:
         raise InstallError(f"image role {role!r} already exists in the manifest")
     src = images.get(source_role)
     if not isinstance(src, dict):
-        raise InstallError(f"source role {source_role!r} is not in {manifest_path}")
+        raise InstallError(f"source role {source_role!r} is not in {manifest_path}; "
+                           f"pass --source-role with an existing role")
     src_path = pathlib.Path(str(src.get("path") or ""))
     if not src_path.is_file():
         raise InstallError(f"source image {src_path} does not exist")
     dest_path = pathlib.Path(dest) if dest else src_path.parent / f"{role}.qcow2"
+    if dest_path.is_symlink():
+        raise InstallError(f"refusing a symlinked destination {dest_path}")
     if dest_path.exists():
         raise InstallError(f"refusing to overwrite existing image {dest_path}")
     if not dest_path.parent.is_dir():
@@ -1759,17 +1770,30 @@ def seed_profile(manifest_path: pathlib.Path, *,
         return {"dry_run": True, "role": role, "profile": profile,
                 "template_id": template_id, "path": str(dest_path),
                 "copy_from": str(src_path)}
-    subprocess.run(["cp", "--reflink=auto", str(src_path), str(dest_path)],
-                   check=True)
-    entry["sha256"] = _sha256_file(dest_path)
-    entry["size_bytes"] = dest_path.stat().st_size
+    try:
+        # -n: a file that appears between the check above and this call is
+        # refused, never clobbered (the check alone is TOCTOU).
+        subprocess.run(["cp", "-n", "--reflink=auto", str(src_path),
+                        str(dest_path)], check=True)
+        dest_size = dest_path.stat().st_size
+        sha = _sha256_file(dest_path)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        # never leave a partial image that a later run must delete by hand
+        if dest_path.is_file() and not dest_path.is_symlink():
+            dest_path.unlink(missing_ok=True)
+        raise InstallError(f"copying {src_path} -> {dest_path} failed: "
+                           f"{exc}") from exc
+    entry["sha256"] = sha
+    entry["size_bytes"] = dest_size
     probe["images"][role] = entry
     _atomic_write(manifest_path, json.dumps(probe, indent=2, sort_keys=True)
                   + "\n", 0o644, 0, 0)
     return {"dry_run": False, "role": role, "profile": profile,
             "template_id": template_id, "path": str(dest_path),
             "sha256": entry["sha256"], "size_bytes": entry["size_bytes"],
-            "next": "run `apply` to re-render the policy and broker catalog"}
+            "next": "run `apply` (re-renders the policy) and restart "
+                    "sr-appliance-broker (its catalog loads the manifest "
+                    "once at start)"}
 
 
 def _layout(args) -> Layout:
@@ -1861,7 +1885,7 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--json", action="store_true")
 
     psp = sub.add_parser("seed-profile")
-    common(psp)
+    psp.add_argument("--manifest", required=True)
     psp.add_argument("--role", required=True,
                      help="new manifest image role key (e.g. 'ecomm')")
     psp.add_argument("--profile", required=True,
@@ -1871,7 +1895,7 @@ def main(argv: list[str] | None = None) -> int:
                      help="existing manifest role copied byte-for-byte")
     psp.add_argument("--disk-gb", type=int, default=20)
     psp.add_argument("--memory-mb", type=int, default=2048)
-    psp.add_argument("--vcpus", type=int, default=2)
+    psp.add_argument("--vcpus", type=int, default=1)
     psp.add_argument("--dest", help="copy destination (default: beside the "
                                     "source image, named <role>.qcow2)")
     psp.add_argument("--dry-run", action="store_true")

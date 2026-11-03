@@ -12,6 +12,8 @@ import hashlib
 import json
 import pathlib
 
+import subprocess
+
 import pytest
 
 from deploy.appliance import InstallError, seed_profile
@@ -87,3 +89,69 @@ def test_seed_profile_dry_run_touches_nothing(tmp_path):
                        disk_gb=11, dry_run=True)
     assert out["dry_run"] and not (tmp_path / "ecomm.qcow2").exists()
     assert path.read_text() == before
+
+
+def test_seed_profile_refusals_name_the_actual_rule(tmp_path):
+    path, _ = _write(tmp_path)
+    with pytest.raises(InstallError, match="vcpus"):
+        seed_profile(path, role="big-vcpu", profile="big-vcpu-prof",
+                     template_id=9102, source_role=SOURCE_ROLE, vcpus=7)
+    with pytest.raises(InstallError, match="memory"):
+        seed_profile(path, role="big-mem", profile="big-mem-prof",
+                     template_id=9103, source_role=SOURCE_ROLE,
+                     memory_mb=7000)
+    with pytest.raises(InstallError, match="disk"):
+        seed_profile(path, role="big-disk", profile="big-disk-prof",
+                     template_id=9104, source_role=SOURCE_ROLE, disk_gb=12)
+
+
+def test_seed_profile_vcpus_defaults_to_one(tmp_path):
+    path, raw = _write(tmp_path)
+    seed_profile(path, role="defaults", profile="defaults-prof",
+                 template_id=9105, source_role=SOURCE_ROLE, disk_gb=11)
+    assert json.loads(path.read_text())["images"]["defaults"]["vcpus"] == 1
+
+
+def test_seed_profile_dest_and_parent_refusals(tmp_path):
+    path, _ = _write(tmp_path)
+    with pytest.raises(InstallError, match="directory"):
+        seed_profile(path, role="elsewhere", profile="elsewhere-prof",
+                     template_id=9106, source_role=SOURCE_ROLE, disk_gb=11,
+                     dest=tmp_path / "custom" / "any.qcow2")
+
+
+def test_seed_profile_records_mode_0644(tmp_path):
+    path, _ = _write(tmp_path)
+    seed_profile(path, role="modes", profile="modes-prof", template_id=9107,
+                 source_role=SOURCE_ROLE, disk_gb=11)
+    import stat
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+
+def test_seed_profile_cleans_partial_copy_on_cp_failure(tmp_path, monkeypatch):
+    path, _ = _write(tmp_path)
+    dest = tmp_path / "partial.qcow2"
+
+    def fake_cp(args, check=True):
+        dest.write_bytes(b"partial")
+        raise subprocess.CalledProcessError(1, "cp")
+
+    monkeypatch.setattr("deploy.appliance.subprocess.run", fake_cp)
+    with pytest.raises(InstallError, match="failed"):
+        seed_profile(path, role="partial", profile="partial-prof",
+                     template_id=9108, source_role=SOURCE_ROLE, disk_gb=11,
+                     dest=dest)
+    assert not dest.exists(), "a failed copy must not strand a partial image"
+
+
+def test_seed_profile_refuses_symlinked_destination(tmp_path):
+    path, _ = _write(tmp_path)
+    real = tmp_path / "real.qcow2"
+    real.write_bytes(b"keep")
+    link = tmp_path / "link.qcow2"
+    link.symlink_to(real)
+    with pytest.raises(InstallError, match="symlink"):
+        seed_profile(path, role="linked", profile="linked-prof",
+                     template_id=9109, source_role=SOURCE_ROLE, disk_gb=11,
+                     dest=link)
+    assert link.is_symlink() and real.read_bytes() == b"keep"
