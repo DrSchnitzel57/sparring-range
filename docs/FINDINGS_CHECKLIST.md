@@ -701,3 +701,35 @@ where they name fixtures, not product artifacts.
 
 This is compatibility retirement, not a contract change: authority, isolation,
 append-only evidence and fail-closed obligations are untouched.
+
+### Per-role provisioning landed (2026-11-04 night)
+
+The gap was named plainly: images booted and labs deployed, but nothing
+configured the software roles, which is why `dns-authoritative` passed while
+`directory-auth` failed and the store returned a TLS error.
+
+Landed (code, not yet live-proven on all roles):
+- `srplatform/scenario_engine/env_provision.py`: pure `build_plan` per
+  blueprint `services`, idempotent steps over the broker's typed `guest_exec`
+  with the deploy's own generation, `unimplemented` never reported `ready`,
+  evidence = names/states/exit codes (no secrets, no command text);
+  handlers: `ssh`, `active-directory`, `dns`, `mssql`, `winrm`, `sssd-ad`,
+  `splunk`, `syslog-receiver`, `nginx`, `nopcommerce` (catalogue substitute),
+  `postfix`, `dovecot`, `roundcube` (PHP substitute).
+- `srplatform/labs/pki.py`: one CA per installation, service certs carry the
+  IP SAN of the guest address the check actually dials.
+- `srplatform/environment_specs/router_config.py`: VyOS `config.boot` +
+  OPNsense `config.xml` rendered from the typed blueprint contracts.
+- provisioning runs after deploy and writes `provisioning` /
+  `provisioning_ready` evidence on each deployment resource row; a
+  provisioning fault never un-readies a deployed lab.
+
+Still false/unknown: the mail and store substitutes are not the reported
+nopCommerce/Roundcube stack (fidelity-labeled); the scoring vantage does not
+trust the lab CA yet; routers are placeholders pending image builds; Windows
+guests have no running agent until the ws2022 image is rebuilt.
+
+Incident: the appliance hung during the restarted Windows 2019 build (leftover
+nbd-backed build artifacts from the killed first build). Rebooted at 03:38;
+redeployed the repo HEAD to `/opt/sparring-range` (the installed copy still
+required mojang roles), released the broker latch, all `sr-*` units active.

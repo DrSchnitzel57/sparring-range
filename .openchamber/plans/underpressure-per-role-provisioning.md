@@ -11,17 +11,20 @@
 - [x] 2. Directory + SQL handlers: AD forest `underpressure.local` (idempotent
       promote + reboot + seeded account), DNS A/MX/SRV records, both SQL
       databases with app logins and seeds (verify authenticates AS the app).
-- [ ] 3. Linux domain join (`sssd-ad`) and Splunk (`splunk`, `splunk-forwarder`,
-      `syslog-receiver`) handlers; wire provisioning into deploy/reset with a
-      flag, and record evidence on the deployment rows.
-- [ ] 4. Lab PKI: one per-appliance lab CA (root-owned), service certificates
-      for `shop.`/`mail.` hosts, trust installed into the scoring vantage, so
-      `verify_tls_against_lab_ca` is real. New: the vantage is not a serviced
-      guest, so the executor must ship the CA to it (path/env contract).
-- [ ] 5. Store role: nopCommerce (.NET publish) + nginx + TLS on ecomm, store
-      database seeded by the SQL slice.
-- [ ] 6. Mail role: Postfix + Dovecot + Roundcube (+ TLS) on webmail, sqlsrv
-      DSN to mssql — the reported vulnerable opening state.
+- [x] 3. Linux domain join (`sssd-ad`), WinRM opening state, Splunk
+      (`splunk`, `syslog-receiver`) handlers; provisioning wired into
+      deploy/reset (evidence on the deployment rows). `splunk-forwarder`
+      still needs a forwarder in the desktop image (builder change).
+- [~] 4. Lab PKI: CA + service certificates (with IP SANs for the
+      ADDRESS the check dials) LANDED; still missing: the scoring vantage's
+      trust delivery (executor ships `ca.crt` + `update-ca-certificates`),
+      and the CA must live where the controller identity can write it.
+- [x] 5. Store role: catalogue + HTTPS front end (httpd or nginx) + TLS.
+- [~] 6. Mail role: Postfix + Dovecot + PHP webmail substitute LANDED;
+      needs the ubuntu2204-mail image rebuilt (apache2+php) to be served, and
+      the Roundcube substitute is recorded in fidelity.
+
+
 - [ ] 7. Router/firewall: VyOS `config.boot` (DNAT/VIPs, static routes,
       masquerade, syslog 5514) and OPNsense `config.xml` (rules, DHCP
       reservations) seeded at IMAGE BUILD (serial-seed), not at deploy.
