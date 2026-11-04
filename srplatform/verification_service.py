@@ -20,7 +20,7 @@ from typing import Callable
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from srplatform.db.models import Deployment, Event
+from srplatform.db.models import Deployment, Event, Lab, Session as SessionModel
 from srplatform.scenario_engine.loader import load_scenario
 from srplatform.settings import get_settings
 from srplatform.ssh_channel import SSH_ALIVE_OPTS
@@ -96,8 +96,31 @@ def active_deployment(db: Session, session_id) -> Deployment | None:
     (possibly reused, possibly foreign) resources must not be verified."""
     if session_id is None:
         return None
+    own = db.execute(select(Deployment)
+                     .where(Deployment.session_id == session_id,
+                            Deployment.status == "ready")
+                     .order_by(Deployment.created_at.desc())).scalars().first()
+    if own is not None:
+        return own
+    # A lab-bound EXERCISE session ranges on the deployment it was GIVEN: the
+    # lab's home session deployed the guests once, and this session owns no
+    # clone. Resolving only from `session_id` made its host map EMPTY, so
+    # every verifier reported unknown and nothing was ever graded — the
+    # session looked fine and scored nothing. The lab's READY deployment is
+    # the same generation the captain and the reset plan operate on.
+    sess = db.get(SessionModel, session_id)
+    if sess is None or sess.lab_id is None:
+        return None
+    lab = db.get(Lab, sess.lab_id)
+    if lab is None:
+        return None
+    home = db.execute(select(SessionModel)
+                      .where(SessionModel.lab_id == lab.lab_id)
+                      .order_by(SessionModel.started_at)).scalars().first()
+    if home is None:
+        return None
     return db.execute(select(Deployment)
-                      .where(Deployment.session_id == session_id,
+                      .where(Deployment.session_id == home.session_id,
                              Deployment.status == "ready")
                       .order_by(Deployment.created_at.desc())).scalars().first()
 

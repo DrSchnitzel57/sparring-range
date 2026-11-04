@@ -558,3 +558,31 @@ def test_http_exercise_attach_and_list(client, users, migrated_db,
                     headers={"Authorization": f"Bearer {tok}"},
                     json={"name": "sneak"})
     assert r.status_code == 403, r.text
+
+
+def test_a_lab_exercise_session_resolves_hosts_from_the_lab_deployment(eng):
+    """Consumers must find the range where it actually lives. An exercise
+    session owns no clone; if verification resolved only from its own
+    session id, its host map would be EMPTY and every verifier would report
+    unknown — the session would look healthy and score nothing."""
+    from srplatform import verification_service
+    from srplatform.db.models import Lab
+    from srplatform.db.session import db as db_ctx
+    from srplatform.scenario_engine.env_deploy import deploy_environment
+    from srplatform import lab_service
+
+    bp, broker = _env(eng)
+    lab_id = _service_lab(eng)
+    with db_ctx() as db:
+        lab = db.get(Lab, lab_id)
+        home = lab_service.home_session(db, lab)
+        deploy_environment(db, home.session_id, SCENARIO,
+                           {"environment": ENV_ID}, broker)
+        lab_service.reflect_launch(db, home.session_id)
+        sess = lab_service.attach_exercise(db, lab, lab.owner_id)
+        db.commit()
+        home_map = verification_service.host_map_for(db, home.session_id)
+        exercise_map = verification_service.host_map_for(db, sess.session_id)
+        assert len(home_map) == 12
+        assert exercise_map == home_map
+        assert exercise_map["ecomm"].startswith("172.20.240.")
