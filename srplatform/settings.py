@@ -236,6 +236,10 @@ class Settings(BaseSettings):
     # PINNED management host keys (audit N11): required in production — the
     # verifier never does trust-on-first-use against range hosts.
     verifier_ssh_known_hosts: str = ""
+    #: Protected environment credentials (root-owned, 0600): the ONLY place a
+    #: lab credential value exists. Empty -> the default path; a missing file
+    #: makes every credentialed check honestly `unknown` (never a failure).
+    environment_credentials_file: str = ""
     verifier_exec_timeout_s: int = 30
 
     # --- Deploy (M1) ---

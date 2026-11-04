@@ -77,9 +77,19 @@ def _main() -> int:
         known_hosts = known or None
     transport = SshVantage(host=vantage["ip"], user="sr", key_path=key,
                            known_hosts=known_hosts)
+    from srplatform.availability_plan import plan_transactions
+    from srplatform.credentials import DEFAULT_PATH, resolver
+
+    store_path = s.environment_credentials_file or DEFAULT_PATH
+    creds = resolver(store_path, ENV_ID, require_secure=True)
+    wanted = {name for plan in plan_transactions(env.checks, env.blueprint)
+              for name in plan["credential_env"]}
+    resolved = [name for name in wanted if creds(name) is not None]
+    print(f"credential store {store_path}: {len(resolved)} resolved "
+          f"(values never printed)")
     evidence = sample_window(env.checks, env.blueprint,
                              transport=transport,
-                             credentials=lambda name: None,
+                             credentials=creds,
                              guest_states=guest_states)
     rows = {cid: row["state"] for cid, row in evidence["checks"].items()}
     print(json.dumps({"states": rows, "coverage": evidence["coverage"],
