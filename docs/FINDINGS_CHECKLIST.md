@@ -774,3 +774,30 @@ to the Server 2019 media/setup transition under nested KVM. Next attempt:
 restore hv_time (no hv_vapic), then single-vCPU, then TCG. If 2019 remains
 unbuildable, the fidelity ledger must record a 2022 substitution rather than
 claim a 2019 SQL host.
+
+### ws2022 golden rebuilt with a REAL agent; appliance dropped again (2026-11-04 06:20)
+
+- `run_win_build --version 2022` completed: `installed: true`, marker
+  `build-complete`, `qemu_ga: true`, stage `firstlogon/qga-and-driver-attempted`,
+  qemu_rc 0. This is the image whose predecessor had qemu-ga on disk but no
+  running service — Windows guest_exec had never worked. Rebuild fixes it.
+- REGISTRATION DID NOT LAND: while `register_image --apply` ran
+  (5.8 GiB copy + `deploy.appliance apply`), the appliance left the network
+  again (ARP INCOMPLETE, ssh no route). Second disappearance tonight, both
+  under heavy appliance work. On return: re-run registration WITHOUT
+  `--apply` (manifest edit + API/broker restart is sufficient) and treat
+  `deploy.appliance apply` as the suspect for the drop.
+- `qemu_alone_preflight` now refuses a build when ANY qemu exists or
+  MemAvailable < guest + 4 GiB: the first disappearance overlapped a build
+  with a leftover spin, the second ran one build (not two), so concurrency
+  is ruled out for it — but serialization is now enforced regardless.
+
+### Still not true (do not claim otherwise)
+
+- ws2019-sql: Server 2019 media freezes at the setup→oobe transition twice
+  (hv_vapic off included). Server 2022 media builds in ~11 minutes on the
+  same host. Fallback if 2019 cannot build: record a 2022 substitution in
+  fidelity.yaml.
+- Roundcube is a PHP substitute (fidelity-labelled), Splunk forwarder is
+  rsyslog-to-5514 (fidelity-labelled), store is a static catalogue page
+  (fidelity-labelled).

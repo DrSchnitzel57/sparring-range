@@ -15,21 +15,25 @@
       (`splunk`, `syslog-receiver`) handlers; provisioning wired into
       deploy/reset (evidence on the deployment rows). `splunk-forwarder`
       still needs a forwarder in the desktop image (builder change).
-- [~] 4. Lab PKI: CA + service certificates (with IP SANs for the
-      ADDRESS the check dials) LANDED; still missing: the scoring vantage's
-      trust delivery (executor ships `ca.crt` + `update-ca-certificates`),
-      and the CA must live where the controller identity can write it.
+- [x] 4. Lab PKI: CA + service certificates (IP SANs for the ADDRESS the
+      check dials) + vantage trust: SshVantage ships `ca.crt` and exports
+      `SSL_CERT_FILE`, so verification is ON against the replica CA.
 - [x] 5. Store role: catalogue + HTTPS front end (httpd or nginx) + TLS.
 - [~] 6. Mail role: Postfix + Dovecot + PHP webmail substitute LANDED;
       needs the ubuntu2204-mail image rebuilt (apache2+php) to be served, and
       the Roundcube substitute is recorded in fidelity.
 
 
-- [ ] 7. Router/firewall: VyOS `config.boot` (DNAT/VIPs, static routes,
-      masquerade, syslog 5514) and OPNsense `config.xml` (rules, DHCP
-      reservations) seeded at IMAGE BUILD (serial-seed), not at deploy.
-- [ ] 8. Workstations: Ubuntu (join + forwarder) and Windows 11 (join).
-- [ ] 9. Availability registry green from the real vantage (all 8 checks).
+- [~] 7. Router/firewall: VyOS + OPNsense configs RENDER from the typed
+      contracts (tested); VyOS builder drives the vendor ISO over serial and
+      reads the disk's grub entry back (written, not yet live-run). OPNsense
+      config seed at image build still missing.
+- [~] 8. Workstations: Ubuntu join + rsyslog forwarder handlers landed;
+      WIN11 image still a base copy (needs UEFI+TPM: no OVMF/swtpm on the
+      appliance yet).
+- [ ] 9. Availability registry green from the real vantage (all 8 checks) —
+      plans now dial the declared VIPs; routers + ws2022/ws2019 images must
+      be live first.
 - [ ] 10. Integrated proof gate + findings/release review.
 
 ## Change map (producer -> consumer)
