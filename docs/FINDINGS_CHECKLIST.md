@@ -763,3 +763,14 @@ enlightenment boots past the black screen (Windows logo, setup continues).
 The builder now passes `host,hv_relaxed=on,hv_spinlocks=0x1fff` only; the
 nested Broadwell (E5-2697A v4) VAPIC path is the documented freeze source.
 The earlier VBS hypothesis (module docstring) was not the cause here.
+Correction (2026-11-04 06:05): the "hv_vapic proven" note above is WRONG.
+A second fresh ws2019 build with `host,hv_relaxed=on,hv_spinlocks=0x1fff`
+(no hv_vapic, no hv_time) froze at the SAME point: black screen, two vCPUs
+spinning, zero disk I/O for minutes after `specialize-done`. The resume that
+booted to LogonUI was therefore not evidence about hv_vapic — the resume was
+a direct disk boot, not the setup transition. Server 2022 media installs
+fine on this host (11-minute build on 2026-11-03); the freeze appears specific
+to the Server 2019 media/setup transition under nested KVM. Next attempt:
+restore hv_time (no hv_vapic), then single-vCPU, then TCG. If 2019 remains
+unbuildable, the fidelity ledger must record a 2022 substitution rather than
+claim a 2019 SQL host.
