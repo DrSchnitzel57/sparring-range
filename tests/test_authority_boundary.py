@@ -998,3 +998,95 @@ def test_guest_exec_uncertain_run_retains_an_obligation(tmp_path):
                           session_id="sess-1", generation="g1")
     kinds = [o["kind"] for o in service.ledger.open_obligations()]
     assert "guest-exec-uncertain" in kinds
+
+
+# --------------------------------------------------------------------------- #
+# 5d. release retires provably-absent obligations itself (ceremony, not safety)#
+# --------------------------------------------------------------------------- #
+
+def test_release_retires_a_clone_whose_vmid_is_provably_gone(tmp_path):
+    """The rule "no release with an open obligation" is right; needing a human
+    to type `resolve --id 3` when the backend already answers "the VMID does
+    not exist" is ceremony. The absence IS the evidence."""
+    client, service, http = _mk(tmp_path)
+    service.ledger.add_obligation("clone-outcome-unknown", 777,
+                                  "intent only; never became a domain")
+    assert 777 not in http.vms
+    out = service.release_latch("operator")
+    assert out["released"] is True
+    assert service.ledger.open_obligations() == []
+    kinds = [r["kind"] for r in service.ledger.audit_tail(10)]
+    assert "auto-resolve" in kinds
+
+
+def test_a_vmid_that_still_exists_keeps_the_latch_shut(tmp_path):
+    """Absence is the whole proof: the same obligation must NOT resolve while
+    the VM is really there (an uncertain clone that DID materialise)."""
+    client, service, http = _mk(tmp_path)
+    _clone(client)                       # vmid 210 exists
+    service.ledger.add_obligation("clone-outcome-unknown", 210, "outcome unclear")
+    with pytest.raises(BrokerConflict, match="unresolved obligation"):
+        service.release_latch("operator")
+    kinds = [o["kind"] for o in service.ledger.open_obligations()]
+    assert "clone-outcome-unknown" in kinds
+
+
+def test_auto_resolve_never_touches_an_operator_decision(tmp_path):
+    """Only "the thing is not there" kinds are auto-retirable. A host-key
+    read that could not be trusted is an operator's call, forever."""
+    client, service, http = _mk(tmp_path)
+    service.ledger.add_obligation("host-key-read-uncertain", 888, "agent flaked")
+    with pytest.raises(BrokerConflict, match="host-key-read-uncertain"):
+        service.release_latch("operator")
+
+
+def test_a_late_boot_marker_on_a_running_guest_settles_itself(tmp_path):
+    """Heavy images (Kali, desktop) finish booting after the marker window
+    closes. The guest is RUNNING — that IS the answer; keeping a latch shut
+    for it punished a slow boot, not an unknown outcome."""
+    client, service, http = _mk(tmp_path)
+    _clone(client)
+    client.start_and_wait(NODE, 210)
+    service.ledger.add_obligation("boot-never-finished", 210,
+                                  "cloud-init did not complete in window")
+    assert service.release_latch("operator")["released"] is True
+    assert service.ledger.open_obligations() == []
+
+
+def test_a_late_boot_marker_on_a_STOPPED_guest_is_not_settled(tmp_path):
+    client, service, http = _mk(tmp_path)
+    _clone(client)                       # exists, stopped
+    service.ledger.add_obligation("boot-never-finished", 210, "marker late")
+    with pytest.raises(BrokerConflict, match="boot-never-finished"):
+        service.release_latch("operator")
+
+
+def test_an_absent_agent_is_unavailable_not_an_uncertain_outcome(tmp_path):
+    """The adapter's own BackendUnavailable means the command never ran. That
+    must NOT become 'guest-exec-uncertain' (an obligation only an operator
+    can clear) — nothing happened, and the caller needs a plain unknown."""
+    from infra.appliance.errors import BackendUnavailable as BackendGone
+    from infra.broker.errors import BrokerUnavailable
+
+    client, service, http = _mk(tmp_path)
+    _clone(client)
+    client.start_and_wait(NODE, 210)
+    http.exec_results = {210: BackendGone("guest agent is not running")}
+    with pytest.raises(BrokerUnavailable, match="agent"):
+        client.guest_exec(NODE, 210, ["cmd.exe", "/c", "ver"],
+                          session_id="sess-1", generation="g1")
+    assert service.ledger.open_obligations() == []
+
+
+def test_an_exec_the_agent_never_accepted_settles_itself(tmp_path):
+    """'Uncertain outcome' and 'the command never ran' are different facts.
+    When the agent refused the request (recorded in the obligation's detail)
+    nothing happened, so the obligation can retire without a destroy."""
+    client, service, http = _mk(tmp_path)
+    _clone(client)
+    client.start_and_wait(NODE, 210)
+    service.ledger.add_obligation(
+        "guest-exec-uncertain", 210,
+        "guest agent on VMID 210 did not accept guest-exec")
+    assert service.release_latch("operator")["released"] is True
+    assert service.ledger.open_obligations() == []

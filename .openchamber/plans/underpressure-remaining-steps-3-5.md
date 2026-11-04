@@ -40,8 +40,9 @@
 - LANDED IN CODE, NOT YET LIVE-PROVEN: the availability VANTAGE executor
   (`srplatform/availability_runner.py`, plans -> exit-code -> evidence);
   lab-bound exercise sessions (`lab_service.attach_exercise`, no second clone)
-  and their verifier host resolution; typed `guest_exec` (the Windows
-  verifier lane, through the guest agent).
+  and their verifier host resolution; typed `guest_exec` plus the Windows
+  verifier dispatch (platform from `image_profile`, `cat` -> `cmd /c type`,
+  anything untranslated = unknown).
 - RESOLVED 2026-11-04: a closed TCP port is now `failed` (exit 3), not a
   scorer error — the boundary is "did the target answer at all"; timeouts and
   script faults stay `unknown`. Tests run the rendered plans against closed

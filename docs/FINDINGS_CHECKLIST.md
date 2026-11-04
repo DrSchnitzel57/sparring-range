@@ -646,3 +646,36 @@ reading evidence rather than trusting the design:
 
 Still honestly unpinned: Windows/router goldens (no sshd) — their lane is the
 typed `guest_exec` through the same agent, not sshd.
+
+### Ceremony removed, checks untouched (2026-11-04)
+
+Operator decision: "remove all the ceremony and fluff". Nothing that decides a
+score was weakened — every check, pin and obligation rule survives; what went
+away was the manual theatre around them.
+
+- **Boot**: the 30 GB startup hash is gone (sha256 is enforced before every
+  clone instead). Broker restart 4 min -> **2 s**.
+- **Release**: `tools release` runs WHILE the daemon is up and takes **0 s**
+  (live 2026-11-04). The old "stop the daemon first or it hangs" was nothing
+  but that boot hash; the ledger is WAL and the daemon re-reads the latch per
+  operation.
+- **Obligations retire themselves when the backend already answers**:
+  `clone-outcome-unknown` / `boot-never-finished` whose VMID is provably
+  absent, or a boot window that closed late on a RUNNING guest ("it finished
+  booting, the marker read was just late"), and `guest-exec-uncertain` whose
+  detail shows the agent never accepted the command ("nothing ran"). The proof
+  is written to the audit log. Live: two obligations retired in one release
+  with 0 s of operator time. What still needs a human is the genuinely
+  undecided: a LIVE claim whose VM vanished, an untrusted host-key read.
+- **Real bug found by the same work**: the adapter raises
+  `infra.appliance.errors.BackendUnavailable` but the service only caught
+  `infra.broker.errors.BrokerUnavailable`, so an absent Windows agent became
+  `guest-exec-uncertain` (a human-only obligation) instead of plain
+  "unavailable". Fixed in `guest_exec`.
+
+Scoring itself is unchanged, and deliberately not ping-based: availability is
+real transactions (fetch the storefront and check its text, send and read back
+a mail, run a Splunk search, SELECT from the seeded DB) run FROM the scoring
+vantage; blue checks read the host's own state (nginx/sshd running, firewall
+on, rogue admin, flag file). A check that could not run is `unknown`, never a
+defender zero, and a refused port is now real downtime (`failed`).

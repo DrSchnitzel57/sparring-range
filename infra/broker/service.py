@@ -31,7 +31,9 @@ import uuid
 
 from .errors import (BrokerConflict, BrokerLatched, BrokerRefused,
                      BrokerUnavailable, PolicyViolation)
-from .ledger import Ledger, args_hash
+from infra.appliance.errors import BackendUnavailable as BackendGone
+
+from .ledger import ACTIVE_CLAIM_STATES, Ledger, args_hash
 from .policy import (BrokerPolicy, check_effective_nics,
                      check_nic_vector)
 
@@ -225,8 +227,13 @@ class BrokerService:
             try:
                 out = self.backend.guest_exec(node, int(vmid), argv,
                                               timeout_s=timeout_s)
-            except BrokerUnavailable:
-                raise
+            except (BrokerUnavailable, BackendGone) as e:
+                # The ADAPTER says "unavailable" in its own error type (agent
+                # absent, domain gone). That is an infrastructure state, not
+                # an uncertain OUTCOME of the command: nothing ran, so it is
+                # reported as unavailable and NOT turned into an obligation
+                # that only a human could clear.
+                raise BrokerUnavailable(str(e)) from e
             except Exception as e:  # noqa: BLE001 — uncertain, retain
                 self.ledger.add_obligation("guest-exec-uncertain", int(vmid),
                                            str(e)[:300])
@@ -849,12 +856,81 @@ class BrokerService:
         return report
 
     # ------------------------------------------------------------- operator ---
+    #: Obligations whose only possible outcome is "the thing is not there":
+    #: an intent that never became a domain, or a boot window that closed on a
+    #: guest since destroyed. When the BACKEND itself confirms the VMID is
+    #: absent, that absence IS the evidence — no operator has to type an id.
+    AUTO_RESOLVABLE = frozenset({"clone-outcome-unknown", "boot-never-finished",
+                                 "guest-exec-uncertain"})
+
+    def _auto_resolve_absent(self, obligations: list[dict]) -> list[int]:
+        """Retire provably-absent obligations at release time.
+
+        This is the difference between fail-closed and fail-closed-forever:
+        the rule that an unknown outcome blocks a release is right, but it
+        should not need a human when the backend read-back already answers
+        the question. A VMID that still exists, or is still held by a live
+        claim, is NEVER touched — those remain the operator's decision.
+        """
+        retired = []
+        for ob in obligations:
+            if ob["kind"] not in self.AUTO_RESOLVABLE:
+                continue
+            vmid = int(ob["vmid"])
+            claim = self.ledger.get_claim(vmid)
+            live_claim = (claim is not None
+                          and claim.get("state") in ACTIVE_CLAIM_STATES)
+            try:
+                cfg = self.backend.try_lookup_config(self.policy.node, vmid)
+            except Exception:  # noqa: BLE001 — unreadable is not evidence
+                continue
+            proof = None
+            if cfg is None or "_unavailable" in (cfg or {}):
+                # A LIVE claim whose VM is gone is a real uncertainty: the
+                # operator decides. Only an abandoned intent is self-evident.
+                if live_claim:
+                    continue
+                proof = "backend read-back: VMID absent"
+            elif (ob["kind"] == "guest-exec-uncertain"
+                  and "did not accept" in str(ob.get("detail") or "")):
+                # The AGENT refused the request: the command never started, so
+                # the "uncertain outcome" is provably "nothing ran". Without
+                # this the lab stayed un-releasable until the VM was destroyed
+                # - and an agent hiccup is not an unknown outcome.
+                proof = "agent never accepted the command: nothing ran"
+            elif ob["kind"] == "boot-never-finished":
+                # A boot window that closed on a RUNNING guest is settled
+                # reality: it finished booting, the marker read was just late
+                # (heavy images do this). Holding the latch for it forever
+                # punished the operator for a slow boot, not for an unknown.
+                try:
+                    status = self.backend.vm_status(self.policy.node, vmid)
+                except Exception:  # noqa: BLE001
+                    status = None
+                if status == "running":
+                    proof = "guest is running: the boot window closed late"
+            if proof is None:
+                continue                    # it exists and nothing settles it
+            self.ledger.resolve_obligation(int(ob["id"]))
+            self.ledger.audit("auto-resolve",
+                              {"obligation": int(ob["id"]), "vmid": vmid,
+                               "kind": ob["kind"], "proof": proof})
+            retired.append(int(ob["id"]))
+        return retired
+
     def release_latch(self, operator: str, note: str = "") -> dict:
         open_ob = self.ledger.open_obligations()
         if open_ob:
-            raise BrokerConflict(
-                f"{len(open_ob)} unresolved obligation(s) — resolve them "
-                "(status/stop/reconcile) before releasing")
+            retired = self._auto_resolve_absent(open_ob)
+            still = self.ledger.open_obligations()
+            if still:
+                raise BrokerConflict(
+                    f"{len(still)} unresolved obligation(s) — resolve them "
+                    "(status/stop/reconcile) before releasing: "
+                    + ", ".join(f"#{o['id']}/{o['kind']}" for o in still))
+            note = (note + ("; " if note else "") +
+                    "auto-resolved provably-absent: " +
+                    ",".join(str(i) for i in retired))
         self.ledger.set_latch(False)
         # A release IS the operator attesting control, and the restart that
         # follows takes seconds — so arm the lease fresh as part of it. This

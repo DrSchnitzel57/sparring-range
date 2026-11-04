@@ -491,21 +491,27 @@ recovery password lives at `/root/.sr-operator-bootstrap` ON it).
    `qemu-nbd -d /dev/nbd0`, `rmdir /mnt/sr-chroot-* /mnt/sr-report*`, then
    check `df -h /` (build overlays eat tens of GiB).
 4. **Services + latch:** `systemctl is-active sr-api sr-appliance-broker
-   sr-worker-supervisor`. A stop→start cycle is now cheap (boot no longer
-   hashes the goldens; sha256 is enforced before every clone instead), but it
-   still latches: `renew_lease` is refused while latched, so the control lease
-   (30 s TTL) expires during the stop and startup reconciliation latches
-   fail-closed. Recover in this exact order, which leaves the broker UNLATCHED
-   and the API heartbeat renewing:
+   sr-worker-supervisor`. A broker restart is cheap (2 s; boot no longer hashes
+   the goldens, because sha256 is enforced before every clone instead), and
+   the release can be run WHILE THE DAEMON IS UP — it takes ~0 s now (the old
+   "stop first or it hangs" was the 30 GB boot hash):
 
-       systemctl stop sr-appliance-broker
        .venv/bin/python -m infra.broker.tools release --operator drew --note …
-       systemctl start sr-appliance-broker
 
-   Resolve any open obligation first (`tools status` / `tools resolve --id N`);
-   a release that refreshes the lease is the operator's attestation of control.
-   Do not run `tools release` while the daemon is up — it blocks on the ledger
-   lock. Never "fix" a latch by widening `lease_ttl_s`.
+   A restart still latches: `renew_lease` is refused while latched, so the
+   control lease (30 s TTL) lapses during the stop; a release refreshes the
+   armed lease and the API heartbeat renews it. Obligations no longer need a
+   human when the backend already holds the answer — these retire themselves
+   at release, with the proof written to the audit log:
+
+   * `clone-outcome-unknown` / `boot-never-finished` whose VMID is provably
+     absent, or a boot marker that closed late on a RUNNING guest;
+   * `guest-exec-uncertain` whose detail shows the agent never accepted the
+     command (nothing ran).
+
+   Everything else (a live claim whose VM vanished, an untrusted host-key
+   read) still needs `tools resolve --id N --operator …`. Never "fix" a latch
+   by widening `lease_ttl_s`.
 5. **Range lease:** a dead gate run can leave `RangeLease` held. Release it
    (fenced) before the next provision — `infra/dev/lab_gate.py` deletes
    stale labs first, and `DELETE /labs/{id}` now releases the lease itself.

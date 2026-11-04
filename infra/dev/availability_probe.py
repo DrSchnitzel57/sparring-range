@@ -50,12 +50,33 @@ def _main() -> int:
     if vantage is None:
         print("no scoring-vantage in the deployment", file=sys.stderr)
         return 2
-    key = s.runner_ssh_key_path or s.verifier_ssh_key_path
-    known = s.runner_ssh_known_hosts or s.verifier_ssh_known_hosts
+    # The appliance sets SR_BASTION_TARGETS_KNOWN_HOSTS and publishes every
+    # pinned guest there; the runner/verifier pin files are empty in this
+    # install, and StrictHostKeyChecking has no TOFU fallback.
+    key = (s.runner_ssh_key_path or s.verifier_ssh_key_path
+           or "/etc/sparring-range/keys/runner")
+    known = (s.runner_ssh_known_hosts or s.verifier_ssh_known_hosts
+             or s.bastion_targets_known_hosts)
     print(f"vantage {vantage['host']} {vantage['ip']}  lab {lab.lab_id} "
           f"state {lab.state}")
+    # The DEPLOYMENT pin is the truth (the broker read it through the guest
+    # agent and the token route serves it); the shared known-hosts file is
+    # only how clients learn it and may be empty on this install. Write the
+    # one pin we need to a private temp file and dial strictly against it.
+    known_hosts = None
+    pin = (vantage.get("host_key_pin") or "").strip()
+    if pin:
+        import pathlib
+        import tempfile
+        f = tempfile.NamedTemporaryFile("w", suffix=".known_hosts",
+                                        delete=False)
+        f.write(f"{vantage['ip']} {pin}\n")
+        f.close()
+        known_hosts = f.name
+    else:
+        known_hosts = known or None
     transport = SshVantage(host=vantage["ip"], user="sr", key_path=key,
-                           known_hosts=known or None)
+                           known_hosts=known_hosts)
     evidence = sample_window(env.checks, env.blueprint,
                              transport=transport,
                              credentials=lambda name: None,
