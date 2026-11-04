@@ -42,9 +42,14 @@
   lab-bound exercise sessions (`lab_service.attach_exercise`, no second clone)
   and their verifier host resolution; typed `guest_exec` (the Windows
   verifier lane, through the guest agent).
-- ASSUMED (needs verification): the availability runner's plan templates treat
-  a refused TCP connection as a SCORER error (exit != 0/3), i.e. `unknown`
-  rather than `failed` — the semantics to settle before scoring on it.
+- RESOLVED 2026-11-04: a closed TCP port is now `failed` (exit 3), not a
+  scorer error — the boundary is "did the target answer at all"; timeouts and
+  script faults stay `unknown`. Tests run the rendered plans against closed
+  loopback ports.
+- STILL OPEN: SQL/Mail credential REJECTION is classified as it falls
+  (`SMTPRecipientsRefused` and `pymssql` login errors surface as unknown);
+  decide whether a rejecting service counts as downtime before scoring on the
+  DB/mail checks.
 - NOT STARTED: console gateway (A), Windows verifier dispatch onto `guest_exec`,
   offense binding for env guests (D), integrated proof gate (E), release
   review (F).
