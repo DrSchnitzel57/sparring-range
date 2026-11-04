@@ -200,6 +200,54 @@ class BrokerService:
         raise _BU(f"host-key for VMID {vmid} never stabilized — refusing "
                   f"to pin a transient")
 
+    def guest_exec(self, node: str, vmid: int, argv: list[str], *,
+                   session_id: str | None = None,
+                   generation: str | int = 1,
+                   timeout_s: float = 30.0) -> dict:
+        """Run ARGV inside an OWNED guest (the Windows verification lane).
+
+        Windows goldens carry no sshd, so their verifier evidence must come
+        through the guest agent; this is the typed door for it. The claim's
+        OWNERSHIP and GENERATION are checked before AND after the run (a
+        vmid recycled mid-command must not have its output attributed to us),
+        and an uncertain run retains an obligation instead of becoming a
+        silent empty success that a verifier would grade as healthy.
+        """
+        self._require_unlatched("guest_exec")
+        self._node(node)
+        self.policy.check_vmid(int(vmid))
+        with self._op_lock:
+            claim = self._active_claim(int(vmid), session_id)
+            if str(claim.get("generation", 1)) != str(generation):
+                raise BrokerConflict(
+                    f"VMID {vmid} is generation {claim.get('generation')!r}, "
+                    f"not {generation!r} — refusing exec for a stale generation")
+            try:
+                out = self.backend.guest_exec(node, int(vmid), argv,
+                                              timeout_s=timeout_s)
+            except BrokerUnavailable:
+                raise
+            except Exception as e:  # noqa: BLE001 — uncertain, retain
+                self.ledger.add_obligation("guest-exec-uncertain", int(vmid),
+                                           str(e)[:300])
+                self.ledger.audit("guest-exec-uncertain",
+                                  {"vmid": int(vmid), "error": str(e)[:200]})
+                raise BrokerUnavailable(
+                    f"guest exec uncertain for VMID {vmid}: {e}") from e
+            cfg = self.backend.try_lookup_config(node, int(vmid)) or {}
+            if cfg.get("name") not in (None, claim.get("name")):
+                self.ledger.add_obligation(
+                    "guest-exec-foreign-identity", int(vmid),
+                    f"claimed {claim.get('name')!r}, found {cfg.get('name')!r}")
+                raise BrokerConflict(
+                    f"VMID {vmid} identity changed during exec (claimed "
+                    f"{claim.get('name')!r}, found {cfg.get('name')!r}) — "
+                    "refusing to attribute foreign output")
+            self.ledger.audit("guest-exec", {
+                "vmid": int(vmid), "argv0": str(argv[0]) if argv else "",
+                "argc": len(argv), "returncode": out.get("returncode")})
+            return out
+
     def read_host_key(self, node: str, vmid: int, session_id: str | None = None,
                       generation: str | int = 1) -> str:
         self._node(node)

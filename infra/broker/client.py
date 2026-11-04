@@ -202,6 +202,15 @@ class BrokerClient:
     def read_config(self, node, vmid):
         return self._call("read_config", node=node, vmid=int(vmid))
 
+    def guest_exec(self, node, vmid, argv, session_id=None, generation=1,
+                   timeout_s=30.0):
+        """Run ARGV inside an OWNED guest (agent channel). Windows goldens
+        have no sshd, so this is their verification lane."""
+        return self._call("guest_exec", node=node, vmid=int(vmid),
+                          argv=[str(a) for a in argv],
+                          session_id=session_id, generation=str(generation),
+                          timeout_s=float(timeout_s))
+
     def read_host_key(self, node, vmid, session_id=None, generation=1):
         return self._call("read_host_key", node=node, vmid=int(vmid),
                           session_id=session_id, generation=str(generation))

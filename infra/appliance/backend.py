@@ -46,11 +46,29 @@ GUEST_HOST_KEY_PATH = "/etc/ssh/ssh_host_ed25519_key.pub"
 FIXTURE_ADDRESS = "10.0.2.15"
 FIXTURE_GATEWAY = "10.0.2.2"
 FIRST_BOOT_MARKER = "/var/lib/sparring-range/first-boot-complete"
+#: Ceiling on a guest-exec command: a verifier must never hold the broker in
+#: an operation for minutes because a guest's process wedged.
+GUEST_EXEC_MAX_TIMEOUT_S = 120.0
+#: How much of a guest command's output crosses the broker boundary. Enough
+#: for evidence, small enough that a chatty command cannot flood the ledger.
+GUEST_EXEC_MAX_OUTPUT = 8000
 _DESC_PREFIX = "SRAPPLIANCE:"
 
 
 def _desc_json(desc: dict) -> str:
     return _DESC_PREFIX + json.dumps(desc, sort_keys=True, separators=(",", ":"))
+
+
+def _b64_text(payload) -> str:
+    """Guest-agent output fields are base64 (`out-data`/`err-data`); a
+    malformed or absent field is an empty string, never a crash mid-evidence."""
+    if not isinstance(payload, str) or not payload:
+        return ""
+    try:
+        return base64.b64decode(payload, validate=False).decode(
+            "utf-8", "replace")[:GUEST_EXEC_MAX_OUTPUT]
+    except Exception:  # noqa: BLE001 — undecodable output is just no output
+        return ""
 
 
 def _parse_desc(text: str | None) -> dict | None:
@@ -821,6 +839,59 @@ class LibvirtBackend:
             except Exception:  # noqa: BLE001
                 pass
         return "".join(chunks)
+
+    def guest_exec(self, node: str, vmid: int, argv: list[str],
+                   timeout_s: float = 30.0) -> dict:
+        """Run ARGV inside the guest through its own agent (guest-exec).
+
+        The Windows goldens have no sshd, so the agent the hypervisor already
+        talks to is the only authenticated channel into them — the defender's
+        verifiers need it or half the range can be graded by nobody. The
+        AGENT is the boundary: absent, not running, or a command that never
+        reports completion is UNKNOWN (BackendUnavailable), never an empty
+        successful run that a verifier would read as "nothing wrong".
+        """
+        self._require_node(node)
+        dom, _ = self._find(int(vmid), node)
+        if dom is None:
+            raise BackendUnavailable(f"VMID {vmid} is absent while running exec")
+        argv = [str(a) for a in argv if str(a)]
+        if not argv:
+            raise BackendUnavailable("guest-exec requires a non-empty argv")
+        window = max(1.0, min(float(timeout_s), GUEST_EXEC_MAX_TIMEOUT_S))
+        opened = self._qga(dom, json.dumps({
+            "execute": "guest-exec",
+            "arguments": {"path": argv[0], "arg": argv[1:],
+                          "capture-output": True}}), min(window, 10.0))
+        if not opened:
+            raise BackendUnavailable(
+                f"guest agent on VMID {vmid} did not accept guest-exec")
+        try:
+            pid = json.loads(opened).get("return", {}).get("pid")
+        except json.JSONDecodeError as exc:
+            raise BackendUnavailable(f"guest-exec reply unreadable: {exc}") from exc
+        if not isinstance(pid, int):
+            raise BackendUnavailable(f"guest-exec returned no pid: {opened[:200]}")
+        deadline = time.monotonic() + window
+        while time.monotonic() < deadline:
+            raw = self._qga(dom, json.dumps({
+                "execute": "guest-exec-status", "arguments": {"pid": pid}}),
+                min(10.0, max(1.0, deadline - time.monotonic())))
+            if raw:
+                try:
+                    status = json.loads(raw).get("return")
+                except json.JSONDecodeError:
+                    status = None
+                if isinstance(status, dict) and status.get("exited"):
+                    return {
+                        "returncode": int(status.get("exitcode", -1)),
+                        "stdout": _b64_text(status.get("out-data")),
+                        "stderr": _b64_text(status.get("err-data")),
+                    }
+            time.sleep(0.1)
+        raise BackendUnavailable(
+            f"guest exec (pid {pid}) on VMID {vmid} did not finish within "
+            f"{window:.0f}s — unknown, not a failed command")
 
     def read_boot_marker(self, node: str, vmid: int, timeout_s: float = 120,
                          poll_s: float = 2.0) -> bool:

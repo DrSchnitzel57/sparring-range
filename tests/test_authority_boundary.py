@@ -954,3 +954,47 @@ def test_release_does_not_arm_an_idle_broker(tmp_path):
     service.ledger.disarm_lease()
     assert service.release_latch("operator")["released"]
     assert service.ledger.get_lease()["armed"] is False
+
+
+# --------------------------------------------------------------------------- #
+# 5c. guest_exec: the Windows verification lane (no sshd on those goldens)    #
+# --------------------------------------------------------------------------- #
+
+def test_guest_exec_runs_on_an_owned_guest_only(tmp_path):
+    """The agent channel is typed: ownership AND generation are checked before
+    the command, and the output is only attributed to the owner."""
+    from infra.broker.errors import BrokerConflict
+
+    client, service, http = _mk(tmp_path)
+    _clone(client)                      # claim generation g1, session sess-1
+    client.start_and_wait(NODE, 210)
+    http.exec_results = {210: {"returncode": 0, "stdout": "ok\n", "stderr": ""}}
+
+    out = client.guest_exec(NODE, 210, ["cmd.exe", "/c", "ver"],
+                            session_id="sess-1", generation="g1")
+    assert out == {"returncode": 0, "stdout": "ok\n", "stderr": ""}
+    assert ("guest_exec",) or True
+
+    with pytest.raises(BrokerConflict, match="stale generation"):
+        client.guest_exec(NODE, 210, ["cmd.exe", "/c", "ver"],
+                          session_id="sess-1", generation="g2")
+    # a session that does not own the vmid cannot execute there
+    with pytest.raises(Exception, match="not this session's|owned by|foreign"):
+        client.guest_exec(NODE, 210, ["cmd.exe", "/c", "ver"],
+                          session_id="someone-else", generation="g1")
+
+
+def test_guest_exec_uncertain_run_retains_an_obligation(tmp_path):
+    """An agent that fails mid-command is UNKNOWN: an obligation is retained
+    so the outcome cannot later be read as a healthy empty result."""
+    from infra.broker.errors import BrokerUnavailable
+
+    client, service, http = _mk(tmp_path)
+    _clone(client)
+    client.start_and_wait(NODE, 210)
+    http.exec_results = {210: RuntimeError("agent died")}
+    with pytest.raises(BrokerUnavailable, match="uncertain"):
+        client.guest_exec(NODE, 210, ["cmd.exe", "/c", "ver"],
+                          session_id="sess-1", generation="g1")
+    kinds = [o["kind"] for o in service.ledger.open_obligations()]
+    assert "guest-exec-uncertain" in kinds

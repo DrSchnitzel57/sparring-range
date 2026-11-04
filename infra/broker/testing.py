@@ -103,6 +103,9 @@ class FakeBackend:
         self.task_polls_needed = 0
         self.agent_not_ready_polls = 0
         self.empty_key_polls = 0
+        #: guest_exec answers per vmid (dict, or an exception to raise);
+        #: unset means a plain successful no-op.
+        self.exec_results: dict[int, dict | BaseException] = {}
         # `.api` keeps the historical test handle onto the boundary object
         self.api = self
 
@@ -311,6 +314,25 @@ class FakeBackend:
                 return False
             time.sleep(max(0.05, min(float(poll_s),
                                      deadline - time.monotonic())))
+
+    def guest_exec(self, node: str, vmid: int, argv: list[str],
+                   timeout_s: float = 30.0) -> dict:
+        """The agent channel for a guest with no sshd (Windows verifiers).
+
+        Scripted per vmid via ``exec_results`` (vmid -> dict or exception);
+        absent is a plain successful no-op so ordinary tests need no setup.
+        """
+        self._record("guest_exec", node=node, vmid=int(vmid),
+                     argv=list(argv))
+        self._maybe_fail("guest_exec", int(vmid))
+        if self._entry(vmid) is None:
+            raise BackendUnavailable(f"VMID {vmid} is absent while running exec")
+        scripted = getattr(self, "exec_results", {}).get(int(vmid))
+        if isinstance(scripted, BaseException):
+            raise scripted
+        if scripted is not None:
+            return dict(scripted)
+        return {"returncode": 0, "stdout": "", "stderr": ""}
 
     def read_guest_file_when_ready(self, node: str, vmid: int, path: str,
                                    timeout_s: float = 120.0,
