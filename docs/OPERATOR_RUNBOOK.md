@@ -570,3 +570,56 @@ inside-lan guests. The lab test gave it temporary addresses
 - **guest images must trust the bastion client key**: it is derived from
   the private key above and appended to the guest `sr` account; the
   builders should bake it in (open item).
+
+## Per-role provisioning (the role images must BE their competition roles, 2026-11-04)
+
+A booted golden is a generic OS until provisioning configures its declared
+`services`. Two rules decide whether that happened:
+
+- a deployed VM lab is **usable** even when provisioning is incomplete;
+- the deployment row carries `provisioning: {service: {state, steps}}` per
+  guest, and a service is `ready` ONLY when every step exited 0 on the guest.
+  `unimplemented` and `failed` are honest evidence, never "ready".
+
+### What the protected credential store must contain
+
+`/etc/sparring-range/environment-credentials.json` (root:root 0600; the
+`credentials` module refuses anything group/world readable). Beyond the check
+accounts, provisioning needs these synthetic lab values:
+
+| variable | shape | used by |
+| --- | --- | --- |
+| `SR_CRED_DIRECTORY_DSRM` | `user:password` | AD forest install (safe-mode) |
+| `SR_CRED_DIRECTORY_JOIN` | `DOMAIN\administrator:password` | Linux `realm join` |
+| `SR_CRED_SPLUNK_ADMIN` | `admin:password` | Splunk receiver/user API |
+| `SR_CRED_PRB_MAIL_SENDER` / `..._READER` | `user@domain:password` | guest Maildir + vantage probe |
+| `SR_CRED_SPLUNK_PRB` | `user:password` | authenticated search probe |
+
+Readability is the CALLER's property: the API identity (`srrange`) can not
+read a root:0600 store, so today provisioning evidence is complete only on a
+root-run gate (`infra/dev/lab_up.py`) or where the operator points
+`environment_credentials_file` at a store the API may read. A lab deployed by
+the API still records every credential-dependent service as `failed` with the
+VARIABLE NAME — it never silently pretends.
+
+### The replica CA
+
+One CA per installation under `<state>/controller/pki` (`ca.crt` public,
+`ca.key` 0600). Service certificates include the guest ADDRESS **and** every
+public VIP that DNATs to it — the availability plans dial the VIP, so IP SANs
+are not optional. The probe ships `ca.crt` to the scoring vantage and exports
+`SSL_CERT_FILE`; `verify_tls_against_lab_ca` therefore verifies for real.
+
+### Registering a built image
+
+```
+.venv/bin/python -m infra.dev.register_image \
+  --role ws2019-sql --artifact /var/lib/sparring-range/builds/win2019/sr-win2019.qcow2 \
+  --template-id 9106 --profile ws2019-sql \
+  --disk-gb 64 --memory-mb 6144 --vcpus 2 --apply
+```
+
+It computes the digest of the bytes actually shipped, writes the role entry
+wholesale (a stale digest is never carried), validates the manifest, and
+`--apply` runs `deploy.appliance apply`. Restart nothing else: the broker
+re-reads the manifest on its next start and its release clears the latch.
