@@ -257,6 +257,8 @@ def main(argv: list[str] | None = None) -> int:
         bp = load_environment("underpressure-range").blueprint
         config_text = render_vyos(bp)
 
+    from infra.images.windows_build import qemu_alone_preflight
+    qemu_alone_preflight(2048)
     out = pathlib.Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     disk = out / "vyos.qcow2"

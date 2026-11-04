@@ -34,6 +34,8 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     run_dir = pathlib.Path(args.run_dir) if args.run_dir \
         else BUILDS / f"win{args.version}"
+    from infra.images.windows_build import qemu_alone_preflight
+    qemu_alone_preflight(args.memory_mb)
     out = build_windows(
         windows_iso=MEDIA / args.iso,
         virtio_iso=MEDIA / "virtio-win.iso",

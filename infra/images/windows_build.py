@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import os
 import pathlib
 import subprocess
 import time
@@ -103,6 +104,44 @@ FIRST_LOGON_CMD = (
     r'& echo build-complete > C:\sr-build-complete.txt '
     r'& shutdown.exe /s /t 5 /f'
 )
+
+
+def qemu_alone_preflight(memory_mb: int, *,
+                         meminfo: pathlib.Path | None = None) -> None:
+    """Refuse a build unless the box is EMPTY of other QEMU guests and has
+    memory to spare.
+
+    Live evidence 2026-11-04 (twice): the appliance went off the network while
+    a Windows build ran; once with a leftover QEMU from a killed attempt still
+    spinning. A build is not allowed to start on top of another guest or with
+    less than memory + 4 GiB available — failing BEFORE qemu starts leaves a
+    clean box and a readable reason, never a wedged half-build.
+    """
+    own = os.getpid()
+    procs = subprocess.run(["ps", "-eo", "pid,cmd"], capture_output=True,
+                           text=True, check=False).stdout.splitlines()
+    others = [line for line in procs
+              if "qemu-system" in line
+              and not line.strip().startswith(str(own))]
+    if others:
+        raise RuntimeError(
+            f"{len(others)} qemu process(es) already running "
+            f"({others[0].strip()[:80]}...) — builds are serialized on the "
+            f"appliance; stop them (or wait) and retry")
+    info = meminfo or pathlib.Path("/proc/meminfo")
+    try:
+        for line in info.read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                avail_mb = int(line.split()[1]) // 1024
+                break
+        else:
+            avail_mb = None
+    except OSError:
+        avail_mb = None
+    if avail_mb is not None and avail_mb < int(memory_mb) + 4096:
+        raise RuntimeError(
+            f"only {avail_mb} MiB available; the guest wants {memory_mb} MiB "
+            f"plus a 4096 MiB reserve — refusing rather than swapping")
 
 
 def render_autounattend(*, version: str = "2022",
