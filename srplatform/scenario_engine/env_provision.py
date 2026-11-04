@@ -82,6 +82,17 @@ class ProvisionTransport(Protocol):
     def reboot(self, guest: str) -> None: ...
 
 
+class LabPKI(Protocol):
+    """The little bit of the replica CA a handler is allowed to use: issue a
+    service certificate for a name + SANs, and hand out the PUBLIC anchor.
+    The CA key never reaches a provision step."""
+
+    def issue(self, common_name: str, sans: Sequence[str]):
+        """Return an object with `certificate_pem` and `key_pem` bytes."""
+
+    def trust_pem(self) -> bytes: ...
+
+
 @dataclass(frozen=True)
 class ProvisionContext:
     guest: str
@@ -90,6 +101,28 @@ class ProvisionContext:
     addresses: Mapping[str, str]  # guest name -> first static address
     generation: str
     resolver: CredentialResolver
+    pki: LabPKI | None = None
+
+    def own_address(self) -> str:
+        return self.address(self.guest)
+
+    def certificate(self, hostname: str) -> tuple[str, str]:
+        """(certificate, key) PEM for THIS guest's address under `hostname`.
+        The IP SAN is what makes `verify_tls_against_lab_ca` pass: the check
+        dials the guest ADDRESS and hostname-verifies against it."""
+        if self.pki is None:
+            raise ProvisionError(
+                f"provisioning {self.guest!r} needs the replica CA for TLS "
+                f"but no CA was supplied to the plan")
+        issued = self.pki.issue(hostname,
+                                [hostname, self.own_address()])
+        return (issued.certificate_pem.decode(),
+                issued.key_pem.decode())
+
+    def ca_pem(self) -> str:
+        if self.pki is None:
+            raise ProvisionError("replica CA unavailable")
+        return self.pki.trust_pem().decode()
 
     def address(self, other: str) -> str:
         try:
@@ -203,7 +236,8 @@ def _guest_addresses(bp) -> dict[str, str]:
 
 
 def build_plan(bp, *, generation: str,
-               resolver: CredentialResolver) -> list[GuestPlan]:
+               resolver: CredentialResolver,
+               pki: "LabPKI | None" = None) -> list[GuestPlan]:
     """PURE. Dependency-ordered plans for every guest that declares services.
 
     An unknown service is `unimplemented`; a handler that raises
@@ -219,7 +253,7 @@ def build_plan(bp, *, generation: str,
         ctx = ProvisionContext(
             guest=name, os=str(getattr(guest, "os", "")).split(".")[-1].lower(),
             domain=str(getattr(bp, "domain", "")), addresses=addresses,
-            generation=generation, resolver=resolver)
+            generation=generation, resolver=resolver, pki=pki)
         svc_plans: list[ServicePlan] = []
         for raw in guest.services:
             sid = ServiceId(raw)
@@ -420,6 +454,7 @@ def resolver_from_settings(settings) -> CredentialResolver:
 
 def provision_deployment(db, session_id, deployment, bp, broker, *,
                          node: str, resolver: CredentialResolver,
+                         pki: "LabPKI | None" = None,
                          generation: str | None = None) -> dict:
     """Run the plan for a deployed environment and persist the evidence.
 
@@ -428,7 +463,7 @@ def provision_deployment(db, session_id, deployment, bp, broker, *,
     """
     resources = [dict(r) for r in (deployment.resources or [])]
     generation = generation or str(deployment.deployment_id)
-    plans = build_plan(bp, generation=generation, resolver=resolver)
+    plans = build_plan(bp, generation=generation, resolver=resolver, pki=pki)
     transport = BrokerProvisionTransport(
         broker, node=node, resources=resources, session_id=session_id,
         deployment_id=deployment.deployment_id)
@@ -802,3 +837,297 @@ marker=$(cat /tmp/sr-syslog-marker)
              timeout_s=300),
     )
 
+
+
+# ------------------------------------------------------------- store role
+#
+# The golden is Rocky 9 with httpd+PHP (built that way); the reported stack was
+# nginx + nopCommerce/.NET. Provisioning uses what the image actually carries
+# and the substitution is recorded in fidelity.yaml — never claimed as
+# nopCommerce.
+
+STORE_PAGE = """<!doctype html>
+<html><head><title>Underpressure Water Authority Store</title></head>
+<body>
+<h1>Underpressure Water Authority Store</h1>
+<p>Water accounts, conservation kits and meter services.</p>
+<ul class="catalogue">
+  <li data-sku="WATER-KIT-01">Household Water Kit</li>
+  <li data-sku="METER-SVC-02">Meter Service Plan</li>
+  <li data-sku="TANK-VALVE-03">Tank Valve Assembly</li>
+</ul>
+</body></html>
+"""
+
+
+def _write_pem_step(stem: str, cert: str, key: str) -> str:
+    """Write a certificate/key pair without shell interpolation of PEM."""
+    import base64 as _b64
+    c = _b64.b64encode(cert.encode()).decode()
+    k = _b64.b64encode(key.encode()).decode()
+    return f"""
+install -d -m 755 /etc/pki/sr
+printf '%s' '{c}' | base64 -d > /etc/pki/sr/{stem}.crt
+printf '%s' '{k}' | base64 -d > /etc/pki/sr/{stem}.key
+chmod 600 /etc/pki/sr/{stem}.key"""
+
+
+def _write_ca_step(ca: str) -> str:
+    import base64 as _b64
+    c = _b64.b64encode(ca.encode()).decode()
+    return f"""
+install -d -m 755 /etc/pki/sr
+printf '%s' '{c}' | base64 -d > /etc/pki/sr/ca.crt
+chmod 644 /etc/pki/sr/ca.crt"""
+
+
+@handler(ServiceId.NOPCOMMERCE)
+def nopcommerce_handler(ctx: ProvisionContext) -> Sequence[Step]:
+    """The store's CONTENT (a seeded catalogue page). The HTTPS front end is
+    the `nginx` service's job; this handler only guarantees that the catalogue
+    exists and is what the check reads."""
+    page = STORE_PAGE.replace("'", "'\\''")
+    return (
+        Step("store-content",
+             linux(f"""
+install -d -m 755 /var/www/store
+cat > /var/www/store/index.html <<'HTML'
+{STORE_PAGE}HTML
+if command -v chcon >/dev/null 2>&1; then chcon -R -t httpd_sys_content_t /var/www/store 2>/dev/null || true; fi""",
+                   timeout_s=60),
+             timeout_s=60),
+        Step("store-content-verify",
+             linux(f"grep -q 'Underpressure Water Authority Store' "
+                   "/var/www/store/index.html"),
+             timeout_s=30),
+    )
+
+
+@handler(ServiceId.NGINX)
+def nginx_handler(ctx: ProvisionContext) -> Sequence[Step]:
+    """HTTPS for `shop.<domain>` on THIS guest's address, signed by the
+    replica CA, served by whichever front end the golden carries (nginx or
+    httpd — both are accepted; a missing one fails the verify, never a
+    silent success)."""
+    host = "shop." + ctx.domain
+    cert, key = ctx.certificate(host)
+    ca = ctx.ca_pem()
+    conf = f"""
+if command -v nginx >/dev/null 2>&1; then
+  cat > /etc/nginx/conf.d/sr-store.conf <<'CONF'
+server {{
+  listen 80;
+  server_name {host};
+  return 301 https://$host$request_uri;
+}}
+server {{
+  listen 443 ssl;
+  server_name {host};
+  root /var/www/store;
+  index index.html;
+  ssl_certificate /etc/pki/sr/shop.crt;
+  ssl_certificate_key /etc/pki/sr/shop.key;
+}}
+CONF
+  nginx -t && systemctl enable --now nginx && systemctl reload nginx
+else
+  cat > /etc/httpd/conf.d/sr-store.conf <<'CONF'
+Listen 80
+<VirtualHost *:80>
+  ServerName {host}
+  Redirect permanent / https://{host}/
+</VirtualHost>
+Listen 443
+<VirtualHost *:443>
+  SSLEngine on
+  SSLCertificateFile /etc/pki/sr/shop.crt
+  SSLCertificateKeyFile /etc/pki/sr/shop.key
+  ServerName {host}
+  DocumentRoot /var/www/store
+  <Directory /var/www/store>
+    Require all granted
+  </Directory>
+</VirtualHost>
+CONF
+  httpd -t && systemctl enable --now httpd && systemctl reload httpd
+fi"""
+    verify = f"""
+curl -sS --silent --fail --cacert /etc/pki/sr/ca.crt \
+  --resolve {host}:443:127.0.0.1 https://{host}/ -o /dev/null"""
+    return (
+        Step("store-tls", linux(_write_pem_step("shop", cert, key) + "\n"
+                                + _write_ca_step(ca)), timeout_s=60),
+        Step("store-front", linux(conf, timeout_s=300), timeout_s=300),
+        Step("store-tls-verify", linux(verify, timeout_s=60), timeout_s=60),
+    )
+
+
+# -------------------------------------------------------------- mail role
+
+
+def _mail_users(ctx: ProvisionContext) -> list[tuple[str, str]]:
+    """(local part, password) for the two practice mail identities the check
+    sends/reads as — the SAME values the vantage receives as env vars."""
+    out = []
+    for ref in ("credential:prb-mail-sender", "credential:prb-mail-reader"):
+        user, password = split_credential(ctx.cred(ref))
+        out.append((user.split("@")[0], password))
+    return out
+
+
+@handler(ServiceId.POSTFIX)
+def postfix_handler(ctx: ProvisionContext) -> Sequence[Step]:
+    users = _mail_users(ctx)
+    relaying = ",".join(sorted({u[0] for u in users}))
+    return (
+        Step("postfix-config",
+             linux(f"""
+postconf -e 'myhostname = mail.{ctx.domain}' \
+  'mydomain = {ctx.domain}' 'myorigin = $mydomain' \
+  'mydestination = {ctx.domain}, localhost' \
+  'inet_interfaces = all' 'inet_protocols = ipv4' \
+  'home_mailbox = Maildir/' 'mynetworks = 127.0.0.0/8, {ctx.own_address()}/24' \
+  'local_recipient_maps ='
+for u in {relaying}; do
+  id "$u" >/dev/null 2>&1 || useradd -m -s /bin/sh "$u"
+done
+postfix check && systemctl enable --now postfix
+systemctl reload postfix""", timeout_s=300),
+             timeout_s=300),
+        Step("postfix-verify",
+             linux("ss -ltn | grep -q ':25 ' && postfix status >/dev/null"),
+             timeout_s=60),
+    )
+
+
+@handler(ServiceId.DOVECOT)
+def dovecot_handler(ctx: ProvisionContext) -> Sequence[Step]:
+    users = _mail_users(ctx)
+    lines = "\n".join(f"{u}:{{PLAIN}}{p}" for u, p in users)
+    #: Opening state as reported: plaintext auth allowed (TLS is not the
+    #: check's transaction), mail lives in each user's Maildir under /var/mail.
+    return (
+        Step("dovecot-users",
+             linux(f"""
+install -d -m 755 /etc/dovecot
+cat > /etc/dovecot/sr-users <<'USERS'
+{lines}
+USERS
+chown root:www-data /etc/dovecot/sr-users && chmod 640 /etc/dovecot/sr-users
+if ! grep -q 'sr-users' /etc/dovecot/conf.d/10-auth.conf 2>/dev/null; then
+  printf '!include auth-passwd-file.conf\\n' >> /etc/dovecot/conf.d/10-auth.conf
+fi
+cat > /etc/dovecot/conf.d/99-sr.conf <<'CONF'
+disable_plaintext_auth = no
+auth_mechanisms = plain login
+mail_location = maildir:/var/mail/%u/Maildir
+passdb {{
+  driver = passwd-file
+  args = /etc/dovecot/sr-users
+}}
+userdb {{
+  driver = passwd-file
+  args = /etc/dovecot/sr-users
+  default_fields = uid=1000 gid=1000 home=/var/mail/%u
+}}
+protocols = imap pop3
+CONF
+for u in {' '.join(u for u, _ in users)}; do
+  mkdir -p /var/mail/$u/Maildir/cur /var/mail/$u/Maildir/new /var/mail/$u/Maildir/tmp
+  chown -R 1000:1000 /var/mail/$u
+done
+dovecot -n >/dev/null && systemctl enable --now dovecot && systemctl restart dovecot""",
+                   timeout_s=300),
+             timeout_s=300),
+        Step("dovecot-verify",
+             linux("ss -ltn | grep -q ':143 ' && ss -ltn | grep -q ':110 '"),
+             timeout_s=60),
+    )
+
+
+#: Roundcube is NOT in the offline Ubuntu image (its sqlsrv driver comes from
+#: an MS repo), so the webmail UI is a minimal PHP substitute that authenticates
+#: against the same Dovecot passwd-file and lists the Maildir. Recorded as
+#: substituted in fidelity.yaml.
+ROUNDCUBE_APP = r"""<?php
+$users = array();
+foreach (file('/etc/dovecot/sr-users', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+    if (strpos($line, ':') === false) continue;
+    list($u, $p) = explode(':', $line, 2);
+    $users[$u] = preg_replace('/^\{PLAIN\}/', '', $p);
+}
+$user = isset($_POST['_user']) ? $_POST['_user'] : '';
+$user = preg_replace('/@.*$/', '', $user);   // the check posts the full address
+$pass = isset($_POST['_pass']) ? $_POST['_pass'] : '';
+if ($user === '' || !isset($users[$user]) || !hash_equals($users[$user], $pass)) {
+    echo '<html><body><h2>Webmail login</h2>';
+    echo '<form method="post"><input name="_user"><input name="_pass" type="password"><button>Login</button></form>';
+    echo '</body></html>';
+    exit;
+}
+$dir = '/var/mail/' . $user . '/Maildir/new';
+$mails = is_dir($dir) ? glob($dir . '/*') : array();
+echo '<html><body><h2>Inbox</h2><p>' . count($mails) . ' message(s)</p><ul>';
+foreach ($mails as $m) {
+    $fh = fopen($m, 'r');
+    $subject = '';
+    foreach (explode("\n", fread($fh, 2048)) as $h) {
+        if (stripos($h, 'Subject:') === 0) { $subject = trim(substr($h, 8)); break; }
+        if (trim($h) === '') break;
+    }
+    fclose($fh);
+    echo '<li>' . htmlspecialchars($subject) . '</li>';
+}
+echo '</ul></body></html>';
+"""
+
+
+@handler(ServiceId.ROUNDCUBE)
+def roundcube_handler(ctx: ProvisionContext) -> Sequence[Step]:
+    host = "mail." + ctx.domain
+    cert, key = ctx.certificate(host)
+    ca = ctx.ca_pem()
+    app = ROUNDCUBE_APP.replace("\\", "\\\\").replace("'", "'\\''")
+    return (
+        Step("roundcube-tls",
+             linux(_write_pem_step("mail", cert, key) + "\n"
+                   + _write_ca_step(ca)
+                   + f"""
+install -d -m 755 /var/www/webmail
+chown -R www-data:www-data /var/www/webmail 2>/dev/null || true""",
+                   timeout_s=60),
+             timeout_s=60),
+        Step("roundcube-app",
+             linux(f"""
+cat > /var/www/webmail/index.php <<'PHP'
+{ROUNDCUBE_APP}PHP
+cat > /etc/apache2/sites-available/sr-webmail.conf <<'CONF'
+<VirtualHost *:80>
+  ServerName {host}
+  Redirect permanent / https://{host}/
+</VirtualHost>
+<VirtualHost *:443>
+  SSLEngine on
+  SSLCertificateFile /etc/pki/sr/mail.crt
+  SSLCertificateKeyFile /etc/pki/sr/mail.key
+  ServerName {host}
+  DocumentRoot /var/www/webmail
+  <Directory /var/www/webmail>
+    Require all granted
+  </Directory>
+</VirtualHost>
+CONF
+a2enmod ssl >/dev/null 2>&1 || true
+a2ensite sr-webmail >/dev/null 2>&1 || true
+apache2ctl configtest && systemctl enable --now apache2 && systemctl reload apache2""",
+                   timeout_s=300),
+             timeout_s=300),
+        Step("roundcube-verify",
+             linux(f"""
+curl -sS --silent --fail --cacert /etc/pki/sr/ca.crt \
+  --resolve {host}:443:127.0.0.1 \
+  -d '_user=prb-roundcube&_pass=x&_action=login&_task=login' \
+  https://{host}/ -o /dev/null
+ss -ltn | grep -q ':443 '""", timeout_s=60),
+             timeout_s=60),
+    )

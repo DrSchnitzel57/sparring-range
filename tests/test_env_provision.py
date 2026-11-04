@@ -8,6 +8,7 @@ live behaviour — that is the availability gate's job.
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 
@@ -26,7 +27,17 @@ CREDS = {
     "SR_CRED_RC_APP_SQL": "rc-app:RcP@ss1",
     "SR_CRED_SPLUNK_ADMIN": "admin:Changeme123",
     "SR_CRED_SPLUNK_PRB": "splunk-prb:SplunkP@ss1",
+    "SR_CRED_PRB_MAIL_SENDER": "prb-sender@underpressure.local:SenderP@ss1",
+    "SR_CRED_PRB_MAIL_READER": "prb-reader@underpressure.local:ReaderP@ss1",
+    "SR_CRED_PRB_ROUNDCUBE": "prb-roundcube@underpressure.local:RoundP@ss1",
 }
+
+
+def _tmp_pki():
+    import tempfile
+    from srplatform.labs.pki import LabPKI
+    d = pathlib.Path(tempfile.mkdtemp(prefix="sr-pki-"))
+    return LabPKI(d / "pki")
 
 
 def resolver(name: str) -> str | None:
@@ -49,6 +60,14 @@ class FakeTransport:
 
 def _plan(gen="g1", res=resolver):
     return ep.build_plan(BP, generation=gen, resolver=res)
+
+
+def _pem_b64(step_text: str, dest: str) -> str:
+    import re
+    for line in step_text.splitlines():
+        if f"base64 -d > {dest}" in line:
+            return re.findall(r"'([A-Za-z0-9+/=]{16,})'", line)[0]
+    raise AssertionError(f"no base64 for {dest}")
 
 
 def _services(plans, guest):
@@ -79,9 +98,9 @@ def test_declared_service_order_is_preserved():
 
 
 def test_unimplemented_is_not_ready():
-    svc = _services(_plan(), "ecomm")
-    assert svc["nginx"].state == "unimplemented"
-    assert svc["ssh"].state == "ready"
+    ad = _services(_plan(), "ad-dns")
+    assert ad["ca-fileshare"].state == "unimplemented"
+    assert _services(_plan(), "ecomm")["ssh"].state == "ready"
 
 
 # --------------------------------------------------------- credentials
@@ -354,3 +373,98 @@ def test_splunk_missing_admin_credential_is_failed_not_ready():
         svc = _services(_plan(res=missing), guest)
         assert svc["splunk"].state == "failed"
         assert "SR_CRED_SPLUNK_ADMIN" in (svc["splunk"].error or "")
+
+
+# ------------------------------------------------------ store role + PKI
+
+
+def test_store_tls_is_signed_for_the_guest_address_not_just_the_name(tmp_path):
+    from srplatform.labs.pki import LabPKI
+    from cryptography import x509
+    import base64
+
+    pki = LabPKI(tmp_path / "pki")
+    plans = ep.build_plan(BP, generation="g1", resolver=resolver, pki=pki)
+    nginx = _services(plans, "ecomm")["nginx"]
+    assert [s.id for s in nginx.steps] == [
+        "store-tls", "store-front", "store-tls-verify"]
+    b64 = _pem_b64(nginx.steps[0].argv[-1], "/etc/pki/sr/shop.crt")
+    cert = x509.load_pem_x509_certificate(base64.b64decode(b64))
+    sans = cert.extensions.get_extension_for_class(
+        x509.SubjectAlternativeName).value
+    ips = {str(i) for i in sans.get_values_for_type(x509.IPAddress)}
+    assert BP.guest("ecomm").interfaces[0].ipv4.address in ips
+    assert "shop.underpressure.local" in {
+        n for n in sans.get_values_for_type(x509.DNSName)}
+
+
+def test_store_plan_uses_the_front_end_the_golden_carries():
+    plans = ep.build_plan(BP, generation="g", resolver=resolver,
+                          pki=_tmp_pki())
+    nginx = _services(plans, "ecomm")["nginx"]
+    text = "\n".join(" ".join(s.argv) for s in nginx.steps)
+    assert "command -v nginx" in text and "httpd -t" in text
+    assert "--cacert /etc/pki/sr/ca.crt" in text
+
+
+def test_tls_without_a_ca_is_failed_evidence_not_plain_http():
+    nginx = _services(_plan(), "ecomm")["nginx"]
+    assert nginx.state == "failed"
+    assert "no CA" in (nginx.error or "")
+
+
+def test_store_content_carries_the_catalogue_text_the_check_reads():
+    nop = _services(_plan(), "ecomm")["nopcommerce"]
+    text = "\n".join(" ".join(s.argv) for s in nop.steps)
+    assert "Underpressure Water Authority Store" in text
+    assert 'data-sku="WATER-KIT-01"' in text
+
+
+# ------------------------------------------------------- mail role
+
+
+def test_mail_hands_share_one_identity_set_between_guest_and_vantage():
+    postfix = _services(_plan(), "webmail")["postfix"]
+    dovecot = _services(_plan(), "webmail")["dovecot"]
+    for plan in (postfix, dovecot):
+        text = "\n".join(" ".join(s.argv) for s in plan.steps)
+        assert "prb-mail-sender" in text or "prb-sender" in text
+        assert "prb-mail-reader" in text or "prb-reader" in text
+    # plaintext auth is the reported opening state, deliberately kept
+    dtext = "\n".join(" ".join(s.argv) for s in dovecot.steps)
+    assert "disable_plaintext_auth = no" in dtext
+
+
+def test_roundcube_substitute_accepts_the_full_address_the_check_posts():
+    plans = ep.build_plan(BP, generation="g", resolver=resolver,
+                          pki=_tmp_pki())
+    rc = _services(plans, "webmail")["roundcube"]
+    text = "\n".join(" ".join(s.argv) for s in rc.steps)
+    assert "preg_replace('/@.*$/', '', $user)" in text
+    assert "Inbox" in text
+    assert "--resolve mail.underpressure.local" in text
+
+
+def test_mail_tls_certificate_covers_the_webmail_address(tmp_path):
+    from srplatform.labs.pki import LabPKI
+    from cryptography import x509
+    import base64
+
+    pki = LabPKI(tmp_path / "pki")
+    plans = ep.build_plan(BP, generation="g", resolver=resolver, pki=pki)
+    rc = _services(plans, "webmail")["roundcube"]
+    b64 = _pem_b64(rc.steps[0].argv[-1], "/etc/pki/sr/mail.crt")
+    cert = x509.load_pem_x509_certificate(base64.b64decode(b64))
+    sans = cert.extensions.get_extension_for_class(
+        x509.SubjectAlternativeName).value
+    ips = {str(i) for i in sans.get_values_for_type(x509.IPAddress)}
+    assert BP.guest("webmail").interfaces[0].ipv4.address in ips
+
+
+def test_mail_passwords_never_reach_the_evidence():
+    plans = ep.build_plan(BP, generation="g", resolver=resolver,
+                          pki=_tmp_pki())
+    evidence = ep.outcome_evidence(ep.run_plan(plans, FakeTransport()))
+    blob = json.dumps(evidence)
+    for secret in ("SenderP@ss1", "ReaderP@ss1", "RoundP@ss1"):
+        assert secret not in blob

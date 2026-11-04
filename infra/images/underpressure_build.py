@@ -145,8 +145,12 @@ APT_PACKAGES: dict[str, list[str]] = {
     "debian12-splunk": ["curl", "wget", "openssl", "python3", "dnsutils",
                         "openssh-server", "qemu-guest-agent", "auditd",
                         "ca-certificates"],
+    # apache2/php: the webmail UI is served by the image the golden actually
+    # carries (Roundcube's sqlsrv driver is not in the offline Ubuntu image;
+    # the substitute is recorded in fidelity.yaml).
     "ubuntu2204-mail": ["postfix", "dovecot-core", "dovecot-imapd",
-                        "dovecot-pop3d", "openssh-server",
+                        "dovecot-pop3d", "apache2", "php",
+                        "libapache2-mod-php", "openssh-server",
                         "qemu-guest-agent", "auditd", "ufw"],
     "scoring-debian": [
         "curl", "wget", "openssl", "python3", "python3-pip",

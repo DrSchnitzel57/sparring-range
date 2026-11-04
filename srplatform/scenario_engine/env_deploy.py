@@ -432,11 +432,14 @@ def deploy_environment(db: Session, session_id, scenario_id: str, spec: dict,
     # gate can read it; the API can not unless the operator says so).
     provisioning: dict = {}
     if provision:
+        from srplatform.labs.pki import LabPKI, pki_directory
         from srplatform.scenario_engine import env_provision
         resolver = env_provision.resolver_from_settings(s)
+        pki = LabPKI(pki_directory(s))
         try:
             provisioning = env_provision.provision_deployment(
-                db, session_id, dep, bp, broker, node=node, resolver=resolver)
+                db, session_id, dep, bp, broker, node=node, resolver=resolver,
+                pki=pki)
         except Exception as exc:  # noqa: BLE001 — evidence, not deploy failure
             provisioning = {"_error": f"{type(exc).__name__}: {exc}"[:300]}
             orch._log(db, session_id, "provision_error", scenario_id,
