@@ -616,3 +616,33 @@ Fixes (both verified live on the appliance):
   reads `qemu-ga.exe` and `System32\drivers\viostor.sys` off the disk.
   The current rebuild remains in progress; UEFI/vTPM is declared in
   blueprints but unimplemented in the backend (stated, never implied).
+
+### The way in — bastion tokens reach Linux environment guests (2026-11-04)
+
+The member login path is real now. On a 12/12 `active` lab,
+`ssh -p 2222 -l tok-… -i ~/.ssh/appliance_ed25519 10.10.10.105` from the
+operator box logged into `ecomm` as `sr` (uid 1001) with the guest's own
+hostname, and a second token worked the same way. This is NOT acceptance of
+the range: it is one member capability proven end to end.
+
+Two defects sat between "the code looks right" and "it works", both found by
+reading evidence rather than trusting the design:
+
+- **Keys owned by the wrong uid.** A maintenance injection chowned
+  `authorized_keys` to 1000:1000, but cloud bases give `ubuntu` 1000 and the
+  appliance account `sr` 1001, so sshd StrictModes refused the file for the
+  bastion key AND the runner key while the file itself looked perfect.
+  `infra/images/golden_keys.py` now reads the uid from the image's own
+  `/etc/passwd` and audits ownership (`--check`).
+- **The guest agent was never enabled.** `systemctl enable … qemu-guest-agent`
+  ran inside a chroot, where systemd has no bus, and failed silently on every
+  build; the agent only ran when cloud-init happened to start it, and the
+  desktop image shipped no agent at all. The broker pins a host key and runs
+  verifier commands THROUGH that agent, so an unenabled agent means an
+  unpinnable guest with no way in — live: `team-kali` and `ubuntu-wkst` came
+  up `ready` and could not be dialled even after they finished booting. The
+  builder now installs the agent in every profile and creates the wants link
+  by hand (a failed build says `SR-GUEST-AGENT-NOT-ENABLED`).
+
+Still honestly unpinned: Windows/router goldens (no sshd) — their lane is the
+typed `guest_exec` through the same agent, not sshd.

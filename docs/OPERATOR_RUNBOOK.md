@@ -515,21 +515,32 @@ recovery password lives at `/root/.sr-operator-bootstrap` ON it).
 
 ## Getting into an environment lab (2026-11-03 findings)
 
-**Bastion tokens do NOT work for environment guests yet, by design.** The
-proxy refuses to dial a range host without a deployment-served host-key pin
-("the deployment served no guest host-key pin — refusing to dial on a local
-file or on TOFU"); environment guests are recorded honestly as
-`environment_guest: true` and stay outside the pin lane until their own
-attestation slice lands. Token logins still fail closed with a clear
-message in the member's terminal.
+**Bastion tokens DO reach Linux environment guests** (verified 2026-11-04).
+The env lane pins each Linux guest's SSH host key through the broker's
+guest-agent channel and stores it on the deployment resource the token route
+serves, so from the operator box:
 
-**Live stopgap (verified):** from the operator box,
+    ssh -p 2222 -l <token from lab_up> -i ~/.ssh/appliance_ed25519 10.10.10.105
+
+Verified: logged into `ecomm` and saw `sr` (uid 1001) with a real hostname.
+A guest whose pin failed still refuses honestly ("the deployment served no
+guest host-key pin"), never TOFU. Windows/router goldens stay unpinned until
+their own access lane lands.
+
+**Why a pin can fail on a healthy guest:** the pin is read through
+`qemu-guest-agent`, and chroot-built goldens never ENABLED that unit (chroot
+`systemctl enable` has no bus and failed silently) — it only ran when
+cloud-init happened to start it. The builder now installs and enables it,
+and `infra/dev/repin.py` re-pins a guest that missed the first-boot window.
+If a token dial is refused, check `systemctl is-active qemu-guest-agent`
+inside the guest through the stopgap below.
+
+**Live stopgap:** from the operator box,
 
     ssh -t appliance "sudo ssh -i /etc/sparring-range/keys/runner sr@<guest-ip>"
 
 `sr` exists in every chroot-built golden, has the runner public key and
-NOPASSWD sudo. Verified reachable on 2026-11-03: ecomm `172.20.240.10`,
-webmail `172.20.240.15`, ubuntu-wkst `172.20.240.112`.
+NOPASSWD sudo.
 
 **Why the appliance needs segment addresses:** the host starts with NO
 address on any segment bridge, so neither the bastion nor `ssh` can reach
