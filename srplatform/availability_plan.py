@@ -62,14 +62,27 @@ def _script(check: ServiceCheck, address: str) -> str:
         host = p.get("host_header") or address
         verify = "true" if p.get("verify_tls_against_lab_ca", True) else "false"
         return f"""python3 - <<'PY'
-import ssl, sys, urllib.request
+import ssl, sys, urllib.error, urllib.request
+
+# A CLOSED port is the TARGET answering, not the scorer failing: the
+# transaction ran and the service is down, so it is real downtime (3), never
+# `unknown` — otherwise a dead service could never deduct a point.
+def _closed(exc):
+    if isinstance(getattr(exc, "reason", exc),
+                  (ConnectionRefusedError, ConnectionResetError)):
+        sys.exit(3)
+    raise exc
+
 ctx = ssl.create_default_context()
 if "{verify}" == "false":
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 url = f"https://{address}{p['url_path']}"
 req = urllib.request.Request(url, headers={{"Host": "{host}"}})
-body = urllib.request.urlopen(req, timeout=10, context=ctx).read().decode(errors="replace")
+try:
+    body = urllib.request.urlopen(req, timeout=10, context=ctx).read().decode(errors="replace")
+except urllib.error.URLError as e:
+    _closed(e)
 sys.exit(0 if {p['expected_text']!r} in body else 3)
 PY"""
     if kind == CheckKind.MAIL_ROUNDTRIP:
@@ -80,20 +93,29 @@ sender = os.environ["{_cred_env(p['sender_ref'])}"]
 reader = os.environ["{_cred_env(p['recipient_ref'])}"]
 prefix = "{p.get('subject_prefix', 'SRPRB')}"
 subject = prefix + "-" + str(int(time.time()))
-smtp = smtplib.SMTP("{address}", 25, timeout=20)
-smtp.sendmail(sender, [reader], f"Subject: {{subject}}\\n\\nprobe")
-smtp.quit()
+try:
+    smtp = smtplib.SMTP("{address}", 25, timeout=20)
+    smtp.sendmail(sender, [reader], f"Subject: {{subject}}\\n\\nprobe")
+    smtp.quit()
+except (ConnectionRefusedError, ConnectionResetError):
+    sys.exit(3)   # the mail port answered closed: real downtime
 ok = False
 for proto in "{protos}".split(","):
     if proto == "imap":
-        c = imaplib.IMAP4("{address}", 143)
+        try:
+            c = imaplib.IMAP4("{address}", 143)
+        except (ConnectionRefusedError, ConnectionResetError):
+            sys.exit(3)
         c.login(reader.split("@")[0], os.environ["{_cred_env(p['recipient_ref'])}"])
         c.select("INBOX")
         _, data = c.search(None, "SUBJECT", subject)
         ok = ok or bool(data and data[0])
         c.logout()
     elif proto == "pop3":
-        c = poplib.POP3("{address}", 110, timeout=20)
+        try:
+            c = poplib.POP3("{address}", 110, timeout=20)
+        except (ConnectionRefusedError, ConnectionResetError):
+            sys.exit(3)
         c.user(reader.split("@")[0])
         c.pass_(os.environ["{_cred_env(p['recipient_ref'])}"])
         ok = ok or any(subject.encode() in line for line in c.list()[1])
@@ -103,7 +125,14 @@ PY"""
     if kind == CheckKind.WEB_LOGIN:
         verify = "true" if p.get("verify_tls_against_lab_ca", True) else "false"
         return f"""python3 - <<'PY'
-import os, ssl, sys, urllib.parse, urllib.request
+import os, ssl, sys, urllib.error, urllib.parse, urllib.request
+
+def _closed(exc):
+    if isinstance(getattr(exc, "reason", exc),
+                  (ConnectionRefusedError, ConnectionResetError)):
+        sys.exit(3)   # the port answered closed: the service is down
+    raise exc
+
 ctx = ssl.create_default_context()
 if "{verify}" == "false":
     ctx.check_hostname = False
@@ -112,9 +141,12 @@ acct = os.environ["{_cred_env(p['account_ref'])}"]
 user, _, password = acct.partition(":")
 data = urllib.parse.urlencode({{"_user": user, "_pass": password,
                                "_task": "login", "_action": "login"}}).encode()
-body = urllib.request.urlopen(
-    f"https://{address}{p['url_path']}", data=data, timeout=15,
-    context=ctx).read().decode(errors="replace")
+try:
+    body = urllib.request.urlopen(
+        f"https://{address}{p['url_path']}", data=data, timeout=15,
+        context=ctx).read().decode(errors="replace")
+except urllib.error.URLError as e:
+    _closed(e)
 sys.exit(0 if {p['success_text']!r} in body else 3)
 PY"""
     if kind == CheckKind.DNS_RECORDS:
@@ -170,7 +202,7 @@ sys.exit(0 if rows > 0 else 3)
 PY"""
     if kind == CheckKind.SPLUNK_SEARCH:
         return f"""python3 - <<'PY'
-import base64, json, os, sys, time, urllib.parse, urllib.request
+import base64, json, os, sys, time, urllib.error, urllib.parse, urllib.request
 acct = os.environ["{_cred_env(p['ingest_account_ref'])}"]
 user, _, password = acct.partition(":")
 base = "https://{address}:8089"
@@ -180,7 +212,13 @@ req = urllib.request.Request(
                                   "output_mode": "json"}}).encode(),
     headers={{"Authorization": "Basic " + base64.b64encode(
         f"{{user}}:{{password}}".encode()).decode()}})
-body = json.loads(urllib.request.urlopen(req, timeout=20).read())
+try:
+    body = json.loads(urllib.request.urlopen(req, timeout=20).read())
+except urllib.error.URLError as e:
+    if isinstance(getattr(e, "reason", e), (ConnectionRefusedError,
+                                            ConnectionResetError)):
+        sys.exit(3)   # the search API answered closed: real downtime
+    raise
 sid = body.get("sid")
 for _ in range(20):
     time.sleep(1)

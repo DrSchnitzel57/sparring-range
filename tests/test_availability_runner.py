@@ -202,3 +202,43 @@ def test_every_plan_still_has_one_exit_contract_writer():
         assert "sys.exit(0" in script or "sys.exit(0)" in script or True
     # the two codes the runner honours
     assert (EXIT_OK, EXIT_EXPECTATION_FAILED) == (0, 3)
+
+
+# --------------------------------------------------- closed port semantics ---
+def _run_plan_script(script: str, env: dict[str, str] | None = None,
+                     timeout: int = 30):
+    """Execute a rendered plan the way the vantage does (bash reading the
+    script from stdin), returning the process exit code."""
+    import subprocess
+
+    proc = subprocess.run(["bash", "-s"], input=script.encode(),
+                          capture_output=True, timeout=timeout,
+                          env={**__import__("os").environ, **(env or {})})
+    return proc.returncode, proc.stderr.decode(errors="replace")
+
+
+def test_a_closed_https_port_is_real_downtime_not_a_scorer_error():
+    """A refused connection is the TARGET answering closed: the transaction
+    ran, the service is down, and that must deduct (exit 3). Reporting it as
+    a scorer error would make real downtime permanently `unknown` - nobody
+    would ever lose a point for a dead service."""
+    env = _env()
+    plan = next(p for p in plan_transactions(env.checks, env.blueprint)
+                if p["kind"] == "https-content")
+    script = plan["script"].replace(plan["address"], "127.0.0.1:1")
+    rc, err = _run_plan_script(script)
+    assert rc == 3, (rc, err[-500:])
+
+
+def test_a_closed_mail_port_is_real_downtime_too():
+    env = _env()
+    plan = next(p for p in plan_transactions(env.checks, env.blueprint)
+                if p["kind"] == "mail-roundtrip")
+    # a port nothing listens on: localhost:1, not SMTP's 25 (this dev box
+    # runs an MTA that would answer and turn the test into a bad-recipient
+    # probe instead of a closed-port probe)
+    script = plan["script"].replace(f'"{plan["address"]}", 25',
+                                    '"127.0.0.1", 1')
+    cred_env = {name: "prb:pass" for name in plan["credential_env"]}
+    rc, err = _run_plan_script(script, env=cred_env)
+    assert rc == 3, (rc, err[-500:])
