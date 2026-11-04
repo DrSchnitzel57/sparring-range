@@ -748,3 +748,18 @@ required mojang roles), released the broker latch, all `sr-*` units active.
 - Browser console: `/api/console/{token}/stream` WebSocket relays RFB through
   the SAME socket-tested relay; nginx renders Upgrade headers for /api/.
   No browser page is built yet (remaining slice).
+
+### Windows build freeze: hv_vapic, not VBS (2026-11-04, live)
+
+The ws2019 build hit its 90-minute timeout with a black screen and *zero*
+disk I/O while two vCPUs burned CPU. Offline inspection of the artifact:
+C:\Windows present (7.3 GiB used), `sr-stage.log` = `specialize-start,
+vbs-off, vbs-required0, hypervisor-off, specialize-done` — so the
+specialize pass (which disables VBS and the hypervisor launcher) COMPLETED
+and the freeze was the post-specialize boot.
+
+Resuming the SAME disk with the same media minus QEMU's `hv_vapic`
+enlightenment boots past the black screen (Windows logo, setup continues).
+The builder now passes `host,hv_relaxed=on,hv_spinlocks=0x1fff` only; the
+nested Broadwell (E5-2697A v4) VAPIC path is the documented freeze source.
+The earlier VBS hypothesis (module docstring) was not the cause here.
