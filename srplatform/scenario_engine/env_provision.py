@@ -154,7 +154,9 @@ def windows(script: str, timeout_s: float = 180.0) -> tuple[str, ...]:
             "-ExecutionPolicy", "Bypass", "-Command", script)
 
 
-def linux(script: str) -> tuple[str, ...]:
+def linux(script: str, timeout_s: float | None = None) -> tuple[str, ...]:
+    """`sh -c` invocation; `timeout_s` is accepted only so handlers can pass
+    the same number to both the argv and the Step (the Step is authoritative)."""
     return ("/bin/sh", "-c", script)
 
 
@@ -627,3 +629,149 @@ END"""), timeout_s=600),
                  database="UnderpressureStore"), timeout_s=180),
              timeout_s=180),
     )
+
+
+@handler(ServiceId.WINRM)
+def winrm_handler(ctx: ProvisionContext) -> Sequence[Step]:
+    """The reported weak opening state: WinRM over HTTP, 5985, plainly
+    encrypted-optional — reproduced deliberately, because the entry-path
+    security task is graded on it. Idempotent; the verify proves the listener
+    answers on the port the defenders have to remediate.
+    """
+    return (
+        Step("winrm-enable",
+             windows("""
+Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null
+Set-Item WSMan:\\localhost\\Service\\AllowUnencrypted -Value $true -Force
+Set-Item WSMan:\\localhost\\Client\\AllowUnencrypted -Value $true -Force
+Set-Item WSMan:\\localhost\\Service\\Auth\\Basic -Value $true -Force
+Set-Item WSMan:\\localhost\\Client\\Auth\\Basic -Value $true -Force
+Set-Service -Name WinRM -StartupType Automatic
+Restart-Service WinRM -Force""", timeout_s=300),
+             timeout_s=300),
+        Step("winrm-verify",
+             windows("""
+$l = Get-NetTCPConnection -LocalPort 5985 -State Listen `
+  -ErrorAction SilentlyContinue
+if (-not $l) { throw '5985 is not listening' }""", timeout_s=60),
+             timeout_s=60),
+    )
+
+
+@handler(ServiceId.SSSD_AD)
+def sssd_ad_handler(ctx: ProvisionContext) -> Sequence[Step]:
+    """Linux domain join: the resolver points at AD DNS, then realmd joins the
+    forest with the directory admin account, then the practice account is
+    looked up BY NAME — SSSD join evidence, not a package list.
+
+    Password travels on stdin, never on the argument list the broker audits.
+    """
+    admin = split_credential(ctx.cred("credential:directory-join"))[0]
+    password = split_credential(ctx.cred("credential:directory-join"))[1]
+    dns = ps_quote(ctx.address("ad-dns"))
+    return (
+        Step("sssd-dns-client",
+             linux(f"""
+printf 'nameserver %s\\nsearch {ctx.domain}\\noptions timeout:2 attempts:2\\n' > /etc/resolv.conf
+if command -v resolvectl >/dev/null 2>&1 && systemctl is-active -q systemd-resolved; then
+  resolvectl dns "$(ip route show default | awk '{{print $5}}' | head -1)" {dns} >/dev/null 2>&1 || true
+  resolvectl domain "$(ip route show default | awk '{{print $5}}' | head -1)" {ctx.domain} >/dev/null 2>&1 || true
+fi
+getent hosts {ctx.address("ad-dns")} >/dev/null"""),
+             timeout_s=120),
+        Step("sssd-packages",
+             linux("export DEBIAN_FRONTEND=noninteractive; "
+                   "dpkg -s sssd realmd adcli oddjob-mkhomedir >/dev/null 2>&1 || "
+                   "apt-get -y install sssd realmd adcli oddjob-mkhomedir "
+                   "libnss-sss libpam-sss >/dev/null 2>&1 || true"),
+             timeout_s=900),
+        Step("sssd-join",
+             linux(f"""
+realm list 2>/dev/null | grep -qi {ps_quote(ctx.domain)} && exit 0
+echo {ps_quote(password)} | realm join --user={ps_quote(admin)} --computer-ou='/CN=Computers,DC={ctx.domain.replace(".", ",DC=")}' {ctx.domain} 2>&1 | tail -5
+realm list 2>/dev/null | grep -qi {ps_quote(ctx.domain)}""", timeout_s=600),
+             timeout_s=600),
+        Step("sssd-verify",
+             linux(f"getent passwd {ps_quote('prb-directory@' + ctx.domain)} "
+                   "> /dev/null"),
+             timeout_s=120),
+    )
+
+
+#: Splunk's first start in the build seed uses `--accept-license --no-prompt`,
+#: which leaves the shipped default admin credential. It is a synthetic lab
+#: value, replaced here by the protected store entry, never assumed.
+SPLUNK_INPUTS_CONF = """[UDP://sr-syslog]
+connection_host = dns
+port = 5514
+"""
+
+
+@handler(ServiceId.SPLUNK)
+def splunk_handler(ctx: ProvisionContext) -> Sequence[Step]:
+    """Splunk answers an AUTHENTICATED search as the practice account, after
+    proving it accepts events end to end (UDP -> index -> searchable)."""
+    admin_user, admin_pw = split_credential(ctx.cred("credential:splunk-admin"))
+    prb_user, prb_pw = split_credential(ctx.cred("credential:splunk-prb"))
+    return (
+        Step("splunk-listen",
+             linux(f"""
+/opt/splunk/bin/splunk enable listen 9997 -auth {admin_user}:{admin_pw} >/dev/null 2>&1 || true
+ss -ltn | grep -q ':9997 '""", timeout_s=300),
+             timeout_s=300),
+        Step("splunk-user",
+             linux(f"""
+pw=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" {ps_quote(prb_pw)})
+if ! curl -s -k -u {admin_user}:{admin_pw} \
+     https://127.0.0.1:8089/services/authentication/users/{ps_quote(prb_user)} \
+     -o /dev/null; then
+  curl -s -k -u {admin_user}:{admin_pw} -X POST \
+    https://127.0.0.1:8089/services/authentication/users \
+    -d "name={prb_user}" -d "password=$pw" -d "roles=user" >/dev/null
+fi
+curl -s -k -u {admin_user}:{admin_pw} \
+  https://127.0.0.1:8089/services/authentication/users/{ps_quote(prb_user)} \
+  -o /dev/null""", timeout_s=300),
+             timeout_s=300),
+        Step("splunk-verify",
+             linux(f"""
+/opt/splunk/bin/splunk search 'search index=main | head 1' \
+  -auth {admin_user}:{admin_pw} -maxout 1 >/dev/null 2>&1 || exit 1""",
+                   timeout_s=300),
+             timeout_s=300),
+    )
+
+
+@handler(ServiceId.SYSLOG_RECEIVER)
+def syslog_receiver_handler(ctx: ProvisionContext) -> Sequence[Step]:
+    """The 5514 UDP input AND a seed event that proves the chain: the guest
+    sends one synthetic line to its own input, waits, and finds it by search.
+    A listening port alone never counts."""
+    admin_user, admin_pw = split_credential(ctx.cred("credential:splunk-admin"))
+    return (
+        Step("syslog-input",
+             linux(f"""
+mkdir -p /opt/splunk/etc/system/local
+grep -q '\\[UDP://sr-syslog\\]' /opt/splunk/etc/system/local/inputs.conf 2>/dev/null || cat >> /opt/splunk/etc/system/local/inputs.conf <<'CONF'
+{SPLUNK_INPUTS_CONF}CONF
+ss -lun | grep -q ':5514 ' || /opt/splunk/bin/splunk restart --no-prompt >/dev/null 2>&1 || systemctl restart Splunkd
+ss -lun | grep -q ':5514 '""", timeout_s=600),
+             timeout_s=600),
+        Step("syslog-seed",
+             linux(f"""
+python3 - <<'PY'
+import socket, time
+marker = "SRPRB-syslog-" + str(int(time.time()))
+with open("/tmp/sr-syslog-marker", "w") as fh:
+    fh.write(marker)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.sendto((marker + " synthetic edge event").encode(), ("127.0.0.1", 5514))
+PY
+sleep 8
+marker=$(cat /tmp/sr-syslog-marker)
+/opt/splunk/bin/splunk search "search index=main $marker" \
+  -auth {admin_user}:{admin_pw} -maxout 1 2>/dev/null | grep -q "$marker" """,
+                   timeout_s=300),
+             timeout_s=300),
+    )
+

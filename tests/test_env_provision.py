@@ -20,9 +20,12 @@ BP = load_environment("underpressure-range").blueprint
 #: entry is reserved for the forest install (see OPERATOR_RUNBOOK).
 CREDS = {
     "SR_CRED_DIRECTORY_DSRM": "dsrm:DsrmP@ss1",
+    "SR_CRED_DIRECTORY_JOIN": "UNDERPRESSURE\\administrator:AdminP@ss1",
     "SR_CRED_PRB_DIRECTORY": "UNDERPRESSURE\\prb-directory:DirP@ss1",
     "SR_CRED_STORE_APP_SQL": "store:StoreP@ss1",
     "SR_CRED_RC_APP_SQL": "rc-app:RcP@ss1",
+    "SR_CRED_SPLUNK_ADMIN": "admin:Changeme123",
+    "SR_CRED_SPLUNK_PRB": "splunk-prb:SplunkP@ss1",
 }
 
 
@@ -69,9 +72,10 @@ def test_declared_service_order_is_preserved():
     svc = _services(_plan(), "ad-dns")
     assert [s.service for s in svc.values()] == [
         "active-directory", "dns", "winrm", "ca-fileshare"]
-    assert svc["winrm"].state == "unimplemented"
+    assert svc["ca-fileshare"].state == "unimplemented"
     assert svc["active-directory"].state == "ready"
     assert svc["dns"].state == "ready"
+    assert svc["winrm"].state == "ready"
 
 
 def test_unimplemented_is_not_ready():
@@ -85,11 +89,13 @@ def test_unimplemented_is_not_ready():
 
 def test_missing_credential_fails_closed_with_the_variable_name():
     plans = ep.build_plan(BP, generation="g1", resolver=lambda name: None)
-    svc = _services(plans, "ad-dns")
-    assert svc["active-directory"].state == "failed"
-    assert "SR_CRED_DIRECTORY_DSRM" in (svc["active-directory"].error or "")
+    ad = {s.service: s for s in _services(plans, "ad-dns").values()}
+    assert ad["active-directory"].state == "failed"
+    assert "SR_CRED_DIRECTORY_DSRM" in (ad["active-directory"].error or "")
     # the DNS handler needs no secret and still plans
-    assert svc["dns"].state == "ready"
+    assert ad["dns"].state == "ready"
+    # and the winrm handler needs no credential either
+    assert ad["winrm"].state == "ready"
 
 
 def test_credential_variable_naming():
@@ -185,7 +191,9 @@ def test_a_failed_step_stops_the_service_and_the_guest():
     # later services of a broken guest do not run at all
     assert ad["dns"].state == "failed"
     assert "not run" in (ad["dns"].error or "")
-    assert ad["winrm"].state == "unimplemented"
+    assert ad["winrm"].state == "failed"
+    assert "not run" in (ad["winrm"].error or "")
+    assert ad["ca-fileshare"].state == "unimplemented"
 
 
 def test_transport_error_is_failed_evidence_never_success():
@@ -272,3 +280,77 @@ def test_broker_transport_refuses_a_guest_without_a_vmid():
 def test_registering_a_second_handler_is_a_loud_error():
     with pytest.raises(ValueError, match="already has a handler"):
         ep.handler(ep.ServiceId.SSH)(lambda ctx: [])
+
+
+# ------------------------------------------------------- winrm (opening state)
+
+
+def test_winrm_reproduces_the_weak_http_listener():
+    winrm = _services(_plan(), "ad-dns")["winrm"]
+    assert [s.id for s in winrm.steps] == ["winrm-enable", "winrm-verify"]
+    enable = winrm.steps[0].argv[-1]
+    assert "AllowUnencrypted -Value $true" in enable
+    assert "Auth\\Basic -Value $true" in enable
+    assert "5985" in winrm.steps[1].argv[-1]
+
+
+# ------------------------------------------------------- linux domain join
+
+
+def test_sssd_join_points_at_ad_dns_and_verifies_by_name():
+    sssd = _services(_plan(), "ecomm")["sssd-ad"]
+    assert [s.id for s in sssd.steps] == [
+        "sssd-dns-client", "sssd-packages", "sssd-join", "sssd-verify"]
+    text = "\n".join(" ".join(s.argv) for s in sssd.steps)
+    assert BP.guest("ad-dns").interfaces[0].ipv4.address in text
+    assert "search underpressure.local" in text
+    assert "realm join" in text
+    assert "prb-directory@underpressure.local" in text
+
+
+def test_sssd_join_password_reaches_the_guest_but_not_the_evidence():
+    sssd = _services(_plan(), "ecomm")["sssd-ad"]
+    join = next(s for s in sssd.steps if s.id == "sssd-join")
+    assert "AdminP@ss1" in join.argv[-1]      # it must authenticate
+    evidence = ep.outcome_evidence(ep.run_plan(_plan(), FakeTransport()))
+    assert "AdminP@ss1" not in json.dumps(evidence)
+
+
+def test_sssd_join_fails_closed_without_the_admin_credential():
+    def missing(name):
+        return None if name == "SR_CRED_DIRECTORY_JOIN" else resolver(name)
+
+    sssd = _services(_plan(res=missing), "ecomm")["sssd-ad"]
+    assert sssd.state == "failed"
+    assert "SR_CRED_DIRECTORY_JOIN" in (sssd.error or "")
+
+
+# ------------------------------------------------------------- splunk
+
+
+def test_splunk_enables_the_receiver_and_a_search_account():
+    splunk = _services(_plan(), "splunk")["splunk"]
+    assert [s.id for s in splunk.steps] == [
+        "splunk-listen", "splunk-user", "splunk-verify"]
+    text = "\n".join(" ".join(s.argv) for s in splunk.steps)
+    assert "enable listen 9997" in text
+    assert "services/authentication/users" in text
+    assert "splunk-prb" in text
+
+
+def test_syslog_receiver_seeds_an_event_and_finds_it_by_search():
+    syslog = _services(_plan(), "splunk")["syslog-receiver"]
+    assert [s.id for s in syslog.steps] == ["syslog-input", "syslog-seed"]
+    text = "\n".join(" ".join(s.argv) for s in syslog.steps)
+    assert "5514" in text and "splunk search" in text
+    assert "sendto" in text            # the seed really transmits
+
+
+def test_splunk_missing_admin_credential_is_failed_not_ready():
+    def missing(name):
+        return None if name == "SR_CRED_SPLUNK_ADMIN" else resolver(name)
+
+    for guest in ("splunk",):
+        svc = _services(_plan(res=missing), guest)
+        assert svc["splunk"].state == "failed"
+        assert "SR_CRED_SPLUNK_ADMIN" in (svc["splunk"].error or "")
