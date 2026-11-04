@@ -294,3 +294,27 @@ def test_fetch_extra_debs_caches_and_hashes_the_bytes(tmp_path, monkeypatch):
 
 def test_profiles_without_vendor_debs_fetch_nothing(tmp_path):
     assert ub.fetch_extra_debs("attacker-debian", tmp_path) == []
+
+
+def test_every_linux_profile_installs_and_ENABLES_the_guest_agent():
+    """`systemctl enable` cannot run in a chroot, so it failed silently on
+    every build: the unit existed but was never wanted and the agent only
+    ran when cloud-init started it. A lagged cloud-init left a silent agent,
+    an unpinnable host key and a guest no bastion token could dial. The
+    desktop image additionally shipped NO agent at all.
+
+    So: the agent is part of every apt profile's install set, and the wants
+    link is created by hand."""
+    import infra.images.underpressure_build as ub
+
+    checked = 0
+    for profile in ("ubuntu-desktop", "debian12-splunk", "attacker-debian",
+                    "scoring-debian", "ubuntu2204-mail"):
+        script = ub._provision_script(profile)
+        checked += 1
+        assert "qemu-guest-agent" in script, profile
+        assert "multi-user.target.wants" in script, profile
+        assert "SR-GUEST-AGENT-NOT-ENABLED" in script, profile
+        assert "systemctl enable ssh qemu-guest-agent" not in script, \
+            f"{profile}: chroot systemctl enable does not work"
+    assert checked == 5

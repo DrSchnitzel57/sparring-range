@@ -476,7 +476,14 @@ def _provision_script(profile: str, *, distro: str | None = None) -> str:
     media = PROFILE_MEDIA.get(profile, "debian12")
     distro = distro or DISTROS.get(media, "apt")
     cross = CROSS_DISTRO_PACKAGES.get(profile, {})
-    pkgs = cross.get(distro) or APT_PACKAGES.get(profile, [])
+    pkgs = list(cross.get(distro) or APT_PACKAGES.get(profile, []))
+    # EVERY Linux golden carries the guest agent, whatever the profile asked
+    # for: the broker reads a guest's SSH host key and runs verifier commands
+    # through it, and an image without it is silently unmanageable (live find
+    # 2026-11-04 — the desktop image shipped no agent at all, so its host key
+    # could never be pinned and no bastion token could dial it).
+    if "qemu-guest-agent" not in pkgs:
+        pkgs.append("qemu-guest-agent")
     pkgs_join = " ".join(pkgs)
     if distro == "apt":
         install = ("apt-get update -qq\n"
@@ -539,7 +546,20 @@ SRPUBKEY
 chown -R sr:sr /home/sr/.ssh
 echo 'sr ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/sr
 chmod 0440 /etc/sudoers.d/sr
-systemctl enable ssh qemu-guest-agent auditd >/dev/null 2>&1 || true
+# `systemctl enable` CANNOT run in a chroot (no bus), and it failed silently
+# on every build: the agent unit existed but was never wanted, so it only
+# ever ran when cloud-init happened to start it — a lagged cloud-init left a
+# silent agent and an unpinnable host key (live find 2026-11-04). Create the
+# wants links by hand instead.
+mkdir -p /etc/systemd/system/multi-user.target.wants
+for _u in ssh qemu-guest-agent auditd; do
+  for _p in /lib/systemd/system/$_u.service /usr/lib/systemd/system/$_u.service \
+            /etc/systemd/system/$_u.service; do
+    [ -f "$_p" ] && ln -sf "$_p" /etc/systemd/system/multi-user.target.wants/$_u.service && break
+  done
+done
+test -L /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service \
+  || echo SR-GUEST-AGENT-NOT-ENABLED
 # The broker waits for /var/lib/sparring-range/first-boot-complete before
 # it will read (and pin) a guest's SSH host key; chroot images bake it, and
 # their host keys are generated at build time, so a clone's pin is stable.
