@@ -225,7 +225,10 @@ def test_a_closed_https_port_is_real_downtime_not_a_scorer_error():
     env = _env()
     plan = next(p for p in plan_transactions(env.checks, env.blueprint)
                 if p["kind"] == "https-content")
-    script = plan["script"].replace(plan["address"], "127.0.0.1:1")
+    import re
+    # the dialed endpoint is the public VIP now; nothing is listening on :1
+    script = re.sub(r'https://[^"\s]+', "https://127.0.0.1:1", plan["script"],
+                    count=1)
     rc, err = _run_plan_script(script)
     assert rc == 3, (rc, err[-500:])
 
@@ -237,8 +240,9 @@ def test_a_closed_mail_port_is_real_downtime_too():
     # a port nothing listens on: localhost:1, not SMTP's 25 (this dev box
     # runs an MTA that would answer and turn the test into a bad-recipient
     # probe instead of a closed-port probe)
-    script = plan["script"].replace(f'"{plan["address"]}", 25',
-                                    '"127.0.0.1", 1')
+    import re
+    script = re.sub(r'smtplib\.SMTP\("[^"]+", \d+',
+                    'smtplib.SMTP("127.0.0.1", 1', plan["script"], count=1)
     cred_env = {name: "prb:pass" for name in plan["credential_env"]}
     rc, err = _run_plan_script(script, env=cred_env)
     assert rc == 3, (rc, err[-500:])

@@ -424,8 +424,10 @@ def test_store_content_carries_the_catalogue_text_the_check_reads():
 
 
 def test_mail_hands_share_one_identity_set_between_guest_and_vantage():
-    postfix = _services(_plan(), "webmail")["postfix"]
-    dovecot = _services(_plan(), "webmail")["dovecot"]
+    plans = ep.build_plan(BP, generation="g", resolver=resolver,
+                          pki=_tmp_pki())
+    postfix = _services(plans, "webmail")["postfix"]
+    dovecot = _services(plans, "webmail")["dovecot"]
     for plan in (postfix, dovecot):
         text = "\n".join(" ".join(s.argv) for s in plan.steps)
         assert "prb-mail-sender" in text or "prb-sender" in text
@@ -433,6 +435,9 @@ def test_mail_hands_share_one_identity_set_between_guest_and_vantage():
     # plaintext auth is the reported opening state, deliberately kept
     dtext = "\n".join(" ".join(s.argv) for s in dovecot.steps)
     assert "disable_plaintext_auth = no" in dtext
+    # the public path is the published secure ports; Dovecot terminates TLS
+    assert "ssl = yes" in dtext and "ssl_cert = </etc/pki/sr/mail.crt" in dtext
+    assert "':993 '" in dtext and "':995 '" in dtext
 
 
 def test_roundcube_substitute_accepts_the_full_address_the_check_posts():
@@ -468,3 +473,11 @@ def test_mail_passwords_never_reach_the_evidence():
     blob = json.dumps(evidence)
     for secret in ("SenderP@ss1", "ReaderP@ss1", "RoundP@ss1"):
         assert secret not in blob
+
+
+def test_forwarder_ships_to_the_declared_syslog_input():
+    fwd = _services(_plan(), "ubuntu-wkst")["splunk-forwarder"]
+    text = "\n".join(" ".join(s.argv) for s in fwd.steps)
+    splunk = BP.guest("splunk").interfaces[0].ipv4.address
+    assert splunk in text and "5514" in text and "protocol=\"udp\"" in text
+    assert "logger" in text          # verify transmits, not just configures

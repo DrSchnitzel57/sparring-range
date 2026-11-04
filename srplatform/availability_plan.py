@@ -47,6 +47,29 @@ def _cred_env(ref: str) -> str:
     return "SR_CRED_" + m.group(1).upper().replace(".", "_").replace("-", "_")
 
 
+def _forward_for(bp: EnvironmentBlueprint, guest: str, target_port: int,
+                 protocol: str | None = None):
+    """The declared public path that reaches `guest:target_port` — the VIP the
+    checks must dial, per the blueprint's typed contract. None means the
+    service has no public path and the check falls back to the guest address
+    (a declared non-public service, never a guessed hop)."""
+    for f in getattr(bp, "public_forwards", []):
+        if (f.target_guest == guest and int(f.target_port) == int(target_port)
+                and (protocol is None or f.protocol == protocol)):
+            return f
+    return None
+
+
+def _public_endpoint(bp: EnvironmentBlueprint, guest: str, target_port: int,
+                     protocol: str | None = None) -> tuple[str, int]:
+    """(host, port) the vantage dials: the VIP and its published port when a
+    forward exists, else the guest's own address on the target port."""
+    f = _forward_for(bp, guest, target_port, protocol)
+    if f is not None:
+        return str(f.vip), int(f.vip_port)
+    return _guest_address(bp, guest), int(target_port)
+
+
 def _guest_address(bp: EnvironmentBlueprint, guest: str) -> str:
     g = bp.guest(guest)
     for iface in g.interfaces:
@@ -55,11 +78,13 @@ def _guest_address(bp: EnvironmentBlueprint, guest: str) -> str:
     raise ValueError(f"guest {guest!r} has no static address")
 
 
-def _script(check: ServiceCheck, address: str) -> str:
+def _script(check: ServiceCheck, address: str,
+            bp: EnvironmentBlueprint) -> str:
     p = check.params
     kind = check.kind
     if kind == CheckKind.HTTPS_CONTENT:
         host = p.get("host_header") or address
+        vip, vip_port = _public_endpoint(bp, check.guest, 443, "tcp")
         verify = "true" if p.get("verify_tls_against_lab_ca", True) else "false"
         return f"""python3 - <<'PY'
 import ssl, sys, urllib.error, urllib.request
@@ -77,7 +102,7 @@ ctx = ssl.create_default_context()
 if "{verify}" == "false":
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-url = f"https://{address}{p['url_path']}"
+url = f"https://{vip}:{vip_port}{p['url_path']}"
 req = urllib.request.Request(url, headers={{"Host": "{host}"}})
 try:
     body = urllib.request.urlopen(req, timeout=10, context=ctx).read().decode(errors="replace")
@@ -87,6 +112,9 @@ sys.exit(0 if {p['expected_text']!r} in body else 3)
 PY"""
     if kind == CheckKind.MAIL_ROUNDTRIP:
         protos = ",".join(p.get("protocols") or ["imap"])
+        smtp_host, smtp_port = _public_endpoint(bp, check.guest, 25, "tcp")
+        imap_host, imap_port = _public_endpoint(bp, check.guest, 993, "tcp")
+        pop3_host, pop3_port = _public_endpoint(bp, check.guest, 995, "tcp")
         return f"""python3 - <<'PY'
 import imaplib, os, poplib, smtplib, sys, time
 sender = os.environ["{_cred_env(p['sender_ref'])}"]
@@ -94,7 +122,7 @@ reader = os.environ["{_cred_env(p['recipient_ref'])}"]
 prefix = "{p.get('subject_prefix', 'SRPRB')}"
 subject = prefix + "-" + str(int(time.time()))
 try:
-    smtp = smtplib.SMTP("{address}", 25, timeout=20)
+    smtp = smtplib.SMTP("{smtp_host}", {smtp_port}, timeout=20)
     smtp.sendmail(sender, [reader], f"Subject: {{subject}}\\n\\nprobe")
     smtp.quit()
 except (ConnectionRefusedError, ConnectionResetError):
@@ -103,7 +131,7 @@ ok = False
 for proto in "{protos}".split(","):
     if proto == "imap":
         try:
-            c = imaplib.IMAP4("{address}", 143)
+            c = imaplib.IMAP4_SSL("{imap_host}", {imap_port})
         except (ConnectionRefusedError, ConnectionResetError):
             sys.exit(3)
         c.login(reader.split("@")[0], os.environ["{_cred_env(p['recipient_ref'])}"])
@@ -113,7 +141,7 @@ for proto in "{protos}".split(","):
         c.logout()
     elif proto == "pop3":
         try:
-            c = poplib.POP3("{address}", 110, timeout=20)
+            c = poplib.POP3_SSL("{pop3_host}", {pop3_port}, timeout=20)
         except (ConnectionRefusedError, ConnectionResetError):
             sys.exit(3)
         c.user(reader.split("@")[0])
@@ -123,6 +151,7 @@ for proto in "{protos}".split(","):
 sys.exit(0 if ok else 3)
 PY"""
     if kind == CheckKind.WEB_LOGIN:
+        vip, vip_port = _public_endpoint(bp, check.guest, 443, "tcp")
         verify = "true" if p.get("verify_tls_against_lab_ca", True) else "false"
         return f"""python3 - <<'PY'
 import os, ssl, sys, urllib.error, urllib.parse, urllib.request
@@ -143,13 +172,14 @@ data = urllib.parse.urlencode({{"_user": user, "_pass": password,
                                "_task": "login", "_action": "login"}}).encode()
 try:
     body = urllib.request.urlopen(
-        f"https://{address}{p['url_path']}", data=data, timeout=15,
+        f"https://{vip}:{vip_port}{p['url_path']}", data=data, timeout=15,
         context=ctx).read().decode(errors="replace")
 except urllib.error.URLError as e:
     _closed(e)
 sys.exit(0 if {p['success_text']!r} in body else 3)
 PY"""
     if kind == CheckKind.DNS_RECORDS:
+        dns_host, dns_port = _public_endpoint(bp, check.guest, 53, "udp")
         lines = []
         for name, types in p["records"].items():
             for rtype in types:
@@ -161,13 +191,14 @@ want = [
 ]
 bad = []
 for name, rtype in want:
-    out = subprocess.run(["dig", "+short", rtype, name, "@{address}"],
+    out = subprocess.run(["dig", "+short", rtype, name, "@{dns_host}"],
                          capture_output=True, text=True, timeout=8).stdout.strip()
     if not out:
         bad.append(name + "/" + rtype)
 sys.exit(0 if not bad else 3)
 PY"""
     if kind == CheckKind.DIRECTORY_AUTH:
+        ldap_host, ldap_port = _public_endpoint(bp, check.guest, 389, "tcp")
         if p.get("method") == "kerberos-asreq":
             return f"""python3 - <<'PY'
 import os, subprocess, sys
@@ -181,18 +212,20 @@ import os, subprocess, sys
 acct = os.environ["{_cred_env(p['account_ref'])}"]
 user, _, password = acct.partition(":")
 out = subprocess.run(
-    ["ldapsearch", "-x", "-H", "ldap://{address}", "-D", user,
+    ["ldapsearch", "-x", "-H", "ldap://{ldap_host}:{ldap_port}", "-D", user,
      "-w", password, "-b", "", "-s", "base", "(objectClass=*)", "dn"],
     capture_output=True, text=True, timeout=15)
 sys.exit(0 if out.returncode == 0 and "dn:" in out.stdout else 3)
 PY"""
     if kind == CheckKind.SQL_SEED_READ:
+        sql_host, sql_port = _public_endpoint(bp, check.guest, 1433, "tcp")
         return f"""python3 - <<'PY'
 import os, sys
 import pymssql
 acct = os.environ["{_cred_env(p['app_account_ref'])}"]
 user, _, password = acct.partition(":")
-conn = pymssql.connect(server="{address}", user=user, password=password,
+conn = pymssql.connect(server="{sql_host}", port={sql_port},
+                       user=user, password=password,
                        database="{p['database']}", timeout=20)
 cur = conn.cursor()
 cur.execute("SELECT COUNT(*) FROM sysobjects WHERE type = 'U'")
@@ -201,11 +234,13 @@ conn.close()
 sys.exit(0 if rows > 0 else 3)
 PY"""
     if kind == CheckKind.SPLUNK_SEARCH:
+        splunk_host, splunk_port = _public_endpoint(bp, check.guest, 8089,
+                                                    "tcp")
         return f"""python3 - <<'PY'
 import base64, json, os, sys, time, urllib.error, urllib.parse, urllib.request
 acct = os.environ["{_cred_env(p['ingest_account_ref'])}"]
 user, _, password = acct.partition(":")
-base = "https://{address}:8089"
+base = "https://{splunk_host}:{splunk_port}"
 req = urllib.request.Request(
     base + "/services/search/jobs",
     data=urllib.parse.urlencode({{"search": "search index={p['index']} | head 1",
@@ -246,7 +281,7 @@ def plan_transactions(registry: ServiceCheckRegistry,
             "guest": check.guest,
             "address": address,
             "timeout_s": TRANSACTION_TIMEOUT_S[check.kind],
-            "script": _script(check, address),
+            "script": _script(check, address, blueprint),
             # env var NAMES only — the executor resolves the values from the
             # protected credential store; a plan never carries a secret.
             "credential_env": sorted({

@@ -102,6 +102,9 @@ class ProvisionContext:
     generation: str
     resolver: CredentialResolver
     pki: LabPKI | None = None
+    #: Public VIPs that DNAT to this guest (the addresses the scoring
+    #: vantage actually dials through the edge).
+    public_vips: tuple[str, ...] = ()
 
     def own_address(self) -> str:
         return self.address(self.guest)
@@ -115,7 +118,8 @@ class ProvisionContext:
                 f"provisioning {self.guest!r} needs the replica CA for TLS "
                 f"but no CA was supplied to the plan")
         issued = self.pki.issue(hostname,
-                                [hostname, self.own_address()])
+                                [hostname, self.own_address(),
+                                 *self.public_vips])
         return (issued.certificate_pem.decode(),
                 issued.key_pem.decode())
 
@@ -250,10 +254,13 @@ def build_plan(bp, *, generation: str,
         guest = bp.guest(name)
         if not guest.services:
             continue
+        vips = tuple(str(f.vip) for f in getattr(bp, "public_forwards", [])
+                     if f.target_guest == name)
         ctx = ProvisionContext(
             guest=name, os=str(getattr(guest, "os", "")).split(".")[-1].lower(),
             domain=str(getattr(bp, "domain", "")), addresses=addresses,
-            generation=generation, resolver=resolver, pki=pki)
+            generation=generation, resolver=resolver, pki=pki,
+            public_vips=vips)
         svc_plans: list[ServicePlan] = []
         for raw in guest.services:
             sid = ServiceId(raw)
@@ -1004,9 +1011,23 @@ systemctl reload postfix""", timeout_s=300),
 def dovecot_handler(ctx: ProvisionContext) -> Sequence[Step]:
     users = _mail_users(ctx)
     lines = "\n".join(f"{u}:{{PLAIN}}{p}" for u, p in users)
-    #: Opening state as reported: plaintext auth allowed (TLS is not the
-    #: check's transaction), mail lives in each user's Maildir under /var/mail.
+    host = "mail." + ctx.domain
+    cert, key = ctx.certificate(host)
+    ca = ctx.ca_pem()
+    #: Opening state as reported: plaintext auth allowed; the public path is
+    #: the published secure ports (993/995) the blueprint DNATs, so Dovecot
+    #: terminates TLS there with the replica CA.
     return (
+        Step("dovecot-tls",
+             linux(_write_pem_step("mail", cert, key) + "\n"
+                   + _write_ca_step(ca)
+                   + """
+if ! getent group dovecot >/dev/null 2>&1; then
+  groupadd -r dovecot 2>/dev/null || true
+fi
+chown dovecot:dovecot /etc/pki/sr/mail.key 2>/dev/null || true
+chmod 640 /etc/pki/sr/mail.key""", timeout_s=60),
+             timeout_s=60),
         Step("dovecot-users",
              linux(f"""
 install -d -m 755 /etc/dovecot
@@ -1020,6 +1041,9 @@ fi
 cat > /etc/dovecot/conf.d/99-sr.conf <<'CONF'
 disable_plaintext_auth = no
 auth_mechanisms = plain login
+ssl = yes
+ssl_cert = </etc/pki/sr/mail.crt
+ssl_key = </etc/pki/sr/mail.key
 mail_location = maildir:/var/mail/%u/Maildir
 passdb {{
   driver = passwd-file
@@ -1040,7 +1064,7 @@ dovecot -n >/dev/null && systemctl enable --now dovecot && systemctl restart dov
                    timeout_s=300),
              timeout_s=300),
         Step("dovecot-verify",
-             linux("ss -ltn | grep -q ':143 ' && ss -ltn | grep -q ':110 '"),
+             linux("ss -ltn | grep -q ':993 ' && ss -ltn | grep -q ':995 '"),
              timeout_s=60),
     )
 
@@ -1129,5 +1153,33 @@ curl -sS --silent --fail --cacert /etc/pki/sr/ca.crt \
   -d '_user=prb-roundcube&_pass=x&_action=login&_task=login' \
   https://{host}/ -o /dev/null
 ss -ltn | grep -q ':443 '""", timeout_s=60),
+             timeout_s=60),
+    )
+
+
+@handler(ServiceId.SPLUNK_FORWARDER)
+def splunk_forwarder_handler(ctx: ProvisionContext) -> Sequence[Step]:
+    """The workstation's telemetry ship: rsyslog forwards to the replica's
+    declared syslog input (5514/udp).
+
+    The reported stack is the Splunk Universal Forwarder to 9997; the desktop
+    golden carries no forwarder (its vendor deb is not in the offline image),
+    so the substitution is labelled in fidelity.yaml. The verify is a real
+    transmission, not a config file check.
+    """
+    sink = ctx.address("splunk")
+    return (
+        Step("forwarder-config",
+             linux(f"""
+cat > /etc/rsyslog.d/50-sr-splunk.conf <<'CONF'
+*.* action(type="omfwd" target="{sink}" port="5514" protocol="udp"
+          template="RSYSLOG_SyslogProtocol23Format")
+CONF
+systemctl enable --now rsyslog && systemctl restart rsyslog""",
+                   timeout_s=180),
+             timeout_s=180),
+        Step("forwarder-verify",
+             linux("logger -p user.info 'SRPRB-forwarder-probe' && "
+                   "systemctl is-active rsyslog >/dev/null"),
              timeout_s=60),
     )

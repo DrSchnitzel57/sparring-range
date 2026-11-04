@@ -73,3 +73,29 @@ def test_unknown_guest_address_fails_closed():
                 iface.ipv4 = None
     with pytest.raises(ValueError, match="no static address"):
         plan_transactions(env.checks, broken)
+
+
+def test_scripts_dial_the_public_vips_and_never_bypass_the_edge():
+    """The registry's titles promise 'through the public VIP'; the scripts
+    must actually dial the VIP the blueprint DNATs, and must not reach the
+    guest's private address directly (that path is not declared for the
+    vantage and would be a shortcut around the replica's own routing)."""
+    env = _env()
+    for plan in plan_transactions(env.checks, env.blueprint):
+        forwards = [f for f in env.blueprint.public_forwards
+                    if f.target_guest == plan["guest"]]
+        if not forwards:
+            continue
+        vips = {f.vip for f in forwards}
+        assert any(v in plan["script"] for v in vips), plan["check"]
+        assert plan["address"] not in plan["script"], plan["check"]
+
+
+def test_mail_roundtrip_uses_the_published_service_ports():
+    env = _env()
+    plan = next(p for p in plan_transactions(env.checks, env.blueprint)
+                if p["kind"] == "mail-roundtrip")
+    # 993/995 are the PUBLISHED ports that DNAT to 143/110 in the replica
+    assert "smtplib.SMTP(\"172.25.31.15\", 25" in plan["script"]
+    assert "imaplib.IMAP4_SSL(\"172.25.31.15\", 993" in plan["script"]
+    assert "poplib.POP3_SSL(\"172.25.31.15\", 995" in plan["script"]
