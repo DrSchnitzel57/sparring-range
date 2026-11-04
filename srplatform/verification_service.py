@@ -21,6 +21,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from srplatform.db.models import Deployment, Event, Lab, Session as SessionModel
+
+#: Command shell on a Windows guest (no sshd: the agent runs this).
+WINDOWS_CMD = "C:\\Windows\\system32\\cmd.exe"
+
 from srplatform.scenario_engine.loader import load_scenario
 from srplatform.settings import get_settings
 from srplatform.ssh_channel import SSH_ALIVE_OPTS
@@ -143,7 +147,105 @@ _NOT_OWNED = "[verifier-exec] target not in the session's owned active inventory
              "no DNS fallback, no SSH attempt (unknown)"
 
 
-def _resolve(exec_fn: VerifierExec, hmap: dict[str, str]) -> VerifierExec:
+def resource_platform(res: dict) -> str:
+    """The verifier channel a resource needs: Windows guests have no sshd and
+    must be reached through their agent. Decided from the deployment's own
+    `image_profile` (the artifact the broker cloned), never from a guess at
+    the hostname."""
+    profile = str(res.get("image_profile") or "").lower()
+    return "windows" if profile.startswith(("win", "ws")) else "linux"
+
+
+def platform_map_for(db: Session, session_id) -> dict[str, str]:
+    """Logical host -> channel platform, from the SAME owned, created rows the
+    address map comes from."""
+    dep = active_deployment(db, session_id)
+    if not dep:
+        return {}
+    return {r["host"]: resource_platform(r) for r in (dep.resources or [])
+            if r.get("host") and r.get("ip") and r.get("state") == "created"}
+
+
+def windows_argv(command: str) -> list[str] | None:
+    """Translate the POSIX command a verifier emits into a Windows one.
+
+    Only TRANSLATED commands run; anything else returns None and the caller
+    reports the channel as unknown rather than running a command Windows does
+    not understand and reading its error as the target's state.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    if not argv:
+        return None
+    if argv[0] == "cat" and len(argv) == 2:
+        return [WINDOWS_CMD, "/c", "type", argv[1]]
+    return None
+
+
+_guest_exec_override = None
+
+
+def set_guest_exec(fn: VerifierExec | None) -> None:
+    """Test hook: replaces the broker's guest_exec with a fake of the same
+    shape — `fn(node, vmid, argv, *, session_id, generation) ->
+    {returncode, stdout, stderr}`. Production resolves the real broker lazily
+    so the module needs no app import."""
+    global _guest_exec_override
+    _guest_exec_override = fn
+
+
+def _generation_of(dep: Deployment, res: dict) -> str:
+    attempt = int(res.get("generation_attempt") or 0)
+    return str(dep.deployment_id) + (f":a{attempt}" if attempt else "")
+
+
+def windows_channel(db: Session, session_id) -> VerifierExec | None:
+    """The verifier channel for Windows guests (their agent, not sshd).
+
+    Every failure is a loud UNKNOWN with a reserved sentinel exit: an agent
+    that is absent, a generation the broker refuses, or a command with no
+    Windows translation must never be read as the guest's actual state.
+    """
+    dep = active_deployment(db, session_id)
+    if dep is None:
+        return None
+    rows = {r["host"]: dict(r) for r in (dep.resources or [])
+            if r.get("host") and r.get("state") == "created" and r.get("vmid")}
+    node = next((r.get("node") for r in rows.values() if r.get("node")), None)
+    session = str(dep.session_id)
+
+    def resolved(host: str, command: str) -> tuple[int, str]:
+        row = rows.get(host)
+        if row is None or node is None:
+            return 254, _NOT_OWNED
+        argv = windows_argv(command)
+        if argv is None:
+            return 126, (f"[verifier-exec] no Windows translation for "
+                         f"{command.split()[0] if command.split() else '?'} — "
+                         "unknown, not attempted")
+        try:
+            exec_ = _guest_exec_override
+            if exec_ is None:
+                from srplatform.api.deps import get_broker
+                exec_ = get_broker().guest_exec
+            out = exec_(node, int(row["vmid"]), argv,
+                        session_id=session,
+                        generation=_generation_of(dep, row))
+        except Exception as exc:  # noqa: BLE001 — channel, not target state
+            return 125, (f"[verifier-exec] guest agent channel unavailable: "
+                         f"{type(exc).__name__}: {str(exc)[:200]}")
+        code = int(out.get("returncode", 255))
+        body = str(out.get("stdout") or "") + str(out.get("stderr") or "")
+        return code, body[:8000]
+
+    return resolved
+
+
+def _resolve(exec_fn: VerifierExec, hmap: dict[str, str], *,
+             platforms: dict[str, str] | None = None,
+             windows: VerifierExec | None = None) -> VerifierExec:
     def resolved(host: str, command: str) -> tuple[int, str]:
         addr = hmap.get(host)
         if addr is None:
@@ -151,6 +253,13 @@ def _resolve(exec_fn: VerifierExec, hmap: dict[str, str]) -> VerifierExec:
             # name — a DNS lookup of a stale/foreign name and an SSH attempt
             # at whatever answered. Resolution is now inventory-only.
             return 254, _NOT_OWNED
+        if (platforms or {}).get(host) == "windows":
+            # Windows goldens carry no sshd: their evidence comes from the
+            # guest agent, and a missing channel is UNKNOWN, never a pass.
+            if windows is None:
+                return 126, ("[verifier-exec] Windows guest with no agent "
+                             "channel configured — unknown, not attempted")
+            return windows(host, command)
         return exec_fn(addr, command)
     return resolved
 
@@ -316,7 +425,10 @@ def readiness_checks(db: Session, session_id, broker=None) -> dict:
             hmap = host_map_for(db, session_id)
             exec_fn = _exec_override or _ssh_exec
             v = registry.get("service_present")
-            ctx = Context(exec=_resolve(exec_fn, hmap), hosts=hmap)
+            ctx = Context(exec=_resolve(exec_fn, hmap,
+                                        platforms=platform_map_for(db, session_id),
+                                        windows=windows_channel(db, session_id)),
+                          hosts=hmap)
             for host, svc in declared:
                 unit = SUPPORTED_SERVICES.get(svc, svc)
                 outcome = v.evaluate(ctx, host=host, service=unit)
@@ -461,7 +573,10 @@ def check_objective(db: Session, session_id, objective_id: str) -> dict:
         return {"error": f"unknown objective '{objective_id}'"}
     exec_fn = _exec_override or _ssh_exec
     hmap = host_map_for(db, session_id)
-    ctx = Context(exec=_resolve(exec_fn, hmap), hosts=hmap)
+    ctx = Context(exec=_resolve(exec_fn, hmap,
+                                platforms=platform_map_for(db, session_id),
+                                windows=windows_channel(db, session_id)),
+                  hosts=hmap)
     v = registry.get(obj["verifier"])
     args = with_cron_baseline(dict(obj.get("args") or {}),
                               verifier_id=obj["verifier"],
@@ -509,7 +624,10 @@ def build_scorecard(db: Session, session_id) -> dict:
         raise RuntimeError("no active owned deployment inventory for this session — "
                            "live rescore refused (historical score_snapshot remains "
                            "read-only available); no SSH attempted")
-    ctx = Context(exec=_resolve(exec_fn, hmap), hosts=hmap)
+    ctx = Context(exec=_resolve(exec_fn, hmap,
+                                platforms=platform_map_for(db, session_id),
+                                windows=windows_channel(db, session_id)),
+                  hosts=hmap)
     # trusted cron content pins: loaded ONCE per scorecard build so every
     # cron check in this snapshot sees the same truth (plan 18)
     cron_artifacts = cron_artifact_map(db, session_id)
