@@ -159,13 +159,30 @@ def test_ad_plan_is_idempotent_by_construction():
 # ------------------------------------------------------------ DNS plan
 
 
-def test_dns_records_come_from_blueprint_addresses():
+def test_dns_records_come_from_the_blueprint_ledger():
     dns = _services(_plan(), "ad-dns")["dns"]
     text = "\n".join(" ".join(s.argv) for s in dns.steps)
-    for guest in ("ecomm", "webmail", "splunk", "ad-dns"):
-        assert BP.guest(guest).interfaces[0].ipv4.address in text
-    assert "shop" in text and "mail" in text
+    # every declared A record's address is seeded (not a hand-typed subset)
+    for rec in BP.dns_records:
+        if rec.type == "A":
+            assert rec.value in text, rec
+    # CNAMEs alias the declared names, and the MX points at the mail host
+    assert "Add-DnsServerResourceRecordCName" in text
+    assert "ecomm.underpressure.local" in text
+    assert "Add-DnsServerResourceRecordMX" in text
+    # the LDAP SRV is the promotion's and is only verified here
     assert "_ldap._tcp.dc._msdcs" in text
+
+
+def test_dns_plan_fails_closed_without_the_ledger():
+    import copy
+    # a blueprint whose dns_records are empty cannot seed a zone honestly
+    stripped = copy.deepcopy(BP)
+    stripped.dns_records = []
+    plans = ep.build_plan(stripped, generation="g", resolver=resolver)
+    dns = _services(plans, "ad-dns")["dns"]
+    assert dns.state == "failed"
+    assert "dns_records" in (dns.error or "")
 
 
 # ---------------------------------------------------------- SQL plan

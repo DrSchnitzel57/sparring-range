@@ -105,6 +105,9 @@ class ProvisionContext:
     #: Public VIPs that DNAT to this guest (the addresses the scoring
     #: vantage actually dials through the edge).
     public_vips: tuple[str, ...] = ()
+    #: The blueprint's declared DNS records (name, type, value, preference),
+    #: so the zone is the documented one and not a hand-typed subset.
+    dns_records: tuple = ()
 
     def own_address(self) -> str:
         return self.address(self.guest)
@@ -256,11 +259,14 @@ def build_plan(bp, *, generation: str,
             continue
         vips = tuple(str(f.vip) for f in getattr(bp, "public_forwards", [])
                      if f.target_guest == name)
+        dns_records = tuple(
+            (str(r.name), str(r.type), str(r.value), getattr(r, "preference", None))
+            for r in getattr(bp, "dns_records", []))
         ctx = ProvisionContext(
             guest=name, os=str(getattr(guest, "os", "")).split(".")[-1].lower(),
             domain=str(getattr(bp, "domain", "")), addresses=addresses,
             generation=generation, resolver=resolver, pki=pki,
-            public_vips=vips)
+            public_vips=vips, dns_records=dns_records)
         svc_plans: list[ServicePlan] = []
         for raw in guest.services:
             sid = ServiceId(raw)
@@ -576,51 +582,68 @@ if (-not (Get-ADUser -Filter "SamAccountName -eq '{sam}'" -ErrorAction SilentlyC
 
 @handler(ServiceId.DNS)
 def dns_handler(ctx: ProvisionContext) -> Sequence[Step]:
-    """The AD-integrated zone's service records: the apex MX, the replica's
-    own A records and the LDAP SRV the directory check reads.
-
-    Everything is name-addressed from the blueprint (no hard-coded lab
-    answer); re-running never duplicates a record.
-    """
+    """The AD-integrated zone seeded with EVERY record the blueprint declares
+    (A, MX, CNAME); the LDAP SRV is created by the promotion and only
+    verified here. Re-running never duplicates a record."""
+    if not ctx.dns_records:
+        raise ProvisionError(
+            "the blueprint declares no dns_records — the zone cannot be "
+            "seeded without them")
     zone = ps_quote(ctx.domain)
-    host_records = (
-        ("ecomm", ctx.address("ecomm")),
-        ("mail", ctx.address("webmail")),
-        ("shop", ctx.address("ecomm")),
-        ("splunk", ctx.address("splunk")),
-        ("dc", ctx.address("ad-dns")),
-    )
-    adds = "\n".join(
-        f"  @{{ Name = {ps_quote(name)}; IPv4 = {ps_quote(ip)} }}"
-        for name, ip in host_records)
-    verify = "\n".join(
-        f"if (-not (Resolve-DnsName -Name '{name}.{ctx.domain}' -Server 127.0.0.1 "
-        f"-Type A -ErrorAction SilentlyContinue)) {{ throw 'missing A {name}' }}"
-        for name, _ip in host_records)
+    suffix = "." + ctx.domain
+
+    def rel(name: str) -> str:
+        return name[:-len(suffix)] if name.endswith(suffix) else name
+
+    a_recs = [(rel(n), v) for n, kind, v, _p in ctx.dns_records
+              if kind == "A"]
+    cname_recs = [(rel(n), v) for n, kind, v, _p in ctx.dns_records
+                  if kind == "CNAME"]
+    mx_recs = [(v, p) for n, kind, v, p in ctx.dns_records if kind == "MX"]
+
+    adds = []
+    for name, addr in a_recs:
+        adds.append(
+            f"if (-not (Get-DnsServerResourceRecord -ZoneName {zone} "
+            f"-Name {ps_quote(name)} -RRType A -ErrorAction SilentlyContinue)) {{"
+            f" Add-DnsServerResourceRecordA -ZoneName {zone} -Name "
+            f"{ps_quote(name)} -IPv4Address {ps_quote(addr)} "
+            f"-AllowUpdateAny -ErrorAction Stop }}")
+    for name, alias in cname_recs:
+        adds.append(
+            f"if (-not (Get-DnsServerResourceRecord -ZoneName {zone} "
+            f"-Name {ps_quote(name)} -RRType CNAME -ErrorAction SilentlyContinue)) {{"
+            f" Add-DnsServerResourceRecordCName -ZoneName {zone} -Name "
+            f"{ps_quote(name)} -HostNameAlias {ps_quote(alias)} "
+            f"-AllowUpdateAny -ErrorAction Stop }}")
+    if mx_recs:
+        exchange, preference = mx_recs[0]
+        adds.append(
+            f"if (-not (Get-DnsServerResourceRecord -ZoneName {zone} "
+            f"-RRType MX -ErrorAction SilentlyContinue)) {{ "
+            f"Add-DnsServerResourceRecordMX -ZoneName {zone} -Name '@' "
+            f"-MailExchange {ps_quote(exchange)} -Preference "
+            f"{int(preference or 10)} -AllowUpdateAny -ErrorAction Stop }}")
+    seed = "\n".join(adds)
+    verify_lines = [
+        f"if (-not (Resolve-DnsName -Name {ps_quote(n)} -Server 127.0.0.1 "
+        f"-ErrorAction SilentlyContinue)) {{ throw 'missing {n}' }}"
+        for n in [rel(x[0]) for x in a_recs] + [rel(x[0]) for x in cname_recs]
+    ]
+    verify = "\n".join(verify_lines)
     return (
-        Step("dns-a-records",
+        Step("dns-records",
              windows(f"""
-foreach ($r in @(
-{adds}
-)) {{
-  if (-not (Get-DnsServerResourceRecord -ZoneName {zone} -Name $r.Name -RRType A -ErrorAction SilentlyContinue)) {{
-    Add-DnsServerResourceRecordA -ZoneName {zone} -Name $r.Name `
-      -IPv4Address $r.IPv4 -AllowUpdateAny -ErrorAction Stop
-  }}
-}}""", timeout_s=300),
+{seed}""", timeout_s=300),
              timeout_s=300),
         Step("dns-mx",
              windows(f"""
-$mx = Get-DnsServerResourceRecord -ZoneName {zone} -RRType MX -ErrorAction SilentlyContinue
-if (-not $mx) {{
-  Add-DnsServerResourceRecordMX -ZoneName {zone} -Name "@" `
-    -MailExchange "mail.{ctx.domain}" -Preference 10 -AllowUpdateAny -ErrorAction Stop
-}}""", timeout_s=120),
+if (-not (Resolve-DnsName -Name {ps_quote(ctx.domain)} -Server 127.0.0.1 -Type MX -ErrorAction SilentlyContinue)) {{ throw 'missing MX' }}""",
+                     timeout_s=120),
              timeout_s=120),
         Step("dns-verify",
              windows(f"""
 {verify}
-if (-not (Resolve-DnsName -Name {ps_quote(ctx.domain)} -Server 127.0.0.1 -Type MX -ErrorAction SilentlyContinue)) {{ throw 'missing MX' }}
 if (-not (Resolve-DnsName -Name {ps_quote('_ldap._tcp.dc._msdcs.' + ctx.domain)} -Server 127.0.0.1 -Type SRV -ErrorAction SilentlyContinue)) {{ throw 'missing LDAP SRV' }}""",
                      timeout_s=180),
              timeout_s=180),
