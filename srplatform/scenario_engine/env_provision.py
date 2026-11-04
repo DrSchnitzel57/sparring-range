@@ -391,6 +391,33 @@ class BrokerProvisionTransport:
                                     session_id=self._session_id)
 
 
+def resolver_from_settings(settings) -> CredentialResolver:
+    """The protected store as a resolver, for whatever identity calls this.
+
+    Readability is the CALLER's property, not a fallback: `credentials.load`
+    refuses a mis-owned/mis-moded file (the rule that keeps it a secret), and
+    a resolver bound without rights simply answers None for every name — the
+    lab still deploys, its credential-dependent services record `failed` with
+    the variable name. Root-run gates and the operator path can read it; the
+    API identity cannot unless the operator says so.
+    """
+    from srplatform.credentials import DEFAULT_PATH, resolver
+
+    path = getattr(settings, "environment_credentials_file", "") or DEFAULT_PATH
+    try:
+        inner = resolver(path)
+    except Exception:  # noqa: BLE001 — unreadable now, re-checked per name
+        return lambda name: None
+
+    def resolve(name: str) -> str | None:
+        try:
+            return inner(name)
+        except Exception:  # noqa: BLE001 — never fatal to a deploy
+            return None
+
+    return resolve
+
+
 def provision_deployment(db, session_id, deployment, bp, broker, *,
                          node: str, resolver: CredentialResolver,
                          generation: str | None = None) -> dict:

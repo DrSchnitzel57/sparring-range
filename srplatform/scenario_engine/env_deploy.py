@@ -233,7 +233,8 @@ def _pin_env_host_key(db, session_id, dep, res: dict, resources: list,
 
 
 def deploy_environment(db: Session, session_id, scenario_id: str, spec: dict,
-                       broker, resume: bool = True) -> dict:
+                       broker, resume: bool = True,
+                       provision: bool = True) -> dict:
     """Provision (or resume) every blueprint guest. Same idempotence
     discipline as the v1 lane: ready deployment returns as-is; per-guest
     pending intents are durable before side effects; created rows skip."""
@@ -423,7 +424,26 @@ def deploy_environment(db: Session, session_id, scenario_id: str, spec: dict,
     dep.resources = resources
     flag_modified(dep, "resources")
     db.commit()
+
+    # SERVICES: the VMs are up; their roles are not yet configured. This runs
+    # AFTER the deployment is durable, so a provisioning fault can never
+    # un-ready the lab — it is separate evidence on the same rows. Passwords
+    # come from the protected store through the CALLER's identity (a root-run
+    # gate can read it; the API can not unless the operator says so).
+    provisioning: dict = {}
+    if provision:
+        from srplatform.scenario_engine import env_provision
+        resolver = env_provision.resolver_from_settings(s)
+        try:
+            provisioning = env_provision.provision_deployment(
+                db, session_id, dep, bp, broker, node=node, resolver=resolver)
+        except Exception as exc:  # noqa: BLE001 — evidence, not deploy failure
+            provisioning = {"_error": f"{type(exc).__name__}: {exc}"[:300]}
+            orch._log(db, session_id, "provision_error", scenario_id,
+                      {"error": provisioning["_error"]})
+
     return {"scenario_id": scenario_id, "action": "deploy",
             "deployment_id": str(dep.deployment_id),
             "hosts": [r for r in resources if r.get("state") == "created"],
-            "telemetry_enrollments": {}}
+            "telemetry_enrollments": {},
+            "provisioning": provisioning}
