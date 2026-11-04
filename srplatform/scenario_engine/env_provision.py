@@ -1206,3 +1206,98 @@ systemctl enable --now rsyslog && systemctl restart rsyslog""",
                    "systemctl is-active rsyslog >/dev/null"),
              timeout_s=60),
     )
+
+
+@handler(ServiceId.CHRONY)
+def chrony_handler(ctx: ProvisionContext) -> Sequence[Step]:
+    """Time service, reported offline-simulated: chrony may never reach a
+    real upstream (egress is denied) — the requirement is a RUNNING,
+    disciplined clock daemon, not an NTP response."""
+    return (
+        Step("chrony-enable",
+             linux("systemctl disable --now systemd-timesyncd 2>/dev/null || true; "
+                   "systemctl enable --now chrony 2>/dev/null || "
+                   "systemctl enable --now chronyd 2>/dev/null"),
+             timeout_s=120),
+        Step("chrony-verify",
+             linux("systemctl is-active chrony >/dev/null 2>&1 || "
+                   "systemctl is-active chronyd >/dev/null 2>&1"),
+             timeout_s=60),
+    )
+
+
+@handler(ServiceId.CUPS)
+def cups_handler(ctx: ProvisionContext) -> Sequence[Step]:
+    """Print service (reported in the workstation's service list): the CUPS
+    listener must answer on 631, not just be enabled at boot."""
+    return (
+        Step("cups-enable",
+             linux("systemctl enable --now cups 2>/dev/null || "
+                   "systemctl enable --now cups-browsed 2>/dev/null || true"),
+             timeout_s=120),
+        Step("cups-verify",
+             linux("ss -ltn | grep -q ':631 '"),
+             timeout_s=60),
+    )
+
+
+@handler(ServiceId.AVAHI)
+def avahi_handler(ctx: ProvisionContext) -> Sequence[Step]:
+    """mDNS (reported): daemon running and the 5353 UDP socket bound."""
+    return (
+        Step("avahi-enable",
+             linux("systemctl enable --now avahi-daemon"),
+             timeout_s=120),
+        Step("avahi-verify",
+             linux("ss -lun | grep -q ':5353 '"),
+             timeout_s=60),
+    )
+
+
+@handler(ServiceId.CA_FILESHARE)
+def ca_fileshare_handler(ctx: ProvisionContext) -> Sequence[Step]:
+    """The exposed certificate services the entry-path task grades: an
+    Enterprise Root CA with its PUBLIC certificate on an SMB share.
+
+    The install runs non-interactively as SYSTEM (the guest agent's
+    identity); the share is read-only for Everyone, which is the reported
+    exposure and is disclosed as a synthetic reconstruction.
+    """
+    return (
+        Step("ca-role",
+             windows("Install-WindowsFeature -Name AD-Certificate "
+                     "-IncludeManagementTools | Out-Null", timeout_s=600),
+             timeout_s=600),
+        Step("ca-install",
+             windows("""
+if (-not (Get-CertificationAuthority -ErrorAction SilentlyContinue)) {
+  $p = @{
+    CAtype = 'EnterpriseRootCA'
+    CryptoProviderName = 'RSA#Microsoft Software Key Storage Provider'
+    KeyLength = 2048
+    HashAlgorithmName = 'SHA256'
+    ValidityPeriod = 'Years'
+    ValidityPeriodUnits = 5
+    Force = $true
+  }
+  Install-AdcsCertificationAuthority @p -ErrorAction Stop
+}""", timeout_s=900),
+             timeout_s=900),
+        Step("ca-share",
+             windows("""
+$dir = 'C:\\CA'
+New-Item -ItemType Directory -Path $dir -Force | Out-Null
+certutil.exe -ca.cert "$dir\\root.cer" | Out-Null
+if (-not (Get-SmbShare -Name 'CA' -ErrorAction SilentlyContinue)) {
+  New-SmbShare -Name 'CA' -Path $dir -ReadAccess 'Everyone' |
+    Out-Null
+}""", timeout_s=300),
+             timeout_s=300),
+        Step("ca-verify",
+             windows("""
+if (-not (Test-Path 'C:\\CA\\root.cer')) { throw 'CA cert missing' }
+if (-not (Get-SmbShare -Name 'CA' -ErrorAction SilentlyContinue)) {
+  throw 'CA share missing'
+}""", timeout_s=120),
+             timeout_s=120),
+    )

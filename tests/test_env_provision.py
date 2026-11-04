@@ -91,16 +91,17 @@ def test_declared_service_order_is_preserved():
     svc = _services(_plan(), "ad-dns")
     assert [s.service for s in svc.values()] == [
         "active-directory", "dns", "winrm", "ca-fileshare"]
-    assert svc["ca-fileshare"].state == "unimplemented"
+    assert svc["ca-fileshare"].state == "ready"
     assert svc["active-directory"].state == "ready"
     assert svc["dns"].state == "ready"
     assert svc["winrm"].state == "ready"
 
 
-def test_unimplemented_is_not_ready():
-    ad = _services(_plan(), "ad-dns")
-    assert ad["ca-fileshare"].state == "unimplemented"
-    assert _services(_plan(), "ecomm")["ssh"].state == "ready"
+def test_no_service_reports_ready_without_steps():
+    for gp in _plan():
+        for sp in gp.services:
+            if sp.state == "ready":
+                assert sp.steps, (gp.guest, sp.service)
 
 
 # --------------------------------------------------------- credentials
@@ -229,7 +230,8 @@ def test_a_failed_step_stops_the_service_and_the_guest():
     assert "not run" in (ad["dns"].error or "")
     assert ad["winrm"].state == "failed"
     assert "not run" in (ad["winrm"].error or "")
-    assert ad["ca-fileshare"].state == "unimplemented"
+    assert ad["ca-fileshare"].state == "failed"
+    assert "not run" in (ad["ca-fileshare"].error or "")
 
 
 def test_transport_error_is_failed_evidence_never_success():
@@ -259,7 +261,7 @@ def test_evidence_carries_no_secret_and_no_command_text():
         assert secret not in blob
     assert "powershell" not in blob.lower()
     assert evidence["ad-dns"]["services"]["active-directory"]["state"] == "ready"
-    assert evidence["ad-dns"]["ready"] is False  # winrm unimplemented
+    assert evidence["ad-dns"]["ready"] is True  # every declared service ran
 
 
 # ----------------------------------------------------- broker transport
@@ -505,3 +507,32 @@ def test_probe_verdict_is_strict_about_failed_and_unimplemented():
     assert _verdict({"ecomm": {"nginx": "ready", "ssh": "ready"}}) == 0
     assert _verdict({"ecomm": {"nginx": "failed"}}) == 1
     assert _verdict({"ecomm": {"ssh": "unimplemented"}}) == 1
+
+
+# ------------------------------------------------- remaining small services
+
+
+def test_desktop_services_are_configured_and_verified_on_ports():
+    plans = ep.build_plan(BP, generation="g", resolver=resolver,
+                          pki=_tmp_pki())
+    for service, needle in (("chrony", "chrony"), ("cups", ":631 "),
+                            ("avahi", ":5353 ")):
+        plan = _services(plans, "ubuntu-wkst")[service]
+        assert plan.state == "ready", (service, plan.error)
+        text = "\n".join(" ".join(s.argv) for s in plan.steps)
+        assert needle in text
+
+
+def test_every_declared_service_in_the_blueprint_has_a_handler():
+    plans = ep.build_plan(BP, generation="g", resolver=resolver,
+                          pki=_tmp_pki())
+    missing = [(gp.guest, sp.service) for gp in plans for sp in gp.services
+               if sp.state == "unimplemented"]
+    assert missing == []
+
+
+def test_ca_fileshare_is_enterprise_ca_plus_public_cert_share():
+    ca = _services(_plan(), "ad-dns")["ca-fileshare"]
+    text = "\n".join(" ".join(s.argv) for s in ca.steps)
+    assert "EnterpriseRootCA" in text
+    assert "New-SmbShare" in text and "root.cer" in text
