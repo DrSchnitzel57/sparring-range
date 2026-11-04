@@ -26,19 +26,28 @@
 
 ## Observed vs. assumed
 
-- OBSERVED: nine real goldens registered and verified (attacker-debian, webmail,
-  ecomm, opnsense, scoring, ubuntu-desktop, team-kali, splunk, ws2022-dc);
-  selective reset code paths exist and pass db tests; availability decision
-  table exists and is tested; red agent already renders environment context.
-- OBSERVED (open): the 12-guest live gate reached `active` but the selective
-  reset hit two broker-identity bugs (re-cloning onto a released vmid); the
-  second is fixed, the first fix is committed after the outage.
-- ASSUMED (needs verification on the appliance): the lab product's live path
-  now passes with the vmid fix; VBS-off Windows images boot as env guests;
-  Console gateway needs an SSH multiplexor decision (per-console session vs
-  ssh -L), not yet inspected.
-- NOT STARTED: availability VANTAGE executor (real transactions), console
-  gateway, lab-bound exercise sessions, integrated proof gate, release review.
+- OBSERVED (2026-11-04): nine real goldens registered and verified; the 12-guest
+  lab reaches `active` on the appliance; a bastion token logs a member into a
+  Linux environment guest from the operator box (`ecomm`, `sr` uid 1001);
+  selective reset + lab API + availability decision table pass db tests; red
+  agent renders environment context.
+- OBSERVED FIXES this session (root causes, not workarounds): broker restart
+  deadlock (boot hashed 30 GB against a 30 s lease, and releases did not
+  refresh the lease — the range could not come back up); image keys owned by
+  the wrong uid (`sr` is 1001, `ubuntu` is 1000); `qemu-guest-agent` never
+  enabled by a chroot `systemctl enable` and missing entirely from the desktop
+  image.
+- LANDED IN CODE, NOT YET LIVE-PROVEN: the availability VANTAGE executor
+  (`srplatform/availability_runner.py`, plans -> exit-code -> evidence);
+  lab-bound exercise sessions (`lab_service.attach_exercise`, no second clone)
+  and their verifier host resolution; typed `guest_exec` (the Windows
+  verifier lane, through the guest agent).
+- ASSUMED (needs verification): the availability runner's plan templates treat
+  a refused TCP connection as a SCORER error (exit != 0/3), i.e. `unknown`
+  rather than `failed` — the semantics to settle before scoring on it.
+- NOT STARTED: console gateway (A), Windows verifier dispatch onto `guest_exec`,
+  offense binding for env guests (D), integrated proof gate (E), release
+  review (F).
 
 ## Non-goals (kept honest)
 
