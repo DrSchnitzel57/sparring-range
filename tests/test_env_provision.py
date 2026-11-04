@@ -498,3 +498,10 @@ def test_forwarder_ships_to_the_declared_syslog_input():
     splunk = BP.guest("splunk").interfaces[0].ipv4.address
     assert splunk in text and "5514" in text and "protocol=\"udp\"" in text
     assert "logger" in text          # verify transmits, not just configures
+
+
+def test_probe_verdict_is_strict_about_failed_and_unimplemented():
+    from infra.dev.provision_probe import _verdict
+    assert _verdict({"ecomm": {"nginx": "ready", "ssh": "ready"}}) == 0
+    assert _verdict({"ecomm": {"nginx": "failed"}}) == 1
+    assert _verdict({"ecomm": {"ssh": "unimplemented"}}) == 1
