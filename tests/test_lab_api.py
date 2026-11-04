@@ -455,3 +455,106 @@ def test_http_delete_releases_the_range_lease(client, users, migrated_db):
         row = db.execute(select(RangeLease).where(
             RangeLease.id == 1)).scalar_one()
         assert row.released_at is not None
+
+
+# --------------------------------------------------- exercise sessions ----
+def test_exercise_session_reuses_the_lab_deployment_without_cloning(eng):
+    """An exercise session is a durable handle on the SAME range: the lab's
+    home deployment. Nothing is cloned (the broker sees no new call), the
+    session resolves to that deployment, and the event says it was reuse."""
+    from srplatform.db.models import Deployment, Event, Lab
+    from srplatform.db.session import db as db_ctx
+    from srplatform.scenario_engine.env_deploy import deploy_environment
+    from srplatform import lab_service
+
+    bp, broker = _env(eng)
+    lab_id = _service_lab(eng)
+    with db_ctx() as db:
+        lab = db.get(Lab, lab_id)
+        home = lab_service.home_session(db, lab)
+        deploy_environment(db, home.session_id, SCENARIO,
+                           {"environment": ENV_ID}, broker)
+        lab_service.reflect_launch(db, home.session_id)
+        deploys_before = len(db.scalars(select(Deployment)).all())
+        calls_before = list(broker.calls)
+        home_resources = lab_service.session_resources(db, home.session_id)
+        assert len(home_resources) == 12
+
+        sess = lab_service.attach_exercise(db, lab, lab.owner_id,
+                                           name="drill")
+        db.commit()
+        assert sess.lab_id == lab_id and sess.status == "ready"
+        assert sess.scenario_id == SCENARIO
+        # no second clone: not one broker call, not one new deployment row
+        assert list(broker.calls) == calls_before
+        assert len(db.scalars(select(Deployment)).all()) == deploys_before
+        resolved = lab_service.deployment_for_session(db, sess.session_id)
+        assert resolved is not None and resolved.session_id == home.session_id
+        assert lab_service.session_resources(db, sess.session_id) == \
+            home_resources
+        view = lab_service.session_view(db, sess)
+        assert view["reuses_home_deployment"] is True
+        assert view["exercise"] == "drill"
+        ev = db.scalars(select(Event).where(
+            Event.session_id == sess.session_id,
+            Event.action_type == "session_attach")).first()
+        assert ev is not None and ev.payload["reused"] is True
+        assert ev.payload["reuses_session"] == str(home.session_id)
+
+
+def test_attach_refuses_a_pending_lab_and_a_non_member(eng):
+    """Fail closed on both sides: a lab that has not deployed its guests
+    cannot run an exercise, and only lab members may attach."""
+    from srplatform import lab_service
+    from srplatform.db.models import Lab
+    from srplatform.db.session import db as db_ctx
+    from srplatform.lab_service import LabError
+
+    lab_id = _service_lab(eng)
+    with db_ctx() as db:
+        lab = db.get(Lab, lab_id)
+        assert lab.state == "provisioning"
+        with pytest.raises(LabError) as err:
+            lab_service.attach_exercise(db, lab, lab.owner_id)
+        assert err.value.status == 409
+        assert err.value.detail["error"] == "lab_not_live"
+
+        lab.state = "active"
+        db.commit()
+        outsider = _owner(eng, "outsider")
+        with pytest.raises(LabError) as err:
+            lab_service.attach_exercise(db, lab, outsider)
+        assert err.value.status == 403
+        assert err.value.detail["error"] == "not_a_member"
+
+
+def test_http_exercise_attach_and_list(client, users, migrated_db,
+                                       test_db_url_owner):
+    lab = _http_lab(client, users["member"])
+    _make_ready(test_db_url_owner, lab["lab_id"])
+    r = client.post(f"/labs/{lab['lab_id']}/sessions",
+                    headers=users["member"], json={"name": "first drill"})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["lab_id"] == lab["lab_id"]
+    assert body["exercise"] == "first drill"
+    assert body["scenario_id"]
+
+    # the home session and the exercise are both visible to a member
+    listed = client.get(f"/labs/{lab['lab_id']}/sessions",
+                        headers=users["member"]).json()["sessions"]
+    ids = {s["session_id"] for s in listed}
+    assert body["session_id"] in ids
+    assert lab["home_session_id"] in ids
+
+    # an outsider cannot attach to (or read) the lab at all
+    client.post("/users", headers=users["op"],
+                json={"username": "violet", "password": "violet-testpw-9",
+                      "role": "member"})
+    tok = client.post("/auth/login",
+                      json={"username": "violet",
+                            "password": "violet-testpw-9"}).json()["token"]
+    r = client.post(f"/labs/{lab['lab_id']}/sessions",
+                    headers={"Authorization": f"Bearer {tok}"},
+                    json={"name": "sneak"})
+    assert r.status_code == 403, r.text

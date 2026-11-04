@@ -47,6 +47,10 @@ class PlanRequest(BaseModel):
     full: bool = False
 
 
+class ExerciseRequest(BaseModel):
+    name: str = "practice"
+
+
 # --------------------------------------------------------------- helpers ----
 def _error(e: lab_service.LabError) -> HTTPException:
     return HTTPException(e.status, e.detail)
@@ -352,3 +356,31 @@ def approve_reset(lab_id: uuid.UUID, plan_id: uuid.UUID,
         except Exception:  # noqa: BLE001 — the conflict is the real answer
             pass
         raise
+
+
+# ------------------------------------------------------- exercise sessions ---
+@router.post("/labs/{lab_id}/sessions", status_code=201)
+def attach_exercise(lab_id: uuid.UUID, body: ExerciseRequest,
+                    p: Principal = Depends(_principal), db: DbSession = None):
+    """Start an exercise session ON the lab's existing deployment.
+
+    No clone: the lab deployed its guests once (its home session), and an
+    exercise session is a durable handle on that SAME range, so members share
+    what they were actually given. Refused while the lab is not live.
+    """
+    lab, _role = _lab(db, p, lab_id)
+    try:
+        sess = lab_service.attach_exercise(db, lab, p.user_id, name=body.name)
+    except lab_service.LabError as e:
+        raise _error(e) from e
+    db.commit()
+    return lab_service.session_view(db, sess)
+
+
+@router.get("/labs/{lab_id}/sessions")
+def list_exercise_sessions(lab_id: uuid.UUID,
+                           p: Principal = Depends(_principal),
+                           db: DbSession = None):
+    lab, _role = _lab(db, p, lab_id)
+    return {"sessions": [lab_service.session_view(db, s)
+                         for s in lab_service.sessions_of(db, lab)]}

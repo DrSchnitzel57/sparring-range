@@ -312,6 +312,117 @@ def home_session(db, lab: Lab) -> SessionModel | None:
             SessionModel.started_at)).first()
 
 
+# --------------------------------------------------- exercise sessions ----
+#: A lab's guests are deployed ONCE (its home session). An exercise session is
+#: a durable handle on that SAME deployment — `sessions.lab_id` points at the
+#: lab, and NOTHING is cloned again: two members exercising during one lab
+#: share the range they were given, which is what makes reset/reset-proof
+#: comparisons possible at all.
+def sessions_of(db, lab: Lab) -> list[SessionModel]:
+    return list(db.scalars(select(SessionModel).where(
+        SessionModel.lab_id == lab.lab_id).order_by(
+            SessionModel.started_at)).all())
+
+
+def deployment_for_session(db, session_id) -> Deployment | None:
+    """The deployment a session RANGES on: its own first (a flat scenario
+    session owns its clone), else the lab's home deployment (an exercise
+    session reuses the lab). Never a second clone."""
+    own = _latest_deployment(db, session_id)
+    if own is not None:
+        return own
+    sess = db.get(SessionModel, session_id)
+    if sess is None or sess.lab_id is None:
+        return None
+    lab = db.get(Lab, sess.lab_id)
+    home = home_session(db, lab) if lab is not None else None
+    return None if home is None else _latest_deployment(db, home.session_id)
+
+
+def session_resources(db, session_id) -> list[dict]:
+    """Per-guest resource rows for a session (own deployment, else the lab's).
+    Empty is honest: a session with no deployment has no guests, not `[]`
+    meaning success."""
+    dep = deployment_for_session(db, session_id)
+    return [dict(r) for r in (dep.resources or [])] if dep is not None else []
+
+
+def attach_exercise(db, lab: Lab, user_id, *, name: str = "practice"
+                    ) -> SessionModel:
+    """Attach an exercise session to a LIVE lab. No clone: the lab's home
+    deployment IS the range, recorded on the event so a later reader can
+    prove it was reuse and not a second provision.
+
+    Fail-closed: a member of the lab only, and only once the lab is live —
+    an exercise against pending guests would grade nothing while looking
+    successful.
+    """
+    role = role_in(db, lab, user_id)
+    if role not in LAB_ROLES:
+        raise LabError(403, {"error": "not_a_member",
+                             "detail": f"user {user_id} is not a member of "
+                                       f"lab {lab.lab_id}"})
+    if lab.deleted_at is not None:
+        raise LabError(404, {"error": "lab_deleted",
+                             "detail": f"lab {lab.lab_id} is deleted"})
+    if lab.state not in _LIVE_LAB_STATES:
+        raise LabError(409, {"error": "lab_not_live",
+                             "detail": f"lab is {lab.state!r}; provision it "
+                                       f"before attaching an exercise"})
+    home = home_session(db, lab)
+    if home is None:
+        raise LabError(409, {"error": "no_home_session",
+                             "detail": "lab has no deployment session"})
+    dep = _latest_deployment(db, home.session_id)
+    scenario_id = lab.pins.get("scenario_id")
+    if not scenario_id:
+        raise LabError(409, {"error": "no_pinned_scenario",
+                             "detail": "lab pins carry no scenario id"})
+    sess = SessionModel(scenario_id=scenario_id, user_id=user_id,
+                        status="ready", lab_id=lab.lab_id,
+                        players={"exercise": name})
+    db.add(sess)
+    db.flush()
+    db.add(Event(session_id=sess.session_id, ts=_now(), actor=str(user_id),
+                 action_type="session_attach",
+                 payload={"lab_id": str(lab.lab_id), "exercise": name,
+                          "reuses_session": str(home.session_id),
+                          "deployment_id": str(dep.deployment_id)
+                          if dep is not None else None,
+                          "reused": dep is not None}))
+    db.flush()
+    return sess
+
+
+def session_view(db, sess: SessionModel) -> dict:
+    """One session as the lab API returns it: the range it ranges on and
+    whether that range is REUSE of a lab deployment."""
+    dep = deployment_for_session(db, sess.session_id)
+    home = None
+    if sess.lab_id is not None:
+        lab = db.get(Lab, sess.lab_id)
+        home = home_session(db, lab) if lab is not None else None
+    return {
+        "session_id": str(sess.session_id),
+        "lab_id": str(sess.lab_id) if sess.lab_id else None,
+        "scenario_id": sess.scenario_id,
+        "user_id": str(sess.user_id) if sess.user_id else None,
+        "status": sess.status,
+        "started_at": sess.started_at.isoformat() if sess.started_at else None,
+        "exercise": (sess.players or {}).get("exercise"),
+        "home_session_id": str(home.session_id) if home else None,
+        "reuses_home_deployment": bool(
+            dep is not None and home is not None
+            and dep.session_id == home.session_id),
+        "deployment": None if dep is None else {
+            "deployment_id": str(dep.deployment_id),
+            "status": dep.status,
+            "guests": len([r for r in (dep.resources or [])
+                           if r.get("state") == "created"]),
+        },
+    }
+
+
 # ----------------------------------------------------- deploy reflection ----
 def _guests(db, lab: Lab) -> list[LabGuest]:
     return db.scalars(select(LabGuest).where(
