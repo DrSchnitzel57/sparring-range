@@ -263,11 +263,15 @@ def install_command(*, disk: pathlib.Path, windows_iso: pathlib.Path,
     accel = ["-accel", "kvm"] if kvm else ["-accel", "tcg"]
     return [
         "qemu-system-x86_64", "-machine", "pc", *accel,
-        # hv_* enlightenments are what Windows Server 2022 expects on KVM;
-        # without them VBS/Hyper-V code inside NESTED KVM spins (the 1h
-        # black-screen stalls). Harmless for older guests.
-        "-cpu", ("host,hv_relaxed=on,hv_spinlocks=0x1fff,hv_vapic=on,"
-                 "hv_time=on") if kvm else "max",
+        # hv_* enlightenments are what Windows Server 2022 expects on KVM.
+        # hv_vapic is DELIBERATELY absent: live evidence 2026-11-04 — the
+        # install reached `specialize-done` (VBS and hypervisorlaunchtype
+        # already off) and then froze on the post-specialize boot with two
+        # vCPUs spinning and ZERO disk I/O for 40 minutes. That is the
+        # documented nested-KVM (Broadwell E5-2697A v4) VAPIC freeze; the
+        # relaxed-clock and spinlock enlightenments stay, hv_time for a
+        # build VM is not worth a second freeze.
+        "-cpu", ("host,hv_relaxed=on,hv_spinlocks=0x1fff") if kvm else "max",
         "-m", str(memory_mb), "-smp", str(smp),
         "-drive", f"file={disk},format=qcow2,if=ide,index=0",
         "-drive", f"file={windows_iso},media=cdrom,readonly=on,index=1",
