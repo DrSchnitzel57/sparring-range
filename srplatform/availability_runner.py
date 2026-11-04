@@ -135,10 +135,25 @@ class SshVantage:
     key_path: str = "/etc/sparring-range/keys/runner"
     known_hosts: str | None = None
     ssh: str = "ssh"
+    #: The replica CA (PUBLIC anchor only). When supplied, the very first
+    #: transaction writes it to the vantage and exports SSL_CERT_FILE, so
+    #: `verify_tls_against_lab_ca` verifies against the lab CA on the SAME
+    #: default trust path Python uses — never by switching verification off.
+    trust_pem: bytes | None = None
+    trust_path: str = "/etc/sr-lab/lab-ca.crt"
 
     def run(self, plan: dict, *, env: dict[str, str]) -> VantageSample:
         exports = "".join(f"export {k}={shlex.quote(str(v))}\n"
                           for k, v in sorted(env.items()))
+        if self.trust_pem:
+            import base64
+            blob = base64.b64encode(self.trust_pem).decode()
+            exports += (
+                "install -d -m 755 $(dirname " + shlex.quote(self.trust_path) + ")\n"
+                "printf '%s' '" + blob + "' | base64 -d > "
+                + shlex.quote(self.trust_path) + "\n"
+                "chmod 644 " + shlex.quote(self.trust_path) + "\n"
+                "export SSL_CERT_FILE=" + shlex.quote(self.trust_path) + "\n")
         cmd = [self.ssh, "-o", "BatchMode=yes",
                "-o", "StrictHostKeyChecking=yes",
                "-o", f"ConnectTimeout=10"]

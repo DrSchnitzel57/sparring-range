@@ -75,8 +75,17 @@ def _main() -> int:
         known_hosts = f.name
     else:
         known_hosts = known or None
+    #: TLS checks verify against the replica CA on the vantage's default
+    #: trust path; the public anchor travels with the first transaction.
+    try:
+        from srplatform.labs.pki import LabPKI, pki_directory
+        trust = LabPKI(pki_directory(s)).trust_pem()
+    except Exception as exc:  # noqa: BLE001 — checks then verify against system
+        print(f"lab CA unavailable ({type(exc).__name__}: {exc}); "
+              "TLS checks verify against the vantage's system trust")
+        trust = None
     transport = SshVantage(host=vantage["ip"], user="sr", key_path=key,
-                           known_hosts=known_hosts)
+                           known_hosts=known_hosts, trust_pem=trust)
     from srplatform.availability_plan import plan_transactions
     from srplatform.credentials import DEFAULT_PATH, resolver
 

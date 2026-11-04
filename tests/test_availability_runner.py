@@ -242,3 +242,49 @@ def test_a_closed_mail_port_is_real_downtime_too():
     cred_env = {name: "prb:pass" for name in plan["credential_env"]}
     rc, err = _run_plan_script(script, env=cred_env)
     assert rc == 3, (rc, err[-500:])
+
+
+def test_ssh_vantage_ships_the_lab_ca_and_exports_the_same_path(monkeypatch):
+    seen = {}
+
+    class Proc:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+
+    def fake_run(cmd, **kw):
+        seen["input"] = kw["input"].decode()
+        seen["cmd"] = cmd
+        return Proc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ca = b"-----BEGIN CERTIFICATE-----\nLAB\n-----END CERTIFICATE-----\n"
+    vantage = SshVantage(host="172.20.240.20", trust_pem=ca)
+    plan = {"timeout_s": 15, "script": "true", "credential_env": []}
+    vantage.run(plan, env={})
+    text = seen["input"]
+    assert "SR-LAB" not in text             # no invented flag
+    assert "/etc/sr-lab/lab-ca.crt" in text
+    assert "export SSL_CERT_FILE=/etc/sr-lab/lab-ca.crt" in text
+    # the PEM travels base64-encoded on stdin, never as an argv shell word
+    import base64
+    assert base64.b64encode(ca).decode() in text
+    assert not any("BEGIN CERTIFICATE" in p for p in seen["cmd"])
+
+
+def test_ssh_vantage_without_a_ca_touches_no_trust_path(monkeypatch):
+    seen = {}
+
+    class Proc:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+
+    def fake_run(cmd, **kw):
+        seen["input"] = kw["input"].decode()
+        return Proc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    SshVantage(host="172.20.240.20").run(
+        {"timeout_s": 5, "script": "true", "credential_env": []}, env={})
+    assert "SSL_CERT_FILE" not in seen["input"]
