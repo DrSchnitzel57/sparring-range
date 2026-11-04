@@ -350,7 +350,7 @@ WORKFLOW_ALLOWED_TOP = {"name", "on", "permissions", "env", "defaults",
                         "concurrency", "jobs"}
 WORKFLOW_ALLOWED_JOB = {"needs", "name", "if", "runs-on", "steps", "strategy",
                         "timeout-minutes", "env", "permissions", "container",
-                        "services", "continue-on-error", "timeout-minutes"}
+                        "services", "continue-on-error", "outputs"}
 WORKFLOW_ALLOWED_STEP = {"id", "name", "uses", "with", "run", "env",
                          "continue-on-error", "timeout-minutes", "if",
                          "working-directory", "shell"}
