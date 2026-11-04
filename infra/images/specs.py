@@ -11,25 +11,17 @@ from __future__ import annotations
 GUEST_BUDGETS: dict[str, dict] = {
     "attacker": {"vcpus": 2, "memory_mb": 2048, "disk_gb": 16,
                  "template_vmid": 9005},
-    "mojang-web-local": {"vcpus": 2, "memory_mb": 2048, "disk_gb": 12,
-                         "template_vmid": 9011},
-    "mojang-web-db": {"vcpus": 2, "memory_mb": 2048, "disk_gb": 16,
-                      "template_vmid": 9012},
 }
 
-# Template VMID -> guest role (new mojang IDs; legacy snapshots preserved
-# separately and are NOT release-ready without manifests).
+# Template VMID -> guest role.
+#: No flat preset declares guests yet: the environment lane brings its own
+#: blueprint. Kept as a dict because `aggregate_for` is generic.
+SCENARIO_GUESTS: dict[str, tuple[str, ...]] = {}
+
 TEMPLATE_ROLES: dict[int, str] = {
     9005: "attacker",
-    9011: "mojang-web-local",
-    9012: "mojang-web-db",
 }
 
-# Scenario -> expected guest roles (attacker is always fresh per session).
-SCENARIO_GUESTS: dict[str, tuple[str, ...]] = {
-    "mojang-web-01": ("attacker", "mojang-web-local"),
-    "mojang-web-db-01": ("attacker", "mojang-web-local", "mojang-web-db"),
-}
 
 RANGE_TOTALS_DB = {"vcpus": 6, "memory_mb": 6144, "disk_gb": 44}
 

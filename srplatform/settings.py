@@ -260,8 +260,6 @@ class Settings(BaseSettings):
     template_vmid_linux: int = 9004
     # Paired 03+04 Mojang guests (new IDs; legacy snapshots preserved).
     template_vmid_attacker: int = 9005
-    template_vmid_mojang_web: int = 9011
-    template_vmid_mojang_db: int = 9012
 
     # --- LLM serving (OpenAI-compatible; swappable per Part 6.1) ---
     llm_base_url: str = "http://localhost:8001/v1"

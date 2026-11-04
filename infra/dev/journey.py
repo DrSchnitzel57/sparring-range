@@ -40,7 +40,7 @@ import httpx
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 
-PRESETS = ("mojang-web-01", "mojang-web-db-01")
+PRESETS = ("quick-win-01", "web-foothold-01")   # flat scenarios that remain
 
 # The match options the product must cover (plan 15): both presets, the three
 # durations, the two modes, both start conditions and the inject toggle.  The

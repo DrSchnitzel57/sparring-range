@@ -23,7 +23,7 @@ def test_option_matrix_covers_every_documented_option():
     assert {o["start_condition"] for o in opts} == {"network-entry",
                                                    "assumed-breach"}
     assert {o["injects_enabled"] for o in opts} == {True, False}
-    assert journey.PRESETS == ("mojang-web-01", "mojang-web-db-01")
+    assert journey.PRESETS == ("quick-win-01", "web-foothold-01")
 
 
 def test_journey_creates_a_session_for_every_option(monkeypatch):

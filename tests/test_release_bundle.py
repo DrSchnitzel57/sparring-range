@@ -37,7 +37,7 @@ def _build(tmp_path: pathlib.Path, *, roles: bool = True) -> pathlib.Path:
     base = _fake_image(tmp_path / "appliance-base.qcow2")
     role_images = {}
     if roles:
-        for role in ("attacker", "mojang-web-local", "mojang-web-db"):
+        for role in ("attacker",):
             role_images[role] = _fake_image(tmp_path / f"{role}.qcow2", 2048)
     out = tmp_path / "bundle"
     bundle_mod.build(out, base_image=base, role_images=role_images,
@@ -134,7 +134,10 @@ def test_bundle_renders_a_valid_operator_manifest(tmp_path):
         internal_url="http://127.0.0.1:8000",
         ingest_url="https://10.66.0.1:8443",
         access_keys=_operator_keys(tmp_path),
-        model_api_key_file=str(_model_key(tmp_path)))
+        model_api_key_file=str(_model_key(tmp_path)),
+        # the bundle now carries ONE role image (Mojang retired), so the
+        # manifest can declare at most 4 guests; the appliance adds the rest
+        max_guests=4)
     assert info["installation_id"] == "4f0e7a1c-8a59-4a4e-9b5d-74f0e7a1c999"
     raw = json.loads(out_manifest.read_text())
     assert raw["network"]["range_cidr"] == "10.66.0.0/24"
@@ -145,16 +148,12 @@ def test_bundle_renders_a_valid_operator_manifest(tmp_path):
 
     parsed = ApplianceManifest.from_dict(raw, verify_images=True)
     assert parsed.installation_id == raw["installation_id"]
-    assert sorted(parsed.images) == ["attacker", "mojang-web-db",
-                                     "mojang-web-local"]
+    assert sorted(parsed.images) == ["attacker"]
     # every role points at ITS OWN artifact, and the paths are absolute
     for role, image in parsed.images.items():
         assert pathlib.Path(image.path).is_absolute(), (role, image.path)
         assert image.path.endswith(f"{role}.qcow2"), (role, image.path)
-    # the role images carry the canonical template ids and budgets
     assert parsed.images["attacker"].template_id == 9005
-    assert parsed.images["mojang-web-local"].template_id == 9011
-    assert parsed.images["mojang-web-db"].template_id == 9012
 
 
 def test_bundle_cli_verify_and_manifest(tmp_path):

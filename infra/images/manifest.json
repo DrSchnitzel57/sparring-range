@@ -13,17 +13,12 @@
   },
   "build_inputs": [
     "infra/cloud-init/attacker.yaml",
-    "infra/cloud-init/mojang-web-db.yaml",
-    "infra/cloud-init/mojang-web-local.yaml",
     "infra/dev/qemu_guest.py",
     "infra/images/guest_build.py",
     "infra/images/guest_seed.py",
     "infra/images/guest_userdata.py",
     "infra/images/manifest.json",
     "infra/images/packages-24.04.txt",
-    "scenarios/mojang-seeds.json",
-    "scenarios/mojang-web-01.yaml",
-    "scenarios/mojang-web-db-01.yaml",
     "telemetry/auditd.rules",
     "telemetry/install.sh",
     "telemetry/shipper.py",
@@ -43,37 +38,6 @@
         "supervisor"
       ],
       "template_vmid": 9005,
-      "vcpus": 2
-    },
-    "mojang-web-db": {
-      "description": "Mojang web+DB tier (MySQL 8.0, PyMySQL app reads).",
-      "disk_gb": 16,
-      "memory_mb": 2048,
-      "services": [
-        "nginx",
-        "mojang-web",
-        "mysql",
-        "sshd",
-        "sparring-shipper",
-        "auditd",
-        "ufw"
-      ],
-      "template_vmid": 9012,
-      "vcpus": 2
-    },
-    "mojang-web-local": {
-      "description": "Mojang web tier with local data (no MySQL).",
-      "disk_gb": 12,
-      "memory_mb": 2048,
-      "services": [
-        "nginx",
-        "mojang-web",
-        "sshd",
-        "sparring-shipper",
-        "auditd",
-        "ufw"
-      ],
-      "template_vmid": 9011,
       "vcpus": 2
     }
   },

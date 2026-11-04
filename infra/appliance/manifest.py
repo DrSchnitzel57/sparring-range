@@ -455,7 +455,7 @@ class ApplianceManifest:
             if verify_images:
                 image.verify_file()
             images[str(role)] = image
-        required_roles = {"attacker", "mojang-web-local", "mojang-web-db"}
+        required_roles = {"attacker"}
         missing_roles = required_roles - set(images)
         if missing_roles:
             raise _bad(f"images missing required roles {sorted(missing_roles)}")

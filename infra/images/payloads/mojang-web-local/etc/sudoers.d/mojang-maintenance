@@ -1,5 +1,0 @@
-# DELIBERATE LAB FLAW (paired 03+04 + pilot step 1): tightly scoped sudo
-# rule letting the limited web-user run the ONE maintenance helper — which
-# itself trusts a web-user-writable directory on PATH (see the helper's
-# header). Documented fix: remove this file; services stay ready.
-web-user ALL=(root) NOPASSWD: /usr/local/bin/mojang-maintenance

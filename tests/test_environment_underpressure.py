@@ -259,8 +259,7 @@ def test_environment_scenario_loads_with_pins():
 
 
 def test_legacy_scenarios_still_validate_as_flat():
-    for sid in ("mojang-web-01", "mojang-web-db-01", "db-exfil-01",
-                "web-foothold-01", "quick-win-01"):
+    for sid in ("db-exfil-01", "web-foothold-01", "quick-win-01"):
         spec = load_scenario(sid)
         assert spec.get("environment") is None
         assert spec["topology"]["hosts"]
@@ -298,8 +297,8 @@ def test_scenario_v2_rejects():
         parse_scenario(yaml.safe_dump(ghost))
     # legacy scenario may not use availability
     legacy = yaml.safe_load(
-        (REPO / "scenarios" / "mojang-web-01.yaml").read_text())
-    legacy["scoring"]["availability"] = ["store-catalog-https"]
+        (REPO / "scenarios" / "quick-win-01.yaml").read_text())
+    legacy.setdefault("scoring", {})["availability"] = ["store-catalog-https"]
     with pytest.raises(ScenarioError, match="requires an"):
         parse_scenario(yaml.safe_dump(legacy))
 

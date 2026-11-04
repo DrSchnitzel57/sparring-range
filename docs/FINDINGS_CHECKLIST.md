@@ -679,3 +679,25 @@ a mail, run a Splunk search, SELECT from the seeded DB) run FROM the scoring
 vantage; blue checks read the host's own state (nginx/sshd running, firewall
 on, rogue admin, flag file). A check that could not run is `unknown`, never a
 defender zero, and a refused port is now real downtime (`failed`).
+
+### Mojang retired (2026-11-04, operator decision)
+
+"I don't care to preserve any of the old images or testing." The flat Mojang
+preset is gone end to end, not hidden behind skips:
+
+- scenarios `mojang-web-01`, `mojang-web-db-01` and `mojang-seeds.json`;
+- its verifiers (`HttpContent`, `MysqlRows`), cloud-init files and image
+  payloads, and the whole guest-contract/image-acceptance test files;
+- template ids 9011/9012 from settings, the image spec table, the broker
+  fixture policy, the control-env renderer, the bundle role list, the shipped
+  example manifests and the journey preset matrix;
+- the two goldens ON THE APPLIANCE (manifest + policy + bytes, ~4.6 GiB).
+
+What remains and was re-pointed at live roles: `ecomm` (9103) and `webmail`
+(9111) keep the manifest/bundle fixtures honest, and the attacker (9005) is
+still required because the flat test lane and the environment lane both use
+it. `test_injects`/`test_worker_supervisor` keep internal mojang strings only
+where they name fixtures, not product artifacts.
+
+This is compatibility retirement, not a contract change: authority, isolation,
+append-only evidence and fail-closed obligations are untouched.

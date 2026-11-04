@@ -245,8 +245,10 @@ def _env_lines(values: list[tuple[str, object]]) -> str:
 
 def render_control_env(m: ApplianceManifest, *, etc: pathlib.Path = DEFAULT_ETC,
                        prefix: pathlib.Path = DEFAULT_PREFIX) -> str:
+    #: Only roles the INSTALLER writes into the control env. Mojang is
+    # retired (2026-11-04); the environment lane carries its own image set.
     by_role = {role: m.image_for_role(role).template_id for role in
-               ("attacker", "mojang-web-local", "mojang-web-db")}
+               ("attacker",)}
     return _env_lines([
         ("SR_ENV", "production"),
         ("SR_BROKER_SOCKET", m.broker_socket),
@@ -295,8 +297,6 @@ def render_control_env(m: ApplianceManifest, *, etc: pathlib.Path = DEFAULT_ETC,
         ("SR_DEPLOY_VMID_BASE", "200"),
         ("SR_DEPLOY_CLONE_MODE", "full"),
         ("SR_TEMPLATE_VMID_ATTACKER", by_role["attacker"]),
-        ("SR_TEMPLATE_VMID_MOJANG_WEB", by_role["mojang-web-local"]),
-        ("SR_TEMPLATE_VMID_MOJANG_DB", by_role["mojang-web-db"]),
         ("SR_LLM_BASE_URL", m.model_base_url),
         ("SR_LLM_MODEL_RED", m.model_alias),
         ("SR_LLM_MODEL_COACH", m.model_alias),

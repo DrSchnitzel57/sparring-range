@@ -377,8 +377,7 @@ def policy_from_settings(s) -> BrokerPolicy:
     raw["node"] = s.deploy_node
     raw["templates"] = sorted({s.template_vmid_web, s.template_vmid_win_dc,
                                s.template_vmid_win10, s.template_vmid_linux,
-                               s.template_vmid_attacker, s.template_vmid_mojang_web,
-                               s.template_vmid_mojang_db})
+                               s.template_vmid_attacker})
     raw["vmid_range"] = [s.deploy_vmid_base, s.deploy_vmid_base + 89]
     raw["nic"] = {"bridge": s.range_bridge, "vlan": s.range_vlan}
     raw["provision"] = {"cidr": s.range_cidr, "gateway": s.range_gateway}

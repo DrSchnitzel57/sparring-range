@@ -276,7 +276,7 @@ def test_host_role_policy_and_annotate():
     assert hr.host_role("attacker", None) == "attacker"
     assert hr.host_role("attacker", 9005) == "attacker"     # spec wins, same
     assert hr.host_role("web01", 9001) == "target"          # legacy template
-    assert hr.host_role("web01", 9011) == "mojang-web-local"
+    assert hr.host_role("web01", 9005) == "attacker"
     e = {"host": "attacker", "template_vmid": 9005, "ssh": "ssh ... -l tok",
          "login_token": "tok"}
     hr.annotate(e)
