@@ -733,3 +733,18 @@ Incident: the appliance hung during the restarted Windows 2019 build (leftover
 nbd-backed build artifacts from the killed first build). Rebooted at 03:38;
 redeployed the repo HEAD to `/opt/sparring-range` (the installed copy still
 required mojang roles), released the broker latch, all `sr-*` units active.
+
+### Availability contracts corrected + console browser path (2026-11-04, later)
+
+- The rendered plans dialed each guest's PRIVATE address although every check
+  title says "through the public VIP"; the vantage has no declared route for
+  that shortcut. Plans now resolve host/port from the matching
+  `public_forward` (VIP + published port; mail uses 993/995 with Dovecot TLS);
+  a regression test asserts no plan dials a guest address directly.
+- The replica CA is shipped to the vantage with each window and exported as
+  `SSL_CERT_FILE`, so `verify_tls_against_lab_ca` verifies on the default
+  Python trust path; the CA anchor is public, the key never leaves the
+  controller state directory.
+- Browser console: `/api/console/{token}/stream` WebSocket relays RFB through
+  the SAME socket-tested relay; nginx renders Upgrade headers for /api/.
+  No browser page is built yet (remaining slice).
