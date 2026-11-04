@@ -26,6 +26,7 @@ import os
 import pathlib
 import pwd
 import re
+import secrets
 import shutil
 import subprocess
 import time
@@ -414,6 +415,9 @@ class LibvirtBackend:
                 "overlay": str(overlay), "seed": str(seed),
                 "serial": str(serial), "net0": self.policy.net0_expected,
                 "ipconfig0": "", "tags": "",
+                # The console gateway needs a password the guest never sees;
+                # VNC caps it at 8 characters, so hex(4) it is.
+                "console_password": secrets.token_hex(4),
                 "accelerator": self.accelerator,
                 "fixture_mode": self.cfg.fixture_mode,
                 "created_at": time.time(),
@@ -840,6 +844,56 @@ class LibvirtBackend:
                 pass
         return "".join(chunks)
 
+    def console_access(self, node: str, vmid: int) -> dict:
+        """The guest's VNC console endpoint, for guests with no sshd.
+
+        Windows and network appliances are only reachable this way; a member
+        sees the real console, not a shell. The port comes from the LIVE
+        domain XML (libvirt assigns it, the config says `autoport`), so a
+        stopped or crashed guest is honestly "no console yet", never a
+        connection to a port that happens to be open.
+        """
+        self._require_node(node)
+        dom, _ = self._find(int(vmid), node)
+        if dom is None:
+            raise BackendUnavailable(f"VMID {vmid} is absent")
+        try:
+            active = dom.isActive()
+            xml = dom.XMLDesc(0) if active else ""
+        except Exception as exc:  # noqa: BLE001
+            raise BackendUnavailable(
+                f"cannot read domain XML for VMID {vmid}: {exc}") from exc
+        if not active:
+            raise BackendUnavailable(
+                f"VMID {vmid} is not running — no console to attach to")
+        import xml.etree.ElementTree as ET
+
+        try:
+            root = ET.fromstring(xml)
+        except ET.ParseError as exc:
+            raise BackendUnavailable(
+                f"VMID {vmid}: unparsable domain XML: {exc}") from exc
+        graphics = root.find("./devices/graphics")
+        if graphics is None or graphics.get("type") != "vnc":
+            raise BackendUnavailable(
+                f"VMID {vmid} exposes no VNC console (graphics="
+                f"{None if graphics is None else graphics.get('type')!r})")
+        try:
+            port = int(graphics.get("port") or -1)
+        except ValueError:
+            port = -1
+        if port < 1:
+            raise BackendUnavailable(
+                f"VMID {vmid}: console port not assigned yet")
+        desc = self._desc(dom) or {}
+        password = str(desc.get("console_password") or "")
+        if not password:
+            raise BackendUnavailable(
+                f"VMID {vmid}: no console password recorded")
+        hint = str(desc.get("name") or "")
+        return {"type": "vnc", "host": "127.0.0.1", "port": port,
+                "password": password, "name": hint}
+
     def guest_exec(self, node: str, vmid: int, argv: list[str],
                    timeout_s: float = 30.0) -> dict:
         """Run ARGV inside the guest through its own agent (guest-exec).
@@ -1000,6 +1054,8 @@ class LibvirtBackend:
     <channel type="unix">
       <target type="virtio" name="org.qemu.guest_agent.0"/>
     </channel>
+    <graphics type="vnc" autoport="yes" listen="127.0.0.1"
+              passwd="{escape(desc.get("console_password") or "")}"/>
     <console type="pty"/>
   </devices>
 </domain>

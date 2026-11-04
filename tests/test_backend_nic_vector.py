@@ -320,3 +320,45 @@ def test_clone_refuses_a_tampered_golden_although_boot_did_not_hash(tmp_path,
 
     with pytest.raises(B.ImageIntegrityError, match="sha256 mismatch"):
         backend.clone_and_wait(m.installation_id, 9005, 240, "sr-env-vm")
+
+
+def test_the_console_is_read_from_the_LIVE_xml_and_needs_a_running_guest(tmp_path,
+                                                                       monkeypatch):
+    """Windows/appliances are only reachable through VNC. The port exists only
+    while libvirt has assigned one (autoport), so a stopped guest must be
+    "no console yet", never a dial to a port that happens to answer."""
+    m_raw = _manifest(tmp_path, verify_files=True)
+    m = ApplianceManifest.from_dict(m_raw, verify_images=False,
+                                    verify_model_key=False)
+    policy = AppliancePolicy.from_manifest(m)
+    backend = B.LibvirtBackend(m, policy, B.BackendConfig(allow_tcg=True))
+
+    live_xml = ('<domain><devices><graphics type="vnc" port="5903" '
+                'listen="127.0.0.1"/></devices>'
+                '<description>SRAPPLIANCE:{"vmid": 210, "name": "sr-env-vm", '
+                '"console_password": "a1b2c3d4"}</description></domain>')
+    dom = FakeDom(live_xml.replace("&quot;", '"'), active=True)
+    monkeypatch.setattr(backend, "_find", lambda *a: (dom, {}))
+    out = backend.console_access(m.installation_id, 210)
+    assert out["port"] == 5903 and out["password"] == "a1b2c3d4"
+    assert out["host"] == "127.0.0.1" and out["type"] == "vnc"
+
+    dom.active = False
+    with pytest.raises(B.BackendUnavailable, match="not running"):
+        backend.console_access(m.installation_id, 210)
+
+
+def test_the_domain_xml_asks_for_a_patched_console(tmp_path):
+    """A defined domain must request VNC on loopback with a password; without
+    it no console gateway can ever attach to a Windows guest."""
+    m = ApplianceManifest.from_dict(_manifest(tmp_path, verify_files=True),
+                                    verify_images=False,
+                                    verify_model_key=False)
+    policy = AppliancePolicy.from_manifest(m)
+    backend = B.LibvirtBackend(m, policy, B.BackendConfig(allow_tcg=True))
+    desc = {"vmid": 210, "node": m.installation_id, "name": "sr-env-vm",
+            "overlay": "/tmp/x.qcow2", "seed": "/tmp/seed.iso",
+            "serial": "/tmp/serial.log", "console_password": "a1b2c3d4"}
+    xml = backend._domain_xml(desc, m.images["attacker"])
+    assert 'type="vnc"' in xml and 'listen="127.0.0.1"' in xml
+    assert 'passwd="a1b2c3d4"' in xml and 'autoport="yes"' in xml

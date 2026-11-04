@@ -20,7 +20,7 @@ from .service import BrokerService
 # (the killswitch must reach cessation); release_latch and enroll are NOT.
 CONTROL_OPS = frozenset({
     "lookup_vm", "lookup_config", "try_lookup_config", "read_config",
-    "read_host_key", "guest_exec",
+    "read_host_key", "guest_exec", "console_access",
     "vm_status", "inventory", "latch_status", "next_vmid", "clone_and_wait",
     "artifact_for_template", "template_catalog",
     "set_config", "start_and_wait", "stop", "stop_and_confirm",

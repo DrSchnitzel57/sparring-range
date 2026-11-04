@@ -315,6 +315,22 @@ class FakeBackend:
             time.sleep(max(0.05, min(float(poll_s),
                                      deadline - time.monotonic())))
 
+    def console_access(self, node: str, vmid: int) -> dict:
+        """Scripted VNC endpoint; absent/stopped guests answer like the
+        production adapter (UNKNOWN, never a port that happens to be free)."""
+        self._record("console_access", node=node, vmid=int(vmid))
+        self._maybe_fail("console_access", int(vmid))
+        v = self._entry(vmid)
+        if v is None:
+            raise BackendUnavailable(f"VMID {vmid} is absent")
+        if str(v.get("status", "stopped")) != "running":
+            raise BackendUnavailable(
+                f"VMID {vmid} is not running — no console to attach to")
+        return {"type": "vnc", "host": "127.0.0.1",
+                "port": 5900 + (int(vmid) % 400),
+                "password": v.get("console_password", "pw123456"),
+                "name": v.get("name", "")}
+
     def guest_exec(self, node: str, vmid: int, argv: list[str],
                    timeout_s: float = 30.0) -> dict:
         """The agent channel for a guest with no sshd (Windows verifiers).

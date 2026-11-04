@@ -202,6 +202,39 @@ class BrokerService:
         raise _BU(f"host-key for VMID {vmid} never stabilized — refusing "
                   f"to pin a transient")
 
+    def console_access(self, node: str, vmid: int, *,
+                       session_id: str | None = None,
+                       generation: str | int = 1) -> dict:
+        """The VNC endpoint of an OWNED guest (Windows/appliances: no sshd).
+
+        Same discipline as every other typed door: ownership AND generation
+        are verified before the read; the password is returned to the caller
+        and NEVER written to the audit log (an audit that holds secrets is
+        not evidence, it is a leak).
+        """
+        self._require_unlatched("console_access")
+        self._node(node)
+        self.policy.check_vmid(int(vmid))
+        with self._op_lock:
+            claim = self._active_claim(int(vmid), session_id)
+            if str(claim.get("generation", 1)) != str(generation):
+                raise BrokerConflict(
+                    f"VMID {vmid} is generation {claim.get('generation')!r}, "
+                    f"not {generation!r} — refusing a stale console")
+            try:
+                out = self.backend.console_access(node, int(vmid))
+            except (BrokerUnavailable, BackendGone) as e:
+                raise BrokerUnavailable(str(e)) from e
+            except Exception as e:  # noqa: BLE001 — uncertain, retain
+                self.ledger.add_obligation("console-access-uncertain",
+                                           int(vmid), str(e)[:300])
+                raise BrokerUnavailable(
+                    f"console access uncertain for VMID {vmid}: {e}") from e
+            self.ledger.audit("console-access", {
+                "vmid": int(vmid), "port": out.get("port"),
+                "name": out.get("name")})
+            return out
+
     def guest_exec(self, node: str, vmid: int, argv: list[str], *,
                    session_id: str | None = None,
                    generation: str | int = 1,

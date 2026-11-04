@@ -394,11 +394,15 @@ def test_images_host_key_guest_read_only_allowlisted_owned_pinned(tmp_path):
         raise AssertionError("non-allowlisted key path was not refused")
     except BackendUnavailable:
         pass
-    # No exec channel exists on the backend or broker surface.
-    assert not hasattr(http, "guest_exec")
-    assert not hasattr(service, "guest_exec")
+    # The broker's EXEC channel exists now (typed guest_exec, added for the
+    # Windows verifier lane: those goldens carry no sshd, so evidence can
+    # only come from the guest agent). It is generation-bound and audited
+    # like every other door - see test_authority_boundary's guest_exec
+    # cases - and the allowlisted-read discipline above is unchanged.
+    assert hasattr(http, "guest_exec")
+    assert hasattr(service, "guest_exec")
     from infra.broker import server
-    assert "guest_exec" not in server.CONTROL_OPS
+    assert "guest_exec" in server.CONTROL_OPS
     assert "read_host_key" in server.CONTROL_OPS
     # Cross-session and stale-generation reads are refused.
     try:

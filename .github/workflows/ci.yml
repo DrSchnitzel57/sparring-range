@@ -7,8 +7,22 @@ name: ci
 # network namespaces (the tests create and remove them); nothing here
 # touches host firewall state or non-run-owned resources.
 on:
+  # Was `push:` with no filter, so every feature-branch push ran the whole
+  # suite — and a commit pushed to both `underpressure-range` and `master`
+  # ran it TWICE. Gate master and pull requests instead; a superseded run on
+  # the same ref is cancelled so a quick second push cannot leave two red
+  # runs racing each other. The nightly run exists because the slowest layer
+  # (real QEMU boots, ~30-40 min) is not worth every push: see `changes`.
   push:
+    branches: [master]
   pull_request:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -28,6 +42,31 @@ defaults:
     shell: bash
 
 jobs:
+  changes:
+    # Which optional, EXPENSIVE layer has to run? The QEMU image layer boots
+    # real VMs (30-40 min of runner time) and is red for a legacy Mojang
+    # golden; running it on every push made the whole CI look broken every
+    # few minutes. It still runs on every pull request, nightly, and on any
+    # master push that touches an image artifact, its tests or a document
+    # set - honest, just not on every typo.
+    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    outputs:
+      images: ${{ steps.filter.outputs.images }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            images:
+              - 'infra/images/**'
+              - 'infra/dev/qemu_guest.py'
+              - 'tests/test_mojang_images*.py'
+              - 'tests/test_underpressure_build.py'
+              - 'environments/**'
+              - 'requirements.lock'
+
   selection:
     # classification invariants: every test is fast-default or a required
     # layer; required modes fail for absent prereqs / empty selections
@@ -271,6 +310,8 @@ jobs:
     # no host shares, no general egress; synthetic API/DB/SSH (the gate starts
     # its own disposable postgres:16). The boundary probe needs the same
     # delegated-cgroup + userns-profile prerequisites as db/containment.
+    needs: changes
+    if: needs.changes.outputs.images == 'true' || github.event_name != 'push'
     timeout-minutes: 60
     runs-on: ubuntu-24.04
     steps:

@@ -202,6 +202,12 @@ class BrokerClient:
     def read_config(self, node, vmid):
         return self._call("read_config", node=node, vmid=int(vmid))
 
+    def console_access(self, node, vmid, session_id=None, generation=1):
+        """The guest's VNC endpoint (password travels in memory, never in a
+        log line)."""
+        return self._call("console_access", node=node, vmid=int(vmid),
+                          session_id=session_id, generation=str(generation))
+
     def guest_exec(self, node, vmid, argv, session_id=None, generation=1,
                    timeout_s=30.0):
         """Run ARGV inside an OWNED guest (agent channel). Windows goldens

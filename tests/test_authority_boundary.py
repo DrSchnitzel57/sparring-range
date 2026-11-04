@@ -1090,3 +1090,40 @@ def test_an_exec_the_agent_never_accepted_settles_itself(tmp_path):
         "guest agent on VMID 210 did not accept guest-exec")
     assert service.release_latch("operator")["released"] is True
     assert service.ledger.open_obligations() == []
+
+
+# --------------------------------------------------------------------------- #
+# 5e. console_access: the only door into a guest with no sshd (Windows)       #
+# --------------------------------------------------------------------------- #
+
+def test_console_access_never_puts_the_password_in_the_audit(tmp_path):
+    client, service, http = _mk(tmp_path)
+    _clone(client)
+    client.start_and_wait(NODE, 210)
+    http.vms[210]["console_password"] = "a1b2c3d4"
+    out = client.console_access(NODE, 210, session_id="sess-1", generation="g1")
+    assert out["type"] == "vnc" and out["port"] > 5900
+    assert out["password"] == "a1b2c3d4"
+    # an audit that holds secrets is a leak, not evidence
+    tail = repr(service.ledger.audit_tail(10))
+    assert "a1b2c3d4" not in tail
+    assert "console-access" in tail
+
+
+def test_console_of_a_stopped_guest_is_unavailable_not_a_dead_port(tmp_path):
+    from infra.broker.errors import BrokerUnavailable
+
+    client, service, http = _mk(tmp_path)
+    _clone(client)                      # stopped
+    with pytest.raises(BrokerUnavailable, match="not running"):
+        client.console_access(NODE, 210, session_id="sess-1", generation="g1")
+
+
+def test_a_stale_generation_cannot_open_a_rebuilt_guests_console(tmp_path):
+    from infra.broker.errors import BrokerConflict
+
+    client, service, http = _mk(tmp_path)
+    _clone(client)
+    client.start_and_wait(NODE, 210)
+    with pytest.raises(BrokerConflict, match="stale console"):
+        client.console_access(NODE, 210, session_id="sess-1", generation="g2")

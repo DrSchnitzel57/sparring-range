@@ -18,8 +18,9 @@ Nothing here claims success that the evidence does not show:
 from __future__ import annotations
 
 import hashlib
+import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 
@@ -392,6 +393,116 @@ def attach_exercise(db, lab: Lab, user_id, *, name: str = "practice"
                           "reused": dep is not None}))
     db.flush()
     return sess
+
+
+# ------------------------------------------------------------ consoles ----
+#: A console capability lives long enough for one practice session and no
+#: longer; the reset/teardown revocation path already kills LoginToken rows.
+CONSOLE_TTL_MINUTES = 60
+
+
+def _guest_generation(dep: Deployment, res: dict) -> str:
+    attempt = int(res.get("generation_attempt") or 0)
+    return str(dep.deployment_id) + (f":a{attempt}" if attempt else "")
+
+
+def mint_console(db, lab: Lab, guest: str, user_id, *, broker) -> dict:
+    """One capability token for one guest's VNC console.
+
+    The broker already checked that the guest is OWNED, RUNNING and of the
+    current generation; this only records the capability and returns the
+    port. The PASSWORD stays in the broker's answer and is never stored here:
+    the console proxy asks the broker again when it connects.
+    """
+    from . import verification_service
+
+    if lab.state not in _LIVE_LAB_STATES:
+        raise LabError(409, {"error": "lab_not_live",
+                             "detail": f"lab is {lab.state!r}"})
+    home = home_session(db, lab)
+    if home is None:
+        raise LabError(409, {"error": "no_home_session",
+                             "detail": "lab has no deployment session"})
+    dep = verification_service.active_deployment(db, home.session_id)
+    if dep is None:
+        raise LabError(409, {"error": "no_deployment",
+                             "detail": "lab has no READY deployment"})
+    row = next((dict(r) for r in (dep.resources or [])
+                if r.get("host") == guest and r.get("state") == "created"
+                and r.get("vmid")), None)
+    if row is None:
+        raise LabError(404, {"error": "guest_not_deployed",
+                             "detail": f"guest {guest!r} is not in the live "
+                                       "deployment"})
+    node = row.get("node")
+    generation = _guest_generation(dep, row)
+    try:
+        ticket = broker.console_access(node, int(row["vmid"]),
+                                       session_id=str(home.session_id),
+                                       generation=generation)
+    except Exception as exc:  # noqa: BLE001 — broker says why, loudly
+        raise LabError(503, {"error": "console_unavailable",
+                             "detail": f"{type(exc).__name__}: "
+                                       f"{str(exc)[:300]}"}) from exc
+    token = ("tok_console_" + re.sub(r"[^a-z0-9]", "_", guest.lower())[:24]
+             + "_" + uuid.uuid4().hex[:10])
+    expires = _now() + timedelta(minutes=CONSOLE_TTL_MINUTES)
+    db.add(LoginToken(token=token, session_id=home.session_id,
+                      user_id=user_id, target_host=guest,
+                      target_port=int(ticket["port"]), expires_at=expires))
+    db.add(Event(session_id=home.session_id, ts=_now(), actor=str(user_id),
+                 action_type="console_opened",
+                 payload={"lab_id": str(lab.lab_id), "guest": guest,
+                          "vmid": int(row["vmid"]), "generation": generation,
+                          "port": int(ticket["port"])}))
+    db.flush()
+    return {"token": token, "console": ticket.get("type", "vnc"),
+            "guest": guest, "generation": generation,
+            "vmid": int(row["vmid"]),
+            "port": int(ticket["port"]),
+            "expires_at": expires.isoformat()}
+
+
+def resolve_console(db, token: str) -> dict:
+    """A live console capability -> what the proxy must connect to.
+
+    Expiry and revocation are enforced here (the capability is the authority
+    the proxy has): a stale token must never reach a port a NEW guest owns.
+    """
+    from . import verification_service
+
+    lt = db.get(LoginToken, token)
+    if lt is None:
+        raise LabError(404, {"error": "unknown_console_token",
+                             "detail": f"no console capability {token!r}"})
+    if lt.revoked_at is not None:
+        raise LabError(410, {"error": "console_revoked",
+                             "detail": "capability revoked (reset or teardown)"})
+    now = _now()
+    if lt.expires_at is not None and lt.expires_at <= now:
+        raise LabError(410, {"error": "console_expired",
+                             "detail": f"capability expired at "
+                                       f"{lt.expires_at.isoformat()}"})
+    sess = db.get(SessionModel, lt.session_id) if lt.session_id else None
+    lab = db.get(Lab, sess.lab_id) if sess is not None and sess.lab_id else None
+    dep = (verification_service.active_deployment(db, sess.session_id)
+           if sess is not None else None)
+    row = None
+    if dep is not None:
+        row = next((dict(r) for r in (dep.resources or [])
+                    if r.get("host") == lt.target_host
+                    and r.get("state") == "created" and r.get("vmid")), None)
+    if row is None or dep is None:
+        raise LabError(410, {"error": "console_generation_gone",
+                             "detail": f"guest {lt.target_host!r} is no longer "
+                                       "in the live deployment"})
+    return {"token": token, "guest": lt.target_host,
+            "lab_id": str(lab.lab_id) if lab else None,
+            "session_id": str(sess.session_id) if sess else None,
+            "vmid": int(row["vmid"]), "node": row.get("node"),
+            "generation": _guest_generation(dep, row),
+            "port": int(lt.target_port),
+            "user_id": str(lt.user_id) if lt.user_id else None}
 
 
 def session_view(db, sess: SessionModel) -> dict:

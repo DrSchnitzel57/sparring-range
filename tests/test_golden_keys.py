@@ -73,8 +73,7 @@ def test_reinstall_adds_only_the_new_key(tmp_path):
     assert again["added"] == 1 and again["keys"] == 2
 
 
-@pytest.mark.skipif(__import__("os").getuid() != 0,
-                    reason="chown to a foreign uid needs root")
+@pytest.mark.images   # chown to a foreign uid needs root (images layer runs as root)
 def test_audit_catches_the_live_failure_wrong_owner(tmp_path):
     """Reproduce the exact live defect: the right keys, owned by 1000."""
     import os
