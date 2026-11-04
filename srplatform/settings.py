@@ -197,7 +197,12 @@ class Settings(BaseSettings):
     # Durable lifecycle operations (plan 13 phase 5): the declared bound for
     # one launch/reset attempt, recorded BEFORE dispatch so pollers and
     # reconciliation see the same deadline the executor works against.
-    deploy_operation_deadline_s: int = 900
+    # 3600s, not 900: a deploy now CONFIGURES the roles after the VMs are up
+    # (AD forest promotion reboots; SQL seeds; mail/TLS), and a deadline that
+    # expires mid-provision would report a fully deployed, half-configured lab
+    # as failed. A VM-only deploy still finishes early; the deadline is a
+    # ceiling, not a schedule.
+    deploy_operation_deadline_s: int = 3600
     # Plan 13 phase 4 — network-plane separation. The controller serves the
     # SAME app on three listeners (see deploy/README §2): trusted processes
     # on loopback, users on the LAN HTTPS front, and GUESTS on the range
