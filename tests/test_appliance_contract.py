@@ -117,9 +117,21 @@ def test_broker_manifest_never_accesses_model_secret(tmp_path, monkeypatch):
         brokerd.build(str(path), "unused", uri="qemu:///system",
                       allow_tcg=False, fixture=False)
 
+    # Boot deliberately does NOT hash the goldens: hashing ~30 GB took ~4 min
+    # while the control lease is 30 s, so every restart latched itself and the
+    # range could never come back up. The BYTES are proven before every clone
+    # (LibvirtBackend._verify_image); a tampered same-size golden is refused
+    # before libvirt is touched in tests/test_backend_nic_vector.py. A bad
+    # digest therefore no longer fails the boot — but nothing may be cloned
+    # from it, and boot still touches no model secret.
     raw["images"]["attacker"]["sha256"] = "0" * 64
     path.write_text(json.dumps(raw))
-    with pytest.raises(Exception, match="sha256 mismatch"):
+    from infra.appliance.manifest import ImageSpec
+    monkeypatch.setattr(
+        ImageSpec, "verify_file",
+        lambda self: (_ for _ in ()).throw(
+            AssertionError("boot hashed a golden image")))
+    with pytest.raises(RuntimeError, match="reached policy validation"):
         brokerd.build(str(path), "unused", uri="qemu:///system",
                       allow_tcg=False, fixture=False)
 

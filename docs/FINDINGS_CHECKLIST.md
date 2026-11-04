@@ -576,7 +576,39 @@ appliance as soon as it answers, and record the outer host's state
   downtime), a scorer error is UNKNOWN, an unsampled check is UNKNOWN,
   and task rollups never award points on unknown evidence.
 
-- **Windows status (not yet claimed):** the unattended Server 2022
+### Restart deadlock — the broker could not come back up (2026-11-04)
+
+Editing a golden image (baking the first-boot marker, injecting the bastion
+public key) changed its sha256, and the broker validates digests from the
+manifest it reads at boot — so every clone after the edit failed 503
+`sha256 mismatch`. Reloading the broker exposed a second, worse defect: the
+daemon hashes every golden at startup (~30 GB, ~4 min at 100% CPU), while the
+control lease TTL is 30 s and `renew_lease` is REFUSED while latched. The
+lease therefore expired **during every boot**, `startup_reconcile` latched
+`broker-restart-unverified-control` on each start, and no release could make
+it stick: releasing needs the daemon stopped (ledger lock), and the next boot
+saw the same expired lease. The range could not be restarted at all, and a
+clone refused on a digest mismatch left obligation #2 (`clone-outcome-unknown`,
+vmid 201) blocking the release for ~40 minutes.
+
+Fixes (both verified live on the appliance):
+
+- **Boot no longer hashes the goldens.** The trust boundary is
+  `LibvirtBackend._verify_image`, which enforces the manifest sha256 BEFORE
+  any libvirt work on every clone (fail-closed, no domain defined against
+  unproven bytes); structure and image paths are still validated at load. A
+  tampered same-size golden is still refused early
+  (`tests/test_backend_nic_vector.py`). Boot went from ~160–240 s to **2 s**.
+- **A release refreshes the armed control lease.** A release IS the operator
+  attesting control, so the seconds-long restart now lands inside the 30 s
+  TTL and `startup_reconcile` reports `latched: False, stopped: None`; an
+  idle/disarmed broker is deliberately left disarmed so its watchdog cannot
+  latch a quiet appliance (`tests/test_authority_boundary.py`).
+- Recovery order (runbook step 4): `stop` → resolve any open obligation →
+  `release` → `start`. Verified: lease age 2 s after the release, 4 s twenty
+  seconds later (the API heartbeat renewing every 5 s), latch clear.
+
+### Windows status (not yet claimed): the unattended Server 2022
   install loop WORKS on BIOS/MBR (build 20348, AutoLogon,
   FirstLogonCommands, ACPI shutdown, offline NTFS marker read). Driver
   and QGA staging moved to the unattend's SPECIALIZE pass (the

@@ -292,3 +292,31 @@ def test_service_readback_mismatch_retains_obligation(tmp_path, monkeypatch):
     obligations = service.ledger.open_obligations()
     kinds = [str(o.get("kind")) for o in obligations]
     assert any("nic-vector-readback-mismatch" in k for k in kinds)
+
+
+def test_clone_refuses_a_tampered_golden_although_boot_did_not_hash(tmp_path,
+                                                                    monkeypatch):
+    """The broker no longer hashes ~30 GB at boot (that dead air made every
+    restart re-latch); the trust boundary is `_verify_image`, which runs
+    BEFORE any libvirt work on every clone. A same-size byte change in a
+    golden must therefore be refused, and refused EARLY — libvirt is never
+    even reached, so no domain can be defined against unproven bytes."""
+    raw = _manifest(tmp_path, verify_files=True)
+    tampered = tmp_path / "attacker.qcow2"
+    data = bytearray(tampered.read_bytes())
+    data[0] ^= 0xFF
+    tampered.write_bytes(bytes(data))
+
+    m = ApplianceManifest.from_dict(raw, verify_images=False,
+                                    verify_model_key=False)
+    policy = AppliancePolicy.from_manifest(m)
+    backend = B.LibvirtBackend(m, policy, B.BackendConfig(allow_tcg=True))
+
+    def boom(*a, **k):
+        raise AssertionError("clone touched libvirt before verifying bytes")
+
+    monkeypatch.setattr(backend, "connect", boom)
+    monkeypatch.setattr(backend, "_find", boom)
+
+    with pytest.raises(B.ImageIntegrityError, match="sha256 mismatch"):
+        backend.clone_and_wait(m.installation_id, 9005, 240, "sr-env-vm")

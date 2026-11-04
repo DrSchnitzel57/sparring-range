@@ -808,6 +808,18 @@ class BrokerService:
                 f"{len(open_ob)} unresolved obligation(s) — resolve them "
                 "(status/stop/reconcile) before releasing")
         self.ledger.set_latch(False)
+        # A release IS the operator attesting control, and the restart that
+        # follows takes seconds — so arm the lease fresh as part of it. This
+        # closes a restart deadlock (live find 2026-11-03): the daemon cannot
+        # renew_lease while latched, the lease TTL is 30 s, and
+        # startup_reconcile latches again on any EXPIRED lease at boot, so the
+        # range could never come back up after a cessation without latching
+        # itself one boot later. Only an already-armed (live-range) lease is
+        # refreshed: an idle, disarmed broker must stay disarmed or its
+        # watchdog would latch a quiet appliance TTL later.
+        lease = self.ledger.get_lease()
+        if lease["armed"] and lease["holder"]:
+            self.ledger.renew_lease(lease["holder"])
         self.ledger.audit("release", {"operator": operator, "note": note})
         return {"released": True, "operator": operator}
 

@@ -23,7 +23,18 @@ from infra.broker.service import BrokerService
 
 def build(manifest_path: str, policy_path: str, *, uri: str,
           allow_tcg: bool, fixture: bool):
-    manifest = ApplianceManifest.load(manifest_path, verify_images=True,
+    # Boot does NOT hash the goldens: the trust boundary is
+    # LibvirtBackend._verify_image, which enforces the manifest's sha256
+    # before EVERY clone (fail-closed, before any domain is defined). Hashing
+    # ~30 GB here cost 4 minutes of dead air, and because the control lease
+    # is 30 s it was always EXPIRED by the time startup_reconcile ran — the
+    # broker therefore re-latched on every restart, and (renew_lease is
+    # refused while latched) the API could never make it fresh again, so the
+    # range could not restart at all after an image edit without a manual
+    # stop/release/start cycle that had no working exit. Structure and image
+    # PATHS are still validated here; bytes are proven at clone time, which
+    # is where a mismatch can actually do harm.
+    manifest = ApplianceManifest.load(manifest_path, verify_images=False,
                                       verify_model_key=False)
     policy = AppliancePolicy.load(policy_path)
     policy.validate_manifest(manifest)

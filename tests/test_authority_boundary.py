@@ -921,3 +921,36 @@ def test_local_transport_is_not_a_wire_bypass(tmp_path):
                                                 "tag": TAG, "operator": "x"})
     with pytest.raises(BrokerRefused, match="not exposed"):
         LocalTransport(service).call("delete", {"path": "/nodes/r740/qemu/101"})
+
+
+def test_release_leaves_the_control_lease_fresh_for_the_restart(tmp_path):
+    """The restart deadlock (live find 2026-11-03): renew_lease is refused
+    while latched, the lease TTL is 30 s, and startup_reconcile latches again
+    on an EXPIRED lease — so a released-and-restarted broker latched itself
+    one boot later and the range could not come back up at all. A release is
+    the operator attesting control, so it now refreshes the armed lease and
+    the seconds-long restart lands inside the TTL. An idle (disarmed) broker
+    must NOT be re-armed by a release, or its watchdog would latch it."""
+    client, service, http = _mk(tmp_path)
+    _clone(client)
+    client.start_and_wait(NODE, 210)
+    service.ledger.renew_lease("api-control")          # a live range's lease
+    report = service.drain_on_shutdown("broker-daemon-exit")
+    assert report and report["latched"]
+    assert service.release_latch("operator")["released"]
+    lease = service.ledger.get_lease()
+    assert lease["armed"] is True and lease["holder"] == "api-control"
+    # the very next boot sees verified control and does NOT re-latch
+    boot = service.startup_reconcile()
+    assert boot["latched"]["latched"] is False, boot
+    assert boot["stopped"] is None
+
+
+def test_release_does_not_arm_an_idle_broker(tmp_path):
+    """No active range: the lease is disarmed, and a release must leave it
+    that way — an armed lease on an idle appliance is the bug that latched
+    every quiet broker one TTL after every session ended."""
+    _client, service, _http = _mk(tmp_path)
+    service.ledger.disarm_lease()
+    assert service.release_latch("operator")["released"]
+    assert service.ledger.get_lease()["armed"] is False
