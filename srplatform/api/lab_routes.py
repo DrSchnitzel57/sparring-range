@@ -384,3 +384,44 @@ def list_exercise_sessions(lab_id: uuid.UUID,
     lab, _role = _lab(db, p, lab_id)
     return {"sessions": [lab_service.session_view(db, s)
                          for s in lab_service.sessions_of(db, lab)]}
+
+
+# ------------------------------------------------------------- consoles ---
+@router.post("/labs/{lab_id}/guests/{guest}/console", status_code=201)
+def open_console(lab_id: uuid.UUID, guest: str, p: Principal = Depends(_principal),
+                 db: DbSession = None):
+    """Open a VNC console capability for ONE guest of a live lab.
+
+    Windows/appliance guests have no sshd: the console is how a member sees
+    them. The broker proves the guest is owned, running and current
+    generation; this records a capability the proxy can carry. The PASSWORD
+    never travels here — the proxy asks the broker when it connects.
+    """
+    lab, _role = _lab(db, p, lab_id)
+    try:
+        ticket = lab_service.mint_console(db, lab, guest, p.user_id,
+                                          broker=get_broker())
+    except lab_service.LabError as e:
+        raise _error(e) from e
+    db.commit()
+    return ticket
+
+
+@router.get("/console/{token}")
+def console_target(token: str, p: Principal = Depends(_principal),
+                   db: DbSession = None):
+    """Resolve a console capability to what the proxy must dial.
+
+    Expiry and revocation are enforced here, and a capability belongs to the
+    member it was minted for (operator sees all) — a token is authority, but
+    not a transferable one.
+    """
+    try:
+        target = lab_service.resolve_console(db, token)
+    except lab_service.LabError as e:
+        raise _error(e) from e
+    owner = target.get("user_id")
+    if not p.is_operator and owner and str(p.user_id) != owner:
+        raise HTTPException(403, {"error": "not_your_console",
+                                  "detail": "capability belongs to another user"})
+    return target

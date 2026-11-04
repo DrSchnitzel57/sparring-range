@@ -586,3 +586,141 @@ def test_a_lab_exercise_session_resolves_hosts_from_the_lab_deployment(eng):
         assert len(home_map) == 12
         assert exercise_map == home_map
         assert exercise_map["ecomm"].startswith("172.20.240.")
+
+
+# ------------------------------------------------------------- consoles ---
+def test_a_member_gets_a_console_capability_but_never_the_password(eng):
+    """Windows/appliance guests have no sshd; the capability is what a member
+    carries to the proxy, and the VNC password stays in the broker."""
+    from datetime import datetime, timedelta, timezone
+
+    from srplatform.db.models import Lab
+    from srplatform.db.session import db as db_ctx
+    from srplatform.scenario_engine.env_deploy import deploy_environment
+    from srplatform import lab_service
+
+    bp, broker = _env(eng)
+    lab_id = _service_lab(eng)
+    with db_ctx() as db:
+        lab = db.get(Lab, lab_id)
+        home = lab_service.home_session(db, lab)
+        deploy_environment(db, home.session_id, SCENARIO,
+                           {"environment": ENV_ID}, broker)
+        lab_service.reflect_launch(db, home.session_id)
+        ticket = lab_service.mint_console(db, lab, "ad-dns", lab.owner_id,
+                                          broker=broker)
+        db.commit()
+        assert ticket["console"] == "vnc" and ticket["port"] > 5900
+        assert "password" not in ticket
+        assert ticket["token"].startswith("tok_console_ad_dns")
+        target = lab_service.resolve_console(db, ticket["token"])
+        assert target["guest"] == "ad-dns" and target["vmid"]
+        assert target["generation"].startswith(str(target["generation"][:0]) + "")
+        assert ticket["generation"] == target["generation"]
+        # a fresh token is not expired; expiry is enforced, not decorative
+        from srplatform.db.models import LoginToken
+        row = db.get(LoginToken, ticket["token"])
+        row.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        db.commit()
+    with db_ctx() as db:
+        with pytest.raises(lab_service.LabError) as err:
+            lab_service.resolve_console(db, ticket["token"])
+        assert err.value.status == 410
+
+
+def test_a_reset_revokes_the_console_capability(eng):
+    """The whole point of a generation-bound capability: when the guest is
+    rebuilt, the old console must not connect to whoever owns the port now."""
+    from srplatform.db.models import Lab
+    from srplatform.db.session import db as db_ctx
+    from srplatform.scenario_engine.env_deploy import deploy_environment
+    from srplatform import lab_service
+
+    bp, broker = _env(eng)
+    lab_id = _service_lab(eng)
+    with db_ctx() as db:
+        lab = db.get(Lab, lab_id)
+        home = lab_service.home_session(db, lab)
+        deploy_environment(db, home.session_id, SCENARIO,
+                           {"environment": ENV_ID}, broker)
+        lab_service.reflect_launch(db, home.session_id)
+        ticket = lab_service.mint_console(db, lab, "ecomm", lab.owner_id,
+                                          broker=broker)
+        lab_service.revoke_session_capabilities(db, home.session_id, "reset")
+        db.commit()
+    with db_ctx() as db:
+        with pytest.raises(lab_service.LabError) as err:
+            lab_service.resolve_console(db, ticket["token"])
+        assert err.value.status == 410
+        assert "revoked" in err.value.detail["error"]
+
+
+def test_a_guest_outside_the_deployment_has_no_console(eng):
+    from srplatform.db.models import Lab
+    from srplatform.db.session import db as db_ctx
+    from srplatform.scenario_engine.env_deploy import deploy_environment
+    from srplatform import lab_service
+
+    bp, broker = _env(eng)
+    lab_id = _service_lab(eng)
+    with db_ctx() as db:
+        lab = db.get(Lab, lab_id)
+        home = lab_service.home_session(db, lab)
+        deploy_environment(db, home.session_id, SCENARIO,
+                           {"environment": ENV_ID}, broker)
+        lab_service.reflect_launch(db, home.session_id)
+        with pytest.raises(lab_service.LabError) as err:
+            lab_service.mint_console(db, lab, "no-such-guest", lab.owner_id,
+                                     broker=broker)
+        assert err.value.status == 404
+
+
+def test_console_route_mints_and_resolves(client, users, migrated_db,
+                                          test_db_url_owner, fake_broker):
+    from sqlalchemy import create_engine
+
+    from srplatform.db.models import Deployment, Lab, LoginToken, Session
+
+    lab = _http_lab(client, users["member"])
+    _make_ready(test_db_url_owner, lab["lab_id"])
+    # a live deployment row is what the console lane reads; the vmid must be
+    # OWNED by the home session in the broker's ledger, so claim it the real
+    # way (clone) under the deployment's own generation.
+    e = create_engine(test_db_url_owner)
+    with SASession(e) as db:
+        sess = db.get(Session, uuid.UUID(lab["home_session_id"]))
+        dep = Deployment(session_id=sess.session_id, status="ready",
+                         scenario_id=SCENARIO,
+                         resources=[{"host": "ecomm", "ip": "172.20.240.10",
+                                     "state": "created", "vmid": 250,
+                                     "node": "appliance",
+                                     "image_profile": "rocky9-ecomm"}])
+        db.add(dep)
+        db.flush()
+        generation = str(dep.deployment_id)
+        sid = str(sess.session_id)
+        db.commit()
+    template = fake_broker.service.policy.templates[0]
+    fake_broker.client.clone_and_wait("appliance", template, 250,
+                                      "sr-console-test",
+                                      session_id=sid,
+                                      generation=generation)
+    fake_broker.http.vms[250]["status"] = "running"
+    r = client.post(f"/labs/{lab['lab_id']}/guests/ecomm/console",
+                    headers=users["member"])
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["port"] > 5900 and "password" not in body
+    target = client.get(f"/console/{body['token']}", headers=users["member"])
+    assert target.status_code == 200, target.text
+    assert target.json()["vmid"] == 250
+    # possession is not authority: another member cannot resolve it
+    client.post("/users", headers=users["op"],
+                json={"username": "cerise", "password": "cerise-testpw-9",
+                      "role": "member"})
+    tok = client.post("/auth/login",
+                      json={"username": "cerise",
+                            "password": "cerise-testpw-9"}).json()["token"]
+    assert client.get(f"/console/{body['token']}",
+                      headers={"Authorization": f"Bearer {tok}"}
+                      ).status_code == 403

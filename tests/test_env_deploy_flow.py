@@ -29,6 +29,7 @@ class StubBroker:
         self.calls: list[tuple] = []
         self.vms: dict[int, dict] = {}
         self.host_key_reads: list[tuple[int, str]] = []
+        self.console_reads: list[tuple[int, str]] = []
         self.on_first_clone = None
 
     def template_catalog(self):
@@ -76,6 +77,12 @@ class StubBroker:
 
     def artifact_for_template(self, template_vmid):
         return None
+
+    def console_access(self, node, vmid, session_id=None, generation=1):
+        self.console_reads.append((int(vmid), str(generation)))
+        return {"type": "vnc", "host": "127.0.0.1",
+                "port": 5900 + (int(vmid) % 400),
+                "password": "pw123456", "name": "sr-test"}
 
     def read_host_key(self, node, vmid, session_id=None, generation=1):
         self.host_key_reads.append((int(vmid), str(generation)))
