@@ -12,9 +12,10 @@ Refusals carry HTTP status + reason; the caller never has to interpret a
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, WebSocket
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -425,3 +426,119 @@ def console_target(token: str, p: Principal = Depends(_principal),
         raise HTTPException(403, {"error": "not_your_console",
                                   "detail": "capability belongs to another user"})
     return target
+
+
+# ---------------------------------------------------- browser console WS ---
+
+
+class _WSReader:
+    """An `asyncio.StreamReader`-shaped view of a WebSocket's byte stream.
+
+    The console relay is written against streams (it runs unchanged against a
+    TCP guest in tests); this adapter keeps ONE relay implementation instead
+    of a second, untested websocket variant. Text frames are accepted as
+    bytes (a member's client is the only writer)."""
+
+    def __init__(self, websocket):
+        self._ws = websocket
+        self._buf = bytearray()
+        self._eof = False
+
+    async def _fill(self) -> None:
+        msg = await self._ws.receive()
+        if msg["type"] == "websocket.disconnect":
+            self._eof = True
+            return
+        data = msg.get("bytes")
+        if data is None:
+            data = (msg.get("text") or "").encode()
+        self._buf.extend(data or b"")
+
+    async def readexactly(self, n: int) -> bytes:
+        while len(self._buf) < n:
+            if self._eof:
+                raise asyncio.IncompleteReadError(bytes(self._buf), n)
+            await self._fill()
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        return out
+
+    async def read(self, n: int = -1) -> bytes:
+        if not self._buf and not self._eof:
+            await self._fill()
+        if not self._buf:
+            return b""
+        take = len(self._buf) if n < 0 else min(n, len(self._buf))
+        out = bytes(self._buf[:take])
+        del self._buf[:take]
+        return out
+
+
+class _WSWriter:
+    """Write-then-drain view of a WebSocket; each drain sends one frame."""
+
+    def __init__(self, websocket):
+        self._ws = websocket
+        self._buf = bytearray()
+
+    def write(self, data: bytes) -> None:
+        self._buf.extend(data)
+
+    async def drain(self) -> None:
+        if self._buf:
+            await self._ws.send_bytes(bytes(self._buf))
+            self._buf.clear()
+
+    def close(self) -> None:  # the relay closes us; the route closes the WS
+        pass
+
+    async def wait_closed(self) -> None:
+        pass
+
+
+@router.websocket("/console/{token}/stream")
+async def console_stream(websocket: WebSocket, token: str):
+    """Relay ONE console capability to a member's browser as RFB over WS.
+
+    The capability token IS the authority here (resolve_console enforces
+    expiry, revocation and generation); the guest's VNC password comes from
+    the broker on THIS connection and never reaches the browser — the relay
+    speaks security type None downstream only AFTER authenticating upstream.
+    """
+    from srplatform.bastion.console import ConsoleError, relay
+
+    await websocket.accept()
+    try:
+        from srplatform.db.session import db as _db_ctx
+        with _db_ctx() as db:
+            target = lab_service.resolve_console(db, token)
+            access = get_broker().console_access(
+                target["node"], int(target["vmid"]),
+                session_id=target["session_id"],
+                generation=target["generation"])
+    except Exception as exc:  # noqa: BLE001 — unknown, close loudly
+        _log_console(websocket, exc)
+        await websocket.close(code=1011, reason="console unavailable")
+        return
+    port = int(access["port"])
+    password = str(access.get("password") or "")
+    host = str(access.get("host") or "127.0.0.1")
+    try:
+        await relay(port, password, _WSReader(websocket),
+                    _WSWriter(websocket), host=host)
+    except ConsoleError:
+        pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:  # noqa: BLE001 — peer already gone
+            pass
+
+
+def _log_console(websocket, exc: Exception) -> None:
+    """Diagnostics without a payload: the reason, never a password."""
+    try:
+        from srplatform.observability import log_event  # type: ignore
+        log_event("console_stream_error", {"error": type(exc).__name__})
+    except Exception:
+        pass
