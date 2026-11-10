@@ -480,11 +480,11 @@ def build_windows(*, windows_iso: pathlib.Path, virtio_iso: pathlib.Path,
     evidence = offline_evidence(disk)
     # viostor is ADVISORY (IDE installs need no virtio driver); the marker
     # and a real qemu-ga.exe on disk are what "installed" requires.
-    # An image whose last logged ImageState is not COMPLETE was shut down
-    # inside OOBE and every clone of it boots back into OOBE; refusing it
-    # here is the difference between a golden and a half-finished install.
-    oobe_ok = evidence["image_state"] in (None, "IMAGE_STATE_COMPLETE")
-    installed = bool(marker) and evidence["qemu_ga"] and oobe_ok
+    # `evidence["image_state"]` is reported for the record, NOT gated on:
+    # setup.exe never logs the OOBE->COMPLETE transition (proven 2026-11-10
+    # on a good rebuild), so the honest OOBE gate is a booted clone asking
+    # the agent (infra/dev/verify_win_image.py), not this log.
+    installed = bool(marker) and evidence["qemu_ga"]
     return {"disk": str(disk), "installed": installed, "marker": marker,
             "evidence": evidence, "qemu_rc": qemu_rc,
             "qemu_tail": qemu_tail, "error": error, "serial": str(serial)}
