@@ -464,8 +464,11 @@ def test_roundcube_substitute_accepts_the_full_address_the_check_posts():
                           pki=_tmp_pki())
     rc = _services(plans, "webmail")["roundcube"]
     text = "\n".join(" ".join(s.argv) for s in rc.steps)
-    assert "preg_replace('/@.*$/', '', $user)" in text
-    assert "Inbox" in text
+    # python3 + ssl substitute: no apache2/php on the webmail golden.
+    assert 'split("@")[0]' in text          # the check posts the full address
+    assert "Inbox" in text                  # the check's success text
+    assert "/etc/dovecot/sr-users" in text  # same identities as Dovecot
+    assert "sr-webmail.service" in text
     assert "--resolve mail.underpressure.local" in text
 
 

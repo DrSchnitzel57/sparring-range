@@ -1161,90 +1161,146 @@ doveconf -n >/dev/null && systemctl enable --now dovecot && systemctl restart do
 
 
 #: Roundcube is NOT in the offline Ubuntu image (its sqlsrv driver comes from
-#: an MS repo), so the webmail UI is a minimal PHP substitute that authenticates
-#: against the same Dovecot passwd-file and lists the Maildir. Recorded as
-#: substituted in fidelity.yaml.
-ROUNDCUBE_APP = r"""<?php
-$users = array();
-foreach (file('/etc/dovecot/sr-users', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
-    if (strpos($line, ':') === false) continue;
-    list($u, $p) = explode(':', $line, 2);
-    $users[$u] = preg_replace('/^\{PLAIN\}/', '', $p);
-}
-$user = isset($_POST['_user']) ? $_POST['_user'] : '';
-$user = preg_replace('/@.*$/', '', $user);   // the check posts the full address
-$pass = isset($_POST['_pass']) ? $_POST['_pass'] : '';
-if ($user === '' || !isset($users[$user]) || !hash_equals($users[$user], $pass)) {
-    echo '<html><body><h2>Webmail login</h2>';
-    echo '<form method="post"><input name="_user"><input name="_pass" type="password"><button>Login</button></form>';
-    echo '</body></html>';
-    exit;
-}
-$dir = '/var/mail/' . $user . '/Maildir/new';
-$mails = is_dir($dir) ? glob($dir . '/*') : array();
-echo '<html><body><h2>Inbox</h2><p>' . count($mails) . ' message(s)</p><ul>';
-foreach ($mails as $m) {
-    $fh = fopen($m, 'r');
-    $subject = '';
-    foreach (explode("\n", fread($fh, 2048)) as $h) {
-        if (stripos($h, 'Subject:') === 0) { $subject = trim(substr($h, 8)); break; }
-        if (trim($h) === '') break;
-    }
-    fclose($fh);
-    echo '<li>' . htmlspecialchars($subject) . '</li>';
-}
-echo '</ul></body></html>';
-"""
+#: an MS repo) and the webmail golden carries NO apache2 and NO php — so the
+#: substitute is plain python3 (the image has it) speaking HTTPS itself: the
+#: same Dovecot passwd-file login and the same Maildir Inbox the check reads.
+#: Recorded as substituted in fidelity.yaml.
+WEBMAIL_APP = r'''#!/usr/bin/env python3
+import glob
+import html
+import ssl
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+CERT = "/etc/pki/sr/mail.crt"
+KEY = "/etc/pki/sr/mail.key"
+USERS_FILE = "/etc/dovecot/sr-users"
+PAGE_TOP = '<!doctype html><html><body><h2>Webmail login</h2>'
+FORM = ('<form method="post"><input name="_user">'
+        '<input name="_pass" type="password"><button>Login</button></form>')
+PAGE_END = '</body></html>'
+
+
+def _users():
+    users = {}
+    try:
+        with open(USERS_FILE) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or ":" not in line:
+                    continue
+                user, password = line.split(":", 1)
+                users[user] = password.replace("{PLAIN}", "", 1)
+    except OSError:
+        pass
+    return users
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "sr-webmail"
+
+    def _send(self, body, code=200):
+        raw = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self):
+        self._send(PAGE_TOP + FORM + PAGE_END)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        form = urllib.parse.parse_qs(self.rfile.read(length).decode())
+        user = (form.get("_user") or [""])[0].split("@")[0]
+        password = (form.get("_pass") or [""])[0]
+        users = _users()
+        if user not in users or users[user] != password:
+            self._send(PAGE_TOP + FORM + '<p>Invalid login</p>' + PAGE_END,
+                       401)
+            return
+        # The same Maildir the practice mail lands in.
+        mails = sorted(glob.glob("/var/mail/%s/Maildir/new/*" % user))
+        rows = []
+        for path in mails:
+            subject = ""
+            try:
+                with open(path, errors="replace") as fh:
+                    for line in fh.read(2048).splitlines():
+                        if line.lower().startswith("subject:"):
+                            subject = line.split(":", 1)[1].strip()
+                            break
+                        if not line.strip():
+                            break
+            except OSError:
+                continue
+            rows.append("<li>%s</li>" % html.escape(subject))
+        body = ("<!doctype html><html><body><h2>Inbox</h2>"
+                + "<p>%d message(s)</p><ul>%s</ul>" % (len(mails), "".join(rows))
+                + PAGE_END)
+        self._send(body)
+
+    def log_message(self, *args):
+        pass
+
+
+def main():
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(CERT, KEY)
+    httpd = HTTPServer(("0.0.0.0", 443), Handler)
+    httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+WEBMAIL_UNIT = '''[Unit]
+Description=SR webmail substitute (HTTPS login + Inbox)
+After=network-online.target dovecot.service
+Wants=network-online.target
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/sr/webmail/webmail.py
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+'''
 
 
 @handler(ServiceId.ROUNDCUBE)
 def roundcube_handler(ctx: ProvisionContext) -> Sequence[Step]:
+    """The webmail UI the golden can actually host: python3 + ssl (the image
+    has no apache2/php), the same Dovecot identities, the same Inbox text."""
     host = "mail." + ctx.domain
     cert, key = ctx.certificate(host)
     ca = ctx.ca_pem()
-    app = ROUNDCUBE_APP.replace("\\", "\\\\").replace("'", "'\\''")
+    app_step = (
+        "install -d -m 755 /opt/sr/webmail\n"
+        "cat > /opt/sr/webmail/webmail.py <<'PY'\n"
+        + WEBMAIL_APP + "PY\n"
+        "chmod 755 /opt/sr/webmail/webmail.py\n"
+        "cat > /etc/systemd/system/sr-webmail.service <<'UNIT'\n"
+        + WEBMAIL_UNIT + "UNIT\n"
+        "systemctl daemon-reload\n"
+        "systemctl enable --now sr-webmail.service\n"
+        "systemctl restart sr-webmail.service")
+    verify = (
+        "set -e\n"
+        "ss -ltn | grep -q ':443 '\n"
+        "code=$(curl -sS --silent --cacert /etc/pki/sr/ca.crt "
+        "--resolve " + host + ":443:127.0.0.1 "
+        "-o /dev/null -w '%{http_code}' https://" + host + "/)\n"
+        '[ "$code" = 200 ]')
     return (
         Step("roundcube-tls",
              linux(_write_pem_step("mail", cert, key) + "\n"
-                   + _write_ca_step(ca)
-                   + f"""
-install -d -m 755 /var/www/webmail
-chown -R www-data:www-data /var/www/webmail 2>/dev/null || true""",
-                   timeout_s=60),
-             timeout_s=60),
-        Step("roundcube-app",
-             linux(f"""
-cat > /var/www/webmail/index.php <<'PHP'
-{ROUNDCUBE_APP}PHP
-cat > /etc/apache2/sites-available/sr-webmail.conf <<'CONF'
-<VirtualHost *:80>
-  ServerName {host}
-  Redirect permanent / https://{host}/
-</VirtualHost>
-<VirtualHost *:443>
-  SSLEngine on
-  SSLCertificateFile /etc/pki/sr/mail.crt
-  SSLCertificateKeyFile /etc/pki/sr/mail.key
-  ServerName {host}
-  DocumentRoot /var/www/webmail
-  <Directory /var/www/webmail>
-    Require all granted
-  </Directory>
-</VirtualHost>
-CONF
-a2enmod ssl >/dev/null 2>&1 || true
-a2ensite sr-webmail >/dev/null 2>&1 || true
-apache2ctl configtest && systemctl enable --now apache2 && systemctl reload apache2""",
-                   timeout_s=300),
-             timeout_s=300),
-        Step("roundcube-verify",
-             linux(f"""
-curl -sS --silent --fail --cacert /etc/pki/sr/ca.crt \
-  --resolve {host}:443:127.0.0.1 \
-  -d '_user=prb-roundcube&_pass=x&_action=login&_task=login' \
-  https://{host}/ -o /dev/null
-ss -ltn | grep -q ':443 '""", timeout_s=60),
-             timeout_s=60),
+                   + _write_ca_step(ca)), timeout_s=60),
+        Step("roundcube-app", linux(app_step, timeout_s=300), timeout_s=300),
+        Step("roundcube-verify", linux(verify, timeout_s=60), timeout_s=60),
     )
 
 
