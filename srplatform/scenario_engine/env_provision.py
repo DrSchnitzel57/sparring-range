@@ -1005,6 +1005,29 @@ server {{
 }}
 CONF
   nginx -t && systemctl enable --now nginx && systemctl reload nginx
+elif command -v apache2 >/dev/null 2>&1; then
+  # Debian/Ubuntu apache2: site files, a2enmod ssl. The ecomm golden is the
+  # Ubuntu 24.04 build with apache2 2.4 (no httpd, no nginx); asking for
+  # httpd exited 127 and abandoned the rest of the guest.
+  a2enmod ssl >/dev/null 2>&1 || true
+  cat > /etc/apache2/sites-available/sr-store.conf <<'CONF'
+<VirtualHost *:80>
+  ServerName {host}
+  Redirect permanent / https://{host}/
+</VirtualHost>
+<VirtualHost *:443>
+  SSLEngine on
+  SSLCertificateFile /etc/pki/sr/shop.crt
+  SSLCertificateKeyFile /etc/pki/sr/shop.key
+  ServerName {host}
+  DocumentRoot /var/www/store
+  <Directory /var/www/store>
+    Require all granted
+  </Directory>
+</VirtualHost>
+CONF
+  a2ensite sr-store >/dev/null 2>&1 || true
+  apache2ctl -t && systemctl enable --now apache2 && systemctl reload apache2
 else
   cat > /etc/httpd/conf.d/sr-store.conf <<'CONF'
 Listen 80
@@ -1128,7 +1151,7 @@ for u in {' '.join(u for u, _ in users)}; do
   mkdir -p /var/mail/$u/Maildir/cur /var/mail/$u/Maildir/new /var/mail/$u/Maildir/tmp
   chown -R 1000:1000 /var/mail/$u
 done
-dovecot -n >/dev/null && systemctl enable --now dovecot && systemctl restart dovecot""",
+doveconf -n >/dev/null && systemctl enable --now dovecot && systemctl restart dovecot""",
                    timeout_s=300),
              timeout_s=300),
         Step("dovecot-verify",

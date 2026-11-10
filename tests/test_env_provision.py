@@ -585,3 +585,23 @@ def test_red_entry_also_reaches_the_vip_prefix_through_the_edge():
     plan = _services(_plan(), "red-entry")["static-routes"]
     text = "\n".join(" ".join(s.argv) for s in plan.steps)
     assert "172.25.31.0/24 via 172.31.31.2" in text
+
+
+def test_store_front_accepts_the_apache2_golden_the_ecomm_guest_carries():
+    plan = _services(ep.build_plan(BP, generation="g1", resolver=resolver,
+                                   pki=_tmp_pki()), "ecomm")["nginx"]
+    text = "\n".join(" ".join(s.argv) for s in plan.steps)
+    # Ubuntu ecomm golden: apache2 2.4, no httpd, no nginx.
+    assert "command -v nginx" in text
+    assert "elif command -v apache2" in text
+    assert "a2ensite sr-store" in text
+    assert "apache2ctl -t" in text
+
+
+def test_dovecot_is_validated_with_doveconf_never_the_running_binary():
+    plan = _services(ep.build_plan(BP, generation="g1", resolver=resolver,
+                                   pki=_tmp_pki()), "webmail")["dovecot"]
+    text = "\n".join(" ".join(s.argv) for s in plan.steps)
+    # `dovecot -n` exits 89 while the image's daemon already runs.
+    assert "doveconf -n" in text
+    assert "dovecot -n" not in text
