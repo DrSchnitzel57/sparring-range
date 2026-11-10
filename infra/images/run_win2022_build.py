@@ -11,11 +11,14 @@ import json
 import pathlib
 import sys
 
-from infra.images.windows_build import build_windows
+from infra.images.windows_build import build_windows, qemu_alone_preflight
 
 
 def main() -> int:
     media = pathlib.Path("/var/lib/sparring-range/media")
+    # A build on top of another QEMU (or on a memory-short box) is how the
+    # appliance dropped off the LAN twice (2026-11-04); refuse it up front.
+    qemu_alone_preflight(4096)
     out = build_windows(
         windows_iso=media / "win2022.iso",
         virtio_iso=media / "virtio-win.iso",
