@@ -17,7 +17,7 @@ schema_version: 1
 id: underpressure-range
 name: "Underpressure Regional Water Authority (replica)"
 domain: underpressure.local
-version: 1
+version: 2
 description: >-
   Ten-machine defensive practice replica (VyOS edge, substitute perimeter
   firewall, Rocky 9 store, Ubuntu mail, Debian 12 Splunk, Server 2022 AD/DNS,
@@ -95,7 +95,7 @@ guests:
     resources: {vcpus: 1, memory_mb: 2048, disk_gb: 8}
     boot: {firmware: efi, bootstrap: serial-seed, image_profile: router-vyos-140}
     depends_on: []
-    services: []
+    services: [edge-nat]
     lab_only_defaults: true
 
   - name: opnsense-fw
@@ -111,7 +111,7 @@ guests:
     resources: {vcpus: 2, memory_mb: 4096, disk_gb: 12}
     boot: {firmware: efi, bootstrap: serial-seed, image_profile: firewall-opnsense}
     depends_on: [vyos-edge]
-    services: []
+    services: [edge-lan]
     lab_only_defaults: true
 
   - name: ecomm
@@ -237,7 +237,7 @@ guests:
     resources: {vcpus: 2, memory_mb: 2048, disk_gb: 20}
     boot: {firmware: efi, bootstrap: qga-ssh, image_profile: attacker-debian}
     depends_on: []
-    services: [ssh]
+    services: [ssh, static-routes]
     lab_only_defaults: true
 
   - name: scoring-vantage
@@ -252,7 +252,7 @@ guests:
     resources: {vcpus: 1, memory_mb: 2048, disk_gb: 20}
     boot: {firmware: efi, bootstrap: qga-ssh, image_profile: scoring-debian}
     depends_on: []
-    services: []
+    services: [static-routes]
     lab_only_defaults: false
 
 edges:

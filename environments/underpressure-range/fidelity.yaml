@@ -157,3 +157,19 @@ entries:
   - {path: /excluded/mojang-diag, classification: excluded, source: plan-defaults,
      note: "The old Mojang diagnostic endpoint vulnerability is never added
             here; opening weaknesses come from the replica spec only."}
+  - {path: /blueprint/version, classification: synthetic, source: lab-synthesis,
+     note: "Version 2 (2026-11-10): the edge and both vantages now declare
+            EXECUTABLE services (edge-nat, edge-lan, static-routes) so the
+            typed routing contracts run on the images that exist today; no
+            address, route or forward value changed."}
+  - {path: /guests/0/services, classification: substituted, source: lab-synthesis,
+     note: "VyOS 1.4.0 is reported; until its vendor-ISO image is built
+            (infra/images/run_vyos_build.py) the edge is a Linux-router
+            substitute that executes the SAME typed contracts: DNAT for every
+            public_forward, masquerade out the WAN, the declared static
+            routes, and syslog to the sink. It is never called VyOS."}
+  - {path: /guests/1/services, classification: substituted, source: lab-synthesis,
+     note: "OPNsense already substitutes the Palo Alto PA-VM2; until the
+            OPNsense image carries its config the perimeter is the same
+            Linux-router substitute — forwarding on and the reported
+            permissive opening policy, with no security profiles claimed."}

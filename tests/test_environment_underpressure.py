@@ -45,7 +45,7 @@ def test_environment_loads_and_accounts_for_itself():
     env = load_environment("underpressure-range")
     pins = env.pins()
     assert pins["environment"] == "underpressure-range"
-    assert pins["blueprint_version"] == 1
+    assert pins["blueprint_version"] == 2
     bp = env.blueprint
     # 12 guests: 10 competition machines + infrastructure attacker + scoring
     assert len(bp.guests) == 12

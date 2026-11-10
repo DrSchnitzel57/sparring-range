@@ -108,6 +108,22 @@ class ProvisionContext:
     #: The blueprint's declared DNS records (name, type, value, preference),
     #: so the zone is the documented one and not a hand-typed subset.
     dns_records: tuple = ()
+    #: The validated blueprint itself: edge handlers need segments, routes and
+    #: public forwards, and restating them as tuples would be a second source
+    #: of truth that could drift.
+    bp: object | None = None
+
+    def own_prefix(self) -> int:
+        """The prefix length of this guest's first address (from its segment)."""
+        import ipaddress
+        if self.bp is None:
+            return 24
+        addr = ipaddress.ip_address(self.own_address())
+        for seg in getattr(self.bp, "segments", []):
+            net = ipaddress.ip_network(str(seg.cidr), strict=False)
+            if addr in net:
+                return net.prefixlen
+        return 24
 
     def own_address(self) -> str:
         return self.address(self.guest)
@@ -266,7 +282,7 @@ def build_plan(bp, *, generation: str,
             guest=name, os=str(getattr(guest, "os", "")).split(".")[-1].lower(),
             domain=str(getattr(bp, "domain", "")), addresses=addresses,
             generation=generation, resolver=resolver, pki=pki,
-            public_vips=vips, dns_records=dns_records)
+            public_vips=vips, dns_records=dns_records, bp=bp)
         svc_plans: list[ServicePlan] = []
         for raw in guest.services:
             sid = ServiceId(raw)
@@ -541,7 +557,21 @@ def active_directory_handler(ctx: ProvisionContext) -> Sequence[Step]:
     dn = ",".join("DC=" + part for part in ctx.domain.split("."))
     dn_q = ps_quote(dn)
     ou_dn_q = ps_quote("OU=Lab," + dn)
+    ip = ctx.own_address()
+    prefix = ctx.own_prefix()
     return (
+        Step("ad-address",
+             windows(f"""
+$if = (Get-NetAdapter | Where-Object {{ $_.Status -eq 'Up' }} |
+       Select-Object -First 1)
+Set-NetIPInterface -InterfaceAlias $if.Name -Dhcp Disabled -ErrorAction SilentlyContinue
+if (-not (Get-NetIPAddress -IPAddress {ps_quote(ip)} -ErrorAction SilentlyContinue)) {{
+  New-NetIPAddress -InterfaceAlias $if.Name -IPAddress {ps_quote(ip)} `
+    -PrefixLength {prefix} -ErrorAction Stop
+}}
+Set-DnsClientServerAddress -InterfaceAlias $if.Name -ServerAddresses '127.0.0.1'""",
+                     timeout_s=120),
+             timeout_s=120),
         Step("ad-roles",
              windows("Install-WindowsFeature -Name AD-Domain-Services,DNS "
                      "-IncludeManagementTools | Out-Null", timeout_s=600),
@@ -683,7 +713,22 @@ def mssql_handler(ctx: ProvisionContext) -> Sequence[Step]:
     seed_rows = "".join(
         f" INSERT INTO dbo.SeedRows (id, label) VALUES ({i}, 'sr-seed-{i}');"
         for i in range(1, 4))
+    dns = ctx.address("ad-dns")
+    ip = ctx.own_address()
+    prefix = ctx.own_prefix()
     return (
+        Step("mssql-address",
+             windows(f"""
+$if = (Get-NetAdapter | Where-Object {{ $_.Status -eq 'Up' }} |
+       Select-Object -First 1)
+Set-NetIPInterface -InterfaceAlias $if.Name -Dhcp Disabled -ErrorAction SilentlyContinue
+if (-not (Get-NetIPAddress -IPAddress {ps_quote(ip)} -ErrorAction SilentlyContinue)) {{
+  New-NetIPAddress -InterfaceAlias $if.Name -IPAddress {ps_quote(ip)} `
+    -PrefixLength {prefix} -ErrorAction Stop
+}}
+Set-DnsClientServerAddress -InterfaceAlias $if.Name -ServerAddresses {ps_quote(dns)}""",
+                     timeout_s=120),
+             timeout_s=120),
         Step("mssql-store",
              windows(_sqlcmd(f"""
 IF DB_ID('UnderpressureStore') IS NULL CREATE DATABASE UnderpressureStore;
@@ -1300,4 +1345,174 @@ if (-not (Get-SmbShare -Name 'CA' -ErrorAction SilentlyContinue)) {
   throw 'CA share missing'
 }""", timeout_s=120),
              timeout_s=120),
+    )
+
+
+# --------------------------------------------------------- edge behaviour
+#
+# The placeholder edge images are bare Debian-family copies; the REAL VyOS /
+# OPNsense images are separate builds (infra/images/run_vyos_build.py). Until
+# those land, the same TYPED contracts (public_forwards, routes, syslog edges)
+# are executed on the placeholder through this handler set and the substitute
+# is recorded in fidelity.yaml. A real VyOS implementation would register the
+# same service ids with its own commands; nothing above this line changes.
+
+
+def _guest_iface_plan(bp, guest_name: str) -> list[tuple[str, str, int]]:
+    """[(segment, address/prefix, prefixlen)] in the guest's NIC order."""
+    out: list[tuple[str, str, int]] = []
+    for iface in bp.guest(guest_name).interfaces:
+        seg = next(s for s in bp.segments if s.name == iface.segment)
+        prefix = int(str(seg.cidr).split("/")[1])
+        out.append((iface.segment, f"{iface.ipv4.address}/{prefix}", prefix))
+    return out
+
+
+def _wan_index(bp, guest_name: str) -> int:
+    """Index of the simulated-WAN interface in NIC order (never guessed)."""
+    for i, iface in enumerate(bp.guest(guest_name).interfaces):
+        for seg in bp.segments:
+            if seg.name == iface.segment and \
+                    str(getattr(seg.purpose, "value", seg.purpose)) == \
+                    "simulated-wan":
+                return i
+    raise ProvisionError(
+        f"edge {guest_name!r} has no interface on the simulated-wan segment")
+
+
+def _linux_configure_addresses(ifaces: list[tuple[str, str, int]]) -> str:
+    specs = " ".join(f'"{addr}"' for _seg, addr, _p in ifaces)
+    return f"""
+i=0
+for spec in {specs}; do
+  dev=$(ip -o link show | awk -F': ' '{{print $2}}' | grep -v lo | sed -n "$((i+1))p")
+  ip addr replace "$spec" dev "$dev" 2>/dev/null || true
+  ip link set "$dev" up
+  i=$((i+1))
+done
+ip -br a"""
+
+
+def _forwarding_on() -> str:
+    return """
+sysctl -q -w net.ipv4.ip_forward=1
+grep -q '^net.ipv4.ip_forward' /etc/sysctl.d/99-sr-range.conf 2>/dev/null || \
+  echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-sr-range.conf"""
+
+
+@handler(ServiceId.EDGE_NAT)
+def edge_nat_handler(ctx: ProvisionContext) -> Sequence[Step]:
+    """Edge DNAT + masquerade + routes + syslog, from the typed contracts."""
+    if ctx.bp is None:
+        raise ProvisionError("edge-nat needs the blueprint")
+    bp = ctx.bp
+    ifaces = _guest_iface_plan(bp, ctx.guest)
+    wan = f"$WANDEV"
+    forwards = [f for f in bp.public_forwards if f.on_guest == ctx.guest]
+    routes = [r for r in bp.routes if r.guest == ctx.guest]
+    sinks = []
+    for e in getattr(bp, "edges", []):
+        if str(getattr(e.kind, "value", e.kind)) != "syslog" or e.src != ctx.guest:
+            continue
+        host = next((str(i.ipv4.address) for g in bp.guests if g.name == e.dst
+                     for i in g.interfaces if i.ipv4), None)
+        if host:
+            sinks.append((host, int(e.port or 514),
+                          str(getattr(e.protocol, "value", e.protocol) or "udp")))
+    nat = []
+    for f in forwards:
+        target = next(str(i.ipv4.address) for g in bp.guests
+                      if g.name == f.target_guest for i in g.interfaces
+                      if i.ipv4)
+        rule = (f"-t nat -C PREROUTING -i {wan} -d {f.vip} -p {f.protocol} "
+                f"--dport {f.vip_port}")
+        add = (f"-t nat -A PREROUTING -i {wan} -d {f.vip} -p {f.protocol} "
+               f"--dport {f.vip_port} -j DNAT --to-destination "
+               f"{target}:{f.target_port}")
+        nat.append(f"iptables {rule} 2>/dev/null || iptables {add}")
+    masq = (f"iptables -t nat -C POSTROUTING -s 172.16.0.0/12 -o {wan} "
+            f"-j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING "
+            f"-s 172.16.0.0/12 -o {wan} -j MASQUERADE")
+    route_cmds = "\n".join(f"ip route replace {r.prefix} via {r.via}"
+                           for r in routes)
+    syslog_cmds = ""
+    for host, port, proto in sinks:
+        syslog_cmds += (f"""
+cat >> /etc/rsyslog.d/50-sr-edge.conf <<'CONF' 2>/dev/null || true
+*.* action(type="omfwd" target="{host}" port="{port}" protocol="{proto}")
+CONF""")
+    verify_forwards = "\n".join(
+        f"iptables -t nat -S PREROUTING | grep -q '{f.vip}'" for f in forwards)
+    verify_routes = "\n".join(
+        f"ip route get {r.prefix.split('/')[0]} | grep -q 'via {r.via}'"
+        for r in routes)
+    return (
+        Step("edge-addresses", linux(_linux_configure_addresses(ifaces)),
+             timeout_s=120),
+        Step("edge-nat", linux(f"""
+WANDEV=$(ip -o link show | awk -F': ' '{{print $2}}' | grep -v lo | sed -n "{_wan_index(bp, ctx.guest) + 1}p"){_forwarding_on()}
+{masq}
+{chr(10).join(nat)}
+{route_cmds}
+{syslog_cmds}
+systemctl restart rsyslog 2>/dev/null || true""", timeout_s=300),
+             timeout_s=300),
+        Step("edge-verify", linux(f"""
+set -e
+{verify_forwards}
+{verify_routes}
+sysctl -n net.ipv4.ip_forward | grep -qx 1""", timeout_s=120),
+             timeout_s=120),
+    )
+
+
+@handler(ServiceId.EDGE_LAN)
+def edge_lan_handler(ctx: ProvisionContext) -> Sequence[Step]:
+    """The perimeter's forwarding + reported permissive opening policy."""
+    if ctx.bp is None:
+        raise ProvisionError("edge-lan needs the blueprint")
+    bp = ctx.bp
+    ifaces = _guest_iface_plan(bp, ctx.guest)
+    lan = next((addr.split("/")[0] for seg, addr, _p in ifaces
+                if seg == "inside-lan"), None)
+    if lan is None:
+        raise ProvisionError(f"{ctx.guest!r} has no inside-lan interface")
+    return (
+        Step("lan-addresses", linux(_linux_configure_addresses(ifaces)),
+             timeout_s=120),
+        Step("lan-permissive", linux(_forwarding_on() + """
+iptables -P FORWARD ACCEPT
+iptables -P INPUT ACCEPT
+iptables -P OUTPUT ACCEPT""", timeout_s=120),
+             timeout_s=120),
+        Step("lan-verify", linux(f"""
+set -e
+ip -4 addr show | grep -q '{lan}'
+sysctl -n net.ipv4.ip_forward | grep -qx 1
+iptables -S FORWARD | grep -qx -- '-P FORWARD ACCEPT'""",
+                   timeout_s=60),
+             timeout_s=60),
+    )
+
+
+@handler(ServiceId.STATIC_ROUTES)
+def static_routes_handler(ctx: ProvisionContext) -> Sequence[Step]:
+    """The guest's declared route table entries (vantages, team) — the typed
+    `routes` contract executed, never a guessed default gateway."""
+    if ctx.bp is None:
+        raise ProvisionError("static-routes needs the blueprint")
+    bp = ctx.bp
+    routes = [r for r in bp.routes if r.guest == ctx.guest]
+    if not routes:
+        raise ProvisionError(
+            f"{ctx.guest!r} declares static-routes but no routes target it")
+    cmds = "\n".join(f"ip route replace {r.prefix} via {r.via}"
+                     for r in routes)
+    checks = "\n".join(
+        f"ip route get {r.prefix.split('/')[0]} | grep -q 'via {r.via}'"
+        for r in routes)
+    return (
+        Step("routes-add", linux(cmds, timeout_s=60), timeout_s=60),
+        Step("routes-verify", linux(f"set -e\n{checks}", timeout_s=60),
+             timeout_s=60),
     )

@@ -117,6 +117,14 @@ class ServiceId(str, Enum):
     CUPS = "cups"
     AVAHI = "avahi"
     CHRONY = "chrony"
+    #: Edge behaviour as a SERVICE, so the placeholder edge images are
+    #: configured by the same engine (and a real VyOS image can implement the
+    #: same ids later). `edge-nat` owns DNAT/masquerade/routes/syslog on the
+    #: WAN edge; `edge-lan` is the perimeter's forwarding/permissive policy;
+    #: `static-routes` installs a guest's declared route table entries.
+    EDGE_NAT = "edge-nat"
+    EDGE_LAN = "edge-lan"
+    STATIC_ROUTES = "static-routes"
 
 
 class EdgeKind(str, Enum):

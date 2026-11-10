@@ -137,7 +137,7 @@ def test_split_credential_keeps_the_domain_side():
 def test_ad_plan_promotes_once_reboots_and_seeds_the_domain():
     ad = _services(_plan(), "ad-dns")["active-directory"]
     assert [s.id for s in ad.steps] == [
-        "ad-roles", "ad-promote", "ad-seed", "ad-verify"]
+        "ad-address", "ad-roles", "ad-promote", "ad-seed", "ad-verify"]
     promote = next(s for s in ad.steps if s.id == "ad-promote")
     assert promote.reboot is True
     assert "-NoRebootOnCompletion" in promote.argv[-1]
@@ -536,3 +536,52 @@ def test_ca_fileshare_is_enterprise_ca_plus_public_cert_share():
     text = "\n".join(" ".join(s.argv) for s in ca.steps)
     assert "EnterpriseRootCA" in text
     assert "New-SmbShare" in text and "root.cer" in text
+
+
+# ------------------------------------------------------------ edge lane
+
+
+def test_edge_nat_executes_every_forward_and_route_from_the_contract():
+    plan = _services(_plan(), "vyos-edge")["edge-nat"]
+    assert plan.state == "ready"
+    text = "\n".join(" ".join(s.argv) for s in plan.steps)
+    for fwd in BP.public_forwards:
+        assert fwd.vip in text and str(fwd.vip_port) in text
+    target = BP.guest("ecomm").interfaces[0].ipv4.address
+    assert "--to-destination " + target in text
+    for route in BP.routes:
+        if route.guest == "vyos-edge":
+            assert f"ip route replace {route.prefix} via {route.via}" in text
+    assert "MASQUERADE" in text
+    assert "5514" in text           # the declared syslog sink
+
+
+def test_edge_nat_addresses_follow_blueprint_interface_order():
+    plan = _services(_plan(), "vyos-edge")["edge-nat"]
+    addrs = plan.steps[0].argv[-1]
+    for iface in BP.guest("vyos-edge").interfaces:
+        assert iface.ipv4.address in addrs
+    # the WAN device is resolved by NIC ORDER, never a guessed name
+    assert 'sed -n "3p"' in plan.steps[1].argv[-1]
+
+
+def test_edge_lan_reproduces_the_reported_permissive_policy():
+    plan = _services(_plan(), "opnsense-fw")["edge-lan"]
+    assert plan.state == "ready"
+    text = "\n".join(" ".join(s.argv) for s in plan.steps)
+    assert "-P FORWARD ACCEPT" in text
+    assert "net.ipv4.ip_forward=1" in text
+
+
+def test_vantage_gets_only_its_typed_vip_route_not_a_default():
+    plan = _services(_plan(), "scoring-vantage")["static-routes"]
+    assert plan.state == "ready"
+    text = "\n".join(" ".join(s.argv) for s in plan.steps)
+    assert "172.25.31.0/24 via 172.31.31.2" in text
+    assert "default" not in text
+
+
+def test_red_entry_also_reaches_the_vip_prefix_through_the_edge():
+    plan = _services(_plan(), "red-entry")["static-routes"]
+    text = "\n".join(" ".join(s.argv) for s in plan.steps)
+    assert "172.25.31.0/24 via 172.31.31.2" in text
