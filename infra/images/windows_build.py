@@ -35,6 +35,7 @@ import contextlib
 import fcntl
 import os
 import pathlib
+import re
 import subprocess
 import time
 
@@ -102,7 +103,17 @@ FIRST_LOGON_CMD = (
     r'/install '
     r'& echo qga-and-driver-attempted >> C:\sr-stage.log '
     r'& echo build-complete > C:\sr-build-complete.txt '
-    r'& shutdown.exe /s /t 5 /f'
+    # OOBE MUST FINISH BEFORE THE SHUTDOWN. Live evidence 2026-11-10: the
+    # build ended with `shutdown /s /t 5 /f` here, one minute after the first
+    # logon session opened, and setupact.log shows ImageState stuck at
+    # [IMAGE_STATE_SPECIALIZE_RESEAL_TO_OOBE] with OOBEInProgress=1. Every
+    # clone of that image boots into OOBE ("Choose your keyboard layout",
+    # proven by VNC screenshot) and the guest agent never starts. The timer
+    # here is DELAYED on purpose: OOBE finalizes after these commands return
+    # (tens of seconds), the state flips to IMAGE_STATE_COMPLETE, and only
+    # then does a graceful shutdown land. Ten minutes of margin is free
+    # against a twenty-minute build.
+    r'& shutdown.exe /s /t 600'
 )
 
 
@@ -367,7 +378,7 @@ def _offline_evidence(disk: pathlib.Path,
     dev = "/dev/nbd0"
     subprocess.run(["modprobe", "nbd"], check=False)
     evidence = {"qemu_ga": False, "viostor": False, "marker": None,
-                "stage": None}
+                "stage": None, "image_state": None}
     subprocess.run(["qemu-nbd", "-r", "-c", dev, str(disk)], check=True,
                    timeout=120)
     try:
@@ -406,6 +417,17 @@ def _offline_evidence(disk: pathlib.Path,
                 if stage.is_file():
                     evidence["stage"] = stage.read_text(
                         errors="replace").replace("\r", "").strip()
+                # The LAST ImageState transition setup.exe logged. OOBE is
+                # complete only when this reads IMAGE_STATE_COMPLETE; a build
+                # that shut down mid-OOBE leaves SPECIALIZE_RESEAL_TO_OOBE and
+                # every clone of it would boot back into OOBE (2026-11-10).
+                setupact = mount_root / "Windows/Panther/setupact.log"
+                if setupact.is_file():
+                    with setupact.open("rb") as fh:
+                        tail = fh.read()[-400_000:].decode(
+                            "utf-8", errors="replace")
+                    states = re.findall(r"\[(IMAGE_STATE_[A-Z_]+)\]", tail)
+                    evidence["image_state"] = states[-1] if states else None
                 return evidence
             finally:
                 subprocess.run(["umount", str(mount_root)], check=False)
@@ -458,7 +480,11 @@ def build_windows(*, windows_iso: pathlib.Path, virtio_iso: pathlib.Path,
     evidence = offline_evidence(disk)
     # viostor is ADVISORY (IDE installs need no virtio driver); the marker
     # and a real qemu-ga.exe on disk are what "installed" requires.
-    installed = bool(marker) and evidence["qemu_ga"]
+    # An image whose last logged ImageState is not COMPLETE was shut down
+    # inside OOBE and every clone of it boots back into OOBE; refusing it
+    # here is the difference between a golden and a half-finished install.
+    oobe_ok = evidence["image_state"] in (None, "IMAGE_STATE_COMPLETE")
+    installed = bool(marker) and evidence["qemu_ga"] and oobe_ok
     return {"disk": str(disk), "installed": installed, "marker": marker,
             "evidence": evidence, "qemu_rc": qemu_rc,
             "qemu_tail": qemu_tail, "error": error, "serial": str(serial)}
