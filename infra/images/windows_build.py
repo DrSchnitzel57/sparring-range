@@ -15,14 +15,17 @@ module therefore:
      the unattend-answer CD on IDE cdrom indexes 1..3;
   3. NO `-no-reboot`: Windows Setup resets mid-install; boot order is
      DVD-then-HDD so the reboot continues from the installed disk (the
-     DVD's "press any key" is never pressed) and the final ACPI shutdown
-     makes qemu exit;
+     DVD's "press any key" is never pressed);
   4. first logon installs the virtio-win drivers (pnputil) AND QGA (its
-     MSI — pnputil alone does not install qemu-ga), writes an ASCII marker
-     with driver/QGA counts, then shuts down;
-  5. verification reads the marker back OFFLINE via qemu-nbd + ntfs3:
-     disk content is evidence, never qemu's exit code, and `installed`
-     requires qga=1 in the marker.
+     MSI — pnputil alone does not install qemu-ga) and writes an ASCII
+     marker; it never shuts the machine down — OOBE is still finalizing;
+  5. the HOST finishes the build through the same QGA channel the
+     appliance carries: wait for Windows to report OOBEInProgress=0x0,
+     then shut down through the agent; an agent that never answers is
+     evidence the image is not a golden;
+  6. verification reads the marker back OFFLINE via qemu-nbd + ntfs3 and
+     `installed` requires the marker, qemu-ga.exe on disk AND the
+     host-observed OOBE completion.
 
 Scope: Server evaluation media (2019/2022). Win11 needs UEFI+TPM (later);
 SQL/Splunk are installed in-guest during role provisioning, not here.
@@ -31,11 +34,14 @@ role provisioning.
 """
 from __future__ import annotations
 
+import base64
 import contextlib
 import fcntl
+import json
 import os
 import pathlib
 import re
+import socket
 import subprocess
 import time
 
@@ -102,18 +108,12 @@ FIRST_LOGON_CMD = (
     r'pnputil.exe /add-driver %I:\viostor\2k22\amd64\viostor.inf '
     r'/install '
     r'& echo qga-and-driver-attempted >> C:\sr-stage.log '
-    r'& echo build-complete > C:\sr-build-complete.txt '
-    # OOBE MUST FINISH BEFORE THE SHUTDOWN. Live evidence 2026-11-10: the
-    # build ended with `shutdown /s /t 5 /f` here, one minute after the first
-    # logon session opened, and setupact.log shows ImageState stuck at
-    # [IMAGE_STATE_SPECIALIZE_RESEAL_TO_OOBE] with OOBEInProgress=1. Every
-    # clone of that image boots into OOBE ("Choose your keyboard layout",
-    # proven by VNC screenshot) and the guest agent never starts. The timer
-    # here is DELAYED on purpose: OOBE finalizes after these commands return
-    # (tens of seconds), the state flips to IMAGE_STATE_COMPLETE, and only
-    # then does a graceful shutdown land. Ten minutes of margin is free
-    # against a twenty-minute build.
-    r'& shutdown.exe /s /t 600'
+    r'& echo build-complete > C:\sr-build-complete.txt'
+    # NO shutdown here, ever. Shutting down from inside the first-logon
+    # session (5 s once, then 600 s later) left OOBEInProgress=1 and every
+    # clone booted back into OOBE (2026-11-10, twice, VNC-proven). The HOST
+    # watches the agent the line above installs and shuts down only once
+    # Windows reports OOBEInProgress=0x0 — see _install_and_finish.
 )
 
 
@@ -304,12 +304,15 @@ def install_command(*, disk: pathlib.Path, windows_iso: pathlib.Path,
                     virtio_iso: pathlib.Path, answer_iso: pathlib.Path,
                     serial_log: pathlib.Path, memory_mb: int = 4096,
                     smp: int = 4, kvm: bool = True,
-                    monitor_socket: pathlib.Path | None = None) -> list[str]:
+                    monitor_socket: pathlib.Path | None = None,
+                    agent_socket: pathlib.Path | None = None) -> list[str]:
     """Install boot: driver-free SATA + NO NIC (`-nic none` = zero egress),
     answer/virtio/Windows CDs on IDE indexes 1..3 (pc has exactly 4 IDE
     units: the old index 4 cannot attach), DVD-then-HDD boot order so
     Windows Setup's mid-install reset continues from the installed disk.
-    No -no-reboot: the unattend's ACPI shutdown is what ends qemu."""
+    No -no-reboot: QEMU is ended by the host-driven finish (the guest agent
+    observes OOBE completion, then shutdowns); `agent_socket` is that
+    channel."""
     accel = ["-accel", "kvm"] if kvm else ["-accel", "tcg"]
     return [
         "qemu-system-x86_64", "-machine", "pc", *accel,
@@ -332,9 +335,138 @@ def install_command(*, disk: pathlib.Path, windows_iso: pathlib.Path,
         "-display", "none", "-vga", "std",
         *(["-monitor", f"unix:{monitor_socket},server=on,wait=off"]
           if monitor_socket else []),
+        # the SAME QGA channel the appliance will carry, so the host can
+        # observe OOBE completion instead of guessing at a timer
+        *(["-chardev", f"socket,id=srqga,path={agent_socket},server=on,"
+                      "wait=off",
+           "-device", "virtio-serial-pci",
+           "-device", "virtserialport,chardev=srqga,"
+                      "name=org.qemu.guest_agent.0"]
+          if agent_socket else []),
         "-serial", f"file:{serial_log}",
         "-rtc", "base=localtime",
     ]
+
+
+# ------------------------------------------------------ the finish line
+#
+# OOBE must be observed finished, not timed. The build's OWN first-logon
+# command cannot shut the machine down: live evidence 2026-11-10 (twice —
+# five seconds and then ten minutes after first logon) left
+# OOBEInProgress=1, every clone booted back into "Choose your keyboard
+# layout", and the guest agent never answered. So the HOST watches the agent
+# the build installs, waits for Windows to report OOBEInProgress=0x0, and
+# only then issues the shutdown through that agent. The agent cannot answer
+# before QGA is installed in the first logon, so silence is evidence too.
+
+
+def _agent_command(path: pathlib.Path | str, payload: dict,
+                   timeout: float = 20.0) -> dict:
+    """One plain-JSON request/reply on the QGA chardev socket."""
+    last_exc: Exception | None = None
+    for attempt in range(4):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout)
+                s.connect(str(path))
+                s.sendall(json.dumps(payload).encode() + b"\n")
+                buf = b""
+                while b"\n" not in buf:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        raise RuntimeError("guest agent closed the channel")
+                    buf += chunk
+            answer = json.loads(buf.split(b"\n", 1)[0].decode())
+            if "error" in answer:
+                raise RuntimeError(str(answer["error"])[:200])
+            return answer
+        except (OSError, RuntimeError, json.JSONDecodeError) as exc:
+            last_exc = exc
+            time.sleep(0.5 + attempt)
+    raise RuntimeError(f"guest agent unreachable: {last_exc}")
+
+
+def _agent_exec(path: pathlib.Path | str, exe: str,
+                *args: str) -> tuple[int, str]:
+    """guest-exec + guest-exec-status; returns (exitcode, stdout)."""
+    started = _agent_command(path, {
+        "execute": "guest-exec",
+        "arguments": {"path": exe, "arg": list(args), "capture-output": True}})
+    pid = started["return"]["pid"]
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        status = _agent_command(path, {
+            "execute": "guest-exec-status",
+            "arguments": {"pid": pid}})["return"]
+        if status.get("exited"):
+            out = base64.b64decode(status.get("out", "")).decode(
+                errors="replace")
+            return int(status.get("exitcode", -1)), out
+        time.sleep(0.5)
+    raise RuntimeError(f"guest-exec pid {pid} did not finish in 120s")
+
+
+def _monitor_command(path: pathlib.Path | str, command: str) -> None:
+    """One raw QEMU monitor command (the fallback ACPI power button)."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(10)
+            s.connect(str(path))
+            s.sendall(command.encode() + b"\n")
+            time.sleep(0.2)
+            s.recv(4096)
+    except OSError:
+        pass
+
+
+def _install_and_finish(*, cmd: list[str], monitor_socket: pathlib.Path,
+                        agent_socket: pathlib.Path,
+                        timeout_s: int) -> dict:
+    """Run the install boot only as long as OOBE needs it."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE)
+    deadline = time.time() + timeout_s
+    answered = False
+    oobe_complete = False
+    query: str | None = None
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break
+        try:
+            if not answered:
+                _agent_command(agent_socket, {"execute": "guest-ping"})
+                answered = True
+            _code, out = _agent_exec(
+                agent_socket, "C:\\Windows\\system32\\reg.exe",
+                "query", "HKLM\\SYSTEM\\Setup", "/v", "OOBEInProgress")
+            query = out.strip()[:200]
+            if "0x0" in out:
+                oobe_complete = True
+                _agent_exec(agent_socket,
+                            "C:\\Windows\\system32\\shutdown.exe",
+                            "/s", "/t", "0")
+                break
+        except (OSError, RuntimeError):
+            pass
+        time.sleep(10)
+    if not oobe_complete:
+        # Never leave a QEMU behind: press the ACPI power button and let
+        # Windows go down on its own.
+        _monitor_command(monitor_socket, "system_powerdown")
+    try:
+        proc.wait(timeout=300)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=60)
+    tail = ""
+    if proc.stderr is not None:
+        try:
+            tail = (proc.stderr.read() or "")[-800:]
+        except (OSError, ValueError):
+            tail = ""
+    return {"qemu_rc": proc.returncode, "qemu_tail": tail,
+            "agent_answered": answered, "oobe_complete": oobe_complete,
+            "oobe_query": query}
 
 
 def _read_marker_offline(disk: pathlib.Path,
@@ -467,15 +599,16 @@ def build_windows(*, windows_iso: pathlib.Path, virtio_iso: pathlib.Path,
                           virtio_iso=virtio_iso, answer_iso=answer,
                           serial_log=serial, memory_mb=memory_mb, smp=smp,
                           kvm=kvm,
-                          monitor_socket=run_dir / "monitor.sock")
-    error = None
-    try:
-        proc = subprocess.run(cmd, timeout=install_timeout_s,
-                              capture_output=True, text=True)
-        qemu_rc, qemu_tail = proc.returncode, (proc.stderr or "")[-800:]
-    except subprocess.TimeoutExpired as exc:
-        error = f"install boot timed out after {install_timeout_s}s"
-        qemu_rc, qemu_tail = None, str(exc)[-400:]
+                          monitor_socket=run_dir / "monitor.sock",
+                          agent_socket=run_dir / "qga.sock")
+    finish = _install_and_finish(
+        cmd=cmd, monitor_socket=run_dir / "monitor.sock",
+        agent_socket=run_dir / "qga.sock", timeout_s=install_timeout_s)
+    qemu_rc, qemu_tail = finish["qemu_rc"], finish["qemu_tail"]
+    error = None if finish["oobe_complete"] else (
+        "OOBE did not finish: "
+        f"agent_answered={finish['agent_answered']} "
+        f"OOBEInProgress={finish['oobe_query']!r}")
     marker = read_marker_offline(disk)
     evidence = offline_evidence(disk)
     # viostor is ADVISORY (IDE installs need no virtio driver); the marker
@@ -484,7 +617,9 @@ def build_windows(*, windows_iso: pathlib.Path, virtio_iso: pathlib.Path,
     # setup.exe never logs the OOBE->COMPLETE transition (proven 2026-11-10
     # on a good rebuild), so the honest OOBE gate is a booted clone asking
     # the agent (infra/dev/verify_win_image.py), not this log.
-    installed = bool(marker) and evidence["qemu_ga"]
+    installed = (bool(marker) and evidence["qemu_ga"]
+                 and finish["oobe_complete"])
     return {"disk": str(disk), "installed": installed, "marker": marker,
             "evidence": evidence, "qemu_rc": qemu_rc,
-            "qemu_tail": qemu_tail, "error": error, "serial": str(serial)}
+            "qemu_tail": qemu_tail, "error": error, "serial": str(serial),
+            "oobe_complete": finish["oobe_complete"]}

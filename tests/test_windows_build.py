@@ -39,12 +39,11 @@ def test_autounattend_is_keyless_datacenter_core_with_first_logon():
     # stage log, no qemu-ga.exe). `start /wait` is required.
     assert "start /wait msiexec.exe" in xml
     assert "echo build-complete" in xml
-    # A DELAYED shutdown ends qemu: shutting down seconds after first logon
-    # left ImageState at SPECIALIZE_RESEAL_TO_OOBE and every clone booted
-    # back into OOBE (2026-11-10). OOBE finalizes after these commands
-    # return; only then may the machine go down.
-    assert "shutdown.exe /s /t 600" in xml
-    assert "shutdown.exe /s /t 5" not in xml
+    # NO shutdown lives in the answer file: shutting down from inside the
+    # first logon, early or ten minutes late, left OOBEInProgress=1 and every
+    # clone booted back into OOBE (2026-11-10). The HOST waits for the agent
+    # to report OOBEInProgress=0x0 and only then shuts down.
+    assert "shutdown.exe" not in xml
 
 
 def test_autounattend_refuses_unknown_windows_version():
