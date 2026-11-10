@@ -157,7 +157,7 @@ entries:
   - {path: /excluded/mojang-diag, classification: excluded, source: plan-defaults,
      note: "The old Mojang diagnostic endpoint vulnerability is never added
             here; opening weaknesses come from the replica spec only."}
-  - {path: /blueprint/version, classification: synthetic, source: lab-synthesis,
+  - {path: /version, classification: synthetic, source: lab-synthesis,
      note: "Version 2 (2026-11-10): the edge and both vantages now declare
             EXECUTABLE services (edge-nat, edge-lan, static-routes) so the
             typed routing contracts run on the images that exist today; no
